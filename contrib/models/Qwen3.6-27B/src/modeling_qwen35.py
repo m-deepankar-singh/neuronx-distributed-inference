@@ -229,33 +229,6 @@ def l2norm(x, dim=-1, eps=1e-6):
     return F.normalize(x, p=2, dim=dim, eps=eps)
 
 
-FUSED_DELTANET_DECAY_MIN = -20.0
-FUSED_DELTANET_DECAY_MAX = 0.0
-
-
-def _bound_fused_deltanet_log_decay(
-    g, batch_size, num_heads, total_seq_len, chunk_size
-):
-    """Bound cumulative DeltaNet decay before the fused NKI kernel.
-
-    The fused kernel internally computes both exp(cumsum(g)) and exp(-cumsum(g)).
-    Large negative cumulative decays make the second term overflow even though
-    the true pairwise decay exp(gc_i - gc_j) is bounded by one.  Return
-    equivalent per-token deltas whose per-chunk cumulative sum is clamped.
-    """
-    num_chunks = total_seq_len // chunk_size
-    g_chunks = g.reshape(batch_size, num_heads, num_chunks, chunk_size)
-    g_cumsum = g_chunks.cumsum(dim=-1).clamp(
-        min=FUSED_DELTANET_DECAY_MIN,
-        max=FUSED_DELTANET_DECAY_MAX,
-    )
-    g_first = g_cumsum[..., :1]
-    g_rest = g_cumsum[..., 1:] - g_cumsum[..., :-1]
-    return torch.cat([g_first, g_rest], dim=-1).reshape(
-        batch_size, num_heads, total_seq_len
-    )
-
-
 # ============================================================
 # Gated DeltaNet Module (Linear Recurrent Attention)
 # ============================================================
@@ -556,7 +529,8 @@ class NeuronGatedDeltaNet(nn.Module):
             beta = F.pad(beta, (0, pad_size))
             g = F.pad(g, (0, pad_size))
         total_seq_len = S + pad_size
-        g = _bound_fused_deltanet_log_decay(g, B, H, total_seq_len, chunk_size)
+        # Pass raw per-token log-decay. The fused NKI kernel forms decay as
+        # exp(cumsum(g)_i - cumsum(g)_j), so no pre-kernel clamp is needed.
 
         BH = B * H
         # Flatten to (BH, S, dim) for per-(b,h) kernel calls
@@ -941,14 +915,17 @@ class NeuronGatedDeltaNet(nn.Module):
             else:
                 new_rec_state = new_state_bf16 + self.recurrent_state_buffer * 0
         else:
-            # CTE: fused, chunk, NKI, or sequential forward
-            use_nki_fused = os.environ.get("USE_NKI_FUSED") == "1"
+            # CTE: fused NKI kernel by default (PyTorch _chunk_forward can hit
+            # neuronx-cc codegen ICE NCC_INLA001 with these DeltaNet dimensions).
+            # Override with env vars for debugging/benchmarking.
+            use_nki_fused = os.environ.get("USE_NKI_FUSED", "1") != "0"
             use_nki_chunked = os.environ.get("USE_NKI_CHUNKED") == "1"
             use_nki = os.environ.get("USE_NKI") == "1"
             use_sequential = os.environ.get("DELTANET_SEQUENTIAL") == "1"
+            use_pytorch_chunk = os.environ.get("USE_PYTORCH_CHUNK") == "1"
 
-            if use_nki_fused:
-                output, final_state = self._fused_chunked_forward(
+            if use_pytorch_chunk:
+                output, final_state = self._chunk_forward(
                     query, key, value, g, beta, output_final_state=True
                 )
             elif use_nki_chunked:
@@ -963,8 +940,12 @@ class NeuronGatedDeltaNet(nn.Module):
                 output, final_state = self._sequential_forward(
                     query, key, value, g, beta, output_final_state=True
                 )
+            elif use_nki_fused:
+                output, final_state = self._fused_chunked_forward(
+                    query, key, value, g, beta, output_final_state=True
+                )
             else:
-                output, final_state = self._chunk_forward(
+                output, final_state = self._fused_chunked_forward(
                     query, key, value, g, beta, output_final_state=True
                 )
 
