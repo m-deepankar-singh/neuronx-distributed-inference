@@ -296,6 +296,12 @@ class NeuronGatedDeltaNet(nn.Module):
         self.layer_idx = layer_idx
         self.rms_norm_eps = tc.rms_norm_eps
         self.use_hybrid_cache_manager = getattr(tc, "use_hybrid_cache_manager", False)
+        self.use_qwen_hybrid_chunked_prefill = getattr(
+            tc, "use_qwen_hybrid_chunked_prefill", False
+        )
+        self.use_qwen_hybrid_chunked_prefill_nki = getattr(
+            tc, "use_qwen_hybrid_chunked_prefill_nki", False
+        )
 
         # KV cache dummy shape info
         self.head_dim = tc.head_dim  # 256
@@ -417,7 +423,7 @@ class NeuronGatedDeltaNet(nn.Module):
         return output, final_state
 
     def _nki_chunked_forward(
-        self, query, key, value, g, beta, output_final_state=False
+        self, query, key, value, g, beta, output_final_state=False, initial_state=None
     ):
         """Chunked NKI kernel forward for context encoding (prefill)."""
         chunk_size = 128
@@ -481,10 +487,17 @@ class NeuronGatedDeltaNet(nn.Module):
             diagonal=0,
         )
 
+        initial_state_flat = None
+        if initial_state is not None:
+            initial_state_flat = initial_state.reshape(BH, k_dim, v_dim).float().contiguous()
+
         all_outputs = []
         all_states = []
         for bh in range(BH):
-            state = torch.zeros(k_dim, v_dim, dtype=torch.float32, device=device)
+            if initial_state_flat is None:
+                state = torch.zeros(k_dim, v_dim, dtype=torch.float32, device=device)
+            else:
+                state = initial_state_flat[bh]
 
             head_chunks = []
             for c_idx in range(num_chunks):
@@ -647,7 +660,9 @@ class NeuronGatedDeltaNet(nn.Module):
         final_state = state if output_final_state else None
         return output, final_state
 
-    def _chunk_forward(self, query, key, value, g, beta, output_final_state=False):
+    def _chunk_forward(
+        self, query, key, value, g, beta, output_final_state=False, initial_state=None
+    ):
         """Chunk-based forward for context encoding (prefill)."""
         chunk_size = 64
 
@@ -697,9 +712,12 @@ class NeuronGatedDeltaNet(nn.Module):
         value = attn @ v_beta
         k_cumdecay = attn @ (k_beta * g.exp().unsqueeze(-1))
 
-        last_recurrent_state = torch.zeros(
-            B, H, k_dim, v_dim, dtype=query.dtype, device=query.device
-        )
+        if initial_state is None:
+            last_recurrent_state = torch.zeros(
+                B, H, k_dim, v_dim, dtype=query.dtype, device=query.device
+            )
+        else:
+            last_recurrent_state = initial_state.to(dtype=query.dtype)
         core_attn_out = torch.zeros_like(value)
         mask2 = torch.triu(
             torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device),
@@ -749,7 +767,12 @@ class NeuronGatedDeltaNet(nn.Module):
         batch_size, seq_len, _ = hidden_states.shape
 
         seq_ids = kwargs.get("seq_ids", None)
-        is_decode = past_key_value is not None
+        qwen_chunked_prefill_active = (
+            self.use_qwen_hybrid_chunked_prefill
+            and past_key_value is not None
+            and seq_len > 1
+        )
+        is_decode = past_key_value is not None and not qwen_chunked_prefill_active
 
         # Padding mask for DeltaNet: [B, S, 1] with 1.0 for real tokens, 0.0 for padding.
         # Passed from get_model_output where it's computed from input_ids != pad_token_id.
@@ -829,21 +852,42 @@ class NeuronGatedDeltaNet(nn.Module):
             else:
                 new_conv_state = new_conv_state + self.conv_state_buffer * 0
         else:
-            mixed_post_conv = F.silu(self.conv1d(mixed)[:, :, :seq_len])
-
-            if valid_mask_1d is not None:
-                # valid_mask_1d is [B, S, 1]; count valid tokens per batch
-                num_valid = (
-                    valid_mask_1d.squeeze(-1).sum(dim=-1, keepdim=True).long()
-                )  # [B, 1]
-                idx_base = num_valid - 3
-                idx_base = idx_base.clamp(min=0)
-                offsets = torch.arange(3, device=mixed.device).unsqueeze(0)
-                gather_idx = idx_base + offsets  # [B, 3]
-                gather_idx = gather_idx.unsqueeze(1).expand(-1, self.conv_dim, -1)
-                new_conv_state = torch.gather(mixed, 2, gather_idx)
+            if qwen_chunked_prefill_active and conv_state_cache is not None:
+                conv_state = conv_state_cache[:batch_size]
+                conv_input = torch.cat([conv_state, mixed], dim=-1)
+                w = self.conv1d.weight.squeeze(1)
+                conv_out = torch.zeros_like(mixed)
+                for k in range(self.conv_kernel_size):
+                    conv_out = conv_out + w[:, k].unsqueeze(0).unsqueeze(-1) * conv_input[
+                        :, :, k : k + seq_len
+                    ]
+                mixed_post_conv = F.silu(conv_out)
+                if valid_mask_1d is not None:
+                    state_len = self.conv_kernel_size - 1
+                    num_valid = valid_mask_1d.squeeze(-1).sum(dim=-1, keepdim=True).long()
+                    idx_base = (state_len + num_valid - state_len).clamp(min=0)
+                    offsets = torch.arange(state_len, device=mixed.device).unsqueeze(0)
+                    gather_idx = idx_base + offsets
+                    gather_idx = gather_idx.unsqueeze(1).expand(-1, self.conv_dim, -1)
+                    new_conv_state = torch.gather(conv_input, 2, gather_idx)
+                else:
+                    new_conv_state = conv_input[:, :, -self.conv_kernel_size + 1 :].contiguous()
             else:
-                new_conv_state = mixed[:, :, -3:].contiguous()
+                mixed_post_conv = F.silu(self.conv1d(mixed)[:, :, :seq_len])
+
+                if valid_mask_1d is not None:
+                    # valid_mask_1d is [B, S, 1]; count valid tokens per batch
+                    num_valid = (
+                        valid_mask_1d.squeeze(-1).sum(dim=-1, keepdim=True).long()
+                    )  # [B, 1]
+                    idx_base = num_valid - 3
+                    idx_base = idx_base.clamp(min=0)
+                    offsets = torch.arange(3, device=mixed.device).unsqueeze(0)
+                    gather_idx = idx_base + offsets  # [B, 3]
+                    gather_idx = gather_idx.unsqueeze(1).expand(-1, self.conv_dim, -1)
+                    new_conv_state = torch.gather(mixed, 2, gather_idx)
+                else:
+                    new_conv_state = mixed[:, :, -3:].contiguous()
 
             alloc_bs = self.conv_state_buffer.shape[0]
             if hybrid_cache_active:
@@ -964,7 +1008,29 @@ class NeuronGatedDeltaNet(nn.Module):
             use_nki = os.environ.get("USE_NKI") == "1"
             use_sequential = os.environ.get("DELTANET_SEQUENTIAL") == "1"
 
-            if use_nki_fused:
+            if qwen_chunked_prefill_active and recurrent_state_cache is not None:
+                initial_state = recurrent_state_cache[:batch_size].float()
+                if self.use_qwen_hybrid_chunked_prefill_nki:
+                    output, final_state = self._nki_chunked_forward(
+                        query,
+                        key,
+                        value,
+                        g,
+                        beta,
+                        output_final_state=True,
+                        initial_state=initial_state,
+                    )
+                else:
+                    output, final_state = self._chunk_forward(
+                        query,
+                        key,
+                        value,
+                        g,
+                        beta,
+                        output_final_state=True,
+                        initial_state=initial_state,
+                    )
+            elif use_nki_fused:
                 output, final_state = self._fused_chunked_forward(
                     query, key, value, g, beta, output_final_state=True
                 )
@@ -1078,6 +1144,8 @@ class Qwen35InferenceConfig(InferenceConfig):
         kwargs.setdefault("linear_value_head_dim", 128)
         kwargs.setdefault("linear_conv_kernel_dim", 4)
         kwargs.setdefault("use_hybrid_cache_manager", False)
+        kwargs.setdefault("use_qwen_hybrid_chunked_prefill", False)
+        kwargs.setdefault("use_qwen_hybrid_chunked_prefill_nki", False)
 
         super().__init__(*args, **kwargs)
 
@@ -1342,6 +1410,48 @@ class NeuronQwen35Attention(NeuronAttentionBase):
 
         return _flash_fwd_call(Q, K, V, use_causal_mask=True), None
 
+    def perform_qwen_chunked_prefill(self, Q, K, V, past_key_value, position_ids):
+        """Exact chunked CTE over the full decode cache.
+
+        The current chunk K/V tensors are scattered into the full cache at
+        absolute position_ids, then attention for this chunk is computed over
+        all cache positions up to the chunk end. This keeps full-attention
+        layers correct when model-local chunked prefill feeds context in
+        multiple CTE-bucket calls.
+        """
+        k_cache, v_cache = past_key_value
+        B, q_heads, q_len, head_dim = Q.shape
+        kv_heads = K.shape[1]
+        cache_len = k_cache.shape[2]
+
+        pos = position_ids.long()
+        k_index = pos[:, None, :, None].expand(B, kv_heads, q_len, head_dim)
+        k_cache = torch.scatter(k_cache, dim=2, index=k_index, src=K.to(k_cache.dtype))
+        v_cache = torch.scatter(v_cache, dim=2, index=k_index, src=V.to(v_cache.dtype))
+
+        if q_heads != kv_heads:
+            kv_rep = q_heads // kv_heads
+            K_full = (
+                k_cache.unsqueeze(2)
+                .expand(-1, -1, kv_rep, -1, -1)
+                .reshape(B, q_heads, cache_len, head_dim)
+            )
+            V_full = (
+                v_cache.unsqueeze(2)
+                .expand(-1, -1, kv_rep, -1, -1)
+                .reshape(B, q_heads, cache_len, head_dim)
+            )
+        else:
+            K_full = k_cache
+            V_full = v_cache
+
+        attn_weights = torch.matmul(Q, K_full.transpose(-1, -2)) / math.sqrt(head_dim)
+        cache_positions = torch.arange(cache_len, device=position_ids.device).view(1, 1, 1, -1)
+        causal_mask = cache_positions <= pos[:, None, :, None]
+        attn_weights = attn_weights.masked_fill(~causal_mask, -65504.0)
+        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(Q.dtype)
+        return torch.matmul(attn_weights, V_full)
+
     def forward(
         self,
         hidden_states,
@@ -1382,10 +1492,20 @@ class NeuronQwen35Attention(NeuronAttentionBase):
             rmsnorm=rmsnorm,
         )
 
+        qwen_chunked_prefill_active = (
+            past_key_value is not None
+            and q_len > 1
+            and getattr(self.config, "use_qwen_hybrid_chunked_prefill", False)
+        )
+
         if past_key_value is None:
             # Context encoding (prefill)
             attn_output, _flash_strategy = self.perform_prefill(
                 Q, K, V, q_len, bsz, attention_mask
+            )
+        elif qwen_chunked_prefill_active:
+            attn_output = self.perform_qwen_chunked_prefill(
+                Q, K, V, past_key_value, position_ids
             )
         else:
             # Token generation (decode)
@@ -1722,6 +1842,15 @@ class HybridDeltaNetCacheManager(KVCacheManager):
                     state_per_layer=kv_per_layer,
                     kvcache_buffer=kvcache_buffer,
                 )
+            elif kwargs.get("qwen_chunked_prefill_update", False):
+                recurrent_state, conv_state = self.update_qwen_chunked_kv_by_layer_id(
+                    idx=idx,
+                    seq_ids=seq_ids,
+                    position_ids=position_ids,
+                    kv_per_layer=kv_per_layer,
+                    kvcache_buffer=kvcache_buffer,
+                    valid_mask=kwargs.get("qwen_chunked_valid_mask", None),
+                )
             else:
                 recurrent_state, conv_state = self.update_kv_by_layer_id(
                     idx=idx,
@@ -1740,6 +1869,59 @@ class HybridDeltaNetCacheManager(KVCacheManager):
             updated_cache.append(conv_state)
         return updated_cache
 
+    def update_qwen_chunked_kv_by_layer_id(
+        self,
+        idx: int,
+        seq_ids: torch.Tensor,
+        position_ids: torch.Tensor,
+        kv_per_layer: Tuple[torch.Tensor, torch.Tensor],
+        kvcache_buffer=None,
+        valid_mask=None,
+    ):
+        latest_k, latest_v = kv_per_layer
+        k_cache, v_cache = self._fetch_cache(idx, kvcache_buffer)
+        latest_k = latest_k.to(k_cache.dtype)
+        latest_v = latest_v.to(v_cache.dtype)
+
+        if seq_ids is not None:
+            cache_idx = self.get_cache_update_index_for_seq_ids(seq_ids)
+            selected_k = torch.index_select(k_cache, dim=0, index=cache_idx)
+            selected_v = torch.index_select(v_cache, dim=0, index=cache_idx)
+        else:
+            cache_idx = None
+            selected_k = k_cache[: latest_k.shape[0]]
+            selected_v = v_cache[: latest_v.shape[0]]
+
+        pos = position_ids.long()
+        k_index = pos[:, None, :, None].expand_as(latest_k)
+        v_index = pos[:, None, :, None].expand_as(latest_v)
+
+        if valid_mask is not None:
+            valid = valid_mask.to(torch.bool)[:, None, :, None]
+            old_k = torch.gather(selected_k, dim=2, index=k_index)
+            old_v = torch.gather(selected_v, dim=2, index=v_index)
+            latest_k = torch.where(valid, latest_k, old_k)
+            latest_v = torch.where(valid, latest_v, old_v)
+
+        updated_k = torch.scatter(selected_k, dim=2, index=k_index, src=latest_k)
+        updated_v = torch.scatter(selected_v, dim=2, index=v_index, src=latest_v)
+
+        if cache_idx is not None:
+            k_row_index = cache_idx.view(-1, 1, 1, 1).expand_as(updated_k)
+            v_row_index = cache_idx.view(-1, 1, 1, 1).expand_as(updated_v)
+            k_cache = torch.scatter(k_cache, dim=0, index=k_row_index, src=updated_k)
+            v_cache = torch.scatter(v_cache, dim=0, index=v_row_index, src=updated_v)
+            return k_cache, v_cache
+
+        if updated_k.shape[0] == k_cache.shape[0]:
+            return updated_k + k_cache * 0, updated_v + v_cache * 0
+
+        pad_rows = k_cache.shape[0] - updated_k.shape[0]
+        if pad_rows > 0:
+            updated_k = torch.cat([updated_k, k_cache[updated_k.shape[0] :] * 0], dim=0)
+            updated_v = torch.cat([updated_v, v_cache[updated_v.shape[0] :] * 0], dim=0)
+        return updated_k + k_cache * 0, updated_v + v_cache * 0
+
     def update_deltanet_state_by_layer_id(
         self,
         idx: int,
@@ -1752,7 +1934,7 @@ class HybridDeltaNetCacheManager(KVCacheManager):
         latest_recurrent = latest_recurrent.to(recurrent_cache.dtype)
         latest_conv = latest_conv.to(conv_cache.dtype)
 
-        if latest_recurrent.shape[0] == recurrent_cache.shape[0]:
+        if latest_recurrent.shape[0] == recurrent_cache.shape[0] and seq_ids is None:
             return (
                 latest_recurrent + recurrent_cache * 0,
                 latest_conv + conv_cache * 0,
@@ -1952,9 +2134,17 @@ class NeuronQwen35Model(NeuronBaseModel):
 
         hidden_states = inputs_embeds
 
-        # Get KV cache for TKG
-        cache_size = self.n_positions
-        if not is_for_context_encoding:
+        # Get KV cache for TKG and for model-local chunked CTE.
+        use_qwen_chunked_prefill = (
+            is_for_context_encoding
+            and getattr(self.config, "use_qwen_hybrid_chunked_prefill", False)
+        )
+        cache_size = (
+            self.config.neuron_config.seq_len
+            if use_qwen_chunked_prefill
+            else self.n_positions
+        )
+        if (not is_for_context_encoding) or use_qwen_chunked_prefill:
             if self.kv_mgr is not None:
                 past_key_values = self.kv_mgr.get_cache(
                     seq_ids=seq_ids,
@@ -2017,6 +2207,10 @@ class NeuronQwen35Model(NeuronBaseModel):
                 windowed_context_encoding_window_idx=windowed_context_encoding_window_idx,
                 padding_mask=padding_mask,
                 deltanet_padding_mask=deltanet_padding_mask,
+                qwen_chunked_prefill_update=use_qwen_chunked_prefill,
+                qwen_chunked_valid_mask=deltanet_padding_mask.squeeze(-1)
+                if use_qwen_chunked_prefill
+                else None,
                 **kwargs,
             )
 
@@ -2040,6 +2234,10 @@ class NeuronQwen35Model(NeuronBaseModel):
                 new_key_values=next_decoder_cache,
                 seq_len=cache_size,
                 windowed_context_encoding_window_idx=windowed_context_encoding_window_idx,
+                qwen_chunked_prefill_update=use_qwen_chunked_prefill,
+                qwen_chunked_valid_mask=deltanet_padding_mask.squeeze(-1)
+                if use_qwen_chunked_prefill
+                else None,
                 **kwargs,
             )
 
@@ -2130,7 +2328,15 @@ class NeuronQwen35Model(NeuronBaseModel):
             if not is_for_context_encoding:
                 pass
             else:
-                index = torch.max(position_ids, dim=1, keepdim=True).indices
+                if getattr(self.config, "use_qwen_hybrid_chunked_prefill", False):
+                    index = (
+                        (input_ids != self.padding_idx)
+                        .sum(dim=1, keepdim=True)
+                        .long()
+                        - 1
+                    ).clamp(min=0)
+                else:
+                    index = torch.max(position_ids, dim=1, keepdim=True).indices
                 index = index.unsqueeze(1).expand(batch_size, 1, self.hidden_size)
                 hidden_states = torch.gather(hidden_states, dim=1, index=index)
 
@@ -2616,7 +2822,10 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
         tf_args=None,
     ):
         """Override to pass all 24 positional args explicitly."""
-        is_prefill = self._is_prefill(position_ids)
+        is_prefill = self._is_prefill(position_ids) or (
+            getattr(self.config, "use_qwen_hybrid_chunked_prefill", False)
+            and input_ids.shape[-1] > 1
+        )
 
         seq_len = input_ids.shape[1]
         batch_size = input_ids.shape[0]
@@ -2658,7 +2867,7 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
 
         empties = [torch.empty(0) for _ in range(14)]
 
-        if self._is_prefill(position_ids):
+        if is_prefill:
             ctx_bs = self.context_encoding_model.neuron_config.batch_size
             output_logits = []
 
