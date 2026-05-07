@@ -1132,6 +1132,7 @@ class Qwen35InferenceConfig(InferenceConfig):
         kwargs.setdefault("use_hybrid_cache_manager", False)
         kwargs.setdefault("use_qwen_hybrid_chunked_prefill", False)
         kwargs.setdefault("use_qwen_hybrid_chunked_prefill_nki", False)
+        kwargs.setdefault("qwen_chunked_prefill_attention_microchunk", 128)
 
         super().__init__(*args, **kwargs)
 
@@ -1444,12 +1445,25 @@ class NeuronQwen35Attention(NeuronAttentionBase):
             K_full = k_cache
             V_full = v_cache
 
-        attn_weights = torch.matmul(Q, K_full.transpose(-1, -2)) / math.sqrt(head_dim)
         cache_positions = torch.arange(cache_len, device=position_ids.device).view(1, 1, 1, -1)
-        causal_mask = cache_positions <= pos[:, None, :, None]
-        attn_weights = attn_weights.masked_fill(~causal_mask, -65504.0)
-        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(Q.dtype)
-        return torch.matmul(attn_weights, V_full)
+        microchunk = int(
+            getattr(self.config, "qwen_chunked_prefill_attention_microchunk", 128)
+        )
+        outputs = []
+        for start in range(0, q_len, microchunk):
+            end = min(start + microchunk, q_len)
+            q_blk = Q[:, :, start:end, :]
+            pos_blk = pos[:, start:end]
+            attn_weights = torch.matmul(q_blk, K_full.transpose(-1, -2)) / math.sqrt(
+                head_dim
+            )
+            causal_mask = cache_positions <= pos_blk[:, None, :, None]
+            attn_weights = attn_weights.masked_fill(~causal_mask, -65504.0)
+            attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(
+                Q.dtype
+            )
+            outputs.append(torch.matmul(attn_weights, V_full))
+        return torch.cat(outputs, dim=2)
 
     def forward(
         self,
