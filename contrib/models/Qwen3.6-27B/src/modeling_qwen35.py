@@ -512,7 +512,14 @@ class NeuronGatedDeltaNet(nn.Module):
         return output, last_recurrent_state
 
     def _fused_chunked_forward(
-        self, query, key, value, g, beta, output_final_state=False
+        self,
+        query,
+        key,
+        value,
+        g,
+        beta,
+        output_final_state=False,
+        initial_state=None,
     ):
         """Fused single-kernel chunked forward for CTE — SSD-style.
 
@@ -556,6 +563,14 @@ class NeuronGatedDeltaNet(nn.Module):
         # g and beta: (BH, S) -> (BH, S, 1) for the kernel's (S, 1) input layout
         g_flat = g.reshape(BH, total_seq_len).unsqueeze(-1).contiguous()
         beta_flat = beta.reshape(BH, total_seq_len).unsqueeze(-1).contiguous()
+        if initial_state is None:
+            initial_state_flat = torch.zeros(
+                BH, k_dim, v_dim, dtype=torch.float32, device=query.device
+            )
+        else:
+            initial_state_flat = (
+                initial_state.reshape(BH, k_dim, v_dim).float().contiguous()
+            )
 
         # Create constant mask tensors (shared across all B*H calls)
         device = query.device
@@ -578,6 +593,7 @@ class NeuronGatedDeltaNet(nn.Module):
                 value_flat[bh],  # (S, 128)
                 g_flat[bh],  # (S, 1) — RAW g, not cumsum
                 beta_flat[bh],  # (S, 1) — sigmoid(b)
+                initial_state_flat[bh],  # (128, 128)
                 lower_mask,  # (128, 128)
                 identity_mat,  # (128, 128)
                 lower_mask_diag,  # (128, 128)
@@ -988,15 +1004,26 @@ class NeuronGatedDeltaNet(nn.Module):
             if qwen_chunked_prefill_active and recurrent_state_cache is not None:
                 initial_state = recurrent_state_cache[:batch_size].float()
                 if self.use_qwen_hybrid_chunked_prefill_nki:
-                    output, final_state = self._nki_chunked_forward(
-                        query,
-                        key,
-                        value,
-                        g,
-                        beta,
-                        output_final_state=True,
-                        initial_state=initial_state,
-                    )
+                    if os.environ.get("USE_QWEN_FUSED_GDN_PREFILL") == "1":
+                        output, final_state = self._fused_chunked_forward(
+                            query,
+                            key,
+                            value,
+                            g,
+                            beta,
+                            output_final_state=True,
+                            initial_state=initial_state,
+                        )
+                    else:
+                        output, final_state = self._nki_chunked_forward(
+                            query,
+                            key,
+                            value,
+                            g,
+                            beta,
+                            output_final_state=True,
+                            initial_state=initial_state,
+                        )
                 else:
                     output, final_state = self._chunk_forward(
                         query,

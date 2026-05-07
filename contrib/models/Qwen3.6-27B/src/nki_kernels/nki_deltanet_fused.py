@@ -17,9 +17,9 @@ NKI 0.3.0 (SDK 2.29). k_dim = v_dim = 128 = P_MAX exactly.
 Chunk size = 128 = P_MAX (one tile per chunk).
 
 Mathematical framework (same as nki_deltanet_chunked.py):
-  Per-chunk Neumann-series power-doubling for intra-chunk correction:
+  Per-chunk blocked forward substitution for intra-chunk correction:
     A = -QK_decay * lower_mask
-    N = (I+A)(I+A^2)(I+A^4)...(I+A^64)  [6 rounds]
+    N = inv(I - A)
     value_corr = N @ v_beta
     k_cumdecay = N @ (k_beta * exp(gc))
 
@@ -29,7 +29,7 @@ Mathematical framework (same as nki_deltanet_chunked.py):
     attn_inter = (q * exp(gc)) @ state
     attn_intra = (q @ k^T) * decay_mask * lower_mask_diag
     output = attn_inter + attn_intra @ v_new
-    state = exp(g_last) * (state + k_raw_decay^T @ v_new)
+    state = state * exp(g_last) + (k * exp(g_last - gc))^T @ v_new
 """
 
 import numpy as np
@@ -67,6 +67,7 @@ def deltanet_fused_chunked_fwd(
     value: nl.ndarray,  # (S, 128) float32
     g_in: nl.ndarray,  # (S, 1)   float32 — per-token log-decay (NOT cumsum)
     beta_in: nl.ndarray,  # (S, 1)   float32 — per-token write gate
+    state_in: nl.ndarray,  # (128, 128) float32 — recurrent state before S
     lower_mask: nl.ndarray,  # (128, 128) float32 — strict lower tri
     identity: nl.ndarray,  # (128, 128) float32 — identity
     lower_mask_diag: nl.ndarray,  # (128, 128) float32 — lower tri with diag
@@ -120,7 +121,7 @@ def deltanet_fused_chunked_fwd(
     # Initialize recurrent state in SBUF — persists across ALL chunks
     # ================================================================
     state = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.memset(dst=state, value=0.0)
+    nisa.dma_copy(dst=state, src=state_in)
 
     # ================================================================
     # Sequential chunk processing
@@ -216,7 +217,7 @@ def deltanet_fused_chunked_fwd(
             src=gc_row[0:1, CHUNK_SIZE - 1 : CHUNK_SIZE],
         )
 
-        # ---- Compute exp(gc), exp(-gc), exp(g_last) as (P_MAX, 1) scalars ----
+        # ---- Compute stable decay helpers as (P_MAX, 1) scalars ----
         # These (P_MAX, 1) tensors are used with tensor_scalar to broadcast
         # across the free dimension without explicit (P_MAX, dim) copies.
 
@@ -229,24 +230,15 @@ def deltanet_fused_chunked_fwd(
             scale=1.0,
         )
 
-        neg_gc_p = nl.ndarray((P_MAX, 1), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_scalar(
-            dst=neg_gc_p,
-            data=gc_p,
-            op0=nl.multiply,
-            operand0=-1.0,
-            engine=nisa.vector_engine,
-        )
-        exp_neg_gc_p = nl.ndarray((P_MAX, 1), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.activation(
-            dst=exp_neg_gc_p[0:P_MAX, 0:1],
-            op=nl.exp,
-            data=neg_gc_p[0:P_MAX, 0:1],
-            bias=None,
-            scale=1.0,
-        )
+        # g_last and exp(g_last): scalar, then broadcast to (P_MAX, 1)
+        gl_p = nl.ndarray((P_MAX, 1), dtype=nl.float32, buffer=nl.sbuf)
+        for i_shuf in nl.static_range(P_MAX // 32):
+            nisa.nc_stream_shuffle(
+                src=gl_11[0:1, 0:1],
+                dst=gl_p[i_shuf * 32 : i_shuf * 32 + 32, 0:1],
+                shuffle_mask=_BROADCAST_MASK,
+            )
 
-        # exp(g_last): scalar, then broadcast to (P_MAX, 1)
         exp_gl_11 = nl.ndarray((1, 1), dtype=nl.float32, buffer=nl.sbuf)
         nisa.activation(
             dst=exp_gl_11,
@@ -263,6 +255,92 @@ def deltanet_fused_chunked_fwd(
                 dst=exp_gl_p[i_shuf * 32 : i_shuf * 32 + 32, 0:1],
                 shuffle_mask=_BROADCAST_MASK,
             )
+
+        # Build pairwise decays as one bounded exponential:
+        #   decay[i,j] = exp(gc[i] - gc[j]) for causal pairs.
+        # This avoids the split exp(gc) * exp(-gc) form that can overflow even
+        # when the causal product is mathematically <= 1.
+        gc_padded = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.memset(dst=gc_padded, value=0.0)
+        nisa.tensor_copy(dst=gc_padded[0:P_MAX, 0:1], src=gc_p[0:P_MAX, 0:1])
+
+        gc_row_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
+        nisa.nc_transpose(dst=gc_row_psum, data=gc_padded)
+
+        gc_row = nl.ndarray((1, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=gc_row[0:1, 0:P_MAX], src=gc_row_psum[0:1, 0:P_MAX])
+
+        gc_row_broadcast = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+        for i_shuf in nl.static_range(P_MAX // 32):
+            nisa.nc_stream_shuffle(
+                src=gc_row[0:1, 0:P_MAX],
+                dst=gc_row_broadcast[i_shuf * 32 : i_shuf * 32 + 32, 0:P_MAX],
+                shuffle_mask=_BROADCAST_MASK,
+            )
+
+        gc_col_strict = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_scalar(
+            dst=gc_col_strict,
+            data=Lmask,
+            op0=nl.multiply,
+            operand0=gc_p,
+            engine=nisa.vector_engine,
+        )
+        gc_row_strict = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_tensor(
+            dst=gc_row_strict, data1=gc_row_broadcast, data2=Lmask, op=nl.multiply
+        )
+        g_diff_strict = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_tensor(
+            dst=g_diff_strict,
+            data1=gc_col_strict,
+            data2=gc_row_strict,
+            op=nl.subtract,
+        )
+        decay_strict_raw = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.activation(
+            dst=decay_strict_raw,
+            op=nl.exp,
+            data=g_diff_strict,
+            bias=None,
+            scale=1.0,
+        )
+        decay_strict = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_tensor(
+            dst=decay_strict, data1=decay_strict_raw, data2=Lmask, op=nl.multiply
+        )
+
+        gc_col_diag = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_scalar(
+            dst=gc_col_diag,
+            data=Lmask_d,
+            op0=nl.multiply,
+            operand0=gc_p,
+            engine=nisa.vector_engine,
+        )
+        gc_row_diag = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_tensor(
+            dst=gc_row_diag, data1=gc_row_broadcast, data2=Lmask_d, op=nl.multiply
+        )
+        g_diff_diag = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_tensor(
+            dst=g_diff_diag,
+            data1=gc_col_diag,
+            data2=gc_row_diag,
+            op=nl.subtract,
+        )
+        decay_diag_raw = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.activation(
+            dst=decay_diag_raw,
+            op=nl.exp,
+            data=g_diff_diag,
+            bias=None,
+            scale=1.0,
+        )
+        decay_diag = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_tensor(
+            dst=decay_diag, data1=decay_diag_raw, data2=Lmask_d, op=nl.multiply
+        )
 
         # ============================================================
         # k_beta = K * beta, v_beta = V * beta
@@ -306,49 +384,9 @@ def deltanet_fused_chunked_fwd(
         QK = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_copy(dst=QK, src=QK_psum)
 
-        # ============================================================
-        # Decay mask: QK_decay[i,j] = QK[i,j] * exp(gc[i]) * exp(-gc[j])
-        #
-        # Apply the strict causal mask before the split exp(gc) / exp(-gc)
-        # scaling. Upper-triangular entries are mathematically unused, but
-        # scaling them first can create very large finite values that poison
-        # later matmuls before the mask is applied.
-        # ============================================================
-        QK_masked = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_tensor(dst=QK_masked, data1=QK, data2=Lmask, op=nl.multiply)
-
-        # Row scaling: QK_row[i,:] = QK[i,:] * exp(gc[i])
-        # Then transpose, column scale, transpose back.
-        # Uses tensor_scalar with (P_MAX,1) operand for row scaling.
-        QK_row = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_scalar(
-            dst=QK_row,
-            data=QK_masked,
-            op0=nl.multiply,
-            operand0=exp_gc_p,
-            engine=nisa.vector_engine,
-        )
-
-        # Transpose to scale columns (now rows in transposed view)
-        QK_r_T_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
-        nisa.nc_transpose(dst=QK_r_T_psum, data=QK_row)
-        QK_r_T = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_copy(dst=QK_r_T, src=QK_r_T_psum)
-
-        QK_r_T_col = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_scalar(
-            dst=QK_r_T_col,
-            data=QK_r_T,
-            op0=nl.multiply,
-            operand0=exp_neg_gc_p,
-            engine=nisa.vector_engine,
-        )
-
-        # Transpose back
-        QK_d_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
-        nisa.nc_transpose(dst=QK_d_psum, data=QK_r_T_col)
+        # QK_decay[i,j] = QK[i,j] * exp(gc[i] - gc[j]) for i > j.
         QK_decay = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_copy(dst=QK_decay, src=QK_d_psum)
+        nisa.tensor_tensor(dst=QK_decay, data1=QK, data2=decay_strict, op=nl.multiply)
 
         # A = -QK_decay * lower_mask
         neg_QK_decay = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
@@ -363,38 +401,156 @@ def deltanet_fused_chunked_fwd(
         nisa.tensor_tensor(dst=A_mat, data1=neg_QK_decay, data2=Lmask, op=nl.multiply)
 
         # ============================================================
-        # Neumann power-doubling: N = (I+A)(I+A^2)...(I+A^{64})
-        # 6 rounds → resolves rank up to 2^6 = 64 (sufficient for chunk=128)
+        # Stable triangular solve: N = inv(I - A_mat)
+        #
+        # A_mat is strictly lower triangular. Solve two 64x64 diagonal blocks
+        # row-by-row, then merge the lower-left block. This is equivalent to
+        # the nilpotent Neumann series but avoids repeated squaring of A.
         # ============================================================
         P_acc = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_tensor(dst=P_acc, data1=eye, data2=A_mat, op=nl.add)
+        nisa.memset(dst=P_acc, value=0.0)
 
-        A_pow = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_copy(dst=A_pow, src=A_mat)
+        A_T_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
+        nisa.nc_transpose(dst=A_T_psum, data=A_mat)
+        A_T = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=A_T, src=A_T_psum)
 
-        for _round in nl.sequential_range(6):
-            # A_pow = A_pow^2: transpose A_pow, then matmul
-            Ap_T_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
-            nisa.nc_transpose(dst=Ap_T_psum, data=A_pow)
-            Ap_T = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.tensor_copy(dst=Ap_T, src=Ap_T_psum)
+        col_mask_left_row = nl.ndarray((1, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.memset(dst=col_mask_left_row, value=0.0)
+        nisa.memset(dst=col_mask_left_row[0:1, 0:64], value=1.0)
+        col_mask_left = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+        for i_shuf in nl.static_range(P_MAX // 32):
+            nisa.nc_stream_shuffle(
+                src=col_mask_left_row[0:1, 0:P_MAX],
+                dst=col_mask_left[i_shuf * 32 : i_shuf * 32 + 32, 0:P_MAX],
+                shuffle_mask=_BROADCAST_MASK,
+            )
 
-            Ap_sq_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
-            nisa.nc_matmul(dst=Ap_sq_psum, stationary=Ap_T, moving=A_pow)
-            nisa.tensor_copy(dst=A_pow, src=Ap_sq_psum)
+        col_mask_right_row = nl.ndarray((1, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.memset(dst=col_mask_right_row, value=0.0)
+        nisa.memset(dst=col_mask_right_row[0:1, 64:P_MAX], value=1.0)
+        col_mask_right = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+        for i_shuf in nl.static_range(P_MAX // 32):
+            nisa.nc_stream_shuffle(
+                src=col_mask_right_row[0:1, 0:P_MAX],
+                dst=col_mask_right[i_shuf * 32 : i_shuf * 32 + 32, 0:P_MAX],
+                shuffle_mask=_BROADCAST_MASK,
+            )
 
-            # P_acc = (I + A_pow) @ P_acc: transpose IpA, then matmul
-            IpA = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.tensor_tensor(dst=IpA, data1=eye, data2=A_pow, op=nl.add)
+        block_row_mask_bottom = nl.ndarray((P_MAX, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_copy(
+            dst=block_row_mask_bottom[0:P_MAX, 0:1],
+            src=Lmask_d[0:P_MAX, 64:65],
+        )
 
-            IpA_T_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
-            nisa.nc_transpose(dst=IpA_T_psum, data=IpA)
-            IpA_T = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.tensor_copy(dst=IpA_T, src=IpA_T_psum)
+        for solve_i in nl.static_range(64):
+            row_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
+            nisa.nc_matmul(dst=row_psum, stationary=A_T, moving=P_acc)
+            row_prod = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_copy(dst=row_prod, src=row_psum)
 
-            Pacc_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
-            nisa.nc_matmul(dst=Pacc_psum, stationary=IpA_T, moving=P_acc)
-            nisa.tensor_copy(dst=P_acc, src=Pacc_psum)
+            row_with_eye = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_tensor(dst=row_with_eye, data1=row_prod, data2=eye, op=nl.add)
+
+            row_col_masked = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_tensor(
+                dst=row_col_masked,
+                data1=row_with_eye,
+                data2=col_mask_left,
+                op=nl.multiply,
+            )
+
+            row_mask = nl.ndarray((P_MAX, 1), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_copy(
+                dst=row_mask[0:P_MAX, 0:1],
+                src=eye[0:P_MAX, solve_i : solve_i + 1],
+            )
+            row_update = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_scalar(
+                dst=row_update,
+                data=row_col_masked,
+                op0=nl.multiply,
+                operand0=row_mask,
+                engine=nisa.vector_engine,
+            )
+
+            P_next = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_tensor(dst=P_next, data1=P_acc, data2=row_update, op=nl.add)
+            nisa.tensor_copy(dst=P_acc, src=P_next)
+
+        for solve_i in nl.static_range(64):
+            row_idx = 64 + solve_i
+
+            row_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
+            nisa.nc_matmul(dst=row_psum, stationary=A_T, moving=P_acc)
+            row_prod = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_copy(dst=row_prod, src=row_psum)
+
+            row_with_eye = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_tensor(dst=row_with_eye, data1=row_prod, data2=eye, op=nl.add)
+
+            row_col_masked = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_tensor(
+                dst=row_col_masked,
+                data1=row_with_eye,
+                data2=col_mask_right,
+                op=nl.multiply,
+            )
+
+            row_mask = nl.ndarray((P_MAX, 1), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_copy(
+                dst=row_mask[0:P_MAX, 0:1],
+                src=eye[0:P_MAX, row_idx : row_idx + 1],
+            )
+            row_update = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_scalar(
+                dst=row_update,
+                data=row_col_masked,
+                op0=nl.multiply,
+                operand0=row_mask,
+                engine=nisa.vector_engine,
+            )
+
+            P_next = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_tensor(dst=P_next, data1=P_acc, data2=row_update, op=nl.add)
+            nisa.tensor_copy(dst=P_acc, src=P_next)
+
+        N_diag_T_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
+        nisa.nc_transpose(dst=N_diag_T_psum, data=P_acc)
+        N_diag_T = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=N_diag_T, src=N_diag_T_psum)
+
+        tmp_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
+        nisa.nc_matmul(dst=tmp_psum, stationary=N_diag_T, moving=A_mat)
+        tmp = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=tmp, src=tmp_psum)
+
+        tmp_T_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
+        nisa.nc_transpose(dst=tmp_T_psum, data=tmp)
+        tmp_T = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=tmp_T, src=tmp_T_psum)
+
+        N21_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
+        nisa.nc_matmul(dst=N21_psum, stationary=tmp_T, moving=P_acc)
+        N21 = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=N21, src=N21_psum)
+
+        N21_col_masked = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_tensor(
+            dst=N21_col_masked,
+            data1=N21,
+            data2=col_mask_left,
+            op=nl.multiply,
+        )
+        N21_block = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_scalar(
+            dst=N21_block,
+            data=N21_col_masked,
+            op0=nl.multiply,
+            operand0=block_row_mask_bottom,
+            engine=nisa.vector_engine,
+        )
+        nisa.tensor_tensor(dst=P_acc, data1=P_acc, data2=N21_block, op=nl.add)
 
         # ============================================================
         # Apply N: value_corr = N @ v_beta
@@ -439,45 +595,8 @@ def deltanet_fused_chunked_fwd(
         qk_raw = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_copy(dst=qk_raw, src=qk_psum)
 
-        # Mask before split scaling for the same reason as the A matrix above:
-        # upper-triangular decay factors are unused and can be numerically huge.
-        qk_masked = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_tensor(dst=qk_masked, data1=qk_raw, data2=Lmask_d, op=nl.multiply)
-
-        # Row-scale by exp(gc)
-        qk_row = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_scalar(
-            dst=qk_row,
-            data=qk_masked,
-            op0=nl.multiply,
-            operand0=exp_gc_p,
-            engine=nisa.vector_engine,
-        )
-
-        # Transpose, column-scale by exp(-gc), transpose back
-        qk_r_T_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
-        nisa.nc_transpose(dst=qk_r_T_psum, data=qk_row)
-        qk_r_T = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_copy(dst=qk_r_T, src=qk_r_T_psum)
-
-        qk_r_T_col = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_scalar(
-            dst=qk_r_T_col,
-            data=qk_r_T,
-            op0=nl.multiply,
-            operand0=exp_neg_gc_p,
-            engine=nisa.vector_engine,
-        )
-
-        qk_d_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
-        nisa.nc_transpose(dst=qk_d_psum, data=qk_r_T_col)
-        qk_decay = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_copy(dst=qk_decay, src=qk_d_psum)
-
         attn_intra = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_tensor(
-            dst=attn_intra, data1=qk_decay, data2=Lmask_d, op=nl.multiply
-        )
+        nisa.tensor_tensor(dst=attn_intra, data1=qk_raw, data2=decay_diag, op=nl.multiply)
 
         # ============================================================
         # v_prime = k_cumdecay @ state   (state is in SBUF!)
@@ -550,12 +669,20 @@ def deltanet_fused_chunked_fwd(
         # k_raw_decay contributes as exp(g_last) * (k * exp(-gc))^T @ v_new.
         # Compute the equivalent stable form k * exp(g_last - gc), so the
         # factor is always <= 1 for valid causal positions.
-        exp_gl_minus_gc_p = nl.ndarray((P_MAX, 1), dtype=nl.float32, buffer=nl.sbuf)
+        gl_minus_gc_p = nl.ndarray((P_MAX, 1), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_tensor(
+            dst=gl_minus_gc_p,
+            data1=gl_p,
+            data2=gc_p,
+            op=nl.subtract,
+        )
+        exp_gl_minus_gc_p = nl.ndarray((P_MAX, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.activation(
             dst=exp_gl_minus_gc_p,
-            data1=exp_gl_p,
-            data2=exp_neg_gc_p,
-            op=nl.multiply,
+            op=nl.exp,
+            data=gl_minus_gc_p,
+            bias=None,
+            scale=1.0,
         )
 
         # k_raw_decay = k * exp(g_last - gc)
