@@ -230,33 +230,6 @@ def l2norm(x, dim=-1, eps=1e-6):
     return F.normalize(x, p=2, dim=dim, eps=eps)
 
 
-FUSED_DELTANET_DECAY_MIN = -20.0
-FUSED_DELTANET_DECAY_MAX = 0.0
-
-
-def _bound_fused_deltanet_log_decay(
-    g, batch_size, num_heads, total_seq_len, chunk_size
-):
-    """Bound cumulative DeltaNet decay before the fused NKI kernel.
-
-    The fused kernel internally computes both exp(cumsum(g)) and exp(-cumsum(g)).
-    Large negative cumulative decays make the second term overflow even though
-    the true pairwise decay exp(gc_i - gc_j) is bounded by one.  Return
-    equivalent per-token deltas whose per-chunk cumulative sum is clamped.
-    """
-    num_chunks = total_seq_len // chunk_size
-    g_chunks = g.reshape(batch_size, num_heads, num_chunks, chunk_size)
-    g_cumsum = g_chunks.cumsum(dim=-1).clamp(
-        min=FUSED_DELTANET_DECAY_MIN,
-        max=FUSED_DELTANET_DECAY_MAX,
-    )
-    g_first = g_cumsum[..., :1]
-    g_rest = g_cumsum[..., 1:] - g_cumsum[..., :-1]
-    return torch.cat([g_first, g_rest], dim=-1).reshape(
-        batch_size, num_heads, total_seq_len
-    )
-
-
 # ============================================================
 # Gated DeltaNet Module (Linear Recurrent Attention)
 # ============================================================
@@ -571,7 +544,8 @@ class NeuronGatedDeltaNet(nn.Module):
             beta = F.pad(beta, (0, pad_size))
             g = F.pad(g, (0, pad_size))
         total_seq_len = S + pad_size
-        g = _bound_fused_deltanet_log_decay(g, B, H, total_seq_len, chunk_size)
+        # Pass raw per-token log-decay. The fused NKI kernel forms decay as
+        # exp(cumsum(g)_i - cumsum(g)_j), so no pre-kernel clamp is needed.
 
         BH = B * H
         # Flatten to (BH, S, dim) for per-(b,h) kernel calls
@@ -1002,11 +976,14 @@ class NeuronGatedDeltaNet(nn.Module):
             else:
                 new_rec_state = new_state_bf16 + self.recurrent_state_buffer * 0
         else:
-            # CTE: fused, chunk, NKI, or sequential forward
-            use_nki_fused = os.environ.get("USE_NKI_FUSED") == "1"
+            # CTE: fused NKI kernel by default (PyTorch _chunk_forward can hit
+            # neuronx-cc codegen ICE NCC_INLA001 with these DeltaNet dimensions).
+            # Override with env vars for debugging/benchmarking.
+            use_nki_fused = os.environ.get("USE_NKI_FUSED", "1") != "0"
             use_nki_chunked = os.environ.get("USE_NKI_CHUNKED") == "1"
             use_nki = os.environ.get("USE_NKI") == "1"
             use_sequential = os.environ.get("DELTANET_SEQUENTIAL") == "1"
+            use_pytorch_chunk = os.environ.get("USE_PYTORCH_CHUNK") == "1"
 
             if qwen_chunked_prefill_active and recurrent_state_cache is not None:
                 initial_state = recurrent_state_cache[:batch_size].float()
@@ -1030,8 +1007,8 @@ class NeuronGatedDeltaNet(nn.Module):
                         output_final_state=True,
                         initial_state=initial_state,
                     )
-            elif use_nki_fused:
-                output, final_state = self._fused_chunked_forward(
+            elif use_pytorch_chunk:
+                output, final_state = self._chunk_forward(
                     query, key, value, g, beta, output_final_state=True
                 )
             elif use_nki_chunked:
@@ -1046,8 +1023,12 @@ class NeuronGatedDeltaNet(nn.Module):
                 output, final_state = self._sequential_forward(
                     query, key, value, g, beta, output_final_state=True
                 )
+            elif use_nki_fused:
+                output, final_state = self._fused_chunked_forward(
+                    query, key, value, g, beta, output_final_state=True
+                )
             else:
-                output, final_state = self._chunk_forward(
+                output, final_state = self._fused_chunked_forward(
                     query, key, value, g, beta, output_final_state=True
                 )
 
@@ -1121,12 +1102,17 @@ class Qwen35InferenceConfig(InferenceConfig):
         # which checks get_required_attributes(). These can be overridden by
         # kwargs or load_config.
 
-        # Layer types for hybrid dispatch: [3 DeltaNet + 1 GQA] x 16 = 64 layers
+        # Layer types for hybrid dispatch: [3 DeltaNet + 1 GQA] repeated.
         if "layer_types" not in kwargs and not any(
             hasattr(a, "layer_types") for a in args if hasattr(a, "__dict__")
         ):
+            num_layers = kwargs.get("num_hidden_layers", 64)
+            if num_layers % 4 != 0:
+                raise ValueError(
+                    f"Qwen3.5 hybrid layer count must be divisible by 4, got {num_layers}"
+                )
             layer_types = []
-            for _ in range(16):
+            for _ in range(num_layers // 4):
                 layer_types.extend(
                     [
                         "linear_attention",
@@ -1380,7 +1366,7 @@ class NeuronQwen35Attention(NeuronAttentionBase):
         if NKILIB_PATCH_ACTIVE:
             return _flash_fwd_call(Q, K, V, use_causal_mask=True), None
 
-        # Fallback: softmax path
+        # Fallback: softmax path (use 3D tensors to avoid compiler ICE with 4D patterns)
         if head_dim > 128:
             # GQA: expand K/V heads to match Q heads
             num_q_heads = Q.shape[1]
@@ -1397,16 +1383,29 @@ class NeuronQwen35Attention(NeuronAttentionBase):
                     .expand(-1, -1, kv_rep, -1, -1)
                     .reshape(bsz, num_q_heads, q_len, head_dim)
                 )
-            attn_weights = torch.matmul(Q, K.transpose(-1, -2)) / math.sqrt(head_dim)
-            if attention_mask is not None:
-                if attention_mask.dtype == torch.bool:
-                    attn_weights = attn_weights.masked_fill(~attention_mask, -65504.0)
-                else:
-                    attn_weights = attn_weights + attention_mask
+            # Reshape to 3D (B*H, S, d) to avoid neuronx-cc codegen ICE with 4D
+            # attention weight tensors (NCC_INLA001: Expected 2D tensor but got 4D AP)
+            Q_3d = Q.reshape(bsz * num_q_heads, q_len, head_dim)
+            K_3d = K.reshape(bsz * num_q_heads, q_len, head_dim)
+            V_3d = V.reshape(bsz * num_q_heads, q_len, head_dim)
+            attn_weights = torch.bmm(Q_3d, K_3d.transpose(-1, -2)) / math.sqrt(head_dim)
+            # Build causal mask for 3D: (1, S, S) broadcast over B*H
+            causal_mask = torch.triu(
+                torch.full(
+                    (q_len, q_len),
+                    -65504.0,
+                    dtype=attn_weights.dtype,
+                    device=attn_weights.device,
+                ),
+                diagonal=1,
+            ).unsqueeze(0)
+            attn_weights = attn_weights + causal_mask
             attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(
                 Q.dtype
             )
-            return torch.matmul(attn_weights, V), None
+            attn_output = torch.bmm(attn_weights, V_3d)
+            # Reshape back to 4D (B, H, S, d)
+            return attn_output.reshape(bsz, num_q_heads, q_len, head_dim), None
 
         return _flash_fwd_call(Q, K, V, use_causal_mask=True), None
 
