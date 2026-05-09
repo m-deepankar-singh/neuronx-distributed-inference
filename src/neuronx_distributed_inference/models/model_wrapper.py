@@ -1695,6 +1695,16 @@ def get_trace_callable(model_cls, config: InferenceConfig, bucket_rank=None):
             q_config = get_default_custom_qconfig_dict()
         else:
             raise RuntimeError(f"{config.neuron_config.quantization_type} is not supported")
+        if isinstance(config.neuron_config.quantization_dtype, str):
+            q_config["quantized_dtype"] = QuantizedDtype.get_dtype(
+                config.neuron_config.quantization_dtype
+            )
+        elif isinstance(config.neuron_config.quantization_dtype, QuantizedDtype):
+            q_config["quantized_dtype"] = config.neuron_config.quantization_dtype
+        q_config["activation_quantization_type"] = ActivationQuantizationType(
+            config.neuron_config.activation_quantization_type
+        )
+        q_config["clamp_bound"] = config.neuron_config.quantize_clamp_bound
         model = convert(
             float_model,
             q_config=q_config,
