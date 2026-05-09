@@ -82,6 +82,7 @@ from neuronx_distributed_inference.models.config import (
     InferenceConfig,
     NeuronConfig,
 )
+from neuronx_distributed_inference.models.llama.modeling_llama import NeuronLlamaMLP
 from neuronx_distributed_inference.models.model_wrapper import (
     CONTEXT_ENCODING_MODEL_TAG,
     TOKEN_GENERATION_MODEL_TAG,
@@ -1457,8 +1458,9 @@ class NeuronQwen35DecoderLayer(nn.Module):
         else:
             self.self_attn = NeuronQwen35Attention(config=config)
 
-        # Dense MLP (all layers)
-        self.mlp = Qwen35MLP(config)
+        # Dense MLP (all layers). Reuse the Llama/Qwen3 SwiGLU MLP module so
+        # Qwen3.6 can opt into NxDI's MLP kernels via NeuronConfig.
+        self.mlp = NeuronLlamaMLP(config)
 
         self.input_layernorm = get_rmsnorm_cls()(
             config.hidden_size, eps=config.rms_norm_eps
@@ -1466,6 +1468,8 @@ class NeuronQwen35DecoderLayer(nn.Module):
         self.post_attention_layernorm = get_rmsnorm_cls()(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        self.mlp_kernel_enabled = config.neuron_config.mlp_kernel_enabled
+        self.mlp_kernel_fused_rmsnorm = not config.neuron_config.sequence_parallel_enabled
 
     def forward(
         self,
@@ -1509,10 +1513,20 @@ class NeuronQwen35DecoderLayer(nn.Module):
             )
             hidden_states = residual + hidden_states
 
-        # Dense MLP FFN
+        # Dense MLP FFN. When mlp_kernel_enabled=True, the NxDI MLP kernel can
+        # fuse post-attention RMSNorm into the MLP call; otherwise this falls
+        # back to the native compiler path.
         residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
+        if self.mlp_kernel_enabled and self.mlp_kernel_fused_rmsnorm:
+            mlp_fused_rmsnorm = self.post_attention_layernorm
+        else:
+            hidden_states = self.post_attention_layernorm(hidden_states)
+            mlp_fused_rmsnorm = None
+
+        hidden_states, _ = self.mlp(
+            hidden_states,
+            rmsnorm=mlp_fused_rmsnorm,
+        )
         hidden_states = residual + hidden_states
 
         hidden_states = ModuleMarkerEndWrapper()(hidden_states)
