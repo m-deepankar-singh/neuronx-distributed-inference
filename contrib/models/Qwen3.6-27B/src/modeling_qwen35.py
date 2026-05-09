@@ -275,6 +275,21 @@ class NeuronGatedDeltaNet(nn.Module):
         self.use_qwen_hybrid_chunked_prefill_nki = getattr(
             tc, "use_qwen_hybrid_chunked_prefill_nki", False
         )
+        self.gdn_layer_ordinal = (
+            sum(
+                1
+                for layer_type in tc.layer_types[: layer_idx + 1]
+                if layer_type == "linear_attention"
+            )
+            - 1
+        )
+        self.gdn_stress_mode = os.environ.get("QWEN_GDN_STRESS_MODE", "").strip().lower()
+        self.gdn_stress_first_n = int(os.environ.get("QWEN_GDN_STRESS_FIRST_N", "4"))
+        self.gdn_stress_every_n = int(os.environ.get("QWEN_GDN_STRESS_EVERY_N", "16"))
+        if self.gdn_stress_mode not in ("", "first4", "first_n", "every16", "every_n"):
+            raise ValueError(
+                "QWEN_GDN_STRESS_MODE must be one of: first4, first_n, every16, every_n"
+            )
 
         # KV cache dummy shape info
         self.head_dim = tc.head_dim  # 256
@@ -335,6 +350,23 @@ class NeuronGatedDeltaNet(nn.Module):
             ),
             requires_grad=False,
         )
+
+    def _should_stress_gdn_kernel(self):
+        """Return True for layers selected by the temporary GDN ablation mode."""
+        if self.gdn_layer_ordinal < 0:
+            return False
+        if self.gdn_stress_mode == "first4":
+            return self.gdn_layer_ordinal < 4
+        if self.gdn_stress_mode == "first_n":
+            return self.gdn_layer_ordinal < self.gdn_stress_first_n
+        if self.gdn_stress_mode == "every16":
+            return self.gdn_layer_ordinal % 16 == 0
+        if self.gdn_stress_mode == "every_n":
+            return (
+                self.gdn_stress_every_n > 0
+                and self.gdn_layer_ordinal % self.gdn_stress_every_n == 0
+            )
+        return False
 
     def _recurrent_step(self, query, key, value, g, beta, recurrent_state):
         """Single-step recurrent update for token generation."""
@@ -464,6 +496,7 @@ class NeuronGatedDeltaNet(nn.Module):
         if initial_state is not None:
             initial_state_flat = initial_state.reshape(BH, k_dim, v_dim).float().contiguous()
 
+        stress_gdn_kernel = self._should_stress_gdn_kernel()
         all_outputs = []
         all_states = []
         for bh in range(BH):
@@ -481,18 +514,36 @@ class NeuronGatedDeltaNet(nn.Module):
                 gc_chunk = gc_chunks[bh, c_idx].contiguous()
                 gl_chunk = gl_chunks[bh, c_idx].contiguous()
 
-                out_chunk, state = _deltanet_nki_chunk_step(
+                state_in = state
+                out_chunk, next_state = _deltanet_nki_chunk_step(
                     q_chunk,
                     k_chunk,
                     v_chunk,
                     beta_chunk,
                     gc_chunk,
                     gl_chunk,
-                    state,
+                    state_in,
                     lower_mask,
                     identity_mat,
                     lower_mask_diag,
                 )
+                if stress_gdn_kernel:
+                    out_chunk_2, next_state_2 = _deltanet_nki_chunk_step(
+                        q_chunk,
+                        k_chunk,
+                        v_chunk,
+                        beta_chunk,
+                        gc_chunk,
+                        gl_chunk,
+                        state_in,
+                        lower_mask,
+                        identity_mat,
+                        lower_mask_diag,
+                    )
+                    out_chunk = (out_chunk + out_chunk_2) * 0.5
+                    state = (next_state + next_state_2) * 0.5
+                else:
+                    state = next_state
                 head_chunks.append(out_chunk)
 
             head_output = torch.cat(head_chunks, dim=0)
@@ -571,6 +622,7 @@ class NeuronGatedDeltaNet(nn.Module):
 
         all_outputs = []
         all_states = []
+        stress_gdn_kernel = self._should_stress_gdn_kernel()
         for bh in range(BH):
             out_bh, state_bh = _deltanet_fused_kernel(
                 query_flat[bh],  # (S, 128)
@@ -582,6 +634,19 @@ class NeuronGatedDeltaNet(nn.Module):
                 identity_mat,  # (128, 128)
                 lower_mask_diag,  # (128, 128)
             )
+            if stress_gdn_kernel:
+                out_bh_2, state_bh_2 = _deltanet_fused_kernel(
+                    query_flat[bh],
+                    key_flat[bh],
+                    value_flat[bh],
+                    g_flat[bh],
+                    beta_flat[bh],
+                    lower_mask,
+                    identity_mat,
+                    lower_mask_diag,
+                )
+                out_bh = (out_bh + out_bh_2) * 0.5
+                state_bh = (state_bh + state_bh_2) * 0.5
             all_outputs.append(out_bh)
             all_states.append(state_bh)
 
