@@ -190,32 +190,38 @@ class QwenOpenAIServer:
 
             new_ids = []
             current_token = first_token
-            for step in range(max_tokens):
-                if current_token < 0 or current_token >= len(self.tokenizer):
-                    raise RuntimeError(f"model generated invalid token id: {current_token}")
-                new_ids.append(current_token)
-                if current_token == self.tokenizer.eos_token_id or step == max_tokens - 1:
-                    break
+            vocab_size = len(self.tokenizer)
+            eos_id = self.tokenizer.eos_token_id
+            decode_ids = torch.empty((1, 1), dtype=torch.int32)
+            decode_position_ids = torch.empty((1, 1), dtype=torch.int32)
+            decode_attention_mask = torch.ones(
+                (1, prompt_tokens + max_tokens),
+                dtype=torch.int32,
+            )
+            with torch.no_grad():
+                for step in range(max_tokens):
+                    if current_token < 0 or current_token >= vocab_size:
+                        raise RuntimeError(f"model generated invalid token id: {current_token}")
+                    new_ids.append(current_token)
+                    if current_token == eos_id or step == max_tokens - 1:
+                        break
 
-                pos_value = prompt_tokens + step
-                decode_ids = torch.tensor([[current_token]], dtype=torch.long)
-                position_ids = torch.tensor([[pos_value]], dtype=torch.long)
-                attention_mask = torch.zeros((1, self.args.seq_len), dtype=torch.long)
-                attention_mask[:, : pos_value + 1] = 1
-
-                with torch.no_grad():
+                    pos_value = prompt_tokens + step
+                    decode_ids[0, 0] = current_token
+                    decode_position_ids[0, 0] = pos_value
+                    active_attention_mask = decode_attention_mask[:, : pos_value + 1]
                     out = self.model(
                         input_ids=decode_ids,
-                        attention_mask=attention_mask,
-                        position_ids=position_ids,
+                        attention_mask=active_attention_mask,
+                        position_ids=decode_position_ids,
                         seq_ids=seq_ids,
                         sampling_params=sampling_params,
                         return_dict=True,
                     )
-                current_token = _token_scalar(out.tokens)
+                    current_token = _token_scalar(out.tokens)
             elapsed = time.perf_counter() - t0
 
-        invalid = [tok for tok in new_ids if tok < 0 or tok >= len(self.tokenizer)]
+        invalid = [tok for tok in new_ids if tok < 0 or tok >= vocab_size]
         if invalid:
             raise RuntimeError(f"model generated invalid token ids: {invalid[:8]}")
 
