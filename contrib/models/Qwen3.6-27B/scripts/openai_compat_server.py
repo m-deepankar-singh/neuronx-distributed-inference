@@ -19,6 +19,8 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List
 
+import torch
+
 
 def _json_response(handler: BaseHTTPRequestHandler, status: int, payload: Dict[str, Any]):
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -48,6 +50,14 @@ def _first_text_prompt(prompt: Any) -> str:
     return str(prompt)
 
 
+def _token_scalar(tokens: Any) -> int:
+    if hasattr(tokens, "detach"):
+        tokens = tokens.detach().cpu()
+    if tokens.ndim == 0:
+        return int(tokens.item())
+    return int(tokens.reshape(-1)[0].item())
+
+
 class QwenOpenAIServer:
     def __init__(self, args: argparse.Namespace):
         self.args = args
@@ -59,9 +69,10 @@ class QwenOpenAIServer:
         if self.args.contrib_root not in sys.path:
             sys.path.insert(0, self.args.contrib_root)
 
-        import transformers
         from transformers import AutoTokenizer, GenerationConfig
-        from neuronx_distributed_inference.utils.hf_adapter import HuggingFaceGenerationAdapter
+        from neuronx_distributed_inference.modules.generation.sampling import (
+            prepare_sampling_params,
+        )
         from src.modeling_qwen35 import NeuronQwen35ForCausalLM
 
         print("Loading tokenizer from", self.args.model_path, flush=True)
@@ -76,26 +87,20 @@ class QwenOpenAIServer:
         t0 = time.perf_counter()
         self.model = NeuronQwen35ForCausalLM(self.args.compiled_path)
         self.model.load(self.args.compiled_path)
-        self.adapter = HuggingFaceGenerationAdapter(self.model)
-        self.adapter.generation_config.transformers_version = transformers.__version__
+        self.model.reset()
+        self.prepare_sampling_params = prepare_sampling_params
         self.GenerationConfig = GenerationConfig
-        self.transformers_version = transformers.__version__
         print(f"Model loaded in {time.perf_counter() - t0:.2f}s", flush=True)
 
-    def _generation_config(self, body: Dict[str, Any]):
-        temperature = float(body.get("temperature", 0) or 0)
-        top_p = float(body.get("top_p", 1) or 1)
-        return self.GenerationConfig(
-            do_sample=temperature > 0,
-            temperature=temperature if temperature > 0 else 1.0,
-            top_p=top_p,
-            num_beams=1,
-            pad_token_id=self.tokenizer.pad_token_id,
-            eos_token_id=self.tokenizer.eos_token_id,
-        )
-
-    def _chat_prompt(self, messages: List[Dict[str, Any]]) -> str:
+    def _chat_prompt(self, messages: List[Dict[str, Any]], enable_thinking: bool = False) -> str:
         try:
+            return self.tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=enable_thinking,
+            )
+        except TypeError:
             return self.tokenizer.apply_chat_template(
                 messages,
                 tokenize=False,
@@ -119,30 +124,97 @@ class QwenOpenAIServer:
                 f"max_tokens={max_tokens} exceeds server limit {self.args.max_new_tokens_limit}"
             )
 
-        inputs = self.tokenizer(prompt, padding=True, return_tensors="pt")
-        prompt_tokens = int(inputs.input_ids.shape[1])
+        input_ids = torch.tensor(
+            [self.tokenizer(prompt, add_special_tokens=False).input_ids],
+            dtype=torch.long,
+        )
+        prompt_tokens = int(input_ids.shape[1])
+        if prompt_tokens <= 0:
+            raise ValueError("prompt must contain at least one token")
         if prompt_tokens + max_tokens > self.args.seq_len:
             raise ValueError(
                 f"prompt_tokens + max_tokens = {prompt_tokens + max_tokens} exceeds "
                 f"seq_len={self.args.seq_len}"
             )
 
-        gen_cfg = self._generation_config(body)
-        gen_cfg.transformers_version = self.transformers_version
+        temperature = float(body.get("temperature", 0.0) or 0.0)
+        top_p = float(body.get("top_p", 1.0) or 1.0)
+        top_k = int(body.get("top_k", 1) or 1)
+        sampling_params = self.prepare_sampling_params(
+            batch_size=1,
+            top_k=[top_k],
+            top_p=[top_p],
+            temperature=[temperature],
+        )
+        pad_id = self.tokenizer.pad_token_id
+        seq_ids = torch.tensor([0], dtype=torch.int32)
 
         with self.lock:
             if hasattr(self.model, "reset"):
                 self.model.reset()
             t0 = time.perf_counter()
-            output = self.adapter.generate(
-                inputs.input_ids,
-                generation_config=gen_cfg,
-                attention_mask=inputs.attention_mask,
-                max_new_tokens=max_tokens,
-            )
+            first_token = None
+            for start in range(0, prompt_tokens, self.args.chunk_size):
+                end = min(start + self.args.chunk_size, prompt_tokens)
+                valid = end - start
+                chunk_ids = input_ids[:, start:end]
+                if valid < self.args.chunk_size:
+                    pad = torch.full(
+                        (1, self.args.chunk_size - valid),
+                        pad_id,
+                        dtype=chunk_ids.dtype,
+                    )
+                    chunk_ids = torch.cat([chunk_ids, pad], dim=1)
+
+                attention_mask = torch.zeros((1, self.args.chunk_size), dtype=torch.long)
+                attention_mask[:, :valid] = 1
+                position_ids = torch.arange(
+                    start,
+                    start + self.args.chunk_size,
+                    dtype=torch.long,
+                ).unsqueeze(0)
+
+                with torch.no_grad():
+                    out = self.model(
+                        input_ids=chunk_ids,
+                        attention_mask=attention_mask,
+                        position_ids=position_ids,
+                        seq_ids=seq_ids,
+                        sampling_params=sampling_params,
+                        return_dict=True,
+                    )
+                first_token = _token_scalar(out.tokens)
+
+            if first_token is None:
+                raise RuntimeError("prefill produced no token")
+
+            new_ids = []
+            current_token = first_token
+            for step in range(max_tokens):
+                if current_token < 0 or current_token >= len(self.tokenizer):
+                    raise RuntimeError(f"model generated invalid token id: {current_token}")
+                new_ids.append(current_token)
+                if current_token == self.tokenizer.eos_token_id or step == max_tokens - 1:
+                    break
+
+                pos_value = prompt_tokens + step
+                decode_ids = torch.tensor([[current_token]], dtype=torch.long)
+                position_ids = torch.tensor([[pos_value]], dtype=torch.long)
+                attention_mask = torch.zeros((1, self.args.seq_len), dtype=torch.long)
+                attention_mask[:, : pos_value + 1] = 1
+
+                with torch.no_grad():
+                    out = self.model(
+                        input_ids=decode_ids,
+                        attention_mask=attention_mask,
+                        position_ids=position_ids,
+                        seq_ids=seq_ids,
+                        sampling_params=sampling_params,
+                        return_dict=True,
+                    )
+                current_token = _token_scalar(out.tokens)
             elapsed = time.perf_counter() - t0
 
-        new_ids = output[0, prompt_tokens:].tolist()
         invalid = [tok for tok in new_ids if tok < 0 or tok >= len(self.tokenizer)]
         if invalid:
             raise RuntimeError(f"model generated invalid token ids: {invalid[:8]}")
@@ -230,7 +302,13 @@ def make_handler(server_state: QwenOpenAIServer):
                     messages = body.get("messages") or []
                     if not isinstance(messages, list):
                         raise ValueError("messages must be a list")
-                    result = server_state._generate(server_state._chat_prompt(messages), body)
+                    result = server_state._generate(
+                        server_state._chat_prompt(
+                            messages,
+                            enable_thinking=bool(body.get("enable_thinking", False)),
+                        ),
+                        body,
+                    )
                     _json_response(
                         self,
                         200,
@@ -276,6 +354,7 @@ def main():
     parser.add_argument("--compiled-path", required=True)
     parser.add_argument("--contrib-root", required=True)
     parser.add_argument("--seq-len", type=int, default=65536)
+    parser.add_argument("--chunk-size", type=int, default=512)
     parser.add_argument("--max-new-tokens-limit", type=int, default=512)
     args = parser.parse_args()
 
