@@ -1,0 +1,2103 @@
+From c598ea2d25708794ffd41c21c5542b14814ae5c3 Mon Sep 17 00:00:00 2001
+From: Ubuntu <ubuntu@ip-172-31-45-78.ap-southeast-4.compute.internal>
+Date: Thu, 7 May 2026 19:18:00 +0000
+Subject: [PATCH 1/5] Pre-profile baseline: CTE=512 chunked NKI
+
+---
+ .../models/Qwen3.6-27B/src/modeling_qwen35.py | 395 +++++++++++++----
+ .../src/nki_kernels/nki_deltanet_chunked.py   | 396 ++++++++++++++----
+ .../src/nki_kernels/nki_deltanet_fused.py     | 387 +++++++++++------
+ 3 files changed, 890 insertions(+), 288 deletions(-)
+
+diff --git a/contrib/models/Qwen3.6-27B/src/modeling_qwen35.py b/contrib/models/Qwen3.6-27B/src/modeling_qwen35.py
+index 3b5884c..40de012 100644
+--- a/contrib/models/Qwen3.6-27B/src/modeling_qwen35.py
++++ b/contrib/models/Qwen3.6-27B/src/modeling_qwen35.py
+@@ -230,33 +230,6 @@ def l2norm(x, dim=-1, eps=1e-6):
+     return F.normalize(x, p=2, dim=dim, eps=eps)
+ 
+ 
+-FUSED_DELTANET_DECAY_MIN = -20.0
+-FUSED_DELTANET_DECAY_MAX = 0.0
+-
+-
+-def _bound_fused_deltanet_log_decay(
+-    g, batch_size, num_heads, total_seq_len, chunk_size
+-):
+-    """Bound cumulative DeltaNet decay before the fused NKI kernel.
+-
+-    The fused kernel internally computes both exp(cumsum(g)) and exp(-cumsum(g)).
+-    Large negative cumulative decays make the second term overflow even though
+-    the true pairwise decay exp(gc_i - gc_j) is bounded by one.  Return
+-    equivalent per-token deltas whose per-chunk cumulative sum is clamped.
+-    """
+-    num_chunks = total_seq_len // chunk_size
+-    g_chunks = g.reshape(batch_size, num_heads, num_chunks, chunk_size)
+-    g_cumsum = g_chunks.cumsum(dim=-1).clamp(
+-        min=FUSED_DELTANET_DECAY_MIN,
+-        max=FUSED_DELTANET_DECAY_MAX,
+-    )
+-    g_first = g_cumsum[..., :1]
+-    g_rest = g_cumsum[..., 1:] - g_cumsum[..., :-1]
+-    return torch.cat([g_first, g_rest], dim=-1).reshape(
+-        batch_size, num_heads, total_seq_len
+-    )
+-
+-
+ # ============================================================
+ # Gated DeltaNet Module (Linear Recurrent Attention)
+ # ============================================================
+@@ -296,6 +269,12 @@ class NeuronGatedDeltaNet(nn.Module):
+         self.layer_idx = layer_idx
+         self.rms_norm_eps = tc.rms_norm_eps
+         self.use_hybrid_cache_manager = getattr(tc, "use_hybrid_cache_manager", False)
++        self.use_qwen_hybrid_chunked_prefill = getattr(
++            tc, "use_qwen_hybrid_chunked_prefill", False
++        )
++        self.use_qwen_hybrid_chunked_prefill_nki = getattr(
++            tc, "use_qwen_hybrid_chunked_prefill_nki", False
++        )
+ 
+         # KV cache dummy shape info
+         self.head_dim = tc.head_dim  # 256
+@@ -417,7 +396,7 @@ class NeuronGatedDeltaNet(nn.Module):
+         return output, final_state
+ 
+     def _nki_chunked_forward(
+-        self, query, key, value, g, beta, output_final_state=False
++        self, query, key, value, g, beta, output_final_state=False, initial_state=None
+     ):
+         """Chunked NKI kernel forward for context encoding (prefill)."""
+         chunk_size = 128
+@@ -481,10 +460,17 @@ class NeuronGatedDeltaNet(nn.Module):
+             diagonal=0,
+         )
+ 
++        initial_state_flat = None
++        if initial_state is not None:
++            initial_state_flat = initial_state.reshape(BH, k_dim, v_dim).float().contiguous()
++
+         all_outputs = []
+         all_states = []
+         for bh in range(BH):
+-            state = torch.zeros(k_dim, v_dim, dtype=torch.float32, device=device)
++            if initial_state_flat is None:
++                state = torch.zeros(k_dim, v_dim, dtype=torch.float32, device=device)
++            else:
++                state = initial_state_flat[bh]
+ 
+             head_chunks = []
+             for c_idx in range(num_chunks):
+@@ -526,7 +512,14 @@ class NeuronGatedDeltaNet(nn.Module):
+         return output, last_recurrent_state
+ 
+     def _fused_chunked_forward(
+-        self, query, key, value, g, beta, output_final_state=False
++        self,
++        query,
++        key,
++        value,
++        g,
++        beta,
++        output_final_state=False,
++        initial_state=None,
+     ):
+         """Fused single-kernel chunked forward for CTE — SSD-style.
+ 
+@@ -558,7 +551,8 @@ class NeuronGatedDeltaNet(nn.Module):
+             beta = F.pad(beta, (0, pad_size))
+             g = F.pad(g, (0, pad_size))
+         total_seq_len = S + pad_size
+-        g = _bound_fused_deltanet_log_decay(g, B, H, total_seq_len, chunk_size)
++        # Pass raw per-token log-decay. The fused NKI kernel forms decay as
++        # exp(cumsum(g)_i - cumsum(g)_j), so no pre-kernel clamp is needed.
+ 
+         BH = B * H
+         # Flatten to (BH, S, dim) for per-(b,h) kernel calls
+@@ -569,6 +563,14 @@ class NeuronGatedDeltaNet(nn.Module):
+         # g and beta: (BH, S) -> (BH, S, 1) for the kernel's (S, 1) input layout
+         g_flat = g.reshape(BH, total_seq_len).unsqueeze(-1).contiguous()
+         beta_flat = beta.reshape(BH, total_seq_len).unsqueeze(-1).contiguous()
++        if initial_state is None:
++            initial_state_flat = torch.zeros(
++                BH, k_dim, v_dim, dtype=torch.float32, device=query.device
++            )
++        else:
++            initial_state_flat = (
++                initial_state.reshape(BH, k_dim, v_dim).float().contiguous()
++            )
+ 
+         # Create constant mask tensors (shared across all B*H calls)
+         device = query.device
+@@ -591,6 +593,7 @@ class NeuronGatedDeltaNet(nn.Module):
+                 value_flat[bh],  # (S, 128)
+                 g_flat[bh],  # (S, 1) — RAW g, not cumsum
+                 beta_flat[bh],  # (S, 1) — sigmoid(b)
++                initial_state_flat[bh],  # (128, 128)
+                 lower_mask,  # (128, 128)
+                 identity_mat,  # (128, 128)
+                 lower_mask_diag,  # (128, 128)
+@@ -647,7 +650,9 @@ class NeuronGatedDeltaNet(nn.Module):
+         final_state = state if output_final_state else None
+         return output, final_state
+ 
+-    def _chunk_forward(self, query, key, value, g, beta, output_final_state=False):
++    def _chunk_forward(
++        self, query, key, value, g, beta, output_final_state=False, initial_state=None
++    ):
+         """Chunk-based forward for context encoding (prefill)."""
+         chunk_size = 64
+ 
+@@ -697,9 +702,12 @@ class NeuronGatedDeltaNet(nn.Module):
+         value = attn @ v_beta
+         k_cumdecay = attn @ (k_beta * g.exp().unsqueeze(-1))
+ 
+-        last_recurrent_state = torch.zeros(
+-            B, H, k_dim, v_dim, dtype=query.dtype, device=query.device
+-        )
++        if initial_state is None:
++            last_recurrent_state = torch.zeros(
++                B, H, k_dim, v_dim, dtype=query.dtype, device=query.device
++            )
++        else:
++            last_recurrent_state = initial_state.to(dtype=query.dtype)
+         core_attn_out = torch.zeros_like(value)
+         mask2 = torch.triu(
+             torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device),
+@@ -749,7 +757,12 @@ class NeuronGatedDeltaNet(nn.Module):
+         batch_size, seq_len, _ = hidden_states.shape
+ 
+         seq_ids = kwargs.get("seq_ids", None)
+-        is_decode = past_key_value is not None
++        qwen_chunked_prefill_active = (
++            self.use_qwen_hybrid_chunked_prefill
++            and past_key_value is not None
++            and seq_len > 1
++        )
++        is_decode = past_key_value is not None and not qwen_chunked_prefill_active
+ 
+         # Padding mask for DeltaNet: [B, S, 1] with 1.0 for real tokens, 0.0 for padding.
+         # Passed from get_model_output where it's computed from input_ids != pad_token_id.
+@@ -829,21 +842,42 @@ class NeuronGatedDeltaNet(nn.Module):
+             else:
+                 new_conv_state = new_conv_state + self.conv_state_buffer * 0
+         else:
+-            mixed_post_conv = F.silu(self.conv1d(mixed)[:, :, :seq_len])
+-
+-            if valid_mask_1d is not None:
+-                # valid_mask_1d is [B, S, 1]; count valid tokens per batch
+-                num_valid = (
+-                    valid_mask_1d.squeeze(-1).sum(dim=-1, keepdim=True).long()
+-                )  # [B, 1]
+-                idx_base = num_valid - 3
+-                idx_base = idx_base.clamp(min=0)
+-                offsets = torch.arange(3, device=mixed.device).unsqueeze(0)
+-                gather_idx = idx_base + offsets  # [B, 3]
+-                gather_idx = gather_idx.unsqueeze(1).expand(-1, self.conv_dim, -1)
+-                new_conv_state = torch.gather(mixed, 2, gather_idx)
++            if qwen_chunked_prefill_active and conv_state_cache is not None:
++                conv_state = conv_state_cache[:batch_size]
++                conv_input = torch.cat([conv_state, mixed], dim=-1)
++                w = self.conv1d.weight.squeeze(1)
++                conv_out = torch.zeros_like(mixed)
++                for k in range(self.conv_kernel_size):
++                    conv_out = conv_out + w[:, k].unsqueeze(0).unsqueeze(-1) * conv_input[
++                        :, :, k : k + seq_len
++                    ]
++                mixed_post_conv = F.silu(conv_out)
++                if valid_mask_1d is not None:
++                    state_len = self.conv_kernel_size - 1
++                    num_valid = valid_mask_1d.squeeze(-1).sum(dim=-1, keepdim=True).long()
++                    idx_base = (state_len + num_valid - state_len).clamp(min=0)
++                    offsets = torch.arange(state_len, device=mixed.device).unsqueeze(0)
++                    gather_idx = idx_base + offsets
++                    gather_idx = gather_idx.unsqueeze(1).expand(-1, self.conv_dim, -1)
++                    new_conv_state = torch.gather(conv_input, 2, gather_idx)
++                else:
++                    new_conv_state = conv_input[:, :, -self.conv_kernel_size + 1 :].contiguous()
+             else:
+-                new_conv_state = mixed[:, :, -3:].contiguous()
++                mixed_post_conv = F.silu(self.conv1d(mixed)[:, :, :seq_len])
++
++                if valid_mask_1d is not None:
++                    # valid_mask_1d is [B, S, 1]; count valid tokens per batch
++                    num_valid = (
++                        valid_mask_1d.squeeze(-1).sum(dim=-1, keepdim=True).long()
++                    )  # [B, 1]
++                    idx_base = num_valid - 3
++                    idx_base = idx_base.clamp(min=0)
++                    offsets = torch.arange(3, device=mixed.device).unsqueeze(0)
++                    gather_idx = idx_base + offsets  # [B, 3]
++                    gather_idx = gather_idx.unsqueeze(1).expand(-1, self.conv_dim, -1)
++                    new_conv_state = torch.gather(mixed, 2, gather_idx)
++                else:
++                    new_conv_state = mixed[:, :, -3:].contiguous()
+ 
+             alloc_bs = self.conv_state_buffer.shape[0]
+             if hybrid_cache_active:
+@@ -958,14 +992,50 @@ class NeuronGatedDeltaNet(nn.Module):
+             else:
+                 new_rec_state = new_state_bf16 + self.recurrent_state_buffer * 0
+         else:
+-            # CTE: fused, chunk, NKI, or sequential forward
+-            use_nki_fused = os.environ.get("USE_NKI_FUSED") == "1"
++            # CTE: fused NKI kernel by default (PyTorch _chunk_forward can hit
++            # neuronx-cc codegen ICE NCC_INLA001 with these DeltaNet dimensions).
++            # Override with env vars for debugging/benchmarking.
++            use_nki_fused = os.environ.get("USE_NKI_FUSED", "1") != "0"
+             use_nki_chunked = os.environ.get("USE_NKI_CHUNKED") == "1"
+             use_nki = os.environ.get("USE_NKI") == "1"
+             use_sequential = os.environ.get("DELTANET_SEQUENTIAL") == "1"
+-
+-            if use_nki_fused:
+-                output, final_state = self._fused_chunked_forward(
++            use_pytorch_chunk = os.environ.get("USE_PYTORCH_CHUNK") == "1"
++
++            if qwen_chunked_prefill_active and recurrent_state_cache is not None:
++                initial_state = recurrent_state_cache[:batch_size].float()
++                if self.use_qwen_hybrid_chunked_prefill_nki:
++                    if os.environ.get("USE_QWEN_FUSED_GDN_PREFILL") == "1":
++                        output, final_state = self._fused_chunked_forward(
++                            query,
++                            key,
++                            value,
++                            g,
++                            beta,
++                            output_final_state=True,
++                            initial_state=initial_state,
++                        )
++                    else:
++                        output, final_state = self._nki_chunked_forward(
++                            query,
++                            key,
++                            value,
++                            g,
++                            beta,
++                            output_final_state=True,
++                            initial_state=initial_state,
++                        )
++                else:
++                    output, final_state = self._chunk_forward(
++                        query,
++                        key,
++                        value,
++                        g,
++                        beta,
++                        output_final_state=True,
++                        initial_state=initial_state,
++                    )
++            elif use_pytorch_chunk:
++                output, final_state = self._chunk_forward(
+                     query, key, value, g, beta, output_final_state=True
+                 )
+             elif use_nki_chunked:
+@@ -980,8 +1050,12 @@ class NeuronGatedDeltaNet(nn.Module):
+                 output, final_state = self._sequential_forward(
+                     query, key, value, g, beta, output_final_state=True
+                 )
++            elif use_nki_fused:
++                output, final_state = self._fused_chunked_forward(
++                    query, key, value, g, beta, output_final_state=True
++                )
+             else:
+-                output, final_state = self._chunk_forward(
++                output, final_state = self._fused_chunked_forward(
+                     query, key, value, g, beta, output_final_state=True
+                 )
+ 
+@@ -1055,12 +1129,17 @@ class Qwen35InferenceConfig(InferenceConfig):
+         # which checks get_required_attributes(). These can be overridden by
+         # kwargs or load_config.
+ 
+-        # Layer types for hybrid dispatch: [3 DeltaNet + 1 GQA] x 16 = 64 layers
++        # Layer types for hybrid dispatch: [3 DeltaNet + 1 GQA] repeated.
+         if "layer_types" not in kwargs and not any(
+             hasattr(a, "layer_types") for a in args if hasattr(a, "__dict__")
+         ):
++            num_layers = kwargs.get("num_hidden_layers", 64)
++            if num_layers % 4 != 0:
++                raise ValueError(
++                    f"Qwen3.5 hybrid layer count must be divisible by 4, got {num_layers}"
++                )
+             layer_types = []
+-            for _ in range(16):
++            for _ in range(num_layers // 4):
+                 layer_types.extend(
+                     [
+                         "linear_attention",
+@@ -1078,6 +1157,9 @@ class Qwen35InferenceConfig(InferenceConfig):
+         kwargs.setdefault("linear_value_head_dim", 128)
+         kwargs.setdefault("linear_conv_kernel_dim", 4)
+         kwargs.setdefault("use_hybrid_cache_manager", False)
++        kwargs.setdefault("use_qwen_hybrid_chunked_prefill", False)
++        kwargs.setdefault("use_qwen_hybrid_chunked_prefill_nki", False)
++        kwargs.setdefault("qwen_chunked_prefill_attention_microchunk", 128)
+ 
+         super().__init__(*args, **kwargs)
+ 
+@@ -1312,7 +1394,7 @@ class NeuronQwen35Attention(NeuronAttentionBase):
+         if NKILIB_PATCH_ACTIVE:
+             return _flash_fwd_call(Q, K, V, use_causal_mask=True), None
+ 
+-        # Fallback: softmax path
++        # Fallback: softmax path (use 3D tensors to avoid compiler ICE with 4D patterns)
+         if head_dim > 128:
+             # GQA: expand K/V heads to match Q heads
+             num_q_heads = Q.shape[1]
+@@ -1329,19 +1411,87 @@ class NeuronQwen35Attention(NeuronAttentionBase):
+                     .expand(-1, -1, kv_rep, -1, -1)
+                     .reshape(bsz, num_q_heads, q_len, head_dim)
+                 )
+-            attn_weights = torch.matmul(Q, K.transpose(-1, -2)) / math.sqrt(head_dim)
+-            if attention_mask is not None:
+-                if attention_mask.dtype == torch.bool:
+-                    attn_weights = attn_weights.masked_fill(~attention_mask, -65504.0)
+-                else:
+-                    attn_weights = attn_weights + attention_mask
++            # Reshape to 3D (B*H, S, d) to avoid neuronx-cc codegen ICE with 4D
++            # attention weight tensors (NCC_INLA001: Expected 2D tensor but got 4D AP)
++            Q_3d = Q.reshape(bsz * num_q_heads, q_len, head_dim)
++            K_3d = K.reshape(bsz * num_q_heads, q_len, head_dim)
++            V_3d = V.reshape(bsz * num_q_heads, q_len, head_dim)
++            attn_weights = torch.bmm(Q_3d, K_3d.transpose(-1, -2)) / math.sqrt(head_dim)
++            # Build causal mask for 3D: (1, S, S) broadcast over B*H
++            causal_mask = torch.triu(
++                torch.full(
++                    (q_len, q_len),
++                    -65504.0,
++                    dtype=attn_weights.dtype,
++                    device=attn_weights.device,
++                ),
++                diagonal=1,
++            ).unsqueeze(0)
++            attn_weights = attn_weights + causal_mask
+             attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(
+                 Q.dtype
+             )
+-            return torch.matmul(attn_weights, V), None
++            attn_output = torch.bmm(attn_weights, V_3d)
++            # Reshape back to 4D (B, H, S, d)
++            return attn_output.reshape(bsz, num_q_heads, q_len, head_dim), None
+ 
+         return _flash_fwd_call(Q, K, V, use_causal_mask=True), None
+ 
++    def perform_qwen_chunked_prefill(self, Q, K, V, past_key_value, position_ids):
++        """Exact chunked CTE over the full decode cache.
++
++        The current chunk K/V tensors are scattered into the full cache at
++        absolute position_ids, then attention for this chunk is computed over
++        all cache positions up to the chunk end. This keeps full-attention
++        layers correct when model-local chunked prefill feeds context in
++        multiple CTE-bucket calls.
++        """
++        k_cache, v_cache = past_key_value
++        B, q_heads, q_len, head_dim = Q.shape
++        kv_heads = K.shape[1]
++        cache_len = k_cache.shape[2]
++
++        pos = position_ids.long()
++        k_index = pos[:, None, :, None].expand(B, kv_heads, q_len, head_dim)
++        k_cache = torch.scatter(k_cache, dim=2, index=k_index, src=K.to(k_cache.dtype))
++        v_cache = torch.scatter(v_cache, dim=2, index=k_index, src=V.to(v_cache.dtype))
++
++        if q_heads != kv_heads:
++            kv_rep = q_heads // kv_heads
++            K_full = (
++                k_cache.unsqueeze(2)
++                .expand(-1, -1, kv_rep, -1, -1)
++                .reshape(B, q_heads, cache_len, head_dim)
++            )
++            V_full = (
++                v_cache.unsqueeze(2)
++                .expand(-1, -1, kv_rep, -1, -1)
++                .reshape(B, q_heads, cache_len, head_dim)
++            )
++        else:
++            K_full = k_cache
++            V_full = v_cache
++
++        cache_positions = torch.arange(cache_len, device=position_ids.device).view(1, 1, 1, -1)
++        microchunk = int(
++            getattr(self.config, "qwen_chunked_prefill_attention_microchunk", 128)
++        )
++        outputs = []
++        for start in range(0, q_len, microchunk):
++            end = min(start + microchunk, q_len)
++            q_blk = Q[:, :, start:end, :]
++            pos_blk = pos[:, start:end]
++            attn_weights = torch.matmul(q_blk, K_full.transpose(-1, -2)) / math.sqrt(
++                head_dim
++            )
++            causal_mask = cache_positions <= pos_blk[:, None, :, None]
++            attn_weights = attn_weights.masked_fill(~causal_mask, -65504.0)
++            attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(
++                Q.dtype
++            )
++            outputs.append(torch.matmul(attn_weights, V_full))
++        return torch.cat(outputs, dim=2)
++
+     def forward(
+         self,
+         hidden_states,
+@@ -1382,11 +1532,21 @@ class NeuronQwen35Attention(NeuronAttentionBase):
+             rmsnorm=rmsnorm,
+         )
+ 
++        qwen_chunked_prefill_active = (
++            past_key_value is not None
++            and q_len > 1
++            and getattr(self.config, "use_qwen_hybrid_chunked_prefill", False)
++        )
++
+         if past_key_value is None:
+             # Context encoding (prefill)
+             attn_output, _flash_strategy = self.perform_prefill(
+                 Q, K, V, q_len, bsz, attention_mask
+             )
++        elif qwen_chunked_prefill_active:
++            attn_output = self.perform_qwen_chunked_prefill(
++                Q, K, V, past_key_value, position_ids
++            )
+         else:
+             # Token generation (decode)
+             tkg_mask = attention_mask
+@@ -1722,6 +1882,15 @@ class HybridDeltaNetCacheManager(KVCacheManager):
+                     state_per_layer=kv_per_layer,
+                     kvcache_buffer=kvcache_buffer,
+                 )
++            elif kwargs.get("qwen_chunked_prefill_update", False):
++                recurrent_state, conv_state = self.update_qwen_chunked_kv_by_layer_id(
++                    idx=idx,
++                    seq_ids=seq_ids,
++                    position_ids=position_ids,
++                    kv_per_layer=kv_per_layer,
++                    kvcache_buffer=kvcache_buffer,
++                    valid_mask=kwargs.get("qwen_chunked_valid_mask", None),
++                )
+             else:
+                 recurrent_state, conv_state = self.update_kv_by_layer_id(
+                     idx=idx,
+@@ -1740,6 +1909,59 @@ class HybridDeltaNetCacheManager(KVCacheManager):
+             updated_cache.append(conv_state)
+         return updated_cache
+ 
++    def update_qwen_chunked_kv_by_layer_id(
++        self,
++        idx: int,
++        seq_ids: torch.Tensor,
++        position_ids: torch.Tensor,
++        kv_per_layer: Tuple[torch.Tensor, torch.Tensor],
++        kvcache_buffer=None,
++        valid_mask=None,
++    ):
++        latest_k, latest_v = kv_per_layer
++        k_cache, v_cache = self._fetch_cache(idx, kvcache_buffer)
++        latest_k = latest_k.to(k_cache.dtype)
++        latest_v = latest_v.to(v_cache.dtype)
++
++        if seq_ids is not None:
++            cache_idx = self.get_cache_update_index_for_seq_ids(seq_ids)
++            selected_k = torch.index_select(k_cache, dim=0, index=cache_idx)
++            selected_v = torch.index_select(v_cache, dim=0, index=cache_idx)
++        else:
++            cache_idx = None
++            selected_k = k_cache[: latest_k.shape[0]]
++            selected_v = v_cache[: latest_v.shape[0]]
++
++        pos = position_ids.long()
++        k_index = pos[:, None, :, None].expand_as(latest_k)
++        v_index = pos[:, None, :, None].expand_as(latest_v)
++
++        if valid_mask is not None:
++            valid = valid_mask.to(torch.bool)[:, None, :, None]
++            old_k = torch.gather(selected_k, dim=2, index=k_index)
++            old_v = torch.gather(selected_v, dim=2, index=v_index)
++            latest_k = torch.where(valid, latest_k, old_k)
++            latest_v = torch.where(valid, latest_v, old_v)
++
++        updated_k = torch.scatter(selected_k, dim=2, index=k_index, src=latest_k)
++        updated_v = torch.scatter(selected_v, dim=2, index=v_index, src=latest_v)
++
++        if cache_idx is not None:
++            k_row_index = cache_idx.view(-1, 1, 1, 1).expand_as(updated_k)
++            v_row_index = cache_idx.view(-1, 1, 1, 1).expand_as(updated_v)
++            k_cache = torch.scatter(k_cache, dim=0, index=k_row_index, src=updated_k)
++            v_cache = torch.scatter(v_cache, dim=0, index=v_row_index, src=updated_v)
++            return k_cache, v_cache
++
++        if updated_k.shape[0] == k_cache.shape[0]:
++            return updated_k + k_cache * 0, updated_v + v_cache * 0
++
++        pad_rows = k_cache.shape[0] - updated_k.shape[0]
++        if pad_rows > 0:
++            updated_k = torch.cat([updated_k, k_cache[updated_k.shape[0] :] * 0], dim=0)
++            updated_v = torch.cat([updated_v, v_cache[updated_v.shape[0] :] * 0], dim=0)
++        return updated_k + k_cache * 0, updated_v + v_cache * 0
++
+     def update_deltanet_state_by_layer_id(
+         self,
+         idx: int,
+@@ -1752,7 +1974,7 @@ class HybridDeltaNetCacheManager(KVCacheManager):
+         latest_recurrent = latest_recurrent.to(recurrent_cache.dtype)
+         latest_conv = latest_conv.to(conv_cache.dtype)
+ 
+-        if latest_recurrent.shape[0] == recurrent_cache.shape[0]:
++        if latest_recurrent.shape[0] == recurrent_cache.shape[0] and seq_ids is None:
+             return (
+                 latest_recurrent + recurrent_cache * 0,
+                 latest_conv + conv_cache * 0,
+@@ -1952,9 +2174,17 @@ class NeuronQwen35Model(NeuronBaseModel):
+ 
+         hidden_states = inputs_embeds
+ 
+-        # Get KV cache for TKG
+-        cache_size = self.n_positions
+-        if not is_for_context_encoding:
++        # Get KV cache for TKG and for model-local chunked CTE.
++        use_qwen_chunked_prefill = (
++            is_for_context_encoding
++            and getattr(self.config, "use_qwen_hybrid_chunked_prefill", False)
++        )
++        cache_size = (
++            self.config.neuron_config.seq_len
++            if use_qwen_chunked_prefill
++            else self.n_positions
++        )
++        if (not is_for_context_encoding) or use_qwen_chunked_prefill:
+             if self.kv_mgr is not None:
+                 past_key_values = self.kv_mgr.get_cache(
+                     seq_ids=seq_ids,
+@@ -2017,6 +2247,10 @@ class NeuronQwen35Model(NeuronBaseModel):
+                 windowed_context_encoding_window_idx=windowed_context_encoding_window_idx,
+                 padding_mask=padding_mask,
+                 deltanet_padding_mask=deltanet_padding_mask,
++                qwen_chunked_prefill_update=use_qwen_chunked_prefill,
++                qwen_chunked_valid_mask=deltanet_padding_mask.squeeze(-1)
++                if use_qwen_chunked_prefill
++                else None,
+                 **kwargs,
+             )
+ 
+@@ -2040,6 +2274,10 @@ class NeuronQwen35Model(NeuronBaseModel):
+                 new_key_values=next_decoder_cache,
+                 seq_len=cache_size,
+                 windowed_context_encoding_window_idx=windowed_context_encoding_window_idx,
++                qwen_chunked_prefill_update=use_qwen_chunked_prefill,
++                qwen_chunked_valid_mask=deltanet_padding_mask.squeeze(-1)
++                if use_qwen_chunked_prefill
++                else None,
+                 **kwargs,
+             )
+ 
+@@ -2130,7 +2368,15 @@ class NeuronQwen35Model(NeuronBaseModel):
+             if not is_for_context_encoding:
+                 pass
+             else:
+-                index = torch.max(position_ids, dim=1, keepdim=True).indices
++                if getattr(self.config, "use_qwen_hybrid_chunked_prefill", False):
++                    index = (
++                        (input_ids != self.padding_idx)
++                        .sum(dim=1, keepdim=True)
++                        .long()
++                        - 1
++                    ).clamp(min=0)
++                else:
++                    index = torch.max(position_ids, dim=1, keepdim=True).indices
+                 index = index.unsqueeze(1).expand(batch_size, 1, self.hidden_size)
+                 hidden_states = torch.gather(hidden_states, dim=1, index=index)
+ 
+@@ -2616,7 +2862,10 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
+         tf_args=None,
+     ):
+         """Override to pass all 24 positional args explicitly."""
+-        is_prefill = self._is_prefill(position_ids)
++        is_prefill = self._is_prefill(position_ids) or (
++            getattr(self.config, "use_qwen_hybrid_chunked_prefill", False)
++            and input_ids.shape[-1] > 1
++        )
+ 
+         seq_len = input_ids.shape[1]
+         batch_size = input_ids.shape[0]
+@@ -2658,7 +2907,7 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
+ 
+         empties = [torch.empty(0) for _ in range(14)]
+ 
+-        if self._is_prefill(position_ids):
++        if is_prefill:
+             ctx_bs = self.context_encoding_model.neuron_config.batch_size
+             output_logits = []
+ 
+diff --git a/contrib/models/Qwen3.6-27B/src/nki_kernels/nki_deltanet_chunked.py b/contrib/models/Qwen3.6-27B/src/nki_kernels/nki_deltanet_chunked.py
+index 5c582f8..f834c96 100644
+--- a/contrib/models/Qwen3.6-27B/src/nki_kernels/nki_deltanet_chunked.py
++++ b/contrib/models/Qwen3.6-27B/src/nki_kernels/nki_deltanet_chunked.py
+@@ -1,8 +1,8 @@
+ """NKI per-chunk DeltaNet kernel for CTE (context encoding / prefill).
+ 
+-Single-chunk kernel: processes one chunk (128 tokens) with Neumann-series
+-power-doubling for intra-chunk correction. The caller loops over chunks
+-in PyTorch, passing state between calls.
++Single-chunk kernel: processes one chunk (128 tokens) with a stable
++triangular solve for intra-chunk correction. The caller loops over chunks in
++PyTorch, passing state between calls.
+ 
+ Each kernel call:
+   - Takes one chunk of data: q, k, v, beta, g_cumsum, g_last  (all 128x128)
+@@ -22,6 +22,9 @@ import nki.language as nl
+ 
+ P_MAX = 128
+ 
++# Broadcast partition 0 to all partitions in a 32-wide group.
++_BROADCAST_MASK = [0] * 32
++
+ 
+ @nki.jit
+ def deltanet_chunk_step(
+@@ -90,25 +93,117 @@ def deltanet_chunk_step(
+     nisa.tensor_tensor(dst=v_beta, data1=v_c, data2=beta_c, op=nl.multiply)
+ 
+     # ============================================================
+-    # exp(g_cumsum) and exp(-g_cumsum)
++    # Stable decay factors from cumulative log-decay
++    #
++    # The caller passes g_cumsum and g_last broadcast to (128, 128).  Extract
++    # one column and build pairwise decays as exp(gc[i] - gc[j]) so no
++    # individual exp(-gc[j]) term can overflow.
+     # ============================================================
+-    exp_gc = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.sbuf)
+-    nisa.activation(dst=exp_gc, op=nl.exp, data=gc_c, bias=None, scale=1.0)
++    gc_p = nl.ndarray((P_MAX, 1), dtype=nl.float32, buffer=nl.sbuf)
++    nisa.tensor_copy(dst=gc_p[0:P_MAX, 0:1], src=gc_c[0:P_MAX, 0:1])
++
++    gl_p = nl.ndarray((P_MAX, 1), dtype=nl.float32, buffer=nl.sbuf)
++    nisa.tensor_copy(dst=gl_p[0:P_MAX, 0:1], src=gl_c[0:P_MAX, 0:1])
++
++    exp_gc_p = nl.ndarray((P_MAX, 1), dtype=nl.float32, buffer=nl.sbuf)
++    nisa.activation(
++        dst=exp_gc_p[0:P_MAX, 0:1],
++        op=nl.exp,
++        data=gc_p[0:P_MAX, 0:1],
++        bias=None,
++        scale=1.0,
++    )
++
++    exp_gl_p = nl.ndarray((P_MAX, 1), dtype=nl.float32, buffer=nl.sbuf)
++    nisa.activation(
++        dst=exp_gl_p[0:P_MAX, 0:1],
++        op=nl.exp,
++        data=gl_p[0:P_MAX, 0:1],
++        bias=None,
++        scale=1.0,
++    )
++
++    gc_padded = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
++    nisa.memset(dst=gc_padded, value=0.0)
++    nisa.tensor_copy(dst=gc_padded[0:P_MAX, 0:1], src=gc_p[0:P_MAX, 0:1])
++
++    gc_row_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
++    nisa.nc_transpose(dst=gc_row_psum, data=gc_padded)
++
++    gc_row = nl.ndarray((1, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
++    nisa.tensor_copy(dst=gc_row[0:1, 0:P_MAX], src=gc_row_psum[0:1, 0:P_MAX])
++
++    gc_row_broadcast = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
++    for i_shuf in nl.static_range(P_MAX // 32):
++        nisa.nc_stream_shuffle(
++            src=gc_row[0:1, 0:P_MAX],
++            dst=gc_row_broadcast[i_shuf * 32 : i_shuf * 32 + 32, 0:P_MAX],
++            shuffle_mask=_BROADCAST_MASK,
++        )
+ 
+-    neg_gc = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.sbuf)
++    gc_col_strict = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+     nisa.tensor_scalar(
+-        dst=neg_gc,
+-        data=gc_c,
++        dst=gc_col_strict,
++        data=Lmask,
+         op0=nl.multiply,
+-        operand0=-1.0,
++        operand0=gc_p,
+         engine=nisa.vector_engine,
+     )
+-    exp_neg_gc = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.sbuf)
+-    nisa.activation(dst=exp_neg_gc, op=nl.exp, data=neg_gc, bias=None, scale=1.0)
++    gc_row_strict = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
++    nisa.tensor_tensor(
++        dst=gc_row_strict, data1=gc_row_broadcast, data2=Lmask, op=nl.multiply
++    )
++    g_diff_strict = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
++    nisa.tensor_tensor(
++        dst=g_diff_strict,
++        data1=gc_col_strict,
++        data2=gc_row_strict,
++        op=nl.subtract,
++    )
++    decay_strict_raw = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
++    nisa.activation(
++        dst=decay_strict_raw,
++        op=nl.exp,
++        data=g_diff_strict,
++        bias=None,
++        scale=1.0,
++    )
++    decay_strict = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
++    nisa.tensor_tensor(
++        dst=decay_strict, data1=decay_strict_raw, data2=Lmask, op=nl.multiply
++    )
+ 
+-    # exp(g_last) for state decay
+-    exp_gl = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.sbuf)
+-    nisa.activation(dst=exp_gl, op=nl.exp, data=gl_c, bias=None, scale=1.0)
++    gc_col_diag = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
++    nisa.tensor_scalar(
++        dst=gc_col_diag,
++        data=Lmask_d,
++        op0=nl.multiply,
++        operand0=gc_p,
++        engine=nisa.vector_engine,
++    )
++    gc_row_diag = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
++    nisa.tensor_tensor(
++        dst=gc_row_diag, data1=gc_row_broadcast, data2=Lmask_d, op=nl.multiply
++    )
++    g_diff_diag = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
++    nisa.tensor_tensor(
++        dst=g_diff_diag,
++        data1=gc_col_diag,
++        data2=gc_row_diag,
++        op=nl.subtract,
++    )
++    decay_diag_raw = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
++    nisa.activation(
++        dst=decay_diag_raw,
++        op=nl.exp,
++        data=g_diff_diag,
++        bias=None,
++        scale=1.0,
++    )
++    decay_diag = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
++    nisa.tensor_tensor(
++        dst=decay_diag, data1=decay_diag_raw, data2=Lmask_d, op=nl.multiply
++    )
+ 
+     # ============================================================
+     # Phase 1: Build A matrix (intra-chunk correction)
+@@ -129,24 +224,9 @@ def deltanet_chunk_step(
+     QK = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+     nisa.tensor_copy(dst=QK, src=QK_psum)
+ 
+-    # ============================================================
+-    # Decay mask: QK_decay[i,j] = QK[i,j] * exp(gc[i]) * exp(-gc[j])
+-    # ============================================================
+-    QK_row = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+-    nisa.tensor_tensor(dst=QK_row, data1=QK, data2=exp_gc, op=nl.multiply)
+-
+-    QK_r_T_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
+-    nisa.nc_matmul(dst=QK_r_T_psum, stationary=QK_row, moving=eye)
+-    QK_r_T = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+-    nisa.tensor_copy(dst=QK_r_T, src=QK_r_T_psum)
+-
+-    QK_r_T_col = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+-    nisa.tensor_tensor(dst=QK_r_T_col, data1=QK_r_T, data2=exp_neg_gc, op=nl.multiply)
+-
+-    QK_d_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
+-    nisa.nc_matmul(dst=QK_d_psum, stationary=QK_r_T_col, moving=eye)
++    # QK_decay[i,j] = QK[i,j] * exp(gc[i] - gc[j]) for i > j.
+     QK_decay = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+-    nisa.tensor_copy(dst=QK_decay, src=QK_d_psum)
++    nisa.tensor_tensor(dst=QK_decay, data1=QK, data2=decay_strict, op=nl.multiply)
+ 
+     # A = -QK_decay * lower_mask
+     neg_QK_decay = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+@@ -157,45 +237,166 @@ def deltanet_chunk_step(
+         operand0=-1.0,
+         engine=nisa.vector_engine,
+     )
+-    A = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+-    nisa.tensor_tensor(dst=A, data1=neg_QK_decay, data2=Lmask, op=nl.multiply)
++    A_mat = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
++    nisa.tensor_tensor(dst=A_mat, data1=neg_QK_decay, data2=Lmask, op=nl.multiply)
+ 
+     # ============================================================
+-    # Neumann power-doubling: N = (I+A)(I+A^2)...(I+A^{64})
++    # Stable triangular solve: N = inv(I - A_mat)
++    #
++    # A_mat is strictly lower triangular. Solve two 64x64 diagonal blocks
++    # row-by-row, then merge the lower-left block. This is equivalent to the
++    # nilpotent Neumann series but avoids repeated squaring of A.
+     # ============================================================
+     P_acc = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+-    nisa.tensor_tensor(dst=P_acc, data1=eye, data2=A, op=nl.add)
+-
+-    A_pow = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+-    nisa.tensor_copy(dst=A_pow, src=A)
+-
+-    for _round in nl.sequential_range(6):
+-        Ap_T_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
+-        nisa.nc_matmul(dst=Ap_T_psum, stationary=A_pow, moving=eye)
+-        Ap_T = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+-        nisa.tensor_copy(dst=Ap_T, src=Ap_T_psum)
+-
+-        Ap_sq_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
+-        nisa.nc_matmul(dst=Ap_sq_psum, stationary=Ap_T, moving=A_pow)
+-        nisa.tensor_copy(dst=A_pow, src=Ap_sq_psum)
+-
+-        IpA = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+-        nisa.tensor_tensor(dst=IpA, data1=eye, data2=A_pow, op=nl.add)
+-
+-        IpA_T_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
+-        nisa.nc_matmul(dst=IpA_T_psum, stationary=IpA, moving=eye)
+-        IpA_T = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+-        nisa.tensor_copy(dst=IpA_T, src=IpA_T_psum)
++    nisa.memset(dst=P_acc, value=0.0)
++
++    A_T_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
++    nisa.nc_transpose(dst=A_T_psum, data=A_mat)
++    A_T = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
++    nisa.tensor_copy(dst=A_T, src=A_T_psum)
++
++    col_mask_left_row = nl.ndarray((1, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
++    nisa.memset(dst=col_mask_left_row, value=0.0)
++    nisa.memset(dst=col_mask_left_row[0:1, 0:64], value=1.0)
++    col_mask_left = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
++    for i_shuf in nl.static_range(P_MAX // 32):
++        nisa.nc_stream_shuffle(
++            src=col_mask_left_row[0:1, 0:P_MAX],
++            dst=col_mask_left[i_shuf * 32 : i_shuf * 32 + 32, 0:P_MAX],
++            shuffle_mask=_BROADCAST_MASK,
++        )
++
++    col_mask_right_row = nl.ndarray((1, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
++    nisa.memset(dst=col_mask_right_row, value=0.0)
++    nisa.memset(dst=col_mask_right_row[0:1, 64:P_MAX], value=1.0)
++    col_mask_right = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
++    for i_shuf in nl.static_range(P_MAX // 32):
++        nisa.nc_stream_shuffle(
++            src=col_mask_right_row[0:1, 0:P_MAX],
++            dst=col_mask_right[i_shuf * 32 : i_shuf * 32 + 32, 0:P_MAX],
++            shuffle_mask=_BROADCAST_MASK,
++        )
++
++    block_row_mask_bottom = nl.ndarray((P_MAX, 1), dtype=nl.float32, buffer=nl.sbuf)
++    nisa.tensor_copy(
++        dst=block_row_mask_bottom[0:P_MAX, 0:1],
++        src=Lmask_d[0:P_MAX, 64:65],
++    )
+ 
+-        Pacc_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
+-        nisa.nc_matmul(dst=Pacc_psum, stationary=IpA_T, moving=P_acc)
+-        nisa.tensor_copy(dst=P_acc, src=Pacc_psum)
++    for solve_i in nl.static_range(64):
++        row_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
++        nisa.nc_matmul(dst=row_psum, stationary=A_T, moving=P_acc)
++        row_prod = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
++        nisa.tensor_copy(dst=row_prod, src=row_psum)
++
++        row_with_eye = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
++        nisa.tensor_tensor(dst=row_with_eye, data1=row_prod, data2=eye, op=nl.add)
++
++        row_col_masked = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
++        nisa.tensor_tensor(
++            dst=row_col_masked,
++            data1=row_with_eye,
++            data2=col_mask_left,
++            op=nl.multiply,
++        )
++
++        row_mask = nl.ndarray((P_MAX, 1), dtype=nl.float32, buffer=nl.sbuf)
++        nisa.tensor_copy(
++            dst=row_mask[0:P_MAX, 0:1],
++            src=eye[0:P_MAX, solve_i : solve_i + 1],
++        )
++        row_update = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
++        nisa.tensor_scalar(
++            dst=row_update,
++            data=row_col_masked,
++            op0=nl.multiply,
++            operand0=row_mask,
++            engine=nisa.vector_engine,
++        )
++
++        P_next = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
++        nisa.tensor_tensor(dst=P_next, data1=P_acc, data2=row_update, op=nl.add)
++        nisa.tensor_copy(dst=P_acc, src=P_next)
++
++    for solve_i in nl.static_range(64):
++        row_idx = 64 + solve_i
++
++        row_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
++        nisa.nc_matmul(dst=row_psum, stationary=A_T, moving=P_acc)
++        row_prod = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
++        nisa.tensor_copy(dst=row_prod, src=row_psum)
++
++        row_with_eye = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
++        nisa.tensor_tensor(dst=row_with_eye, data1=row_prod, data2=eye, op=nl.add)
++
++        row_col_masked = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
++        nisa.tensor_tensor(
++            dst=row_col_masked,
++            data1=row_with_eye,
++            data2=col_mask_right,
++            op=nl.multiply,
++        )
++
++        row_mask = nl.ndarray((P_MAX, 1), dtype=nl.float32, buffer=nl.sbuf)
++        nisa.tensor_copy(
++            dst=row_mask[0:P_MAX, 0:1],
++            src=eye[0:P_MAX, row_idx : row_idx + 1],
++        )
++        row_update = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
++        nisa.tensor_scalar(
++            dst=row_update,
++            data=row_col_masked,
++            op0=nl.multiply,
++            operand0=row_mask,
++            engine=nisa.vector_engine,
++        )
++
++        P_next = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
++        nisa.tensor_tensor(dst=P_next, data1=P_acc, data2=row_update, op=nl.add)
++        nisa.tensor_copy(dst=P_acc, src=P_next)
++
++    N_diag_T_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
++    nisa.nc_transpose(dst=N_diag_T_psum, data=P_acc)
++    N_diag_T = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
++    nisa.tensor_copy(dst=N_diag_T, src=N_diag_T_psum)
++
++    tmp_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
++    nisa.nc_matmul(dst=tmp_psum, stationary=N_diag_T, moving=A_mat)
++    tmp = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
++    nisa.tensor_copy(dst=tmp, src=tmp_psum)
++
++    tmp_T_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
++    nisa.nc_transpose(dst=tmp_T_psum, data=tmp)
++    tmp_T = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
++    nisa.tensor_copy(dst=tmp_T, src=tmp_T_psum)
++
++    N21_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
++    nisa.nc_matmul(dst=N21_psum, stationary=tmp_T, moving=P_acc)
++    N21 = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
++    nisa.tensor_copy(dst=N21, src=N21_psum)
++
++    N21_col_masked = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
++    nisa.tensor_tensor(
++        dst=N21_col_masked,
++        data1=N21,
++        data2=col_mask_left,
++        op=nl.multiply,
++    )
++    N21_block = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
++    nisa.tensor_scalar(
++        dst=N21_block,
++        data=N21_col_masked,
++        op0=nl.multiply,
++        operand0=block_row_mask_bottom,
++        engine=nisa.vector_engine,
++    )
++    nisa.tensor_tensor(dst=P_acc, data1=P_acc, data2=N21_block, op=nl.add)
+ 
+     # ============================================================
+     # Apply N: value_corr = N @ v_beta, k_cumdecay = N @ (k_beta * exp_gc)
+     # ============================================================
+     N_T_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
+-    nisa.nc_matmul(dst=N_T_psum, stationary=P_acc, moving=eye)
++    nisa.nc_transpose(dst=N_T_psum, data=P_acc)
+     N_T = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+     nisa.tensor_copy(dst=N_T, src=N_T_psum)
+ 
+@@ -205,7 +406,13 @@ def deltanet_chunk_step(
+     nisa.tensor_copy(dst=value_corr, src=vc_psum)
+ 
+     kb_exp_gc = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.sbuf)
+-    nisa.tensor_tensor(dst=kb_exp_gc, data1=k_beta, data2=exp_gc, op=nl.multiply)
++    nisa.tensor_scalar(
++        dst=kb_exp_gc,
++        data=k_beta,
++        op0=nl.multiply,
++        operand0=exp_gc_p,
++        engine=nisa.vector_engine,
++    )
+ 
+     kcd_psum = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.psum)
+     nisa.nc_matmul(dst=kcd_psum, stationary=N_T, moving=kb_exp_gc)
+@@ -226,24 +433,8 @@ def deltanet_chunk_step(
+     qk_raw = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+     nisa.tensor_copy(dst=qk_raw, src=qk_psum)
+ 
+-    qk_row = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+-    nisa.tensor_tensor(dst=qk_row, data1=qk_raw, data2=exp_gc, op=nl.multiply)
+-
+-    qk_r_T_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
+-    nisa.nc_matmul(dst=qk_r_T_psum, stationary=qk_row, moving=eye)
+-    qk_r_T = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+-    nisa.tensor_copy(dst=qk_r_T, src=qk_r_T_psum)
+-
+-    qk_r_T_col = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+-    nisa.tensor_tensor(dst=qk_r_T_col, data1=qk_r_T, data2=exp_neg_gc, op=nl.multiply)
+-
+-    qk_d_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
+-    nisa.nc_matmul(dst=qk_d_psum, stationary=qk_r_T_col, moving=eye)
+-    qk_decay = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+-    nisa.tensor_copy(dst=qk_decay, src=qk_d_psum)
+-
+     attn_intra = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+-    nisa.tensor_tensor(dst=attn_intra, data1=qk_decay, data2=Lmask_d, op=nl.multiply)
++    nisa.tensor_tensor(dst=attn_intra, data1=qk_raw, data2=decay_diag, op=nl.multiply)
+ 
+     # ============================================================
+     # v_prime = k_cumdecay @ state
+@@ -265,7 +456,13 @@ def deltanet_chunk_step(
+     # attn_inter = (q * exp(g_cumsum)) @ state
+     # ============================================================
+     q_exp = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.sbuf)
+-    nisa.tensor_tensor(dst=q_exp, data1=q_c, data2=exp_gc, op=nl.multiply)
++    nisa.tensor_scalar(
++        dst=q_exp,
++        data=q_c,
++        op0=nl.multiply,
++        operand0=exp_gc_p,
++        engine=nisa.vector_engine,
++    )
+ 
+     qe_T_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
+     nisa.nc_matmul(dst=qe_T_psum, stationary=q_exp, moving=eye)
+@@ -299,21 +496,50 @@ def deltanet_chunk_step(
+     nisa.dma_copy(dst=output, src=chunk_out)
+ 
+     # ============================================================
+-    # State update: state_new = exp(g_last) * (state + k_raw_decay^T @ v_new)
++    # State update: state_new = state * exp(g_last)
++    #                         + (k * exp(g_last - gc))^T @ v_new
+     # ============================================================
++    gl_minus_gc_p = nl.ndarray((P_MAX, 1), dtype=nl.float32, buffer=nl.sbuf)
++    nisa.tensor_tensor(
++        dst=gl_minus_gc_p,
++        data1=gl_p,
++        data2=gc_p,
++        op=nl.subtract,
++    )
++    exp_gl_minus_gc_p = nl.ndarray((P_MAX, 1), dtype=nl.float32, buffer=nl.sbuf)
++    nisa.activation(
++        dst=exp_gl_minus_gc_p,
++        op=nl.exp,
++        data=gl_minus_gc_p,
++        bias=None,
++        scale=1.0,
++    )
++
+     k_raw_decay = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.sbuf)
+-    nisa.tensor_tensor(dst=k_raw_decay, data1=k_c, data2=exp_neg_gc, op=nl.multiply)
++    nisa.tensor_scalar(
++        dst=k_raw_decay,
++        data=k_c,
++        op0=nl.multiply,
++        operand0=exp_gl_minus_gc_p,
++        engine=nisa.vector_engine,
++    )
+ 
+     kv_psum = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.psum)
+     nisa.nc_matmul(dst=kv_psum, stationary=k_raw_decay, moving=v_new)
+     kv_outer = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.sbuf)
+     nisa.tensor_copy(dst=kv_outer, src=kv_psum)
+ 
+-    state_plus = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.sbuf)
+-    nisa.tensor_tensor(dst=state_plus, data1=state, data2=kv_outer, op=nl.add)
++    state_decayed = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.sbuf)
++    nisa.tensor_scalar(
++        dst=state_decayed,
++        data=state,
++        op0=nl.multiply,
++        operand0=exp_gl_p,
++        engine=nisa.vector_engine,
++    )
+ 
+     state_new = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.sbuf)
+-    nisa.tensor_tensor(dst=state_new, data1=state_plus, data2=exp_gl, op=nl.multiply)
++    nisa.tensor_tensor(dst=state_new, data1=state_decayed, data2=kv_outer, op=nl.add)
+ 
+     nisa.dma_copy(dst=state_out, src=state_new)
+ 
+diff --git a/contrib/models/Qwen3.6-27B/src/nki_kernels/nki_deltanet_fused.py b/contrib/models/Qwen3.6-27B/src/nki_kernels/nki_deltanet_fused.py
+index 6008ae5..6f17097 100644
+--- a/contrib/models/Qwen3.6-27B/src/nki_kernels/nki_deltanet_fused.py
++++ b/contrib/models/Qwen3.6-27B/src/nki_kernels/nki_deltanet_fused.py
+@@ -17,9 +17,9 @@ NKI 0.3.0 (SDK 2.29). k_dim = v_dim = 128 = P_MAX exactly.
+ Chunk size = 128 = P_MAX (one tile per chunk).
+ 
+ Mathematical framework (same as nki_deltanet_chunked.py):
+-  Per-chunk Neumann-series power-doubling for intra-chunk correction:
++  Per-chunk blocked forward substitution for intra-chunk correction:
+     A = -QK_decay * lower_mask
+-    N = (I+A)(I+A^2)(I+A^4)...(I+A^64)  [6 rounds]
++    N = inv(I - A)
+     value_corr = N @ v_beta
+     k_cumdecay = N @ (k_beta * exp(gc))
+ 
+@@ -29,7 +29,7 @@ Mathematical framework (same as nki_deltanet_chunked.py):
+     attn_inter = (q * exp(gc)) @ state
+     attn_intra = (q @ k^T) * decay_mask * lower_mask_diag
+     output = attn_inter + attn_intra @ v_new
+-    state = exp(g_last) * (state + k_raw_decay^T @ v_new)
++    state = state * exp(g_last) + (k * exp(g_last - gc))^T @ v_new
+ """
+ 
+ import numpy as np
+@@ -67,6 +67,7 @@ def deltanet_fused_chunked_fwd(
+     value: nl.ndarray,  # (S, 128) float32
+     g_in: nl.ndarray,  # (S, 1)   float32 — per-token log-decay (NOT cumsum)
+     beta_in: nl.ndarray,  # (S, 1)   float32 — per-token write gate
++    state_in: nl.ndarray,  # (128, 128) float32 — recurrent state before S
+     lower_mask: nl.ndarray,  # (128, 128) float32 — strict lower tri
+     identity: nl.ndarray,  # (128, 128) float32 — identity
+     lower_mask_diag: nl.ndarray,  # (128, 128) float32 — lower tri with diag
+@@ -120,7 +121,7 @@ def deltanet_fused_chunked_fwd(
+     # Initialize recurrent state in SBUF — persists across ALL chunks
+     # ================================================================
+     state = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.sbuf)
+-    nisa.memset(dst=state, value=0.0)
++    nisa.dma_copy(dst=state, src=state_in)
+ 
+     # ================================================================
+     # Sequential chunk processing
+@@ -216,7 +217,7 @@ def deltanet_fused_chunked_fwd(
+             src=gc_row[0:1, CHUNK_SIZE - 1 : CHUNK_SIZE],
+         )
+ 
+-        # ---- Compute exp(gc), exp(-gc), exp(g_last) as (P_MAX, 1) scalars ----
++        # ---- Compute stable decay helpers as (P_MAX, 1) scalars ----
+         # These (P_MAX, 1) tensors are used with tensor_scalar to broadcast
+         # across the free dimension without explicit (P_MAX, dim) copies.
+ 
+@@ -229,24 +230,15 @@ def deltanet_fused_chunked_fwd(
+             scale=1.0,
+         )
+ 
+-        neg_gc_p = nl.ndarray((P_MAX, 1), dtype=nl.float32, buffer=nl.sbuf)
+-        nisa.tensor_scalar(
+-            dst=neg_gc_p,
+-            data=gc_p,
+-            op0=nl.multiply,
+-            operand0=-1.0,
+-            engine=nisa.vector_engine,
+-        )
+-        exp_neg_gc_p = nl.ndarray((P_MAX, 1), dtype=nl.float32, buffer=nl.sbuf)
+-        nisa.activation(
+-            dst=exp_neg_gc_p[0:P_MAX, 0:1],
+-            op=nl.exp,
+-            data=neg_gc_p[0:P_MAX, 0:1],
+-            bias=None,
+-            scale=1.0,
+-        )
++        # g_last and exp(g_last): scalar, then broadcast to (P_MAX, 1)
++        gl_p = nl.ndarray((P_MAX, 1), dtype=nl.float32, buffer=nl.sbuf)
++        for i_shuf in nl.static_range(P_MAX // 32):
++            nisa.nc_stream_shuffle(
++                src=gl_11[0:1, 0:1],
++                dst=gl_p[i_shuf * 32 : i_shuf * 32 + 32, 0:1],
++                shuffle_mask=_BROADCAST_MASK,
++            )
+ 
+-        # exp(g_last): scalar, then broadcast to (P_MAX, 1)
+         exp_gl_11 = nl.ndarray((1, 1), dtype=nl.float32, buffer=nl.sbuf)
+         nisa.activation(
+             dst=exp_gl_11,
+@@ -264,6 +256,92 @@ def deltanet_fused_chunked_fwd(
+                 shuffle_mask=_BROADCAST_MASK,
+             )
+ 
++        # Build pairwise decays as one bounded exponential:
++        #   decay[i,j] = exp(gc[i] - gc[j]) for causal pairs.
++        # This avoids the split exp(gc) * exp(-gc) form that can overflow even
++        # when the causal product is mathematically <= 1.
++        gc_padded = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
++        nisa.memset(dst=gc_padded, value=0.0)
++        nisa.tensor_copy(dst=gc_padded[0:P_MAX, 0:1], src=gc_p[0:P_MAX, 0:1])
++
++        gc_row_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
++        nisa.nc_transpose(dst=gc_row_psum, data=gc_padded)
++
++        gc_row = nl.ndarray((1, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
++        nisa.tensor_copy(dst=gc_row[0:1, 0:P_MAX], src=gc_row_psum[0:1, 0:P_MAX])
++
++        gc_row_broadcast = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
++        for i_shuf in nl.static_range(P_MAX // 32):
++            nisa.nc_stream_shuffle(
++                src=gc_row[0:1, 0:P_MAX],
++                dst=gc_row_broadcast[i_shuf * 32 : i_shuf * 32 + 32, 0:P_MAX],
++                shuffle_mask=_BROADCAST_MASK,
++            )
++
++        gc_col_strict = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
++        nisa.tensor_scalar(
++            dst=gc_col_strict,
++            data=Lmask,
++            op0=nl.multiply,
++            operand0=gc_p,
++            engine=nisa.vector_engine,
++        )
++        gc_row_strict = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
++        nisa.tensor_tensor(
++            dst=gc_row_strict, data1=gc_row_broadcast, data2=Lmask, op=nl.multiply
++        )
++        g_diff_strict = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
++        nisa.tensor_tensor(
++            dst=g_diff_strict,
++            data1=gc_col_strict,
++            data2=gc_row_strict,
++            op=nl.subtract,
++        )
++        decay_strict_raw = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
++        nisa.activation(
++            dst=decay_strict_raw,
++            op=nl.exp,
++            data=g_diff_strict,
++            bias=None,
++            scale=1.0,
++        )
++        decay_strict = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
++        nisa.tensor_tensor(
++            dst=decay_strict, data1=decay_strict_raw, data2=Lmask, op=nl.multiply
++        )
++
++        gc_col_diag = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
++        nisa.tensor_scalar(
++            dst=gc_col_diag,
++            data=Lmask_d,
++            op0=nl.multiply,
++            operand0=gc_p,
++            engine=nisa.vector_engine,
++        )
++        gc_row_diag = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
++        nisa.tensor_tensor(
++            dst=gc_row_diag, data1=gc_row_broadcast, data2=Lmask_d, op=nl.multiply
++        )
++        g_diff_diag = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
++        nisa.tensor_tensor(
++            dst=g_diff_diag,
++            data1=gc_col_diag,
++            data2=gc_row_diag,
++            op=nl.subtract,
++        )
++        decay_diag_raw = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
++        nisa.activation(
++            dst=decay_diag_raw,
++            op=nl.exp,
++            data=g_diff_diag,
++            bias=None,
++            scale=1.0,
++        )
++        decay_diag = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
++        nisa.tensor_tensor(
++            dst=decay_diag, data1=decay_diag_raw, data2=Lmask_d, op=nl.multiply
++        )
++
+         # ============================================================
+         # k_beta = K * beta, v_beta = V * beta
+         # tensor_scalar broadcasts beta_p (P_MAX, 1) across free dim
+@@ -306,49 +384,9 @@ def deltanet_fused_chunked_fwd(
+         QK = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+         nisa.tensor_copy(dst=QK, src=QK_psum)
+ 
+-        # ============================================================
+-        # Decay mask: QK_decay[i,j] = QK[i,j] * exp(gc[i]) * exp(-gc[j])
+-        #
+-        # Apply the strict causal mask before the split exp(gc) / exp(-gc)
+-        # scaling. Upper-triangular entries are mathematically unused, but
+-        # scaling them first can create very large finite values that poison
+-        # later matmuls before the mask is applied.
+-        # ============================================================
+-        QK_masked = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+-        nisa.tensor_tensor(dst=QK_masked, data1=QK, data2=Lmask, op=nl.multiply)
+-
+-        # Row scaling: QK_row[i,:] = QK[i,:] * exp(gc[i])
+-        # Then transpose, column scale, transpose back.
+-        # Uses tensor_scalar with (P_MAX,1) operand for row scaling.
+-        QK_row = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+-        nisa.tensor_scalar(
+-            dst=QK_row,
+-            data=QK_masked,
+-            op0=nl.multiply,
+-            operand0=exp_gc_p,
+-            engine=nisa.vector_engine,
+-        )
+-
+-        # Transpose to scale columns (now rows in transposed view)
+-        QK_r_T_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
+-        nisa.nc_transpose(dst=QK_r_T_psum, data=QK_row)
+-        QK_r_T = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+-        nisa.tensor_copy(dst=QK_r_T, src=QK_r_T_psum)
+-
+-        QK_r_T_col = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+-        nisa.tensor_scalar(
+-            dst=QK_r_T_col,
+-            data=QK_r_T,
+-            op0=nl.multiply,
+-            operand0=exp_neg_gc_p,
+-            engine=nisa.vector_engine,
+-        )
+-
+-        # Transpose back
+-        QK_d_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
+-        nisa.nc_transpose(dst=QK_d_psum, data=QK_r_T_col)
++        # QK_decay[i,j] = QK[i,j] * exp(gc[i] - gc[j]) for i > j.
+         QK_decay = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+-        nisa.tensor_copy(dst=QK_decay, src=QK_d_psum)
++        nisa.tensor_tensor(dst=QK_decay, data1=QK, data2=decay_strict, op=nl.multiply)
+ 
+         # A = -QK_decay * lower_mask
+         neg_QK_decay = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+@@ -363,38 +401,156 @@ def deltanet_fused_chunked_fwd(
+         nisa.tensor_tensor(dst=A_mat, data1=neg_QK_decay, data2=Lmask, op=nl.multiply)
+ 
+         # ============================================================
+-        # Neumann power-doubling: N = (I+A)(I+A^2)...(I+A^{64})
+-        # 6 rounds → resolves rank up to 2^6 = 64 (sufficient for chunk=128)
++        # Stable triangular solve: N = inv(I - A_mat)
++        #
++        # A_mat is strictly lower triangular. Solve two 64x64 diagonal blocks
++        # row-by-row, then merge the lower-left block. This is equivalent to
++        # the nilpotent Neumann series but avoids repeated squaring of A.
+         # ============================================================
+         P_acc = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+-        nisa.tensor_tensor(dst=P_acc, data1=eye, data2=A_mat, op=nl.add)
++        nisa.memset(dst=P_acc, value=0.0)
++
++        A_T_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
++        nisa.nc_transpose(dst=A_T_psum, data=A_mat)
++        A_T = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
++        nisa.tensor_copy(dst=A_T, src=A_T_psum)
++
++        col_mask_left_row = nl.ndarray((1, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
++        nisa.memset(dst=col_mask_left_row, value=0.0)
++        nisa.memset(dst=col_mask_left_row[0:1, 0:64], value=1.0)
++        col_mask_left = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
++        for i_shuf in nl.static_range(P_MAX // 32):
++            nisa.nc_stream_shuffle(
++                src=col_mask_left_row[0:1, 0:P_MAX],
++                dst=col_mask_left[i_shuf * 32 : i_shuf * 32 + 32, 0:P_MAX],
++                shuffle_mask=_BROADCAST_MASK,
++            )
++
++        col_mask_right_row = nl.ndarray((1, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
++        nisa.memset(dst=col_mask_right_row, value=0.0)
++        nisa.memset(dst=col_mask_right_row[0:1, 64:P_MAX], value=1.0)
++        col_mask_right = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
++        for i_shuf in nl.static_range(P_MAX // 32):
++            nisa.nc_stream_shuffle(
++                src=col_mask_right_row[0:1, 0:P_MAX],
++                dst=col_mask_right[i_shuf * 32 : i_shuf * 32 + 32, 0:P_MAX],
++                shuffle_mask=_BROADCAST_MASK,
++            )
++
++        block_row_mask_bottom = nl.ndarray((P_MAX, 1), dtype=nl.float32, buffer=nl.sbuf)
++        nisa.tensor_copy(
++            dst=block_row_mask_bottom[0:P_MAX, 0:1],
++            src=Lmask_d[0:P_MAX, 64:65],
++        )
++
++        for solve_i in nl.static_range(64):
++            row_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
++            nisa.nc_matmul(dst=row_psum, stationary=A_T, moving=P_acc)
++            row_prod = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
++            nisa.tensor_copy(dst=row_prod, src=row_psum)
++
++            row_with_eye = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
++            nisa.tensor_tensor(dst=row_with_eye, data1=row_prod, data2=eye, op=nl.add)
++
++            row_col_masked = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
++            nisa.tensor_tensor(
++                dst=row_col_masked,
++                data1=row_with_eye,
++                data2=col_mask_left,
++                op=nl.multiply,
++            )
++
++            row_mask = nl.ndarray((P_MAX, 1), dtype=nl.float32, buffer=nl.sbuf)
++            nisa.tensor_copy(
++                dst=row_mask[0:P_MAX, 0:1],
++                src=eye[0:P_MAX, solve_i : solve_i + 1],
++            )
++            row_update = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
++            nisa.tensor_scalar(
++                dst=row_update,
++                data=row_col_masked,
++                op0=nl.multiply,
++                operand0=row_mask,
++                engine=nisa.vector_engine,
++            )
++
++            P_next = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
++            nisa.tensor_tensor(dst=P_next, data1=P_acc, data2=row_update, op=nl.add)
++            nisa.tensor_copy(dst=P_acc, src=P_next)
++
++        for solve_i in nl.static_range(64):
++            row_idx = 64 + solve_i
++
++            row_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
++            nisa.nc_matmul(dst=row_psum, stationary=A_T, moving=P_acc)
++            row_prod = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
++            nisa.tensor_copy(dst=row_prod, src=row_psum)
++
++            row_with_eye = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
++            nisa.tensor_tensor(dst=row_with_eye, data1=row_prod, data2=eye, op=nl.add)
++
++            row_col_masked = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
++            nisa.tensor_tensor(
++                dst=row_col_masked,
++                data1=row_with_eye,
++                data2=col_mask_right,
++                op=nl.multiply,
++            )
++
++            row_mask = nl.ndarray((P_MAX, 1), dtype=nl.float32, buffer=nl.sbuf)
++            nisa.tensor_copy(
++                dst=row_mask[0:P_MAX, 0:1],
++                src=eye[0:P_MAX, row_idx : row_idx + 1],
++            )
++            row_update = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
++            nisa.tensor_scalar(
++                dst=row_update,
++                data=row_col_masked,
++                op0=nl.multiply,
++                operand0=row_mask,
++                engine=nisa.vector_engine,
++            )
+ 
+-        A_pow = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+-        nisa.tensor_copy(dst=A_pow, src=A_mat)
++            P_next = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
++            nisa.tensor_tensor(dst=P_next, data1=P_acc, data2=row_update, op=nl.add)
++            nisa.tensor_copy(dst=P_acc, src=P_next)
+ 
+-        for _round in nl.sequential_range(6):
+-            # A_pow = A_pow^2: transpose A_pow, then matmul
+-            Ap_T_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
+-            nisa.nc_transpose(dst=Ap_T_psum, data=A_pow)
+-            Ap_T = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+-            nisa.tensor_copy(dst=Ap_T, src=Ap_T_psum)
++        N_diag_T_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
++        nisa.nc_transpose(dst=N_diag_T_psum, data=P_acc)
++        N_diag_T = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
++        nisa.tensor_copy(dst=N_diag_T, src=N_diag_T_psum)
+ 
+-            Ap_sq_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
+-            nisa.nc_matmul(dst=Ap_sq_psum, stationary=Ap_T, moving=A_pow)
+-            nisa.tensor_copy(dst=A_pow, src=Ap_sq_psum)
++        tmp_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
++        nisa.nc_matmul(dst=tmp_psum, stationary=N_diag_T, moving=A_mat)
++        tmp = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
++        nisa.tensor_copy(dst=tmp, src=tmp_psum)
+ 
+-            # P_acc = (I + A_pow) @ P_acc: transpose IpA, then matmul
+-            IpA = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+-            nisa.tensor_tensor(dst=IpA, data1=eye, data2=A_pow, op=nl.add)
++        tmp_T_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
++        nisa.nc_transpose(dst=tmp_T_psum, data=tmp)
++        tmp_T = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
++        nisa.tensor_copy(dst=tmp_T, src=tmp_T_psum)
+ 
+-            IpA_T_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
+-            nisa.nc_transpose(dst=IpA_T_psum, data=IpA)
+-            IpA_T = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+-            nisa.tensor_copy(dst=IpA_T, src=IpA_T_psum)
++        N21_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
++        nisa.nc_matmul(dst=N21_psum, stationary=tmp_T, moving=P_acc)
++        N21 = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
++        nisa.tensor_copy(dst=N21, src=N21_psum)
+ 
+-            Pacc_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
+-            nisa.nc_matmul(dst=Pacc_psum, stationary=IpA_T, moving=P_acc)
+-            nisa.tensor_copy(dst=P_acc, src=Pacc_psum)
++        N21_col_masked = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
++        nisa.tensor_tensor(
++            dst=N21_col_masked,
++            data1=N21,
++            data2=col_mask_left,
++            op=nl.multiply,
++        )
++        N21_block = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
++        nisa.tensor_scalar(
++            dst=N21_block,
++            data=N21_col_masked,
++            op0=nl.multiply,
++            operand0=block_row_mask_bottom,
++            engine=nisa.vector_engine,
++        )
++        nisa.tensor_tensor(dst=P_acc, data1=P_acc, data2=N21_block, op=nl.add)
+ 
+         # ============================================================
+         # Apply N: value_corr = N @ v_beta
+@@ -439,45 +595,8 @@ def deltanet_fused_chunked_fwd(
+         qk_raw = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+         nisa.tensor_copy(dst=qk_raw, src=qk_psum)
+ 
+-        # Mask before split scaling for the same reason as the A matrix above:
+-        # upper-triangular decay factors are unused and can be numerically huge.
+-        qk_masked = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+-        nisa.tensor_tensor(dst=qk_masked, data1=qk_raw, data2=Lmask_d, op=nl.multiply)
+-
+-        # Row-scale by exp(gc)
+-        qk_row = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+-        nisa.tensor_scalar(
+-            dst=qk_row,
+-            data=qk_masked,
+-            op0=nl.multiply,
+-            operand0=exp_gc_p,
+-            engine=nisa.vector_engine,
+-        )
+-
+-        # Transpose, column-scale by exp(-gc), transpose back
+-        qk_r_T_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
+-        nisa.nc_transpose(dst=qk_r_T_psum, data=qk_row)
+-        qk_r_T = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+-        nisa.tensor_copy(dst=qk_r_T, src=qk_r_T_psum)
+-
+-        qk_r_T_col = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+-        nisa.tensor_scalar(
+-            dst=qk_r_T_col,
+-            data=qk_r_T,
+-            op0=nl.multiply,
+-            operand0=exp_neg_gc_p,
+-            engine=nisa.vector_engine,
+-        )
+-
+-        qk_d_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
+-        nisa.nc_transpose(dst=qk_d_psum, data=qk_r_T_col)
+-        qk_decay = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+-        nisa.tensor_copy(dst=qk_decay, src=qk_d_psum)
+-
+         attn_intra = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+-        nisa.tensor_tensor(
+-            dst=attn_intra, data1=qk_decay, data2=Lmask_d, op=nl.multiply
+-        )
++        nisa.tensor_tensor(dst=attn_intra, data1=qk_raw, data2=decay_diag, op=nl.multiply)
+ 
+         # ============================================================
+         # v_prime = k_cumdecay @ state   (state is in SBUF!)
+@@ -550,12 +669,20 @@ def deltanet_fused_chunked_fwd(
+         # k_raw_decay contributes as exp(g_last) * (k * exp(-gc))^T @ v_new.
+         # Compute the equivalent stable form k * exp(g_last - gc), so the
+         # factor is always <= 1 for valid causal positions.
+-        exp_gl_minus_gc_p = nl.ndarray((P_MAX, 1), dtype=nl.float32, buffer=nl.sbuf)
++        gl_minus_gc_p = nl.ndarray((P_MAX, 1), dtype=nl.float32, buffer=nl.sbuf)
+         nisa.tensor_tensor(
++            dst=gl_minus_gc_p,
++            data1=gl_p,
++            data2=gc_p,
++            op=nl.subtract,
++        )
++        exp_gl_minus_gc_p = nl.ndarray((P_MAX, 1), dtype=nl.float32, buffer=nl.sbuf)
++        nisa.activation(
+             dst=exp_gl_minus_gc_p,
+-            data1=exp_gl_p,
+-            data2=exp_neg_gc_p,
+-            op=nl.multiply,
++            op=nl.exp,
++            data=gl_minus_gc_p,
++            bias=None,
++            scale=1.0,
+         )
+ 
+         # k_raw_decay = k * exp(g_last - gc)
+-- 
+2.43.0
+
+
+From 7c046c3f70e14fd4f6f98c72c82739d4dde9a007 Mon Sep 17 00:00:00 2001
+From: Ubuntu <ubuntu@ip-172-31-45-78.ap-southeast-4.compute.internal>
+Date: Thu, 7 May 2026 19:24:15 +0000
+Subject: [PATCH 2/5] Add Qwen3.6 27B prefill profiling runner
+
+---
+ .../integration/profile_chunked_prefill.py    | 190 ++++++++++++++++++
+ 1 file changed, 190 insertions(+)
+ create mode 100644 contrib/models/Qwen3.6-27B/test/integration/profile_chunked_prefill.py
+
+diff --git a/contrib/models/Qwen3.6-27B/test/integration/profile_chunked_prefill.py b/contrib/models/Qwen3.6-27B/test/integration/profile_chunked_prefill.py
+new file mode 100644
+index 0000000..00ed161
+--- /dev/null
++++ b/contrib/models/Qwen3.6-27B/test/integration/profile_chunked_prefill.py
+@@ -0,0 +1,190 @@
++import argparse
++import json
++import os
++import sys
++import time
++
++import torch
++from transformers import AutoTokenizer
++
++
++FILLER = (
++    "Archive note: The Tokyo 2020 Olympics were delayed and held in 2021. "
++    "Athletes competed in athletics, swimming, gymnastics, team sports, and new events. "
++    "This is repeated background context for long-context profiling. "
++)
++
++
++def maybe_sync():
++    try:
++        import torch_xla.core.xla_model as xm
++
++        xm.mark_step()
++    except Exception:
++        pass
++
++
++def build_prompt_ids(tokenizer, target_tokens):
++    question = (
++        "\n\nQuestion: Give a concise summary of the Tokyo 2020 Olympics. "
++        "Mention the delay and one notable feature.\nAnswer:"
++    )
++    question_ids = tokenizer(question, add_special_tokens=False).input_ids
++    filler_ids = tokenizer(FILLER, add_special_tokens=False).input_ids
++    keep = max(1, target_tokens - len(question_ids))
++    reps = (keep + len(filler_ids) - 1) // len(filler_ids)
++    ids = (filler_ids * reps)[:keep] + question_ids
++    return torch.tensor([ids[:target_tokens]], dtype=torch.long)
++
++
++def token_scalar(tokens):
++    if hasattr(tokens, "detach"):
++        tokens = tokens.detach().cpu()
++    if tokens.ndim == 0:
++        return int(tokens.item())
++    return int(tokens.reshape(-1)[0].item())
++
++
++def run_case(model, tokenizer, target_tokens, chunk_size, seq_len, max_new_tokens):
++    input_ids = build_prompt_ids(tokenizer, target_tokens)
++    prompt_len = input_ids.shape[1]
++    if prompt_len + max_new_tokens > seq_len:
++        raise ValueError(f"{prompt_len} + {max_new_tokens} exceeds seq_len={seq_len}")
++
++    pad_id = tokenizer.pad_token_id
++    seq_ids = torch.tensor([0], dtype=torch.int32)
++    profile = os.environ.get("QWEN35_PROFILE", "0") == "1"
++    chunk_rows = []
++    generated = []
++
++    model.reset()
++    for chunk_index, start in enumerate(range(0, prompt_len, chunk_size)):
++        end = min(start + chunk_size, prompt_len)
++        valid = end - start
++        chunk_ids = input_ids[:, start:end]
++        if valid < chunk_size:
++            pad = torch.full((1, chunk_size - valid), pad_id, dtype=chunk_ids.dtype)
++            chunk_ids = torch.cat([chunk_ids, pad], dim=1)
++
++        attn_mask = torch.zeros((1, chunk_size), dtype=torch.long)
++        attn_mask[:, :valid] = 1
++        pos = torch.arange(start, start + chunk_size, dtype=torch.long).unsqueeze(0)
++
++        maybe_sync()
++        t0 = time.perf_counter()
++        with torch.no_grad():
++            out = model(
++                input_ids=chunk_ids,
++                attention_mask=attn_mask,
++                position_ids=pos,
++                seq_ids=seq_ids,
++                return_dict=True,
++            )
++        maybe_sync()
++        dt = time.perf_counter() - t0
++        tok = token_scalar(out.tokens)
++        row = {
++            "prompt_tokens": prompt_len,
++            "chunk_index": chunk_index,
++            "start": start,
++            "valid": valid,
++            "cumulative_cache_pos": start,
++            "chunk_total_s": dt,
++            "token": tok,
++        }
++        chunk_rows.append(row)
++        if profile:
++            print("PROFILE_CHUNK " + json.dumps(row), flush=True)
++
++    first_token = token_scalar(out.tokens)
++    generated.append(first_token)
++    current_token = first_token
++    decode_times = []
++    for step in range(1, max_new_tokens):
++        pos_value = prompt_len + step - 1
++        ids = torch.tensor([[current_token]], dtype=torch.long)
++        pos = torch.tensor([[pos_value]], dtype=torch.long)
++        attn_mask = torch.zeros((1, seq_len), dtype=torch.long)
++        attn_mask[:, : pos_value + 1] = 1
++
++        maybe_sync()
++        t0 = time.perf_counter()
++        with torch.no_grad():
++            out = model(
++                input_ids=ids,
++                attention_mask=attn_mask,
++                position_ids=pos,
++                seq_ids=seq_ids,
++                return_dict=True,
++            )
++        maybe_sync()
++        decode_times.append(time.perf_counter() - t0)
++        current_token = token_scalar(out.tokens)
++        generated.append(current_token)
++
++    cte_total = sum(row["chunk_total_s"] for row in chunk_rows)
++    summary = {
++        "prompt_tokens": prompt_len,
++        "chunks": len(chunk_rows),
++        "chunk_size": chunk_size,
++        "cte_seconds": cte_total,
++        "ingest_tok_s": prompt_len / cte_total,
++        "avg_chunk_s": cte_total / len(chunk_rows),
++        "min_chunk_s": min(row["chunk_total_s"] for row in chunk_rows),
++        "max_chunk_s": max(row["chunk_total_s"] for row in chunk_rows),
++        "decode_steps": len(decode_times),
++        "decode_tok_s": len(decode_times) / sum(decode_times) if decode_times else 0.0,
++        "generated_tokens": generated,
++        "generated_text": tokenizer.decode(generated, skip_special_tokens=True),
++    }
++    print("PROFILE_SUMMARY " + json.dumps(summary, ensure_ascii=False), flush=True)
++    return chunk_rows, summary
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--compiled-path", required=True)
++    parser.add_argument("--model-path", required=True)
++    parser.add_argument("--contrib-root", required=True)
++    parser.add_argument("--prompt-tokens", type=int, nargs="+", default=[1024, 16384, 65472])
++    parser.add_argument("--chunk-size", type=int, default=512)
++    parser.add_argument("--seq-len", type=int, default=65536)
++    parser.add_argument("--max-new-tokens", type=int, default=5)
++    args = parser.parse_args()
++
++    sys.path.insert(0, args.contrib_root)
++    from src.modeling_qwen35 import NeuronQwen35ForCausalLM
++
++    tokenizer = AutoTokenizer.from_pretrained(args.model_path, padding_side="right")
++    if tokenizer.pad_token is None:
++        tokenizer.pad_token = tokenizer.eos_token
++
++    print("LOAD_START", flush=True)
++    t0 = time.perf_counter()
++    model = NeuronQwen35ForCausalLM(args.compiled_path)
++    model.load(args.compiled_path)
++    print(f"LOAD_DONE seconds={time.perf_counter() - t0:.3f}", flush=True)
++    print(
++        "CONFIG "
++        f"hybrid={getattr(model.config, 'use_hybrid_cache_manager', None)} "
++        f"chunked={getattr(model.config, 'use_qwen_hybrid_chunked_prefill', None)} "
++        f"nki={getattr(model.config, 'use_qwen_hybrid_chunked_prefill_nki', None)} "
++        f"seq_len={model.config.neuron_config.seq_len} "
++        f"ctx_buckets={model.config.neuron_config.context_encoding_buckets}",
++        flush=True,
++    )
++
++    for prompt_tokens in args.prompt_tokens:
++        print(f"CASE_START prompt_tokens={prompt_tokens}", flush=True)
++        run_case(
++            model=model,
++            tokenizer=tokenizer,
++            target_tokens=prompt_tokens,
++            chunk_size=args.chunk_size,
++            seq_len=args.seq_len,
++            max_new_tokens=args.max_new_tokens,
++        )
++
++
++if __name__ == "__main__":
++    main()
+-- 
+2.43.0
+
+
+From 50aac1ff7a5cd831cb2d62b972a701fa7f291899 Mon Sep 17 00:00:00 2001
+From: Ubuntu <ubuntu@ip-172-31-45-78.ap-southeast-4.compute.internal>
+Date: Fri, 8 May 2026 05:05:20 +0000
+Subject: [PATCH 3/5] Add Qwen3.6 27B driver profile report
+
+---
+ contrib/models/Qwen3.6-27B/profile_driver.md | 55 ++++++++++++++++++++
+ 1 file changed, 55 insertions(+)
+ create mode 100644 contrib/models/Qwen3.6-27B/profile_driver.md
+
+diff --git a/contrib/models/Qwen3.6-27B/profile_driver.md b/contrib/models/Qwen3.6-27B/profile_driver.md
+new file mode 100644
+index 0000000..ca00eef
+--- /dev/null
++++ b/contrib/models/Qwen3.6-27B/profile_driver.md
+@@ -0,0 +1,55 @@
++# Qwen3.6 27B Driver-Level Prefill Profile
++
++Artifact: `/opt/dlami/nvme/qwen_artifacts/qwen36_27b_hybrid_chunked_nki_cte512_micro128_tkg65536_run1`  
++Log: `/home/ubuntu/validation_logs/qwen36_27b_profile_driver_20260507_1935.log`  
++Branch: `codex/qwen36-27b-64k-internal`  
++Commits: `c598ea2` baseline, `7c046c3` profiling runner  
++
++## Summary
++
++| Prompt tokens | Chunks | CTE seconds | tok/s | Avg chunk s | Min chunk s | Max chunk s | Decode tok/s |
++|---:|---:|---:|---:|---:|---:|---:|---:|
++| 1024 | 2 | 6.851 | 149.47 | 3.425416 | 3.424343 | 3.426489 | 18.23 |
++| 16384 | 32 | 109.443 | 149.70 | 3.420094 | 3.419857 | 3.420430 | 18.14 |
++| 65472 | 128 | 437.766 | 149.56 | 3.420049 | 3.419766 | 3.420364 | 18.20 |
++
++The driver-level result is internally consistent: throughput stays flat from 1K to near-64K, and the 64K run varies by less than 1 ms across 128 chunks. This strongly argues that cumulative-cache attention scaling is not the dominant visible cost at the CTE-call level.
++
++## Representative 16K Chunks
++
++| Chunk | Cache pos | Valid | Chunk total s | Deviation from avg ms |
++|---:|---:|---:|---:|---:|
++| 0 | 0 | 512 | 3.420430 | 0.336 |
++| 8 | 4096 | 512 | 3.420219 | 0.124 |
++| 16 | 8192 | 512 | 3.420226 | 0.132 |
++| 24 | 12288 | 512 | 3.420119 | 0.025 |
++| 31 | 15872 | 512 | 3.419871 | -0.223 |
++
++## Representative 64K Chunks
++
++| Chunk | Cache pos | Valid | Chunk total s | Deviation from avg ms |
++|---:|---:|---:|---:|---:|
++| 0 | 0 | 512 | 3.420282 | 0.234 |
++| 32 | 16384 | 512 | 3.420121 | 0.072 |
++| 64 | 32768 | 512 | 3.420101 | 0.052 |
++| 96 | 49152 | 512 | 3.420106 | 0.057 |
++| 127 | 65024 | 448 | 3.419979 | -0.070 |
++
++## 64K First vs Last Quarter
++
++| Window | Chunks | Avg chunk s | Min chunk s | Max chunk s | tok/s |
++|---|---:|---:|---:|---:|---:|
++| first_quarter | 32 | 3.420044 | 3.419850 | 3.420364 | 149.71 |
++| last_quarter | 32 | 3.420068 | 3.419802 | 3.420223 | 149.12 |
++
++## Category Breakdown Status
++
++The current artifact is already compiled, so Python timers inside `NeuronGatedDeltaNet`, attention, MLP, and cache-update methods would not execute inside the NEFF. This driver profile therefore measures the compiled context-call boundary only. Inner categories (`deltanet_kernel_total`, `attention_forward_total`, `cache_update_total`, `mlp_total`, `layer_norm_total`, `other`) must come from `neuron-profile` execution traces in Step 3, not from Python timers, unless we accept a recompile with explicit traced timing outputs.
++
++## Immediate Interpretation
++
++- CTE call granularity is 512 input tokens per host call.
++- Each 512-token call takes about 3.420 seconds.
++- Sustained ingest is about 149.6 tok/s across 1K, 16K, and near-64K.
++- Decode remains about 18.1-18.2 tok/s.
++- Last-quarter 64K chunks are not slower than first-quarter chunks, so full-attention cache-length growth is not visible as the dominant driver-level bottleneck.
+-- 
+2.43.0
+
+
+From 102738369969534e055965934d44a729758f0a6f Mon Sep 17 00:00:00 2001
+From: Ubuntu <ubuntu@ip-172-31-45-78.ap-southeast-4.compute.internal>
+Date: Fri, 8 May 2026 05:13:46 +0000
+Subject: [PATCH 4/5] Add Qwen3.6 27B runtime profile report
+
+---
+ contrib/models/Qwen3.6-27B/profile_kernel.md | 69 ++++++++++++++++++++
+ 1 file changed, 69 insertions(+)
+ create mode 100644 contrib/models/Qwen3.6-27B/profile_kernel.md
+
+diff --git a/contrib/models/Qwen3.6-27B/profile_kernel.md b/contrib/models/Qwen3.6-27B/profile_kernel.md
+new file mode 100644
+index 0000000..ab93d75
+--- /dev/null
++++ b/contrib/models/Qwen3.6-27B/profile_kernel.md
+@@ -0,0 +1,69 @@
++# Qwen3.6 27B Runtime/Profile Trace
++
++Artifact: `/opt/dlami/nvme/qwen_artifacts/qwen36_27b_hybrid_chunked_nki_cte512_micro128_tkg65536_run1`  
++Profile output: `/tmp/qwen36_prof_16k`  
++Profile JSON: `/tmp/qwen36_prof_16k.json`  
++Monitor log: `/tmp/qwen36_monitor_16k.log`  
++Prompt: 16K, CTE bucket 512, max_new_tokens 5
++
++## Capture Status
++
++`neuron-profile inspect` succeeded after switching to absolute script paths. The summary export contains runtime event groups, not source-level layer or NKI kernel names. Therefore this report can classify runtime/device execution, copy, allocation, and system utilization, but it cannot directly name `deltanet_chunk_step` vs full-attention vs MLP from the trace alone.
++
++## Driver Result Under Profiler
++
++| Prompt tokens | Chunks | CTE seconds | tok/s | Avg chunk s | Decode tok/s |
++|---:|---:|---:|---:|---:|---:|
++| 16384 | 32 | 109.454 | 149.69 | 3.420441 | 18.15 |
++
++Profiler overhead did not materially change the driver-level result.
++
++## Runtime Event Summary
++
++| Event | Count | Total s | Mean ms | Max ms | Size GB | Interpreted role |
++|---|---:|---:|---:|---:|---:|---|
++| `nrt_execute` | 156 | 453.534 | 2907.269 | 3530.647 | 0.000 | Device execution envelope |
++| `nc_exec_running` | 312 | 905.477 | 2902.169 | 3417.305 | 0.000 | NeuronCore execution, two logical NCs per run |
++| `kmgr_exec_core` | 156 | 452.803 | 2902.585 | 3418.081 | 0.000 | Kernel manager execution |
++| `kbl_exec_wait` | 156 | 452.770 | 2902.370 | 3417.385 | 0.000 | Host waiting for device execution |
++| `dmem_buf_copyin` | 12856 | 22.775 | 1.772 | 269.683 | 94.010 | Runtime input/copy traffic |
++| `nrt_tensor_write` | 4968 | 22.516 | 4.532 | 269.683 | 92.498 | Runtime tensor writes |
++| `nrt_model_submit` | 156 | 0.736 | 4.717 | 114.019 | 0.000 | Host submit overhead |
++| `nrt_tensor_read` | 86 | 0.004 | 0.046 | 1.556 | 0.022 | Runtime output reads |
++
++`nrt_execute` distribution: 132 long executions with mean `3.421s`, 24 short executions with mean `0.082s`. The long group matches context execution envelopes across TP ranks plus warmup/context calls. The short group matches token generation and small auxiliary executions.
++
++## Copy/Bandwidth Signals
++
++| Event | Total GB | Total s | Effective GB/s |
++|---|---:|---:|---:|
++| `dmem_buf_copyin` | 94.010 | 22.775 | 4.13 |
++| `nrt_tensor_write` | 92.498 | 22.516 | 4.11 |
++| `dmem_buf_copyout` | 0.022 | 0.004 | 5.70 |
++| `nrt_tensor_read` | 0.022 | 0.004 | 5.64 |
++
++These are runtime copy signals, not full in-kernel HBM traffic. They do not indicate host copy is the dominant bottleneck: submit overhead is sub-second total, and device execution/wait time dominates.
++
++## neuron-monitor Signals
++
++| Metric | Value |
++|---|---:|
++| Max Neuron device memory | 98.06 GB |
++| Max host memory attributed to runtime | 83.00 GB |
++| Active average NeuronCore utilization | ~79.3% |
++| Active utilization range | ~68.3-100% steady-state samples |
++| Average effective FLOPs per active sample | ~4.0 TF/s per NeuronCore sample |
++| Peak effective FLOPs per sample | ~5.7 TF/s |
++
++The monitor corroborates that the workload is device-execution dominated, not host-submit dominated. Utilization is not near zero, so this is not primarily Python dispatch overhead.
++
++## Important Interpretation Caveat
++
++The flat 1K-to-64K driver throughput does **not** by itself prove attention is cheap. In the current chunked attention implementation, full-attention layers build `K_full` from the full cache tensor and use `cache_len = k_cache.shape[2]`, which is the compiled maximum sequence length (`65536`). That means each chunk can pay a fixed full-cache attention cost regardless of current cumulative position. Flat chunk time rules out growing cumulative-position overhead, but it does not rule out fixed max-cache attention work.
++
++## Verdict
++
++- Host submit/dispatch overhead is not the main bottleneck (`nrt_model_submit` total `0.736s` vs `109.454s` wall CTE).
++- Runtime copy/write traffic is visible but not dominant enough to justify FP8 KV/cache work as the first optimization.
++- Device execution is the dominant envelope (`~3.42s` per 512-token context call).
++- The trace is insufficient to split device time between DeltaNet, full attention, and MLP by name. The code path plus flat timing make two fixed per-token/per-bucket suspects: internal DeltaNet microchunk work and full-cache attention over `65536` cache positions.
+-- 
+2.43.0
+
+
+From e9118a2f88200b6e1324d2284b83b407651c72e4 Mon Sep 17 00:00:00 2001
+From: Ubuntu <ubuntu@ip-172-31-45-78.ap-southeast-4.compute.internal>
+Date: Fri, 8 May 2026 05:15:29 +0000
+Subject: [PATCH 5/5] Add Qwen3.6 27B profile decision report
+
+---
+ .../models/Qwen3.6-27B/profile_decision.md    | 41 ++++++++++++++
+ contrib/models/Qwen3.6-27B/profile_report.md  | 55 +++++++++++++++++++
+ 2 files changed, 96 insertions(+)
+ create mode 100644 contrib/models/Qwen3.6-27B/profile_decision.md
+ create mode 100644 contrib/models/Qwen3.6-27B/profile_report.md
+
+diff --git a/contrib/models/Qwen3.6-27B/profile_decision.md b/contrib/models/Qwen3.6-27B/profile_decision.md
+new file mode 100644
+index 0000000..74042bb
+--- /dev/null
++++ b/contrib/models/Qwen3.6-27B/profile_decision.md
+@@ -0,0 +1,41 @@
++# Qwen3.6 27B Prefill Optimization Decision Matrix
++
++Inputs:
++
++- Driver profile: 149.47 tok/s at 1K, 149.70 tok/s at 16K, 149.56 tok/s at near-64K.
++- Runtime profile: long `nrt_execute` calls dominate; host submit total is only `0.736s` over the 16K run.
++- Monitor: active NeuronCore utilization is typically ~68-100%, max HBM allocation ~98.06 GB.
++- Trace limitation: no source-level layer names; device time cannot be directly split into DeltaNet / attention / MLP from this trace alone.
++
++## Bottleneck Identification
++
++The workload is device-execution dominated, not Python dispatch dominated and not host-copy dominated. A 512-token CTE call costs ~3.42s whether it occurs at the beginning or end of a 64K prompt.
++
++Important correction: flat throughput does not prove full attention is cheap. In the current `perform_qwen_chunked_prefill()` implementation, `cache_len = k_cache.shape[2]`, which is the compiled maximum sequence length (`65536`). Each chunk therefore computes attention against a full-size K/V cache tensor, with masking applied after the QK matmul. That produces a fixed per-chunk full-cache cost, independent of current prompt position.
++
++## Optimization ROI Table
++
++| Option | Assumed affected fraction | Kernel speedup | Expected total speedup | New tok/s from 149.6 | Effort | ROI | Notes |
++|---|---:|---:|---:|---:|---:|---:|---|
++| A. DeltaNet chunk 256 | 35-50% | 1.5x | 1.13-1.20x | 169-180 | 1-2 weeks | medium | Plausible, but not proven by the trace. Needs a DeltaNet-vs-attention ablation first. |
++| B. Head-dim-256 prefix attention / active-cache attention | 30-60% | 2-4x | 1.23-1.82x | 184-272 | 1-2+ weeks | highest | Code proves current chunk attention pays fixed max-cache shape. This is the best candidate if pursuing a real speedup. |
++| C. FP8 KV/cache I/O | <=20% upper bound | 1.7x | <=1.13x | <=169 | ~1 week | low | Runtime copy/write is visible but not dominant; trace does not show HBM cache I/O as the limiting envelope. |
++| D. FP8 weights | 30-45% | 1.4x | 1.10-1.18x | 165-176 | ~1 week | medium-low | Could help MLP/projections, but not enough as first optimization unless quantization is needed anyway. |
++| E. Reduce host chunk/dispatch overhead | <1% host submit, unknown in-NEFF dispatch | 2x | ~1.00x host-side | 150 | 0.5-1 week | low | Host submit is not the bottleneck. Bigger CTE buckets alone already showed limited benefit. |
++| F. Ship current 150 tok/s | 100% | 1.0x | 149.6 | 0 | n/a | Current path is stable and usable at 64K. |
++
++## Recommendation
++
++Highest-ROI optimization is Option B: fix the full-attention chunked CTE path so it does not compute against the full 65,536-token cache for every chunk, ideally via a head_dim=256 prefix-attention kernel or an active-cache-length path that is mathematically exact.
++
++Do not start the DeltaNet chunk_size=256 rewrite as the next major task unless a targeted ablation proves DeltaNet consumes more than ~50% of the 3.42s CTE call. The current profile does not prove that.
++
++## Specific Blockers
++
++- Existing NxDI `attention_cte` and `attention_tkg` kernels cap `head_dim <= 128`; Qwen3.6-27B uses `head_dim=256`.
++- Naive head splitting is not mathematically equivalent because softmax must see the full QK score.
++- A correct attention fix needs either custom head_dim=256 tiled attention or a way to express active-cache prefix attention with static compiled shapes.
++
++## Ship/Stop Recommendation
++
++If the goal is production usability rather than a research optimization push, ship the current ~150 tok/s 64K path and defer further speed work. If the target is a material speedup beyond 1.20x, pursue Option B first, not FP8 KV or host dispatch work.
+diff --git a/contrib/models/Qwen3.6-27B/profile_report.md b/contrib/models/Qwen3.6-27B/profile_report.md
+new file mode 100644
+index 0000000..cbca817
+--- /dev/null
++++ b/contrib/models/Qwen3.6-27B/profile_report.md
+@@ -0,0 +1,55 @@
++# Qwen3.6 27B Prefill Profile Report
++
++Summary:
++
++- Dominant bottleneck: compiled device execution per 512-token CTE call.
++- Top recommended optimization: full-attention chunked CTE active-cache/head_dim=256 path.
++- Expected speedup: 1.23-1.82x if attention is a 30-60% fraction.
++- Effort: 1-2+ weeks.
++- Ship at 150 tok/s instead: yes, if production stability matters more than another kernel project.
++
++## Artifacts
++
++- Driver report: `profile_driver.md`
++- Runtime report: `profile_kernel.md`
++- Decision matrix: `profile_decision.md`
++- Artifact profiled: `/opt/dlami/nvme/qwen_artifacts/qwen36_27b_hybrid_chunked_nki_cte512_micro128_tkg65536_run1`
++- Runtime trace: `/tmp/qwen36_prof_16k`
++
++## Driver Findings
++
++The driver profile measured 1K, 16K, and near-64K prompts using CTE bucket 512:
++
++| Prompt tokens | Chunks | CTE seconds | tok/s | Avg chunk s | Decode tok/s |
++|---:|---:|---:|---:|---:|---:|
++| 1024 | 2 | 6.851 | 149.47 | 3.425416 | 18.23 |
++| 16384 | 32 | 109.443 | 149.70 | 3.420094 | 18.14 |
++| 65472 | 128 | 437.766 | 149.56 | 3.420049 | 18.20 |
++
++64K first and last quarters were essentially identical, so there is no visible cumulative-position slowdown at the driver level.
++
++## Runtime Findings
++
++`neuron-profile inspect` succeeded for the 16K run. Runtime event aggregation shows:
++
++| Event | Count | Total s | Mean ms | Role |
++|---|---:|---:|---:|---|
++| `nrt_execute` | 156 | 453.534 | 2907.269 | Device execution envelope |
++| `nc_exec_running` | 312 | 905.477 | 2902.169 | NeuronCore execution |
++| `dmem_buf_copyin` | 12856 | 22.775 | 1.772 | Runtime copy traffic |
++| `nrt_tensor_write` | 4968 | 22.516 | 4.532 | Runtime tensor writes |
++| `nrt_model_submit` | 156 | 0.736 | 4.717 | Host submit overhead |
++
++`nrt_execute` has 132 long executions averaging `3.421s`, matching the context execution envelope. Host submission is too small to explain the 3.42s chunk time.
++
++`neuron-monitor` corroborates device-heavy execution: active NeuronCore utilization is generally ~68-100%, with max runtime HBM around 98.06 GB.
++
++## Key Caveat
++
++The runtime trace does not expose source-level layer names. It cannot directly say “DeltaNet is X%” or “attention is Y%.” The strongest actionable source-level finding comes from code inspection: current chunked full attention uses `cache_len = k_cache.shape[2]`, so for a 64K artifact it computes against the full 65,536-token cache every chunk, even early in the prompt.
++
++## Decision
++
++The next optimization should not be FP8 KV or host dispatch. Those are not the measured bottleneck.
++
++If continuing speed work, prioritize the full-attention chunked CTE path: avoid full max-cache attention per chunk, or write/port a correct head_dim=256 prefix-attention kernel. DeltaNet chunk 256 remains plausible but should be gated by a targeted ablation before spending another week on kernel surgery.
+-- 
+2.43.0
+

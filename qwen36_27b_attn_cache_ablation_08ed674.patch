@@ -1,0 +1,48 @@
+From 08ed674216fe2f29bd27ee64b4a69510600b38e8 Mon Sep 17 00:00:00 2001
+From: Ubuntu <ubuntu@ip-172-31-45-78.ap-southeast-4.compute.internal>
+Date: Fri, 8 May 2026 05:38:41 +0000
+Subject: [PATCH] Add Qwen3.6 attention cache-limit ablation
+
+---
+ .../models/Qwen3.6-27B/src/modeling_qwen35.py  | 18 ++++++++++++++++++
+ 1 file changed, 18 insertions(+)
+
+diff --git a/contrib/models/Qwen3.6-27B/src/modeling_qwen35.py b/contrib/models/Qwen3.6-27B/src/modeling_qwen35.py
+index 40de012..e665475 100644
+--- a/contrib/models/Qwen3.6-27B/src/modeling_qwen35.py
++++ b/contrib/models/Qwen3.6-27B/src/modeling_qwen35.py
+@@ -1160,6 +1160,7 @@ class Qwen35InferenceConfig(InferenceConfig):
+         kwargs.setdefault("use_qwen_hybrid_chunked_prefill", False)
+         kwargs.setdefault("use_qwen_hybrid_chunked_prefill_nki", False)
+         kwargs.setdefault("qwen_chunked_prefill_attention_microchunk", 128)
++        kwargs.setdefault("qwen_chunked_prefill_attention_cache_limit", None)
+ 
+         super().__init__(*args, **kwargs)
+ 
+@@ -1472,6 +1473,23 @@ class NeuronQwen35Attention(NeuronAttentionBase):
+             K_full = k_cache
+             V_full = v_cache
+ 
++        cache_limit = getattr(
++            self.config, "qwen_chunked_prefill_attention_cache_limit", None
++        )
++        if cache_limit is not None:
++            cache_limit = int(cache_limit)
++            if cache_limit <= 0 or cache_limit > cache_len:
++                raise ValueError(
++                    f"qwen_chunked_prefill_attention_cache_limit must be in "
++                    f"[1, {cache_len}], got {cache_limit}"
++                )
++            # Ablation-only path: callers must keep all chunk positions below
++            # cache_limit. The full KV cache is still updated above so decode
++            # state plumbing remains unchanged.
++            K_full = K_full[:, :, :cache_limit, :]
++            V_full = V_full[:, :, :cache_limit, :]
++            cache_len = cache_limit
++
+         cache_positions = torch.arange(cache_len, device=position_ids.device).view(1, 1, 1, -1)
+         microchunk = int(
+             getattr(self.config, "qwen_chunked_prefill_attention_microchunk", 128)
+-- 
+2.43.0
+

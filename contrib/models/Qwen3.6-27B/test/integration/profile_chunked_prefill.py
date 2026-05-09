@@ -1,0 +1,190 @@
+import argparse
+import json
+import os
+import sys
+import time
+
+import torch
+from transformers import AutoTokenizer
+
+
+FILLER = (
+    "Archive note: The Tokyo 2020 Olympics were delayed and held in 2021. "
+    "Athletes competed in athletics, swimming, gymnastics, team sports, and new events. "
+    "This is repeated background context for long-context profiling. "
+)
+
+
+def maybe_sync():
+    try:
+        import torch_xla.core.xla_model as xm
+
+        xm.mark_step()
+    except Exception:
+        pass
+
+
+def build_prompt_ids(tokenizer, target_tokens):
+    question = (
+        "\n\nQuestion: Give a concise summary of the Tokyo 2020 Olympics. "
+        "Mention the delay and one notable feature.\nAnswer:"
+    )
+    question_ids = tokenizer(question, add_special_tokens=False).input_ids
+    filler_ids = tokenizer(FILLER, add_special_tokens=False).input_ids
+    keep = max(1, target_tokens - len(question_ids))
+    reps = (keep + len(filler_ids) - 1) // len(filler_ids)
+    ids = (filler_ids * reps)[:keep] + question_ids
+    return torch.tensor([ids[:target_tokens]], dtype=torch.long)
+
+
+def token_scalar(tokens):
+    if hasattr(tokens, "detach"):
+        tokens = tokens.detach().cpu()
+    if tokens.ndim == 0:
+        return int(tokens.item())
+    return int(tokens.reshape(-1)[0].item())
+
+
+def run_case(model, tokenizer, target_tokens, chunk_size, seq_len, max_new_tokens):
+    input_ids = build_prompt_ids(tokenizer, target_tokens)
+    prompt_len = input_ids.shape[1]
+    if prompt_len + max_new_tokens > seq_len:
+        raise ValueError(f"{prompt_len} + {max_new_tokens} exceeds seq_len={seq_len}")
+
+    pad_id = tokenizer.pad_token_id
+    seq_ids = torch.tensor([0], dtype=torch.int32)
+    profile = os.environ.get("QWEN35_PROFILE", "0") == "1"
+    chunk_rows = []
+    generated = []
+
+    model.reset()
+    for chunk_index, start in enumerate(range(0, prompt_len, chunk_size)):
+        end = min(start + chunk_size, prompt_len)
+        valid = end - start
+        chunk_ids = input_ids[:, start:end]
+        if valid < chunk_size:
+            pad = torch.full((1, chunk_size - valid), pad_id, dtype=chunk_ids.dtype)
+            chunk_ids = torch.cat([chunk_ids, pad], dim=1)
+
+        attn_mask = torch.zeros((1, chunk_size), dtype=torch.long)
+        attn_mask[:, :valid] = 1
+        pos = torch.arange(start, start + chunk_size, dtype=torch.long).unsqueeze(0)
+
+        maybe_sync()
+        t0 = time.perf_counter()
+        with torch.no_grad():
+            out = model(
+                input_ids=chunk_ids,
+                attention_mask=attn_mask,
+                position_ids=pos,
+                seq_ids=seq_ids,
+                return_dict=True,
+            )
+        maybe_sync()
+        dt = time.perf_counter() - t0
+        tok = token_scalar(out.tokens)
+        row = {
+            "prompt_tokens": prompt_len,
+            "chunk_index": chunk_index,
+            "start": start,
+            "valid": valid,
+            "cumulative_cache_pos": start,
+            "chunk_total_s": dt,
+            "token": tok,
+        }
+        chunk_rows.append(row)
+        if profile:
+            print("PROFILE_CHUNK " + json.dumps(row), flush=True)
+
+    first_token = token_scalar(out.tokens)
+    generated.append(first_token)
+    current_token = first_token
+    decode_times = []
+    for step in range(1, max_new_tokens):
+        pos_value = prompt_len + step - 1
+        ids = torch.tensor([[current_token]], dtype=torch.long)
+        pos = torch.tensor([[pos_value]], dtype=torch.long)
+        attn_mask = torch.zeros((1, seq_len), dtype=torch.long)
+        attn_mask[:, : pos_value + 1] = 1
+
+        maybe_sync()
+        t0 = time.perf_counter()
+        with torch.no_grad():
+            out = model(
+                input_ids=ids,
+                attention_mask=attn_mask,
+                position_ids=pos,
+                seq_ids=seq_ids,
+                return_dict=True,
+            )
+        maybe_sync()
+        decode_times.append(time.perf_counter() - t0)
+        current_token = token_scalar(out.tokens)
+        generated.append(current_token)
+
+    cte_total = sum(row["chunk_total_s"] for row in chunk_rows)
+    summary = {
+        "prompt_tokens": prompt_len,
+        "chunks": len(chunk_rows),
+        "chunk_size": chunk_size,
+        "cte_seconds": cte_total,
+        "ingest_tok_s": prompt_len / cte_total,
+        "avg_chunk_s": cte_total / len(chunk_rows),
+        "min_chunk_s": min(row["chunk_total_s"] for row in chunk_rows),
+        "max_chunk_s": max(row["chunk_total_s"] for row in chunk_rows),
+        "decode_steps": len(decode_times),
+        "decode_tok_s": len(decode_times) / sum(decode_times) if decode_times else 0.0,
+        "generated_tokens": generated,
+        "generated_text": tokenizer.decode(generated, skip_special_tokens=True),
+    }
+    print("PROFILE_SUMMARY " + json.dumps(summary, ensure_ascii=False), flush=True)
+    return chunk_rows, summary
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--compiled-path", required=True)
+    parser.add_argument("--model-path", required=True)
+    parser.add_argument("--contrib-root", required=True)
+    parser.add_argument("--prompt-tokens", type=int, nargs="+", default=[1024, 16384, 65472])
+    parser.add_argument("--chunk-size", type=int, default=512)
+    parser.add_argument("--seq-len", type=int, default=65536)
+    parser.add_argument("--max-new-tokens", type=int, default=5)
+    args = parser.parse_args()
+
+    sys.path.insert(0, args.contrib_root)
+    from src.modeling_qwen35 import NeuronQwen35ForCausalLM
+
+    tokenizer = AutoTokenizer.from_pretrained(args.model_path, padding_side="right")
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    print("LOAD_START", flush=True)
+    t0 = time.perf_counter()
+    model = NeuronQwen35ForCausalLM(args.compiled_path)
+    model.load(args.compiled_path)
+    print(f"LOAD_DONE seconds={time.perf_counter() - t0:.3f}", flush=True)
+    print(
+        "CONFIG "
+        f"hybrid={getattr(model.config, 'use_hybrid_cache_manager', None)} "
+        f"chunked={getattr(model.config, 'use_qwen_hybrid_chunked_prefill', None)} "
+        f"nki={getattr(model.config, 'use_qwen_hybrid_chunked_prefill_nki', None)} "
+        f"seq_len={model.config.neuron_config.seq_len} "
+        f"ctx_buckets={model.config.neuron_config.context_encoding_buckets}",
+        flush=True,
+    )
+
+    for prompt_tokens in args.prompt_tokens:
+        print(f"CASE_START prompt_tokens={prompt_tokens}", flush=True)
+        run_case(
+            model=model,
+            tokenizer=tokenizer,
+            target_tokens=prompt_tokens,
+            chunk_size=args.chunk_size,
+            seq_len=args.seq_len,
+            max_new_tokens=args.max_new_tokens,
+        )
+
+
+if __name__ == "__main__":
+    main()
