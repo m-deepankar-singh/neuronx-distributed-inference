@@ -259,12 +259,27 @@ class NeuronGatedDeltaNet(nn.Module):
         tc = config
 
         self.hidden_size = tc.hidden_size  # 5120
-        self.num_v_heads = tc.linear_num_value_heads  # 48
-        self.num_k_heads = tc.linear_num_key_heads  # 16
+        self.tp_degree = tc.neuron_config.tp_degree
+        self.global_num_v_heads = tc.linear_num_value_heads  # 48
+        self.global_num_k_heads = tc.linear_num_key_heads  # 16
         self.head_k_dim = tc.linear_key_head_dim  # 128
         self.head_v_dim = tc.linear_value_head_dim  # 128
-        self.key_dim = self.head_k_dim * self.num_k_heads  # 2048
-        self.value_dim = self.head_v_dim * self.num_v_heads  # 6144
+        if self.global_num_v_heads % self.tp_degree != 0:
+            raise ValueError(
+                f"linear_num_value_heads={self.global_num_v_heads} must be divisible "
+                f"by tp_degree={self.tp_degree}"
+            )
+        if self.global_num_k_heads % self.tp_degree != 0:
+            raise ValueError(
+                f"linear_num_key_heads={self.global_num_k_heads} must be divisible "
+                f"by tp_degree={self.tp_degree}"
+            )
+        self.num_v_heads = self.global_num_v_heads // self.tp_degree
+        self.num_k_heads = self.global_num_k_heads // self.tp_degree
+        self.global_key_dim = self.head_k_dim * self.global_num_k_heads  # 2048
+        self.global_value_dim = self.head_v_dim * self.global_num_v_heads  # 6144
+        self.key_dim = self.head_k_dim * self.num_k_heads  # 512 at TP=4
+        self.value_dim = self.head_v_dim * self.num_v_heads  # 1536 at TP=4
         self.conv_kernel_size = tc.linear_conv_kernel_dim  # 4
         self.layer_idx = layer_idx
         self.rms_norm_eps = tc.rms_norm_eps
@@ -286,32 +301,72 @@ class NeuronGatedDeltaNet(nn.Module):
             replicated_kv_heads = raw_kv_heads
         self.kv_heads_per_rank = replicated_kv_heads // tp_degree
 
-        # Conv1d on concatenated QKV (NOT Z)
-        self.conv_dim = self.key_dim * 2 + self.value_dim  # 10240
-        self.conv1d = nn.Conv1d(
-            in_channels=self.conv_dim,
-            out_channels=self.conv_dim,
+        # Conv1d on concatenated QKV (NOT Z).  Store the depthwise kernel in a
+        # ColumnParallelLinear parameter container so NxD's checkpoint sharder
+        # can split it by output channel.  Forward still uses it as Conv1d
+        # weight after unsqueezing the singleton input-channel dimension.
+        self.global_conv_dim = self.global_key_dim * 2 + self.global_value_dim  # 10240
+        self.conv_dim = self.key_dim * 2 + self.value_dim  # 2560 at TP=4
+        self.conv1d_weight = ColumnParallelLinear(
+            self.conv_kernel_size,
+            self.global_conv_dim,
             bias=False,
-            kernel_size=self.conv_kernel_size,
-            groups=self.conv_dim,
-            padding=self.conv_kernel_size - 1,
+            gather_output=False,
         )
 
-        # Input projections (nn.Linear — NOT sharded by NxDI TP, replicated on all ranks)
-        self.in_proj_qkv = nn.Linear(
-            self.hidden_size, self.key_dim * 2 + self.value_dim, bias=False
+        # Input/output projections are the large DeltaNet tensors.  Shard them
+        # with tensor parallelism; convert_qwen35_hf_to_neuron_state_dict()
+        # reorders in_proj_qkv into per-rank [Q_local | K_local | V_local]
+        # blocks before NxD slices the output dimension.
+        self.in_proj_qkv = ColumnParallelLinear(
+            self.hidden_size,
+            self.global_key_dim * 2 + self.global_value_dim,
+            bias=False,
+            gather_output=False,
         )
-        self.in_proj_z = nn.Linear(self.hidden_size, self.value_dim, bias=False)
-        self.in_proj_b = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
-        self.in_proj_a = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
+        self.in_proj_z = ColumnParallelLinear(
+            self.hidden_size,
+            self.global_value_dim,
+            bias=False,
+            gather_output=False,
+        )
+        self.in_proj_b = ColumnParallelLinear(
+            self.hidden_size,
+            self.global_num_v_heads,
+            bias=False,
+            gather_output=False,
+        )
+        self.in_proj_a = ColumnParallelLinear(
+            self.hidden_size,
+            self.global_num_v_heads,
+            bias=False,
+            gather_output=False,
+        )
 
-        # Decay parameters
-        self.dt_bias = nn.Parameter(torch.ones(self.num_v_heads))
-        self.A_log = nn.Parameter(torch.zeros(self.num_v_heads))
+        # Same parameter-container pattern for per-value-head decay vectors.
+        # These are used as vectors in forward but sharded by output dim during
+        # checkpoint conversion/loading.
+        self.dt_bias_weight = ColumnParallelLinear(
+            1,
+            self.global_num_v_heads,
+            bias=False,
+            gather_output=False,
+        )
+        self.A_log_weight = ColumnParallelLinear(
+            1,
+            self.global_num_v_heads,
+            bias=False,
+            gather_output=False,
+        )
 
         # Output norm and projection
         self.norm = Qwen3MoeRMSNorm(self.head_v_dim, eps=self.rms_norm_eps)
-        self.out_proj = nn.Linear(self.value_dim, self.hidden_size, bias=False)
+        self.out_proj = RowParallelLinear(
+            self.global_value_dim,
+            self.hidden_size,
+            bias=False,
+            input_is_parallel=True,
+        )
 
         # State buffers for CTE -> TKG carry-over
         alloc_batch_size = getattr(config.neuron_config, "max_batch_size", 1)
@@ -335,6 +390,15 @@ class NeuronGatedDeltaNet(nn.Module):
             ),
             requires_grad=False,
         )
+
+    def _conv1d_weight(self):
+        return self.conv1d_weight.weight.unsqueeze(1)
+
+    def _dt_bias(self):
+        return self.dt_bias_weight.weight.squeeze(1)
+
+    def _A_log(self):
+        return self.A_log_weight.weight.squeeze(1)
 
     def _recurrent_step(self, query, key, value, g, beta, recurrent_state):
         """Single-step recurrent update for token generation."""
@@ -762,7 +826,7 @@ class NeuronGatedDeltaNet(nn.Module):
 
         # Project inputs
         deltanet_fp32 = os.environ.get("DELTANET_FP32") == "1"
-        if deltanet_fp32:
+        if deltanet_fp32 and isinstance(self.in_proj_qkv, nn.Linear):
             hs_f32 = hidden_states.float()
             qkv = F.linear(hs_f32, self.in_proj_qkv.weight.float()).to(
                 hidden_states.dtype
@@ -794,7 +858,7 @@ class NeuronGatedDeltaNet(nn.Module):
                 conv_state = self.conv_state_buffer[:batch_size]
             conv_input = torch.cat([conv_state, mixed], dim=-1)
 
-            w = self.conv1d.weight.squeeze(1)
+            w = self._conv1d_weight().squeeze(1)
             conv_out = torch.zeros_like(mixed)
             for k in range(4):
                 conv_out = (
@@ -829,7 +893,7 @@ class NeuronGatedDeltaNet(nn.Module):
             if qwen_chunked_prefill_active and conv_state_cache is not None:
                 conv_state = conv_state_cache[:batch_size]
                 conv_input = torch.cat([conv_state, mixed], dim=-1)
-                w = self.conv1d.weight.squeeze(1)
+                w = self._conv1d_weight().squeeze(1)
                 conv_out = torch.zeros_like(mixed)
                 for k in range(self.conv_kernel_size):
                     conv_out = conv_out + w[:, k].unsqueeze(0).unsqueeze(-1) * conv_input[
@@ -847,7 +911,15 @@ class NeuronGatedDeltaNet(nn.Module):
                 else:
                     new_conv_state = conv_input[:, :, -self.conv_kernel_size + 1 :].contiguous()
             else:
-                mixed_post_conv = F.silu(self.conv1d(mixed)[:, :, :seq_len])
+                mixed_post_conv = F.silu(
+                    F.conv1d(
+                        mixed,
+                        self._conv1d_weight(),
+                        bias=None,
+                        padding=self.conv_kernel_size - 1,
+                        groups=self.conv_dim,
+                    )[:, :, :seq_len]
+                )
 
                 if valid_mask_1d is not None:
                     # valid_mask_1d is [B, S, 1]; count valid tokens per batch
@@ -913,7 +985,7 @@ class NeuronGatedDeltaNet(nn.Module):
 
         # Compute gating
         beta = b.sigmoid()
-        g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
+        g = -self._A_log().float().exp() * F.softplus(a.float() + self._dt_bias())
 
         if valid_mask_1d is not None:
             # Zero g for padding → alpha=exp(0)=1 → state preserved through padding
@@ -1697,15 +1769,28 @@ class HybridDeltaNetCacheManager(KVCacheManager):
             config.neuron_config.kv_cache_batch_size
             + config.neuron_config.kv_cache_padding_size
         )
+        tp_degree = config.neuron_config.tp_degree
+        if config.linear_num_value_heads % tp_degree != 0:
+            raise ValueError(
+                f"linear_num_value_heads={config.linear_num_value_heads} must be divisible "
+                f"by tp_degree={tp_degree}"
+            )
+        if config.linear_num_key_heads % tp_degree != 0:
+            raise ValueError(
+                f"linear_num_key_heads={config.linear_num_key_heads} must be divisible "
+                f"by tp_degree={tp_degree}"
+            )
+        local_num_value_heads = config.linear_num_value_heads // tp_degree
+        local_num_key_heads = config.linear_num_key_heads // tp_degree
         recurrent_shape = [
             max_batch_size,
-            config.linear_num_value_heads,
+            local_num_value_heads,
             config.linear_key_head_dim,
             config.linear_value_head_dim,
         ]
         conv_dim = (
-            2 * config.linear_num_key_heads * config.linear_key_head_dim
-            + config.linear_num_value_heads * config.linear_value_head_dim
+            2 * local_num_key_heads * config.linear_key_head_dim
+            + local_num_value_heads * config.linear_value_head_dim
         )
         conv_shape = [
             max_batch_size,
@@ -2396,7 +2481,8 @@ def convert_qwen35_hf_to_neuron_state_dict(neuron_state_dict, config):
     DeltaNet layers (linear_attention):
       HF: layers.X.linear_attn.{in_proj_qkv, in_proj_z, in_proj_a, in_proj_b,
           conv1d, A_log, dt_bias, norm, out_proj}
-      NxDI: same names (no remapping needed)
+      NxDI: projections keep names; conv1d/A_log/dt_bias are remapped into
+            ColumnParallelLinear parameter containers so NxD can shard them.
 
     Full attention layers:
       HF: layers.X.self_attn.q_proj.weight: (12288, 5120) -- doubled for gate
@@ -2415,6 +2501,79 @@ def convert_qwen35_hf_to_neuron_state_dict(neuron_state_dict, config):
         config.neuron_config.tp_degree,
         dtype=torch.int32,
     )
+
+    def _reorder_deltanet_qkv_for_tp(qkv_weight: torch.Tensor) -> torch.Tensor:
+        """Pack [Q_all | K_all | V_all] into per-rank Q/K/V blocks.
+
+        ColumnParallelLinear slices the first dimension contiguously.  DeltaNet
+        needs each rank to receive its local query, key, and value heads
+        together, so the full HF tensor is repacked as:
+        [rank0 Q | rank0 K | rank0 V | rank1 Q | rank1 K | rank1 V | ...].
+        """
+        tp_degree = config.neuron_config.tp_degree
+        num_k_heads = config.linear_num_key_heads
+        num_v_heads = config.linear_num_value_heads
+        head_k_dim = config.linear_key_head_dim
+        head_v_dim = config.linear_value_head_dim
+        if num_k_heads % tp_degree != 0:
+            raise ValueError(
+                f"linear_num_key_heads={num_k_heads} must be divisible by tp_degree={tp_degree}"
+            )
+        if num_v_heads % tp_degree != 0:
+            raise ValueError(
+                f"linear_num_value_heads={num_v_heads} must be divisible by tp_degree={tp_degree}"
+            )
+
+        key_dim = num_k_heads * head_k_dim
+        value_dim = num_v_heads * head_v_dim
+        q_weight = qkv_weight[:key_dim].reshape(num_k_heads, head_k_dim, -1)
+        k_weight = qkv_weight[key_dim : 2 * key_dim].reshape(num_k_heads, head_k_dim, -1)
+        v_weight = qkv_weight[2 * key_dim : 2 * key_dim + value_dim].reshape(
+            num_v_heads, head_v_dim, -1
+        )
+        local_k_heads = num_k_heads // tp_degree
+        local_v_heads = num_v_heads // tp_degree
+        blocks = []
+        for rank in range(tp_degree):
+            blocks.append(
+                q_weight[
+                    rank * local_k_heads : (rank + 1) * local_k_heads
+                ].reshape(-1, qkv_weight.shape[1])
+            )
+            blocks.append(
+                k_weight[
+                    rank * local_k_heads : (rank + 1) * local_k_heads
+                ].reshape(-1, qkv_weight.shape[1])
+            )
+            blocks.append(
+                v_weight[
+                    rank * local_v_heads : (rank + 1) * local_v_heads
+                ].reshape(-1, qkv_weight.shape[1])
+            )
+        return torch.cat(blocks, dim=0).contiguous()
+
+    def _reorder_deltanet_qkv_channels_for_tp(channel_tensor: torch.Tensor) -> torch.Tensor:
+        """Repack a first-dimension Q/K/V channel tensor into TP rank blocks."""
+        tp_degree = config.neuron_config.tp_degree
+        num_k_heads = config.linear_num_key_heads
+        num_v_heads = config.linear_num_value_heads
+        head_k_dim = config.linear_key_head_dim
+        head_v_dim = config.linear_value_head_dim
+        key_dim = num_k_heads * head_k_dim
+        value_dim = num_v_heads * head_v_dim
+        q_tensor = channel_tensor[:key_dim]
+        k_tensor = channel_tensor[key_dim : 2 * key_dim]
+        v_tensor = channel_tensor[2 * key_dim : 2 * key_dim + value_dim]
+        local_key_dim = key_dim // tp_degree
+        local_value_dim = value_dim // tp_degree
+        blocks = []
+        for rank in range(tp_degree):
+            blocks.append(q_tensor[rank * local_key_dim : (rank + 1) * local_key_dim])
+            blocks.append(k_tensor[rank * local_key_dim : (rank + 1) * local_key_dim])
+            blocks.append(
+                v_tensor[rank * local_value_dim : (rank + 1) * local_value_dim]
+            )
+        return torch.cat(blocks, dim=0).contiguous()
 
     # CRITICAL: Convert (1+weight) RMSNorm weights to standard RMSNorm weights.
     # Qwen3.5 uses RMSNorm with `output = norm(x) * (1 + weight)` where weight
@@ -2443,6 +2602,30 @@ def convert_qwen35_hf_to_neuron_state_dict(neuron_state_dict, config):
 
     for l in range(config.num_hidden_layers):
         layer_type = config.layer_types[l]
+
+        # === DeltaNet layers ===
+        if layer_type == "linear_attention":
+            qkv_key = f"layers.{l}.linear_attn.in_proj_qkv.weight"
+            if qkv_key in neuron_state_dict and config.neuron_config.tp_degree > 1:
+                neuron_state_dict[qkv_key] = _reorder_deltanet_qkv_for_tp(
+                    neuron_state_dict[qkv_key]
+                )
+
+            conv_key = f"layers.{l}.linear_attn.conv1d.weight"
+            conv_weight_key = f"layers.{l}.linear_attn.conv1d_weight.weight"
+            if conv_key in neuron_state_dict:
+                conv_weight = neuron_state_dict.pop(conv_key)
+                if config.neuron_config.tp_degree > 1:
+                    conv_weight = _reorder_deltanet_qkv_channels_for_tp(conv_weight)
+                neuron_state_dict[conv_weight_key] = conv_weight.squeeze(1).contiguous()
+
+            for vector_name in ("A_log", "dt_bias"):
+                vector_key = f"layers.{l}.linear_attn.{vector_name}"
+                vector_weight_key = f"layers.{l}.linear_attn.{vector_name}_weight.weight"
+                if vector_key in neuron_state_dict:
+                    neuron_state_dict[vector_weight_key] = (
+                        neuron_state_dict.pop(vector_key).reshape(-1, 1).contiguous()
+                    )
 
         # === Attention layers ===
         if layer_type == "full_attention":
