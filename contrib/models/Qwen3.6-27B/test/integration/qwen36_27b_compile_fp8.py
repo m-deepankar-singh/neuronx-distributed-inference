@@ -71,6 +71,97 @@ def _quantized_checkpoint_ready(path: Path) -> bool:
     return False
 
 
+def _is_mlp_weight(name: str) -> bool:
+    parts = name.split(".")
+    return (
+        len(parts) >= 4
+        and parts[-3] == "mlp"
+        and parts[-2] in {"gate_proj", "up_proj", "down_proj"}
+        and parts[-1] == "weight"
+    )
+
+
+def _scale_name(weight_name: str) -> str:
+    return weight_name[: -len(".weight")] + ".weight_scale"
+
+
+def _clear_quantized_checkpoint_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    for child in path.iterdir():
+        if child.name.endswith(".safetensors") or child.name.endswith(".json"):
+            child.unlink()
+
+
+def _save_mlp_only_fp8_state_dict(model_path: Path, output_path: Path) -> None:
+    """Create a sharded FP8 checkpoint directly from HF safetensors.
+
+    Loading the HF architecture requires a newer Transformers than the Neuron
+    venv uses internally. For this MLP-only ablation, we do not need model
+    execution: the checkpoint transform is a direct tensor rewrite.
+    """
+    from safetensors.torch import load_file, save_file  # noqa: WPS433
+    from neuronx_distributed.quantization.quantization_utils import (  # noqa: WPS433
+        quantize_fp8_per_channel,
+    )
+
+    index_path = model_path / "model.safetensors.index.json"
+    if index_path.exists():
+        with index_path.open() as f:
+            source_index = json.load(f)
+        source_weight_map = source_index["weight_map"]
+        filenames = sorted(set(source_weight_map.values()))
+    elif (model_path / "model.safetensors").exists():
+        source_weight_map = None
+        filenames = ["model.safetensors"]
+    else:
+        raise FileNotFoundError(f"No safetensors checkpoint found in {model_path}")
+
+    _clear_quantized_checkpoint_dir(output_path)
+    output_weight_map: dict[str, str] = {}
+    total_size = 0
+    quantized_count = 0
+
+    for filename in filenames:
+        shard = load_file(str(model_path / filename))
+        output_shard = {}
+        for name, tensor in shard.items():
+            if _is_mlp_weight(name):
+                weight, scale = quantize_fp8_per_channel(
+                    tensor,
+                    torch.float8_e4m3fn,
+                    channel_axis=0,
+                )
+                output_shard[name] = weight
+                output_shard[_scale_name(name)] = scale
+                output_weight_map[_scale_name(name)] = filename
+                total_size += weight.numel() * weight.element_size()
+                total_size += scale.numel() * scale.element_size()
+                quantized_count += 1
+            else:
+                output_shard[name] = tensor
+                total_size += tensor.numel() * tensor.element_size()
+            output_weight_map[name] = filename
+
+        save_file(output_shard, str(output_path / filename), metadata={"format": "pt"})
+        del shard
+        del output_shard
+        gc.collect()
+
+    if source_weight_map is not None:
+        with (output_path / "model.safetensors.index.json").open("w") as f:
+            json.dump(
+                {
+                    "metadata": {"total_size": total_size},
+                    "weight_map": output_weight_map,
+                },
+                f,
+                indent=2,
+                sort_keys=True,
+            )
+
+    print("MANUAL_FP8_MLP_WEIGHT_COUNT", quantized_count, flush=True)
+
+
 def _build_config(args: argparse.Namespace):
     from neuronx_distributed_inference.models.config import (  # noqa: WPS433
         NeuronConfig,
@@ -169,9 +260,8 @@ def main() -> int:
     )
 
     if args.force_quantize or not _quantized_checkpoint_ready(quantized_path):
-        quantized_path.mkdir(parents=True, exist_ok=True)
-        print("QUANTIZE_START", flush=True)
-        NeuronQwen35ForCausalLM.save_quantized_state_dict(str(model_path), inf_config)
+        print("QUANTIZE_START manual_mlp_only", flush=True)
+        _save_mlp_only_fp8_state_dict(model_path, quantized_path)
         print("QUANTIZE_DONE", flush=True)
     else:
         print("QUANTIZE_SKIP existing checkpoint found", flush=True)
