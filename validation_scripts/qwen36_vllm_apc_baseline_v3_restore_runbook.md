@@ -3,19 +3,22 @@
 Use this when a new Trainium instance comes up and the previous instance is
 gone.
 
-## 1. Checkout The Saved Baseline
+## 1. Checkout The Restore Branch
 
 ```bash
 cd /home/ubuntu/inferentia-gdn
 git fetch origin --tags
-git checkout -B qwen36-27b-vllm-apc-baseline-v3 qwen36-27b-vllm-apc-baseline-v3
-```
-
-If the tag is not available yet, use:
-
-```bash
 git checkout -B codex/qwen36-vllm-prefix-cache origin/codex/qwen36-vllm-prefix-cache
 ```
+
+The immutable validation tag is still available as:
+
+```bash
+git checkout qwen36-27b-vllm-apc-baseline-v3
+```
+
+Use the branch for restore because it includes post-baseline convenience
+scripts and the remote snapshot; the tag marks the validated runtime state.
 
 ## 2. Verify Required Paths
 
