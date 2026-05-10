@@ -41,6 +41,8 @@ Checks passed:
 - Local `test_deltanet_direct_rhs_solve.py`
 - Remote `py_compile`
 - Remote `test_deltanet_direct_rhs_solve.py`
+- Remote `nki.simulate` vs baseline-v3 chunk kernel:
+  output max abs `2.33e-10`, state max abs `9.31e-10`
 - Hardware compile attempt 1
 - Hardware load/warmup
 - Smoke prompt through proxy: `17 * 23 -> 391`

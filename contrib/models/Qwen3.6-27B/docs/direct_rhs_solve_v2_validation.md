@@ -93,6 +93,16 @@ python -m py_compile modeling_qwen35.py nki_deltanet_chunked_direct_rhs_v2.py qw
 pytest contrib/models/Qwen3.6-27B/test/unit/test_deltanet_direct_rhs_solve.py -q
 ```
 
+The required NKI simulator gate also passed on the Trainium host. The test
+loaded the baseline-v3 chunk kernel and the v2 chunk kernel through
+`nki.simulate`, using identical random fp32 inputs:
+
+```text
+output max_abs 2.3283064365386963e-10 mean_abs 1.1270234745452967e-11
+state  max_abs 9.313225746154785e-10  mean_abs 7.640044152879e-11
+SIMULATE_GATE_PASS
+```
+
 Hardware compile attempt 1 succeeded:
 
 ```text
