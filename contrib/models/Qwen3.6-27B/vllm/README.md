@@ -76,7 +76,7 @@ Precompiled artifact path:
 ```bash
 contrib/models/Qwen3.6-27B/vllm/start_vllm_server.sh \
   --model-path /opt/dlami/nvme/models/Qwen3.6-27B \
-  --compiled-artifacts /opt/dlami/nvme/qwen_artifacts/qwen36_27b_128k_fp8_mlp_only_vllm_qualityfix_run1 \
+  --compiled-artifacts /opt/dlami/nvme/qwen_artifacts/qwen36_27b_128k_fp8_mlp_only_vllm_statereset_run1 \
   --max-model-len 131072 \
   --seq-len 131072 \
   --cte-bucket 512 \
@@ -88,7 +88,7 @@ Long-prompt precompiled artifact path:
 ```bash
 contrib/models/Qwen3.6-27B/vllm/start_vllm_server.sh \
   --model-path /opt/dlami/nvme/models/Qwen3.6-27B \
-  --compiled-artifacts /opt/dlami/nvme/qwen_artifacts/qwen36_27b_128k_fp8_mlp_only_vllm_qualityfix_run1 \
+  --compiled-artifacts /opt/dlami/nvme/qwen_artifacts/qwen36_27b_128k_fp8_mlp_only_vllm_statereset_run1 \
   --max-model-len 131072 \
   --seq-len 131072 \
   --cte-bucket 512 \
@@ -97,12 +97,39 @@ contrib/models/Qwen3.6-27B/vllm/start_vllm_server.sh \
   --port 8000
 ```
 
+Production chat proxy:
+
+```bash
+contrib/models/Qwen3.6-27B/vllm/start_vllm_server.sh \
+  --model-path /opt/dlami/nvme/models/Qwen3.6-27B \
+  --compiled-artifacts /opt/dlami/nvme/qwen_artifacts/qwen36_27b_128k_fp8_mlp_only_vllm_statereset_run1 \
+  --max-model-len 131072 \
+  --seq-len 131072 \
+  --cte-bucket 512 \
+  --block-size 256 \
+  --enable-vllm-chunked-prefill \
+  --port 8001
+```
+
+Then expose the guarded OpenAI-compatible endpoint on port 8000:
+
+```bash
+python contrib/models/Qwen3.6-27B/vllm/qwen36_chat_proxy.py \
+  --backend-url http://127.0.0.1:8001 \
+  --port 8000
+```
+
+The proxy forces `chat_template_kwargs={"enable_thinking": false}` for
+`/v1/chat/completions` by default. It rejects raw `/v1/completions` because raw
+prompts bypass the Qwen chat template and can pollute the hybrid model state.
+Use `--allow-thinking` or `--allow-completions` only for explicit debugging.
+
 Offline long-prompt smoke:
 
 ```bash
 python contrib/models/Qwen3.6-27B/vllm/run_offline_inference.py \
   --model-path /opt/dlami/nvme/models/Qwen3.6-27B \
-  --compiled-artifacts /opt/dlami/nvme/qwen_artifacts/qwen36_27b_128k_fp8_mlp_only_vllm_qualityfix_run1 \
+  --compiled-artifacts /opt/dlami/nvme/qwen_artifacts/qwen36_27b_128k_fp8_mlp_only_vllm_statereset_run1 \
   --max-model-len 131072 \
   --seq-len 131072 \
   --cte-bucket 512 \
@@ -117,23 +144,26 @@ PY
 
 Validation run on Trn2 with the FP8 128K artifact:
 
-- fixed artifact: `/opt/dlami/nvme/qwen_artifacts/qwen36_27b_128k_fp8_mlp_only_vllm_qualityfix_run1`;
-- OpenAI-compatible `/v1/chat/completions` passes 5/5 focused quality checks
-  when requests include `chat_template_kwargs={"enable_thinking": false}`;
+- state-reset artifact: `/opt/dlami/nvme/qwen_artifacts/qwen36_27b_128k_fp8_mlp_only_vllm_statereset_run1`;
+- OpenAI-compatible `/v1/chat/completions` behind the proxy passes focused
+  quality checks without callers passing `chat_template_kwargs`;
+- repeated short-after-long validation passes after 32K and 64K requests,
+  confirming DeltaNet recurrent/conv state is reset for new requests;
+- 32K and 64K needle retrieval prompts return all expected codes;
 - measured prefill is `404-428 tok/s` from 512 through 64K prompt tokens;
 - measured decode is `26.3-26.6 tok/s`;
 - peak Neuron device memory is about `53.25 GB` decimal for the 64K eval.
 
-Raw `/v1/completions` prompts are not chat-templated and can still repeat prompt
-suffixes. Use `/v1/chat/completions` for production calls, or pass a fully
-rendered Qwen chat prompt to `/v1/completions`.
+Raw `/v1/completions` prompts are not chat-templated and can pollute the hybrid
+state if sent directly to the backend. Keep the backend private and expose the
+proxy on the public port for production calls.
 
 ## Offline Smoke
 
 ```bash
 python contrib/models/Qwen3.6-27B/vllm/run_offline_inference.py \
   --model-path /opt/dlami/nvme/models/Qwen3.6-27B \
-  --compiled-artifacts /opt/dlami/nvme/qwen_artifacts/qwen36_27b_128k_fp8_mlp_only_vllm_qualityfix_run1 \
+  --compiled-artifacts /opt/dlami/nvme/qwen_artifacts/qwen36_27b_128k_fp8_mlp_only_vllm_statereset_run1 \
   --max-model-len 131072 \
   --seq-len 131072 \
   --cte-bucket 512 \

@@ -892,6 +892,11 @@ class NeuronGatedDeltaNet(nn.Module):
         else:
             if qwen_chunked_prefill_active and conv_state_cache is not None:
                 conv_state = conv_state_cache[:batch_size]
+                if position_ids is not None:
+                    reset_mask = (position_ids[:, :1].long() == 0).to(
+                        dtype=conv_state.dtype, device=conv_state.device
+                    )
+                    conv_state = conv_state * (1.0 - reset_mask[:, None, :])
                 conv_input = torch.cat([conv_state, mixed], dim=-1)
                 w = self._conv1d_weight().squeeze(1)
                 conv_out = torch.zeros_like(mixed)
@@ -1059,6 +1064,11 @@ class NeuronGatedDeltaNet(nn.Module):
 
             if qwen_chunked_prefill_active and recurrent_state_cache is not None:
                 initial_state = recurrent_state_cache[:batch_size].float()
+                if position_ids is not None:
+                    reset_mask = (position_ids[:, :1].long() == 0).to(
+                        dtype=initial_state.dtype, device=initial_state.device
+                    )
+                    initial_state = initial_state * (1.0 - reset_mask[:, :, None, None])
                 if self.use_qwen_hybrid_chunked_prefill_nki:
                     output, final_state = self._nki_chunked_forward(
                         query,
