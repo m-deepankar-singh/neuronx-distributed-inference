@@ -59,6 +59,10 @@ def main() -> int:
     parser.add_argument("--prompt", default="What is 17 * 23? Answer with the number only.")
     parser.add_argument("--chat", action="store_true")
     parser.add_argument("--enable-vllm-chunked-prefill", action="store_true")
+    parser.add_argument("--enable-prefix-caching", action="store_true")
+    parser.add_argument("--mamba-cache-mode", default=None)
+    parser.add_argument("--mamba-cache-dtype", default=None)
+    parser.add_argument("--mamba-ssm-cache-dtype", default=None)
     parser.add_argument("--max-tokens", type=int, default=64)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-k", type=int, default=1)
@@ -114,10 +118,16 @@ def main() -> int:
         "tensor_parallel_size": args.tensor_parallel_size,
         "max_num_seqs": args.max_num_seqs,
         "max_model_len": args.max_model_len,
-        "enable_prefix_caching": False,
+        "enable_prefix_caching": args.enable_prefix_caching,
         "enable_chunked_prefill": args.enable_vllm_chunked_prefill,
         "additional_config": additional_config,
     }
+    if args.mamba_cache_mode is not None:
+        llm_kwargs["mamba_cache_mode"] = args.mamba_cache_mode
+    if args.mamba_cache_dtype is not None:
+        llm_kwargs["mamba_cache_dtype"] = args.mamba_cache_dtype
+    if args.mamba_ssm_cache_dtype is not None:
+        llm_kwargs["mamba_ssm_cache_dtype"] = args.mamba_ssm_cache_dtype
     if args.enable_vllm_chunked_prefill:
         llm_kwargs["max_num_batched_tokens"] = args.cte_bucket
         llm_kwargs["block_size"] = args.block_size

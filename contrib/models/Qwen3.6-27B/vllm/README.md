@@ -97,6 +97,28 @@ contrib/models/Qwen3.6-27B/vllm/start_vllm_server.sh \
   --port 8000
 ```
 
+Native vLLM prefix-cache experiment:
+
+```bash
+contrib/models/Qwen3.6-27B/vllm/start_vllm_server.sh \
+  --model-path /opt/dlami/nvme/models/Qwen3.6-27B \
+  --compiled-artifacts /opt/dlami/nvme/qwen_artifacts/qwen36_27b_128k_fp8_mlp_only_vllm_statereset_run1 \
+  --max-model-len 131072 \
+  --seq-len 131072 \
+  --cte-bucket 512 \
+  --block-size 256 \
+  --enable-vllm-chunked-prefill \
+  --enable-prefix-caching \
+  --mamba-cache-mode align \
+  --port 8000
+```
+
+Treat this as an experiment, not a production mode, until validation passes.
+Standard vLLM APC reuses attention KV blocks; Qwen3.6 also needs DeltaNet
+recurrent state and conv state at block boundaries. If native APC does not
+produce exact greedy matches and a clear warm-hit speedup, the next step is a
+hybrid APC path that caches those GDN states alongside attention KV.
+
 Production chat proxy:
 
 ```bash
@@ -145,6 +167,34 @@ PY
 )"
 ```
 
+Offline token-exact prefix-cache validation:
+
+```bash
+python validation_scripts/qwen36_vllm_prefix_cache_offline.py \
+  --repo-root /home/ubuntu/inferentia-gdn \
+  --model-path /opt/dlami/nvme/models/Qwen3.6-27B \
+  --compiled-artifacts /opt/dlami/nvme/qwen_artifacts/qwen36_27b_128k_fp8_mlp_only_vllm_statereset_run1 \
+  --max-model-len 131072 \
+  --seq-len 131072 \
+  --cte-bucket 512 \
+  --block-size 256 \
+  --enable-vllm-chunked-prefill \
+  --mamba-cache-mode align
+```
+
+Server-side prefix-cache validation through the guarded proxy:
+
+```bash
+python validation_scripts/qwen36_prefix_cache_validation.py \
+  --base-url http://127.0.0.1:8000 \
+  --model qwen3.6-27b-neuron-128k-fp8-mlp
+```
+
+The acceptance gate is strict: repeated greedy calls must produce identical
+output, and warm-hit latency should be materially lower than cold-fill latency.
+For hybrid Qwen3.6, prefix-cache validation is not complete until the GDN
+recurrent/conv state behavior is proven, not just attention KV cache hits.
+
 Validation run on Trn2 with the FP8 128K artifact:
 
 - state-reset artifact: `/opt/dlami/nvme/qwen_artifacts/qwen36_27b_128k_fp8_mlp_only_vllm_statereset_run1`;
@@ -176,5 +226,6 @@ python contrib/models/Qwen3.6-27B/vllm/run_offline_inference.py \
 
 ## Next Milestone
 
-Validate multi-turn prompts with `--enable-vllm-chunked-prefill`, then measure
-TTFT/TPOT under concurrent requests.
+Validate native vLLM prefix caching with the token-exact offline harness. If it
+does not pass, implement hybrid APC by saving/restoring DeltaNet recurrent and
+conv state at block boundaries.

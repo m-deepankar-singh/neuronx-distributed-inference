@@ -12,6 +12,10 @@ MAX_NUM_SEQS="1"
 PORT="8000"
 HOST="0.0.0.0"
 ENABLE_CHUNKED_PREFILL="0"
+ENABLE_PREFIX_CACHING="0"
+MAMBA_CACHE_MODE=""
+MAMBA_CACHE_DTYPE=""
+MAMBA_SSM_CACHE_DTYPE=""
 BLOCK_SIZE=""
 
 while [[ $# -gt 0 ]]; do
@@ -25,6 +29,11 @@ while [[ $# -gt 0 ]]; do
     --logical-nc-config) LNC="$2"; shift 2 ;;
     --max-num-seqs) MAX_NUM_SEQS="$2"; shift 2 ;;
     --enable-vllm-chunked-prefill) ENABLE_CHUNKED_PREFILL="1"; shift ;;
+    --enable-prefix-caching) ENABLE_PREFIX_CACHING="1"; shift ;;
+    --disable-prefix-caching|--no-enable-prefix-caching) ENABLE_PREFIX_CACHING="0"; shift ;;
+    --mamba-cache-mode) MAMBA_CACHE_MODE="$2"; shift 2 ;;
+    --mamba-cache-dtype) MAMBA_CACHE_DTYPE="$2"; shift 2 ;;
+    --mamba-ssm-cache-dtype) MAMBA_SSM_CACHE_DTYPE="$2"; shift 2 ;;
     --block-size) BLOCK_SIZE="$2"; shift 2 ;;
     --host) HOST="$2"; shift 2 ;;
     --port) PORT="$2"; shift 2 ;;
@@ -93,6 +102,10 @@ echo "Starting vLLM for Qwen3.6-27B"
 echo "MODEL_PATH=${MODEL_PATH}"
 echo "NEURON_COMPILED_ARTIFACTS=${NEURON_COMPILED_ARTIFACTS:-}"
 echo "PYTHONPATH=${PYTHONPATH}"
+echo "ENABLE_PREFIX_CACHING=${ENABLE_PREFIX_CACHING}"
+echo "MAMBA_CACHE_MODE=${MAMBA_CACHE_MODE:-}"
+echo "MAMBA_CACHE_DTYPE=${MAMBA_CACHE_DTYPE:-}"
+echo "MAMBA_SSM_CACHE_DTYPE=${MAMBA_SSM_CACHE_DTYPE:-}"
 echo "ADDITIONAL_CONFIG=${ADDITIONAL_CONFIG}"
 
 VLLM_ARGS=(
@@ -105,9 +118,22 @@ VLLM_ARGS=(
   --max-num-seqs "${MAX_NUM_SEQS}" \
   --max-model-len "${MAX_MODEL_LEN}" \
   --generation-config vllm \
-  --no-enable-prefix-caching \
   --additional-config "${ADDITIONAL_CONFIG}"
 )
+if [[ "${ENABLE_PREFIX_CACHING}" == "1" ]]; then
+  VLLM_ARGS+=(--enable-prefix-caching)
+else
+  VLLM_ARGS+=(--no-enable-prefix-caching)
+fi
+if [[ -n "${MAMBA_CACHE_MODE}" ]]; then
+  VLLM_ARGS+=(--mamba-cache-mode "${MAMBA_CACHE_MODE}")
+fi
+if [[ -n "${MAMBA_CACHE_DTYPE}" ]]; then
+  VLLM_ARGS+=(--mamba-cache-dtype "${MAMBA_CACHE_DTYPE}")
+fi
+if [[ -n "${MAMBA_SSM_CACHE_DTYPE}" ]]; then
+  VLLM_ARGS+=(--mamba-ssm-cache-dtype "${MAMBA_SSM_CACHE_DTYPE}")
+fi
 if [[ "${ENABLE_CHUNKED_PREFILL}" == "1" ]]; then
   VLLM_ARGS+=(
     --enable-chunked-prefill
