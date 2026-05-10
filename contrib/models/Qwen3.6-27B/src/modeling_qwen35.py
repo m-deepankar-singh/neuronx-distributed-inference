@@ -69,6 +69,9 @@ from src.nki_kernels.nki_deltanet import (
 from src.nki_kernels.nki_deltanet_chunked import (
     deltanet_chunk_step as _deltanet_nki_chunk_step,
 )
+from src.nki_kernels.nki_deltanet_chunked_blocked import (
+    deltanet_chunk_step_blocked as _deltanet_nki_chunk_step_blocked,
+)
 from src.nki_kernels.nki_deltanet_fused import (
     deltanet_fused_chunked_fwd as _deltanet_fused_kernel,
 )
@@ -289,6 +292,9 @@ class NeuronGatedDeltaNet(nn.Module):
         )
         self.use_qwen_hybrid_chunked_prefill_nki = getattr(
             tc, "use_qwen_hybrid_chunked_prefill_nki", False
+        )
+        self.use_blocked_deltanet_solve = getattr(
+            tc, "use_blocked_deltanet_solve", False
         )
 
         # KV cache dummy shape info
@@ -545,7 +551,12 @@ class NeuronGatedDeltaNet(nn.Module):
                 gc_chunk = gc_chunks[bh, c_idx].contiguous()
                 gl_chunk = gl_chunks[bh, c_idx].contiguous()
 
-                out_chunk, state = _deltanet_nki_chunk_step(
+                chunk_kernel = (
+                    _deltanet_nki_chunk_step_blocked
+                    if self.use_blocked_deltanet_solve
+                    else _deltanet_nki_chunk_step
+                )
+                out_chunk, state = chunk_kernel(
                     q_chunk,
                     k_chunk,
                     v_chunk,
@@ -1214,6 +1225,7 @@ class Qwen35InferenceConfig(InferenceConfig):
         kwargs.setdefault("use_hybrid_cache_manager", False)
         kwargs.setdefault("use_qwen_hybrid_chunked_prefill", False)
         kwargs.setdefault("use_qwen_hybrid_chunked_prefill_nki", False)
+        kwargs.setdefault("use_blocked_deltanet_solve", False)
 
         super().__init__(*args, **kwargs)
 
