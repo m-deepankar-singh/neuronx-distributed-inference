@@ -208,6 +208,7 @@ def _build_config(args: argparse.Namespace):
     config_dict.setdefault("use_hybrid_cache_manager", True)
     config_dict.setdefault("use_qwen_hybrid_chunked_prefill", True)
     config_dict.setdefault("use_qwen_hybrid_chunked_prefill_nki", True)
+    config_dict.setdefault("use_direct_rhs_solve_v2", args.use_direct_rhs_solve_v2)
 
     inf_config = Qwen35InferenceConfig(neuron_config=neuron_config, **config_dict)
     return inf_config, modules_to_not_convert
@@ -226,6 +227,7 @@ def main() -> int:
     parser.add_argument("--force-quantize", action="store_true")
     parser.add_argument("--quantize-only", action="store_true")
     parser.add_argument("--load-after-compile", action="store_true")
+    parser.add_argument("--use-direct-rhs-solve-v2", action="store_true")
     args = parser.parse_args()
 
     repo = _repo_root(args.repo_root)

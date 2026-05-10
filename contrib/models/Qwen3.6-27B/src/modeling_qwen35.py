@@ -69,6 +69,9 @@ from src.nki_kernels.nki_deltanet import (
 from src.nki_kernels.nki_deltanet_chunked import (
     deltanet_chunk_step as _deltanet_nki_chunk_step,
 )
+from src.nki_kernels.nki_deltanet_chunked_direct_rhs_v2 import (
+    deltanet_chunk_step as _deltanet_nki_chunk_step_direct_rhs_v2,
+)
 from src.nki_kernels.nki_deltanet_fused import (
     deltanet_fused_chunked_fwd as _deltanet_fused_kernel,
 )
@@ -290,6 +293,7 @@ class NeuronGatedDeltaNet(nn.Module):
         self.use_qwen_hybrid_chunked_prefill_nki = getattr(
             tc, "use_qwen_hybrid_chunked_prefill_nki", False
         )
+        self.use_direct_rhs_solve_v2 = getattr(tc, "use_direct_rhs_solve_v2", False)
 
         # KV cache dummy shape info
         self.head_dim = tc.head_dim  # 256
@@ -491,12 +495,20 @@ class NeuronGatedDeltaNet(nn.Module):
         key_chunks = key.reshape(B, H, num_chunks, chunk_size, k_dim)
         value_chunks = value.reshape(B, H, num_chunks, chunk_size, v_dim)
 
-        beta_chunks = (
-            beta.reshape(B, H, num_chunks, chunk_size)
-            .unsqueeze(-1)
-        )
-        gc_chunks = g_cs.unsqueeze(-1)
-        gl_chunks = g_last_expanded.unsqueeze(-1)
+        if self.use_direct_rhs_solve_v2:
+            beta_chunks = (
+                beta.reshape(B, H, num_chunks, chunk_size)
+                .unsqueeze(-1)
+                .expand(-1, -1, -1, -1, v_dim)
+            )
+            gc_chunks = g_cs.unsqueeze(-1).expand(-1, -1, -1, -1, v_dim)
+            gl_chunks = g_last_expanded.unsqueeze(-1).expand(-1, -1, -1, -1, v_dim)
+            scalar_width = v_dim
+        else:
+            beta_chunks = beta.reshape(B, H, num_chunks, chunk_size).unsqueeze(-1)
+            gc_chunks = g_cs.unsqueeze(-1)
+            gl_chunks = g_last_expanded.unsqueeze(-1)
+            scalar_width = 1
 
         BH = B * H
         query_chunks = query_chunks.reshape(
@@ -507,10 +519,10 @@ class NeuronGatedDeltaNet(nn.Module):
             BH, num_chunks, chunk_size, v_dim
         ).contiguous()
         beta_chunks = beta_chunks.reshape(
-            BH, num_chunks, chunk_size, 1
+            BH, num_chunks, chunk_size, scalar_width
         ).contiguous()
-        gc_chunks = gc_chunks.reshape(BH, num_chunks, chunk_size, 1).contiguous()
-        gl_chunks = gl_chunks.reshape(BH, num_chunks, chunk_size, 1).contiguous()
+        gc_chunks = gc_chunks.reshape(BH, num_chunks, chunk_size, scalar_width).contiguous()
+        gl_chunks = gl_chunks.reshape(BH, num_chunks, chunk_size, scalar_width).contiguous()
 
         device = query.device
         lower_mask = torch.tril(
@@ -544,7 +556,12 @@ class NeuronGatedDeltaNet(nn.Module):
                 gc_chunk = gc_chunks[bh, c_idx].contiguous()
                 gl_chunk = gl_chunks[bh, c_idx].contiguous()
 
-                out_chunk, state = _deltanet_nki_chunk_step(
+                chunk_kernel = (
+                    _deltanet_nki_chunk_step_direct_rhs_v2
+                    if self.use_direct_rhs_solve_v2
+                    else _deltanet_nki_chunk_step
+                )
+                out_chunk, state = chunk_kernel(
                     q_chunk,
                     k_chunk,
                     v_chunk,
@@ -1213,6 +1230,7 @@ class Qwen35InferenceConfig(InferenceConfig):
         kwargs.setdefault("use_hybrid_cache_manager", False)
         kwargs.setdefault("use_qwen_hybrid_chunked_prefill", False)
         kwargs.setdefault("use_qwen_hybrid_chunked_prefill_nki", False)
+        kwargs.setdefault("use_direct_rhs_solve_v2", False)
 
         super().__init__(*args, **kwargs)
 
