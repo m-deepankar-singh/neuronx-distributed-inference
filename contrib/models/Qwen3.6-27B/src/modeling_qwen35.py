@@ -291,6 +291,7 @@ class NeuronGatedDeltaNet(nn.Module):
             tc, "use_qwen_hybrid_chunked_prefill_nki", False
         )
         self.qwen_ablate_gdn = getattr(tc, "qwen_ablate_gdn", False)
+        self.qwen_ablate_gdn_core = getattr(tc, "qwen_ablate_gdn_core", False)
 
         # KV cache dummy shape info
         self.head_dim = tc.head_dim  # 256
@@ -1068,9 +1069,13 @@ class NeuronGatedDeltaNet(nn.Module):
             else:
                 recurrent_state = self.recurrent_state_buffer[:batch_size].float()
 
-            output, new_state = self._recurrent_step(
-                query, key, value, g, beta, recurrent_state
-            )
+            if self.qwen_ablate_gdn_core:
+                output = value * 0
+                new_state = recurrent_state
+            else:
+                output, new_state = self._recurrent_step(
+                    query, key, value, g, beta, recurrent_state
+                )
             new_state_bf16 = new_state.to(self.recurrent_state_buffer.dtype)
             alloc_bs = self.recurrent_state_buffer.shape[0]
             if hybrid_cache_active:
@@ -1106,7 +1111,10 @@ class NeuronGatedDeltaNet(nn.Module):
                         dtype=initial_state.dtype, device=initial_state.device
                     )
                     initial_state = initial_state * (1.0 - reset_mask[:, :, None, None])
-                if self.use_qwen_hybrid_chunked_prefill_nki:
+                if self.qwen_ablate_gdn_core:
+                    output = value * 0
+                    final_state = initial_state
+                elif self.use_qwen_hybrid_chunked_prefill_nki:
                     output, final_state = self._nki_chunked_forward(
                         query,
                         key,
@@ -1126,6 +1134,16 @@ class NeuronGatedDeltaNet(nn.Module):
                         output_final_state=True,
                         initial_state=initial_state,
                     )
+            elif self.qwen_ablate_gdn_core:
+                output = value * 0
+                final_state = torch.zeros(
+                    batch_size,
+                    self.num_v_heads,
+                    self.head_k_dim,
+                    self.head_v_dim,
+                    dtype=torch.float32,
+                    device=hidden_states.device,
+                )
             elif use_pytorch_chunk:
                 output, final_state = self._chunk_forward(
                     query, key, value, g, beta, output_final_state=True
@@ -1253,6 +1271,7 @@ class Qwen35InferenceConfig(InferenceConfig):
         kwargs.setdefault("use_qwen_hybrid_chunked_prefill_nki", False)
         kwargs.setdefault("qwen_ablate_mlp", False)
         kwargs.setdefault("qwen_ablate_gdn", False)
+        kwargs.setdefault("qwen_ablate_gdn_core", False)
         kwargs.setdefault("qwen_ablate_attention", False)
 
         super().__init__(*args, **kwargs)

@@ -210,6 +210,7 @@ def _build_config(args: argparse.Namespace):
     config_dict.setdefault("use_qwen_hybrid_chunked_prefill_nki", True)
     config_dict["qwen_ablate_mlp"] = args.ablate == "mlp"
     config_dict["qwen_ablate_gdn"] = args.ablate == "gdn"
+    config_dict["qwen_ablate_gdn_core"] = args.ablate == "gdn_core"
     config_dict["qwen_ablate_attention"] = args.ablate == "attention"
 
     inf_config = Qwen35InferenceConfig(neuron_config=neuron_config, **config_dict)
@@ -231,7 +232,7 @@ def main() -> int:
     parser.add_argument("--load-after-compile", action="store_true")
     parser.add_argument(
         "--ablate",
-        choices=("none", "mlp", "gdn", "attention"),
+        choices=("none", "mlp", "gdn", "gdn_core", "attention"),
         default="none",
         help="Measurement-only no-op ablation for isolating CTE layer-class cost.",
     )
