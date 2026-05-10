@@ -54,3 +54,8 @@ sequence plus APC acceleration, not yet throughput-scaled continuous batching.
 - `validation_scripts/qwen36_vllm_apc_hardening_report.md`
 - `validation_scripts/qwen36_vllm_apc_hardening_eval_20260510T101345Z.json`
 - `validation_scripts/qwen36_27b_vllm_long_chat_eval_20260510T101703Z.json`
+
+## Restore
+
+- Runbook: `validation_scripts/qwen36_vllm_apc_baseline_v3_restore_runbook.md`
+- One-command launcher: `contrib/models/Qwen3.6-27B/vllm/start_baseline_v3.sh`

@@ -119,6 +119,21 @@ recurrent state and conv state at block boundaries. If native APC does not
 produce exact greedy matches and a clear warm-hit speedup, the next step is a
 hybrid APC path that caches those GDN states alongside attention KV.
 
+Baseline v3 one-command restore/start:
+
+```bash
+contrib/models/Qwen3.6-27B/vllm/start_baseline_v3.sh \
+  --restart \
+  --install-registry
+```
+
+This uses the validated 128K FP8 MLP artifact, enables vLLM chunked prefill and
+native APC with `mamba-cache-mode=align`, keeps the backend on
+`127.0.0.1:8001`, exposes the guarded proxy on `:8000`, waits for readiness,
+and runs a short smoke request. See
+`validation_scripts/qwen36_vllm_apc_baseline_v3_restore_runbook.md` for the
+full new-instance runbook.
+
 Production chat proxy:
 
 ```bash
