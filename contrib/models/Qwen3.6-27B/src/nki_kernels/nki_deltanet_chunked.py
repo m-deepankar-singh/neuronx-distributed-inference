@@ -287,42 +287,50 @@ def deltanet_chunk_step(
     #   v_new = solve((I - A_mat), solve_rhs)
     #
     # A_mat is strictly lower triangular, so each row depends only on previous
-    # rows. This computes the needed RHS output directly instead of first
-    # materializing N = inv(I - A_mat).
+    # rows. This keeps the compiler-safe "full matmul + row select" structure
+    # used by the validated inverse solve, but applies it to the one RHS the
+    # model actually needs instead of materializing N = inv(I - A_mat).
     # ============================================================
     v_new = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.sbuf)
     nisa.memset(dst=v_new, value=0.0)
 
+    A_T_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
+    nisa.nc_transpose(dst=A_T_psum, data=A_mat)
+    A_T = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_copy(dst=A_T, src=A_T_psum)
+
     for solve_i in nl.static_range(P_MAX):
-        row_acc = nl.ndarray((1, dim), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_copy(
-            dst=row_acc[0:1, 0:dim],
-            src=solve_rhs[solve_i : solve_i + 1, 0:dim],
+        row_psum = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.psum)
+        nisa.nc_matmul(dst=row_psum, stationary=A_T, moving=v_new)
+        row_prod = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=row_prod, src=row_psum)
+
+        row_with_rhs = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_tensor(
+            dst=row_with_rhs,
+            data1=row_prod,
+            data2=solve_rhs,
+            op=nl.add,
         )
 
-        for prev_i in nl.static_range(P_MAX):
-            scaled_prev = nl.ndarray((1, dim), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.tensor_scalar(
-                dst=scaled_prev,
-                data=v_new[prev_i : prev_i + 1, 0:dim],
-                op0=nl.multiply,
-                operand0=A_mat[solve_i : solve_i + 1, prev_i : prev_i + 1],
-                engine=nisa.vector_engine,
-            )
-
-            row_next = nl.ndarray((1, dim), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.tensor_tensor(
-                dst=row_next,
-                data1=row_acc,
-                data2=scaled_prev,
-                op=nl.add,
-            )
-            nisa.tensor_copy(dst=row_acc, src=row_next)
-
+        row_mask = nl.ndarray((P_MAX, 1), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_copy(
-            dst=v_new[solve_i : solve_i + 1, 0:dim],
-            src=row_acc[0:1, 0:dim],
+            dst=row_mask[0:P_MAX, 0:1],
+            src=eye[0:P_MAX, solve_i : solve_i + 1],
         )
+
+        row_update = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_scalar(
+            dst=row_update,
+            data=row_with_rhs,
+            op0=nl.multiply,
+            operand0=row_mask,
+            engine=nisa.vector_engine,
+        )
+
+        v_next = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_tensor(dst=v_next, data1=v_new, data2=row_update, op=nl.add)
+        nisa.tensor_copy(dst=v_new, src=v_next)
 
     # ============================================================
     # Phase 2: Inter-chunk state propagation
