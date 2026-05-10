@@ -83,6 +83,9 @@ def main() -> int:
         f"{script_dir}:{contrib_root}:{os.environ.get('PYTHONPATH', '')}"
     )
     os.environ.setdefault("VLLM_NEURON_FRAMEWORK", "neuronx-distributed-inference")
+    os.environ.setdefault("VLLM_PLUGINS", "neuron")
+    if args.enable_vllm_chunked_prefill:
+        os.environ["DISABLE_NEURON_CUSTOM_SCHEDULER"] = "1"
     if args.compiled_artifacts:
         os.environ["NEURON_COMPILED_ARTIFACTS"] = str(
             Path(args.compiled_artifacts).expanduser().resolve()
@@ -106,6 +109,7 @@ def main() -> int:
             [{"role": "user", "content": args.prompt}],
             tokenize=False,
             add_generation_prompt=True,
+            enable_thinking=False,
         )
 
     additional_config = _override_config(args)

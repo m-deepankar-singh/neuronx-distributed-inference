@@ -139,6 +139,9 @@ def main() -> int:
     sys.path.insert(0, str(root))
     os.environ["PYTHONPATH"] = f"{vllm_dir}:{root}:{os.environ.get('PYTHONPATH', '')}"
     os.environ.setdefault("VLLM_NEURON_FRAMEWORK", "neuronx-distributed-inference")
+    os.environ.setdefault("VLLM_PLUGINS", "neuron")
+    if args.enable_vllm_chunked_prefill:
+        os.environ["DISABLE_NEURON_CUSTOM_SCHEDULER"] = "1"
     os.environ["NEURON_COMPILED_ARTIFACTS"] = str(
         Path(args.compiled_artifacts).expanduser().resolve()
     )
@@ -155,7 +158,7 @@ def main() -> int:
         [{"role": "user", "content": long_prompt(args.prefix_repeats)}],
         tokenize=False,
         add_generation_prompt=True,
-        chat_template_kwargs={"enable_thinking": False},
+        enable_thinking=False,
     )
 
     additional_config = override_config(args)

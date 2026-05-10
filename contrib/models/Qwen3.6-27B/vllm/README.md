@@ -182,6 +182,21 @@ python validation_scripts/qwen36_vllm_prefix_cache_offline.py \
   --mamba-cache-mode align
 ```
 
+Offline partial-prefix validation:
+
+```bash
+python validation_scripts/qwen36_vllm_prefix_cache_partial_offline.py \
+  --repo-root /home/ubuntu/inferentia-gdn \
+  --model-path /opt/dlami/nvme/models/Qwen3.6-27B \
+  --compiled-artifacts /opt/dlami/nvme/qwen_artifacts/qwen36_27b_128k_fp8_mlp_only_vllm_statereset_run1 \
+  --max-model-len 131072 \
+  --seq-len 131072 \
+  --cte-bucket 512 \
+  --block-size 256 \
+  --enable-vllm-chunked-prefill \
+  --mamba-cache-mode align
+```
+
 Server-side prefix-cache validation through the guarded proxy:
 
 ```bash
@@ -194,6 +209,13 @@ The acceptance gate is strict: repeated greedy calls must produce identical
 output, and warm-hit latency should be materially lower than cold-fill latency.
 For hybrid Qwen3.6, prefix-cache validation is not complete until the GDN
 recurrent/conv state behavior is proven, not just attention KV cache hits.
+
+Native APC validation run on Trn2 with the FP8 128K artifact:
+
+- server exact-repeat, `~10.8K` prompt tokens: `26.68s` cold to `1.67s` warm,
+  `16.0x` speedup, exact greedy text match;
+- offline exact-repeat, token IDs exposed: `26.19s` cold to `2.38s` warm,
+  `11.0x` speedup, exact greedy token-ID match.
 
 Validation run on Trn2 with the FP8 128K artifact:
 
