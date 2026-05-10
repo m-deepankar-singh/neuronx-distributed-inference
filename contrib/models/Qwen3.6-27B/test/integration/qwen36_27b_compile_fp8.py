@@ -210,6 +210,7 @@ def _build_config(args: argparse.Namespace):
     config_dict.setdefault("use_qwen_hybrid_chunked_prefill", True)
     config_dict.setdefault("use_qwen_hybrid_chunked_prefill_nki", True)
     config_dict.setdefault("use_direct_rhs_solve_v2", args.use_direct_rhs_solve_v2)
+    config_dict.setdefault("use_qwen_fused_gdn_prefill", args.use_fused_gdn_prefill)
 
     inf_config = Qwen35InferenceConfig(neuron_config=neuron_config, **config_dict)
     return inf_config, modules_to_not_convert
@@ -230,6 +231,7 @@ def main() -> int:
     parser.add_argument("--load-after-compile", action="store_true")
     parser.add_argument("--use-direct-rhs-solve-v2", action="store_true")
     parser.add_argument("--output-logits", action="store_true")
+    parser.add_argument("--use-fused-gdn-prefill", action="store_true")
     args = parser.parse_args()
 
     repo = _repo_root(args.repo_root)
@@ -257,6 +259,7 @@ def main() -> int:
                 "seq_len": args.seq_len,
                 "max_context_length": args.cte_bucket,
                 "context_encoding_buckets": [args.cte_bucket],
+                "use_qwen_fused_gdn_prefill": args.use_fused_gdn_prefill,
             },
             sort_keys=True,
         ),

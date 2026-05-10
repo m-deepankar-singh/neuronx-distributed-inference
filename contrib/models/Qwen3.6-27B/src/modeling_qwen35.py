@@ -294,6 +294,9 @@ class NeuronGatedDeltaNet(nn.Module):
             tc, "use_qwen_hybrid_chunked_prefill_nki", False
         )
         self.use_direct_rhs_solve_v2 = getattr(tc, "use_direct_rhs_solve_v2", False)
+        self.use_qwen_fused_gdn_prefill = getattr(
+            tc, "use_qwen_fused_gdn_prefill", False
+        )
 
         # KV cache dummy shape info
         self.head_dim = tc.head_dim  # 256
@@ -592,7 +595,14 @@ class NeuronGatedDeltaNet(nn.Module):
         return output, last_recurrent_state
 
     def _fused_chunked_forward(
-        self, query, key, value, g, beta, output_final_state=False
+        self,
+        query,
+        key,
+        value,
+        g,
+        beta,
+        output_final_state=False,
+        initial_state=None,
     ):
         """Fused single-kernel chunked forward for CTE — SSD-style.
 
@@ -637,6 +647,19 @@ class NeuronGatedDeltaNet(nn.Module):
         g_flat = g.reshape(BH, total_seq_len).unsqueeze(-1).contiguous()
         beta_flat = beta.reshape(BH, total_seq_len).unsqueeze(-1).contiguous()
 
+        if initial_state is None:
+            initial_state_flat = torch.zeros(
+                BH,
+                k_dim,
+                v_dim,
+                dtype=torch.float32,
+                device=query.device,
+            ).contiguous()
+        else:
+            initial_state_flat = (
+                initial_state.reshape(BH, k_dim, v_dim).float().contiguous()
+            )
+
         # Create constant mask tensors (shared across all B*H calls)
         device = query.device
         lower_mask = torch.tensor(
@@ -658,6 +681,7 @@ class NeuronGatedDeltaNet(nn.Module):
                 value_flat[bh],  # (S, 128)
                 g_flat[bh],  # (S, 1) — RAW g, not cumsum
                 beta_flat[bh],  # (S, 1) — sigmoid(b)
+                initial_state_flat[bh],  # (128, 128) — recurrent state
                 lower_mask,  # (128, 128)
                 identity_mat,  # (128, 128)
                 lower_mask_diag,  # (128, 128)
@@ -1085,7 +1109,19 @@ class NeuronGatedDeltaNet(nn.Module):
                         dtype=initial_state.dtype, device=initial_state.device
                     )
                     initial_state = initial_state * (1.0 - reset_mask[:, :, None, None])
-                if self.use_qwen_hybrid_chunked_prefill_nki:
+                if self.use_qwen_fused_gdn_prefill or os.environ.get(
+                    "USE_QWEN_FUSED_GDN_PREFILL"
+                ) == "1":
+                    output, final_state = self._fused_chunked_forward(
+                        query,
+                        key,
+                        value,
+                        g,
+                        beta,
+                        output_final_state=True,
+                        initial_state=initial_state,
+                    )
+                elif self.use_qwen_hybrid_chunked_prefill_nki:
                     output, final_state = self._nki_chunked_forward(
                         query,
                         key,
@@ -1231,6 +1267,7 @@ class Qwen35InferenceConfig(InferenceConfig):
         kwargs.setdefault("use_qwen_hybrid_chunked_prefill", False)
         kwargs.setdefault("use_qwen_hybrid_chunked_prefill_nki", False)
         kwargs.setdefault("use_direct_rhs_solve_v2", False)
+        kwargs.setdefault("use_qwen_fused_gdn_prefill", False)
 
         super().__init__(*args, **kwargs)
 
