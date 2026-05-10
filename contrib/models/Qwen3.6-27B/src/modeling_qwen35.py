@@ -73,6 +73,9 @@ from src.nki_kernels.nki_deltanet_fused import (
     deltanet_fused_chunked_fwd as _deltanet_fused_kernel,
 )
 from src.nki_kernels.nki_deltanet_fused import (
+    deltanet_fused_chunked_fwd_headgroup as _deltanet_fused_headgroup_kernel,
+)
+from src.nki_kernels.nki_deltanet_fused import (
     _make_lower_mask,
     _make_lower_mask_diag,
     _make_identity,
@@ -293,6 +296,10 @@ class NeuronGatedDeltaNet(nn.Module):
         self.use_qwen_fused_gdn_prefill = getattr(
             tc, "use_qwen_fused_gdn_prefill", False
         )
+        self.use_qwen_headgroup_gdn_prefill = getattr(
+            tc, "use_qwen_headgroup_gdn_prefill", False
+        )
+        self.qwen_gdn_head_group_size = int(getattr(tc, "qwen_gdn_head_group_size", 4))
 
         # KV cache dummy shape info
         self.head_dim = tc.head_dim  # 256
@@ -679,6 +686,129 @@ class NeuronGatedDeltaNet(nn.Module):
 
         if output_final_state:
             final_state = torch.stack(all_states, dim=0)
+            last_recurrent_state = final_state.reshape(B, H, k_dim, v_dim)
+        else:
+            last_recurrent_state = None
+
+        return output, last_recurrent_state
+
+    def _fused_chunked_forward_headgroup(
+        self,
+        query,
+        key,
+        value,
+        g,
+        beta,
+        output_final_state=False,
+        initial_state=None,
+    ):
+        """Grouped-head fused DeltaNet CTE path.
+
+        This is intentionally a launch-count optimization only: the NKI kernel
+        still runs the validated per-head math, but processes a fixed group of
+        local heads inside one dispatch.
+        """
+        chunk_size = 128
+
+        query = l2norm(query, dim=-1)
+        key = l2norm(key, dim=-1)
+        B, H, S, k_dim = query.shape
+        v_dim = value.shape[-1]
+        scale = 1.0 / (k_dim**0.5)
+        query = query * scale
+
+        head_group_size = self.qwen_gdn_head_group_size
+        if head_group_size <= 0:
+            raise ValueError(f"qwen_gdn_head_group_size must be positive, got {head_group_size}")
+
+        pad_size = (chunk_size - S % chunk_size) % chunk_size
+        if pad_size > 0:
+            query = F.pad(query, (0, 0, 0, pad_size))
+            key = F.pad(key, (0, 0, 0, pad_size))
+            value = F.pad(value, (0, 0, 0, pad_size))
+            beta = F.pad(beta, (0, pad_size))
+            g = F.pad(g, (0, pad_size))
+        total_seq_len = S + pad_size
+
+        BH = B * H
+        if BH % head_group_size != 0:
+            raise ValueError(
+                f"B*H={BH} must be divisible by qwen_gdn_head_group_size={head_group_size}"
+            )
+
+        query_flat = query.reshape(BH, total_seq_len, k_dim).contiguous()
+        key_flat = key.reshape(BH, total_seq_len, k_dim).contiguous()
+        value_flat = value.reshape(BH, total_seq_len, v_dim).contiguous()
+        g_flat = g.reshape(BH, total_seq_len).unsqueeze(-1).contiguous()
+        beta_flat = beta.reshape(BH, total_seq_len).unsqueeze(-1).contiguous()
+
+        if initial_state is None:
+            initial_state_flat = torch.zeros(
+                BH,
+                k_dim,
+                v_dim,
+                dtype=torch.float32,
+                device=query.device,
+            ).contiguous()
+        else:
+            initial_state_flat = (
+                initial_state.reshape(BH, k_dim, v_dim).float().contiguous()
+            )
+
+        num_head_groups = BH // head_group_size
+        query_groups = query_flat.reshape(
+            num_head_groups, head_group_size, total_seq_len, k_dim
+        ).contiguous()
+        key_groups = key_flat.reshape(
+            num_head_groups, head_group_size, total_seq_len, k_dim
+        ).contiguous()
+        value_groups = value_flat.reshape(
+            num_head_groups, head_group_size, total_seq_len, v_dim
+        ).contiguous()
+        g_groups = g_flat.reshape(
+            num_head_groups, head_group_size, total_seq_len, 1
+        ).contiguous()
+        beta_groups = beta_flat.reshape(
+            num_head_groups, head_group_size, total_seq_len, 1
+        ).contiguous()
+        state_groups = initial_state_flat.reshape(
+            num_head_groups, head_group_size, k_dim, v_dim
+        ).contiguous()
+
+        device = query.device
+        lower_mask = torch.tensor(
+            _make_lower_mask(), dtype=torch.float32, device=device
+        )
+        identity_mat = torch.tensor(
+            _make_identity(), dtype=torch.float32, device=device
+        )
+        lower_mask_diag = torch.tensor(
+            _make_lower_mask_diag(), dtype=torch.float32, device=device
+        )
+
+        all_outputs = []
+        all_states = []
+        for group_idx in range(num_head_groups):
+            out_group, state_group = _deltanet_fused_headgroup_kernel(
+                query_groups[group_idx],
+                key_groups[group_idx],
+                value_groups[group_idx],
+                g_groups[group_idx],
+                beta_groups[group_idx],
+                state_groups[group_idx],
+                lower_mask,
+                identity_mat,
+                lower_mask_diag,
+            )
+            all_outputs.append(out_group)
+            all_states.append(state_group)
+
+        output = torch.cat(all_outputs, dim=0)
+        output = output.reshape(B, H, total_seq_len, v_dim)
+        output = output[:, :, :S]
+
+        if output_final_state:
+            final_state = torch.cat(all_states, dim=0)
             last_recurrent_state = final_state.reshape(B, H, k_dim, v_dim)
         else:
             last_recurrent_state = None
@@ -1096,15 +1226,28 @@ class NeuronGatedDeltaNet(nn.Module):
                 if self.use_qwen_fused_gdn_prefill or os.environ.get(
                     "USE_QWEN_FUSED_GDN_PREFILL"
                 ) == "1":
-                    output, final_state = self._fused_chunked_forward(
-                        query,
-                        key,
-                        value,
-                        g,
-                        beta,
-                        output_final_state=True,
-                        initial_state=initial_state,
-                    )
+                    if self.use_qwen_headgroup_gdn_prefill or os.environ.get(
+                        "USE_QWEN_HEADGROUP_GDN_PREFILL"
+                    ) == "1":
+                        output, final_state = self._fused_chunked_forward_headgroup(
+                            query,
+                            key,
+                            value,
+                            g,
+                            beta,
+                            output_final_state=True,
+                            initial_state=initial_state,
+                        )
+                    else:
+                        output, final_state = self._fused_chunked_forward(
+                            query,
+                            key,
+                            value,
+                            g,
+                            beta,
+                            output_final_state=True,
+                            initial_state=initial_state,
+                        )
                 elif self.use_qwen_hybrid_chunked_prefill_nki:
                     output, final_state = self._nki_chunked_forward(
                         query,
@@ -1251,6 +1394,8 @@ class Qwen35InferenceConfig(InferenceConfig):
         kwargs.setdefault("use_qwen_hybrid_chunked_prefill", False)
         kwargs.setdefault("use_qwen_hybrid_chunked_prefill_nki", False)
         kwargs.setdefault("use_qwen_fused_gdn_prefill", False)
+        kwargs.setdefault("use_qwen_headgroup_gdn_prefill", False)
+        kwargs.setdefault("qwen_gdn_head_group_size", 4)
 
         super().__init__(*args, **kwargs)
 

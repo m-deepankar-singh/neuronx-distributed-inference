@@ -209,6 +209,10 @@ def _build_config(args: argparse.Namespace):
     config_dict.setdefault("use_qwen_hybrid_chunked_prefill", True)
     config_dict.setdefault("use_qwen_hybrid_chunked_prefill_nki", True)
     config_dict.setdefault("use_qwen_fused_gdn_prefill", args.use_fused_gdn_prefill)
+    config_dict.setdefault(
+        "use_qwen_headgroup_gdn_prefill", args.use_headgroup_gdn_prefill
+    )
+    config_dict.setdefault("qwen_gdn_head_group_size", args.gdn_head_group_size)
 
     inf_config = Qwen35InferenceConfig(neuron_config=neuron_config, **config_dict)
     return inf_config, modules_to_not_convert
@@ -228,6 +232,8 @@ def main() -> int:
     parser.add_argument("--quantize-only", action="store_true")
     parser.add_argument("--load-after-compile", action="store_true")
     parser.add_argument("--use-fused-gdn-prefill", action="store_true")
+    parser.add_argument("--use-headgroup-gdn-prefill", action="store_true")
+    parser.add_argument("--gdn-head-group-size", type=int, default=4)
     args = parser.parse_args()
 
     repo = _repo_root(args.repo_root)
@@ -256,6 +262,8 @@ def main() -> int:
                 "max_context_length": args.cte_bucket,
                 "context_encoding_buckets": [args.cte_bucket],
                 "use_qwen_fused_gdn_prefill": args.use_fused_gdn_prefill,
+                "use_qwen_headgroup_gdn_prefill": args.use_headgroup_gdn_prefill,
+                "qwen_gdn_head_group_size": args.gdn_head_group_size,
             },
             sort_keys=True,
         ),
