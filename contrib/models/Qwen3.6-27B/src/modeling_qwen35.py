@@ -2175,9 +2175,18 @@ class NeuronQwen35Model(NeuronBaseModel):
         # sequence positions through a linear recurrence.  Padding tokens have
         # real embedding vectors which corrupt the recurrence state.
         # The mask is [B, S, 1] float with 1.0 for real tokens, 0.0 for padding.
-        deltanet_padding_mask = (
-            (input_ids != self.padding_idx).unsqueeze(-1).to(inputs_embeds.dtype)
-        )
+        if (
+            is_for_context_encoding
+            and attention_mask is not None
+            and attention_mask.ndim == 2
+        ):
+            deltanet_padding_mask = attention_mask.unsqueeze(-1).to(
+                inputs_embeds.dtype
+            )
+        else:
+            deltanet_padding_mask = (
+                (input_ids != self.padding_idx).unsqueeze(-1).to(inputs_embeds.dtype)
+            )
         if is_for_context_encoding:
             inputs_embeds = inputs_embeds * deltanet_padding_mask
 
