@@ -43,6 +43,17 @@ Gate:
 - If it is neutral, keep only if it simplifies the next recurrent-core rewrite.
 - If it regresses or mismatches tokens, revert.
 
+Result on Trn2:
+- Compile succeeded.
+- CTE HLO generation dropped from the baseline ~105s to 14.6s.
+- Runtime was neutral: 512-token ~412 tok/s, 2K ~413 tok/s, 16K ~417 tok/s.
+- Smoke prompt returned the correct answer (`391`).
+
+Conclusion: expanded scalar inputs were a graph/compile-time problem, not the
+steady-state prefill wall. Keep the compact path because it simplifies the graph
+and makes follow-on kernel work cheaper to compile, but do not count it as a
+runtime speedup.
+
 ## Phase 2: Remove Constant Mask HBM Inputs
 
 Problem: every microchunk call receives `lower_mask`, `identity`, and
@@ -62,6 +73,10 @@ Gate:
 Target only after Phase 1/2 establish a clean baseline.
 
 Directions:
+- Run a solve-isolation ablation first: replace `N = inv(I - A)` with `N = I`
+  in a measurement-only artifact. If it approaches the recurrent-core no-op
+  speed, the triangular solve is the highest ROI target. If not, the state
+  interaction matmuls and output construction dominate.
 - Reduce transpose count around `N`, `q`, `k`, `k_cumdecay`, and `attn_intra`.
 - Preserve the stable triangular solve until a replacement proves exact enough.
 - Try a recurrence-oriented layout where the free dimension is reused more
