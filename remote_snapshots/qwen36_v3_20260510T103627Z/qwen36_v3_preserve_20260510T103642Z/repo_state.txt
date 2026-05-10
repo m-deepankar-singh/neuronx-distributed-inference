@@ -1,0 +1,28 @@
+date_utc=2026-05-10T10:36:42Z
+hostname=ip-172-31-36-87
+pwd=/home/ubuntu/inferentia-gdn
+## codex/qwen36-vllm-support...origin/codex/qwen36-vllm-support
+ M contrib/models/Qwen3.6-27B/src/modeling_qwen35.py
+ M contrib/models/Qwen3.6-27B/vllm/README.md
+ M contrib/models/Qwen3.6-27B/vllm/run_offline_inference.py
+ M contrib/models/Qwen3.6-27B/vllm/start_vllm_server.sh
+ M validation_scripts/qwen36_27b_128k_fp8_cte512_eval.py
+ M validation_scripts/qwen36_27b_chat_quality_eval.py
+?? contrib/models/Qwen3.6-27B/vllm/qwen36_chat_proxy.py
+?? contrib/models/Qwen3.6-27B/vllm/serve_qwen36.py
+?? validation_scripts/qwen36_27b_vllm_concurrency_eval.py
+?? validation_scripts/qwen36_27b_vllm_long_chat_eval.py
+?? validation_scripts/qwen36_prefix_cache_validation.py
+?? validation_scripts/qwen36_vllm_apc_server_hardening_eval.py
+?? validation_scripts/qwen36_vllm_prefix_cache_offline.py
+?? validation_scripts/qwen36_vllm_prefix_cache_partial_offline.py
+b06ad77 Make Qwen3.6 vLLM smoke usable
+0885965 Avoid vLLM imports in Neuron sitecustomize
+bc8549a Register Qwen3.6 vLLM architecture alias
+97c744a Register Qwen3.6 HF config for vLLM
+099172a Add Qwen3.6 vLLM support scaffold
+0257c01 Fix Qwen OpenAI greedy quality path
+a561ad8 Add Qwen 128K FP8 evaluation results
+f9f9112 Add Qwen 128K FP8 eval harness
+qwen36-27b-baseline-v1
+qwen36-27b-baseline-v2

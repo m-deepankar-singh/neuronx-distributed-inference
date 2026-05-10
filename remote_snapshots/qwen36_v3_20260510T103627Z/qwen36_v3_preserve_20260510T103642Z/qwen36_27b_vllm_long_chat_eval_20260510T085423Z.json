@@ -1,0 +1,58 @@
+{
+  "metadata": {
+    "started_utc": "2026-05-10T08:53:06.928299+00:00",
+    "base_url": "http://127.0.0.1:8000",
+    "model": "/opt/dlami/nvme/models/Qwen3.6-27B",
+    "model_path": "/opt/dlami/nvme/models/Qwen3.6-27B"
+  },
+  "cases": [
+    {
+      "name": "math_no_kwargs_proxy_injection",
+      "wall_s": 1.3704338309908053,
+      "usage": {
+        "prompt_tokens": 41,
+        "total_tokens": 46,
+        "completion_tokens": 5,
+        "prompt_tokens_details": null
+      },
+      "expected_contains": [
+        "3151"
+      ],
+      "contains_expected": true,
+      "text_prefix": "3151"
+    },
+    {
+      "name": "olympics_no_kwargs_proxy_injection",
+      "wall_s": 2.970812109997496,
+      "usage": {
+        "prompt_tokens": 48,
+        "total_tokens": 96,
+        "completion_tokens": 48,
+        "prompt_tokens_details": null
+      },
+      "expected_contains": [
+        "Tokyo"
+      ],
+      "contains_expected": true,
+      "text_prefix": "The 2020 Summer Olympics were held in Tokyo, Japan, and were unusual because they were postponed to 2021 due to the COVID-19 pandemic while retaining the \"2020\" name."
+    },
+    {
+      "name": "needle_32k_chat",
+      "wall_s": 72.21100270099123,
+      "usage": {
+        "prompt_tokens": 30638,
+        "total_tokens": 30657,
+        "completion_tokens": 19,
+        "prompt_tokens_details": null
+      },
+      "expected_contains": [
+        "ORCHID-17",
+        "TITAN-42",
+        "VIOLET-91"
+      ],
+      "contains_expected": true,
+      "text_prefix": "ORCHID-17 TITAN-42 VIOLET-91"
+    }
+  ],
+  "finished_utc": "2026-05-10T08:54:23.481329+00:00"
+}
