@@ -1,0 +1,86 @@
+{
+  "metadata": {
+    "started_utc": "2026-05-09T21:37:14.061983+00:00",
+    "model": "qwen3.6-27b-neuron-128k-fp8-mlp",
+    "base_url": "http://127.0.0.1:8000"
+  },
+  "cases": [
+    {
+      "name": "math",
+      "wall_s": 2.421569153000746,
+      "x_latency_s": 2.4017022989974066,
+      "usage": {
+        "prompt_tokens": 41,
+        "completion_tokens": 32,
+        "total_tokens": 73
+      },
+      "expected_contains": [
+        "3151"
+      ],
+      "contains_expected": false,
+      "text": "</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n"
+    },
+    {
+      "name": "olympics",
+      "wall_s": 4.782965107999189,
+      "x_latency_s": 4.781108350001887,
+      "usage": {
+        "prompt_tokens": 43,
+        "completion_tokens": 96,
+        "total_tokens": 139
+      },
+      "expected_contains": [
+        "Tokyo"
+      ],
+      "contains_expected": false,
+      "text": "</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n"
+    },
+    {
+      "name": "json",
+      "wall_s": 4.176769788999081,
+      "x_latency_s": 4.175067118998413,
+      "usage": {
+        "prompt_tokens": 37,
+        "completion_tokens": 80,
+        "total_tokens": 117
+      },
+      "expected_contains": [
+        "cat",
+        "3"
+      ],
+      "contains_expected": false,
+      "text": "</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n"
+    },
+    {
+      "name": "mgs_summary",
+      "wall_s": 4.182209695001802,
+      "x_latency_s": 4.180554694998136,
+      "usage": {
+        "prompt_tokens": 30,
+        "completion_tokens": 80,
+        "total_tokens": 110
+      },
+      "expected_contains": [
+        "Metal"
+      ],
+      "contains_expected": false,
+      "text": "</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n"
+    },
+    {
+      "name": "refusal_safe",
+      "wall_s": 4.771124070000951,
+      "x_latency_s": 4.769486139000946,
+      "usage": {
+        "prompt_tokens": 35,
+        "completion_tokens": 96,
+        "total_tokens": 131
+      },
+      "expected_contains": [
+        "key"
+      ],
+      "contains_expected": false,
+      "text": "</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n"
+    }
+  ],
+  "finished_utc": "2026-05-09T21:37:34.397175+00:00"
+}
