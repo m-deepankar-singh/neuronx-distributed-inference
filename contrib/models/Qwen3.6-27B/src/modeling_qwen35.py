@@ -2413,12 +2413,18 @@ class NeuronQwen35Model(NeuronBaseModel):
                 pass
             else:
                 if getattr(self.config, "use_qwen_hybrid_chunked_prefill", False):
-                    index = (
-                        (input_ids != self.padding_idx)
-                        .sum(dim=1, keepdim=True)
-                        .long()
-                        - 1
-                    ).clamp(min=0)
+                    if attention_mask is not None and attention_mask.ndim == 2:
+                        index = (
+                            attention_mask.to(torch.long).sum(dim=1, keepdim=True)
+                            - 1
+                        ).clamp(min=0)
+                    else:
+                        index = (
+                            (input_ids != self.padding_idx)
+                            .sum(dim=1, keepdim=True)
+                            .long()
+                            - 1
+                        ).clamp(min=0)
                 else:
                     index = torch.max(position_ids, dim=1, keepdim=True).indices
                 index = index.unsqueeze(1).expand(batch_size, 1, self.hidden_size)
