@@ -29,6 +29,7 @@ if [[ -z "${VENV}" || ! -x "${VENV}/bin/python" ]]; then
 fi
 
 PYTHON="${VENV}/bin/python"
+export PATH="${VENV}/bin:${PATH}"
 export PYTHONPATH="${CONTRIB_ROOT}:${PYTHONPATH:-}"
 
 echo "vLLM/Neuron env : ${VENV}"

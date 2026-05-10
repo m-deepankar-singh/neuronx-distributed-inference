@@ -35,7 +35,7 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONTRIB_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-export PYTHONPATH="${CONTRIB_ROOT}:${PYTHONPATH:-}"
+export PYTHONPATH="${SCRIPT_DIR}:${CONTRIB_ROOT}:${PYTHONPATH:-}"
 export VLLM_NEURON_FRAMEWORK="neuronx-distributed-inference"
 export VLLM_PLUGINS="${VLLM_PLUGINS:-neuron}"
 

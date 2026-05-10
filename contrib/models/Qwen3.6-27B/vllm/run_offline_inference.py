@@ -55,13 +55,21 @@ def main() -> int:
     args = parser.parse_args()
 
     contrib_root = _contrib_root(args.repo_root)
+    script_dir = Path(__file__).resolve().parent
+    sys.path.insert(0, str(script_dir))
     sys.path.insert(0, str(contrib_root))
-    os.environ["PYTHONPATH"] = f"{contrib_root}:{os.environ.get('PYTHONPATH', '')}"
+    os.environ["PYTHONPATH"] = (
+        f"{script_dir}:{contrib_root}:{os.environ.get('PYTHONPATH', '')}"
+    )
     os.environ.setdefault("VLLM_NEURON_FRAMEWORK", "neuronx-distributed-inference")
     if args.compiled_artifacts:
         os.environ["NEURON_COMPILED_ARTIFACTS"] = str(
             Path(args.compiled_artifacts).expanduser().resolve()
         )
+
+    from hf_qwen35_config import register_qwen35_config  # noqa: WPS433
+
+    register_qwen35_config()
 
     from vllm import LLM, SamplingParams  # noqa: WPS433
 
