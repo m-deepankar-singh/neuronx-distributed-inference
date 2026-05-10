@@ -201,7 +201,7 @@ def _build_config(args: argparse.Namespace):
         quantization_dtype="f8e4m3",
         modules_to_not_convert=modules_to_not_convert,
         kv_cache_quant=False,
-        quantized_mlp_kernel_enabled=False,
+        quantized_mlp_kernel_enabled=args.enable_quantized_mlp_kernel,
         activation_quantization_type=None,
     )
 
@@ -226,6 +226,7 @@ def main() -> int:
     parser.add_argument("--force-quantize", action="store_true")
     parser.add_argument("--quantize-only", action="store_true")
     parser.add_argument("--load-after-compile", action="store_true")
+    parser.add_argument("--enable-quantized-mlp-kernel", action="store_true")
     args = parser.parse_args()
 
     repo = _repo_root(args.repo_root)
@@ -253,6 +254,7 @@ def main() -> int:
                 "seq_len": args.seq_len,
                 "max_context_length": args.cte_bucket,
                 "context_encoding_buckets": [args.cte_bucket],
+                "quantized_mlp_kernel_enabled": args.enable_quantized_mlp_kernel,
             },
             sort_keys=True,
         ),
