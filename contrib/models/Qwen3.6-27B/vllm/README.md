@@ -76,7 +76,7 @@ Precompiled artifact path:
 ```bash
 contrib/models/Qwen3.6-27B/vllm/start_vllm_server.sh \
   --model-path /opt/dlami/nvme/models/Qwen3.6-27B \
-  --compiled-artifacts /opt/dlami/nvme/qwen_artifacts/qwen36_27b_128k_fp8_mlp_only_run1 \
+  --compiled-artifacts /opt/dlami/nvme/qwen_artifacts/qwen36_27b_128k_fp8_mlp_only_vllm_qualityfix_run1 \
   --max-model-len 131072 \
   --seq-len 131072 \
   --cte-bucket 512 \
@@ -88,7 +88,7 @@ Long-prompt precompiled artifact path:
 ```bash
 contrib/models/Qwen3.6-27B/vllm/start_vllm_server.sh \
   --model-path /opt/dlami/nvme/models/Qwen3.6-27B \
-  --compiled-artifacts /opt/dlami/nvme/qwen_artifacts/qwen36_27b_128k_fp8_mlp_only_run1 \
+  --compiled-artifacts /opt/dlami/nvme/qwen_artifacts/qwen36_27b_128k_fp8_mlp_only_vllm_qualityfix_run1 \
   --max-model-len 131072 \
   --seq-len 131072 \
   --cte-bucket 512 \
@@ -102,7 +102,7 @@ Offline long-prompt smoke:
 ```bash
 python contrib/models/Qwen3.6-27B/vllm/run_offline_inference.py \
   --model-path /opt/dlami/nvme/models/Qwen3.6-27B \
-  --compiled-artifacts /opt/dlami/nvme/qwen_artifacts/qwen36_27b_128k_fp8_mlp_only_run1 \
+  --compiled-artifacts /opt/dlami/nvme/qwen_artifacts/qwen36_27b_128k_fp8_mlp_only_vllm_qualityfix_run1 \
   --max-model-len 131072 \
   --seq-len 131072 \
   --cte-bucket 512 \
@@ -117,19 +117,23 @@ PY
 
 Validation run on Trn2 with the FP8 128K artifact:
 
-- short prompt loaded and generated through vLLM;
-- ~1K prompt with `--enable-vllm-chunked-prefill` completed in 3.705s;
-- ~4K prompt that fails without chunking completed in 11.007s and generated
-  valid token IDs.
-- OpenAI-compatible `/v1/chat/completions` served a 1215-token prompt in
-  3.87s with valid usage accounting.
+- fixed artifact: `/opt/dlami/nvme/qwen_artifacts/qwen36_27b_128k_fp8_mlp_only_vllm_qualityfix_run1`;
+- OpenAI-compatible `/v1/chat/completions` passes 5/5 focused quality checks
+  when requests include `chat_template_kwargs={"enable_thinking": false}`;
+- measured prefill is `404-428 tok/s` from 512 through 64K prompt tokens;
+- measured decode is `26.3-26.6 tok/s`;
+- peak Neuron device memory is about `53.25 GB` decimal for the 64K eval.
+
+Raw `/v1/completions` prompts are not chat-templated and can still repeat prompt
+suffixes. Use `/v1/chat/completions` for production calls, or pass a fully
+rendered Qwen chat prompt to `/v1/completions`.
 
 ## Offline Smoke
 
 ```bash
 python contrib/models/Qwen3.6-27B/vllm/run_offline_inference.py \
   --model-path /opt/dlami/nvme/models/Qwen3.6-27B \
-  --compiled-artifacts /opt/dlami/nvme/qwen_artifacts/qwen36_27b_128k_fp8_mlp_only_run1 \
+  --compiled-artifacts /opt/dlami/nvme/qwen_artifacts/qwen36_27b_128k_fp8_mlp_only_vllm_qualityfix_run1 \
   --max-model-len 131072 \
   --seq-len 131072 \
   --cte-bucket 512 \
