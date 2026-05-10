@@ -18,23 +18,36 @@ def _contrib_root(repo_root: str | None) -> Path:
 
 
 def _override_config(args: argparse.Namespace) -> dict:
+    neuron_config = {
+        "tp_degree": args.tensor_parallel_size,
+        "batch_size": args.max_num_seqs,
+        "ctx_batch_size": 1,
+        "tkg_batch_size": args.max_num_seqs,
+        "seq_len": args.seq_len,
+        "max_length": args.seq_len,
+        "max_context_length": args.cte_bucket,
+        "context_encoding_buckets": [args.cte_bucket],
+        "token_generation_buckets": [args.seq_len],
+        "enable_bucketing": False,
+        "logical_nc_config": args.logical_nc_config,
+        "torch_dtype": "bfloat16",
+        "save_sharded_checkpoint": True,
+    }
+    if args.enable_vllm_chunked_prefill:
+        neuron_config.update(
+            {
+                "is_block_kv_layout": True,
+                "chunked_prefill_config": {
+                    "max_num_seqs": args.max_num_seqs,
+                    "tkg_model_enabled": True,
+                    "kernel_q_tile_size": 128,
+                    "kernel_kv_tile_size": 1024,
+                },
+            }
+        )
     return {
         "max_prompt_length": args.cte_bucket,
-        "override_neuron_config": {
-            "tp_degree": args.tensor_parallel_size,
-            "batch_size": args.max_num_seqs,
-            "ctx_batch_size": 1,
-            "tkg_batch_size": args.max_num_seqs,
-            "seq_len": args.seq_len,
-            "max_length": args.seq_len,
-            "max_context_length": args.cte_bucket,
-            "context_encoding_buckets": [args.cte_bucket],
-            "token_generation_buckets": [args.seq_len],
-            "enable_bucketing": False,
-            "logical_nc_config": args.logical_nc_config,
-            "torch_dtype": "bfloat16",
-            "save_sharded_checkpoint": True,
-        }
+        "override_neuron_config": neuron_config,
     }
 
 
@@ -45,6 +58,7 @@ def main() -> int:
     parser.add_argument("--compiled-artifacts", default=None)
     parser.add_argument("--prompt", default="What is 17 * 23? Answer with the number only.")
     parser.add_argument("--chat", action="store_true")
+    parser.add_argument("--enable-vllm-chunked-prefill", action="store_true")
     parser.add_argument("--max-tokens", type=int, default=64)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-k", type=int, default=1)
@@ -54,6 +68,7 @@ def main() -> int:
     parser.add_argument("--max-model-len", type=int, default=512)
     parser.add_argument("--seq-len", type=int, default=512)
     parser.add_argument("--cte-bucket", type=int, default=512)
+    parser.add_argument("--block-size", type=int, default=256)
     args = parser.parse_args()
 
     contrib_root = _contrib_root(args.repo_root)
@@ -92,17 +107,21 @@ def main() -> int:
     additional_config = _override_config(args)
     print("VLLM_QWEN36_CONFIG", json.dumps(additional_config, sort_keys=True), flush=True)
 
-    llm = LLM(
-        model=str(Path(args.model_path).expanduser().resolve()),
-        trust_remote_code=True,
-        dtype="bfloat16",
-        tensor_parallel_size=args.tensor_parallel_size,
-        max_num_seqs=args.max_num_seqs,
-        max_model_len=args.max_model_len,
-        enable_prefix_caching=False,
-        enable_chunked_prefill=False,
-        additional_config=additional_config,
-    )
+    llm_kwargs = {
+        "model": str(Path(args.model_path).expanduser().resolve()),
+        "trust_remote_code": True,
+        "dtype": "bfloat16",
+        "tensor_parallel_size": args.tensor_parallel_size,
+        "max_num_seqs": args.max_num_seqs,
+        "max_model_len": args.max_model_len,
+        "enable_prefix_caching": False,
+        "enable_chunked_prefill": args.enable_vllm_chunked_prefill,
+        "additional_config": additional_config,
+    }
+    if args.enable_vllm_chunked_prefill:
+        llm_kwargs["max_num_batched_tokens"] = args.cte_bucket
+        llm_kwargs["block_size"] = args.block_size
+    llm = LLM(**llm_kwargs)
 
     sampling = SamplingParams(
         temperature=args.temperature,

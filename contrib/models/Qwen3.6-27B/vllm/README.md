@@ -3,10 +3,9 @@
 This folder contains the first-pass vLLM integration helpers for the
 Qwen3.6-27B contrib model.
 
-The current goal is **basic vLLM serving through the Neuron/NxDI plugin**.
-Long-context production serving still needs a model-specific chunked-prefill
-shim because the validated Qwen3.6 artifact uses a 512-token context-encoding
-graph with a 128K cache.
+The current goal is **vLLM serving through the Neuron/NxDI plugin** for the
+validated Qwen3.6 artifact, including long prompts through vLLM's native
+chunked-prefill scheduler.
 
 ## Which vLLM Neuron Package?
 
@@ -31,13 +30,14 @@ using the current AWS guide, then run the contrib registry patch below.
   `NEURON_COMPILED_ARTIFACTS`.
 - Run a short OpenAI-compatible smoke prompt.
 
-## Known Limitation
+## Chunked Prefill Note
 
-AWS Neuron vLLM currently lists chunked prefill as unsupported. This matters for
-this model: the 128K artifact is compiled with `seq_len=131072` but
-`max_context_length=512`, so prompts longer than the context bucket require our
-standalone chunked prefill driver until we port that driver into the vLLM model
-runner.
+The Neuron plugin disables vLLM chunked prefill by default and installs a custom
+continuous-batching scheduler. For this Qwen3.6 artifact we need vLLM's native
+chunked-prefill scheduler so prompts longer than the 512-token context graph are
+fed to the precompiled model in 512-token chunks. The launcher sets
+`DISABLE_NEURON_CUSTOM_SCHEDULER=1` when `--enable-vllm-chunked-prefill` is
+passed.
 
 ## Install The Contrib Registry Patch
 
@@ -81,8 +81,46 @@ contrib/models/Qwen3.6-27B/vllm/start_vllm_server.sh \
   --port 8000
 ```
 
-For now, send prompts that fit within the compiled context bucket unless you are
-testing the later vLLM chunked-prefill shim.
+Long-prompt precompiled artifact path:
+
+```bash
+contrib/models/Qwen3.6-27B/vllm/start_vllm_server.sh \
+  --model-path /opt/dlami/nvme/models/Qwen3.6-27B \
+  --compiled-artifacts /opt/dlami/nvme/qwen_artifacts/qwen36_27b_128k_fp8_mlp_only_run1 \
+  --max-model-len 131072 \
+  --seq-len 131072 \
+  --cte-bucket 512 \
+  --block-size 256 \
+  --enable-vllm-chunked-prefill \
+  --port 8000
+```
+
+Offline long-prompt smoke:
+
+```bash
+python contrib/models/Qwen3.6-27B/vllm/run_offline_inference.py \
+  --model-path /opt/dlami/nvme/models/Qwen3.6-27B \
+  --compiled-artifacts /opt/dlami/nvme/qwen_artifacts/qwen36_27b_128k_fp8_mlp_only_run1 \
+  --max-model-len 131072 \
+  --seq-len 131072 \
+  --cte-bucket 512 \
+  --block-size 256 \
+  --enable-vllm-chunked-prefill \
+  --chat \
+  --prompt "$(python - <<'PY'
+print('Summarize this document in one paragraph. ' + 'Neuron inference ' * 700)
+PY
+)"
+```
+
+Validation run on Trn2 with the FP8 128K artifact:
+
+- short prompt loaded and generated through vLLM;
+- ~1K prompt with `--enable-vllm-chunked-prefill` completed in 3.705s;
+- ~4K prompt that fails without chunking completed in 11.007s and generated
+  valid token IDs.
+- OpenAI-compatible `/v1/chat/completions` served a 1215-token prompt in
+  3.87s with valid usage accounting.
 
 ## Offline Smoke
 
@@ -99,11 +137,5 @@ python contrib/models/Qwen3.6-27B/vllm/run_offline_inference.py \
 
 ## Next Milestone
 
-After basic vLLM load works, port the standalone NxDI server's chunked prefill
-driver into the vLLM/Neuron model-runner path:
-
-1. split long prompts into 512-token chunks;
-2. run the compiled context model repeatedly;
-3. preserve attention KV plus GDN recurrent/conv state across chunks;
-4. hand off to token generation;
-5. exact-match greedy tokens against the standalone NxDI server.
+Validate multi-turn prompts with `--enable-vllm-chunked-prefill`, then measure
+TTFT/TPOT under concurrent requests.
