@@ -31,7 +31,11 @@ def request_json(url: str, payload: dict[str, Any] | None = None, timeout: int =
         )
     t0 = time.perf_counter()
     with urllib.request.urlopen(req, timeout=timeout) as response:
-        data = json.loads(response.read())
+        raw = response.read()
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        data = {"status": raw.decode("utf-8", errors="replace")}
     return data, time.perf_counter() - t0
 
 
@@ -44,6 +48,7 @@ def completion(base_url: str, model: str, prompt: str, max_tokens: int, timeout:
             "max_tokens": max_tokens,
             "temperature": 0,
             "top_k": 1,
+            "top_p": 1,
         },
         timeout=timeout,
     )
@@ -64,6 +69,8 @@ def chat(base_url: str, model: str, messages: list[dict[str, str]], max_tokens: 
             "messages": messages,
             "max_tokens": max_tokens,
             "temperature": 0,
+            "top_k": 1,
+            "top_p": 1,
         },
         timeout=900,
     )

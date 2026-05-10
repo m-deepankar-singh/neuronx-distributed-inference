@@ -37,7 +37,9 @@ continuous-batching scheduler. For this Qwen3.6 artifact we need vLLM's native
 chunked-prefill scheduler so prompts longer than the 512-token context graph are
 fed to the precompiled model in 512-token chunks. The launcher sets
 `DISABLE_NEURON_CUSTOM_SCHEDULER=1` when `--enable-vllm-chunked-prefill` is
-passed.
+passed. It also launches with `--generation-config vllm` so model
+`generation_config.json` does not silently override deterministic sampling
+defaults.
 
 ## Install The Contrib Registry Patch
 

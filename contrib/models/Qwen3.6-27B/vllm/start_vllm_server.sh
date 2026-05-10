@@ -104,6 +104,7 @@ VLLM_ARGS=(
   --tensor-parallel-size "${TP_DEGREE}" \
   --max-num-seqs "${MAX_NUM_SEQS}" \
   --max-model-len "${MAX_MODEL_LEN}" \
+  --generation-config vllm \
   --no-enable-prefix-caching \
   --additional-config "${ADDITIONAL_CONFIG}"
 )
