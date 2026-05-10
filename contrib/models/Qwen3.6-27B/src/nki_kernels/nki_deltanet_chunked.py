@@ -217,12 +217,12 @@ def deltanet_chunk_step(
     # QK = k_beta @ k^T  -- contract over features
     # ============================================================
     kb_T_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
-    nisa.nc_matmul(dst=kb_T_psum, stationary=k_beta, moving=eye)
+    nisa.nc_transpose(dst=kb_T_psum, data=k_beta)
     kb_T = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_copy(dst=kb_T, src=kb_T_psum)
 
     k_T_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
-    nisa.nc_matmul(dst=k_T_psum, stationary=k_c, moving=eye)
+    nisa.nc_transpose(dst=k_T_psum, data=k_c)
     k_T = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_copy(dst=k_T, src=k_T_psum)
 
@@ -235,17 +235,16 @@ def deltanet_chunk_step(
     QK_decay = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_tensor(dst=QK_decay, data1=QK, data2=decay_strict, op=nl.multiply)
 
-    # A = -QK_decay * lower_mask
-    neg_QK_decay = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+    # A = -QK_decay. QK_decay is already strictly lower-triangular because
+    # decay_strict includes the lower-triangular mask.
+    A_mat = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_scalar(
-        dst=neg_QK_decay,
+        dst=A_mat,
         data=QK_decay,
         op0=nl.multiply,
         operand0=-1.0,
         engine=nisa.vector_engine,
     )
-    A_mat = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.tensor_tensor(dst=A_mat, data1=neg_QK_decay, data2=Lmask, op=nl.multiply)
 
     # ============================================================
     # Stable triangular solve: N = inv(I - A_mat)
@@ -431,7 +430,7 @@ def deltanet_chunk_step(
     # attn_intra = (q @ k^T) * decay_mask * lower_mask_diag
     # ============================================================
     q_T_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
-    nisa.nc_matmul(dst=q_T_psum, stationary=q_c, moving=eye)
+    nisa.nc_transpose(dst=q_T_psum, data=q_c)
     q_T = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_copy(dst=q_T, src=q_T_psum)
 
@@ -447,7 +446,7 @@ def deltanet_chunk_step(
     # v_prime = k_cumdecay @ state
     # ============================================================
     kcd_T_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
-    nisa.nc_matmul(dst=kcd_T_psum, stationary=k_cumdecay, moving=eye)
+    nisa.nc_transpose(dst=kcd_T_psum, data=k_cumdecay)
     kcd_T = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_copy(dst=kcd_T, src=kcd_T_psum)
 
@@ -472,7 +471,7 @@ def deltanet_chunk_step(
     )
 
     qe_T_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
-    nisa.nc_matmul(dst=qe_T_psum, stationary=q_exp, moving=eye)
+    nisa.nc_transpose(dst=qe_T_psum, data=q_exp)
     qe_T = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_copy(dst=qe_T, src=qe_T_psum)
 
@@ -485,7 +484,7 @@ def deltanet_chunk_step(
     # attn_intra @ v_new
     # ============================================================
     ai_T_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
-    nisa.nc_matmul(dst=ai_T_psum, stationary=attn_intra, moving=eye)
+    nisa.nc_transpose(dst=ai_T_psum, data=attn_intra)
     ai_T = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_copy(dst=ai_T, src=ai_T_psum)
 
