@@ -54,6 +54,21 @@ steady-state prefill wall. Keep the compact path because it simplifies the graph
 and makes follow-on kernel work cheaper to compile, but do not count it as a
 runtime speedup.
 
+## Phase 1.5: Solve-Isolation Result
+
+A measurement-only artifact replaced the stable triangular solve with `N = I`.
+
+| Artifact | 512 tok/s | 2K tok/s | 16K tok/s | 16K TTFT |
+|---|---:|---:|---:|---:|
+| Compact-input baseline | 412 | 413 | 417 | 37.04s |
+| Solve no-op (`N = I`) | 1020 | 1039 | 1058 | 14.58s |
+| GDN recurrent-core no-op | 1067 | 1219 | 1238 | 12.46s |
+
+Bypassing the triangular solve removes ~22.37s from 16K TTFT, which is about
+91% of the recurrent-core removable time measured by the recurrent-core no-op.
+
+Conclusion: optimize the triangular solve first.
+
 ## Phase 2: Remove Constant Mask HBM Inputs
 
 Problem: every microchunk call receives `lower_mask`, `identity`, and
@@ -73,10 +88,11 @@ Gate:
 Target only after Phase 1/2 establish a clean baseline.
 
 Directions:
-- Run a solve-isolation ablation first: replace `N = inv(I - A)` with `N = I`
-  in a measurement-only artifact. If it approaches the recurrent-core no-op
-  speed, the triangular solve is the highest ROI target. If not, the state
-  interaction matmuls and output construction dominate.
+- Do not compute a full inverse matrix if the kernel only needs `N @ v_beta`
+  and `N @ (k_beta * exp(gc))`.
+- Solve the triangular system directly for one or both RHS matrices.
+- If SBUF permits, concatenate the two RHS matrices so the row dependencies are
+  traversed once.
 - Reduce transpose count around `N`, `q`, `k`, `k_cumdecay`, and `attn_intra`.
 - Preserve the stable triangular solve until a replacement proves exact enough.
 - Try a recurrence-oriented layout where the free dimension is reused more
