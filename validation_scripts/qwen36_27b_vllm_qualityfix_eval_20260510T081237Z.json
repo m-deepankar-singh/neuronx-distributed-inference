@@ -1,0 +1,220 @@
+{
+  "metadata": {
+    "started_utc": "2026-05-10T08:12:38.171142+00:00",
+    "model": "/opt/dlami/nvme/models/Qwen3.6-27B",
+    "server_health": {
+      "status": ""
+    },
+    "models": {
+      "object": "list",
+      "data": [
+        {
+          "id": "/opt/dlami/nvme/models/Qwen3.6-27B",
+          "object": "model",
+          "created": 1778400758,
+          "owned_by": "vllm",
+          "root": "/opt/dlami/nvme/models/Qwen3.6-27B",
+          "parent": null,
+          "max_model_len": 131072,
+          "permission": [
+            {
+              "id": "modelperm-9ee8af82d78b4fbb",
+              "object": "model_permission",
+              "created": 1778400758,
+              "allow_create_engine": false,
+              "allow_sampling": true,
+              "allow_logprobs": true,
+              "allow_search_indices": false,
+              "allow_view": true,
+              "allow_fine_tuning": false,
+              "organization": "*",
+              "group": null,
+              "is_blocking": false
+            }
+          ]
+        }
+      ]
+    },
+    "artifact": "/opt/dlami/nvme/qwen_artifacts/qwen36_27b_128k_fp8_mlp_only_run1",
+    "seq_len": 131072,
+    "cte_chunk": 512,
+    "api": "minimal OpenAI-compatible non-streaming server"
+  },
+  "throughput": [
+    {
+      "target_prompt_tokens": 512,
+      "measured_prompt_tokens": 495,
+      "max_tokens_many": 129,
+      "completion_tokens_many": 129,
+      "ttft_proxy_s_max_tokens_1": 1.201987917011138,
+      "prefill_tok_s_prompt_over_ttft_proxy": 411.8177836852691,
+      "decode_steps_paired": 128,
+      "decode_s_paired": 4.819927167001879,
+      "tpot_s_paired": 0.03765568099220218,
+      "decode_tok_s_paired": 26.55641788040116,
+      "request_total_latency_s": 6.021915084013017,
+      "request_completion_goodput_tok_s": 21.42175673357953,
+      "request_total_goodput_tok_s": 103.62152094382658,
+      "wall_s_many": 6.021915084013017,
+      "text_prefix": " Metal Gear Solid is a stealth action game series about espionage, nuclear deterrence, soldiers, politics, identity, and tactical decision making. Metal Gear Solid is a stealth action game series about espionage, nuclear deterrence, soldiers, politics, identity, and tactical decision making. Metal Gear Solid is a stealth action game series about espionage, nuclear deterrence, soldiers, politics, i"
+    },
+    {
+      "target_prompt_tokens": 2048,
+      "measured_prompt_tokens": 1976,
+      "max_tokens_many": 129,
+      "completion_tokens_many": 129,
+      "ttft_proxy_s_max_tokens_1": 4.7761282309948,
+      "prefill_tok_s_prompt_over_ttft_proxy": 413.7242352867957,
+      "decode_steps_paired": 128,
+      "decode_s_paired": 4.823259316995973,
+      "tpot_s_paired": 0.03768171341403104,
+      "decode_tok_s_paired": 26.538071371978624,
+      "request_total_latency_s": 9.599387547990773,
+      "request_completion_goodput_tok_s": 13.438357328015234,
+      "request_total_goodput_tok_s": 219.28482306567497,
+      "wall_s_many": 9.599387547990773,
+      "text_prefix": "Metal Gear Solid is a stealth action game series about espionage, nuclear deterrence, soldiers, politics, identity, and tactical decision making. Metal Gear Solid is a stealth action game series about espionage, nuclear deterrence, soldiers, politics, identity, and tactical decision making. Metal Gear Solid is a stealth action game series about espionage, nuclear deterrence, soldiers, politics, id"
+    },
+    {
+      "target_prompt_tokens": 6000,
+      "measured_prompt_tokens": 5787,
+      "max_tokens_many": 129,
+      "completion_tokens_many": 129,
+      "ttft_proxy_s_max_tokens_1": 14.310495622994495,
+      "prefill_tok_s_prompt_over_ttft_proxy": 404.38850983618556,
+      "decode_steps_paired": 128,
+      "decode_s_paired": 4.830018305001431,
+      "tpot_s_paired": 0.03773451800782368,
+      "decode_tok_s_paired": 26.500934761977486,
+      "request_total_latency_s": 19.140513927995926,
+      "request_completion_goodput_tok_s": 6.739630946445894,
+      "request_total_goodput_tok_s": 309.0826099160768,
+      "wall_s_many": 19.140513927995926,
+      "text_prefix": "Metal Gear Solid is a stealth action game series about espionage, nuclear deterrence, soldiers, politics, identity, and tactical decision making. Metal Gear Solid is a stealth action game series about espionage, nuclear deterrence, soldiers, politics, identity, and tactical decision making. Metal Gear Solid is a stealth action game series about espionage, nuclear deterrence, soldiers, politics, id"
+    },
+    {
+      "target_prompt_tokens": 16000,
+      "measured_prompt_tokens": 15429,
+      "max_tokens_many": 65,
+      "completion_tokens_many": 65,
+      "ttft_proxy_s_max_tokens_1": 36.95567500600009,
+      "prefill_tok_s_prompt_over_ttft_proxy": 417.5001538328,
+      "decode_steps_paired": 64,
+      "decode_s_paired": 2.416164630994899,
+      "tpot_s_paired": 0.0377525723592953,
+      "decode_tok_s_paired": 26.488261262911895,
+      "request_total_latency_s": 39.37183963699499,
+      "request_completion_goodput_tok_s": 1.650926159389413,
+      "request_total_goodput_tok_s": 393.52999867045486,
+      "wall_s_many": 39.37183963699499,
+      "text_prefix": "Metal Gear Solid is a stealth action game series about espionage, nuclear deterrence, soldiers, politics, identity, and tactical decision making. Metal Gear Solid is a stealth action game series about espionage, nuclear deterrence, soldiers, politics, identity, and tactical decision making. Metal Gear Solid is a stealth action game series about espionage"
+    },
+    {
+      "target_prompt_tokens": 32000,
+      "measured_prompt_tokens": 30858,
+      "max_tokens_many": 65,
+      "completion_tokens_many": 65,
+      "ttft_proxy_s_max_tokens_1": 72.72322534100385,
+      "prefill_tok_s_prompt_over_ttft_proxy": 424.3211141324503,
+      "decode_steps_paired": 64,
+      "decode_s_paired": 2.427985362985055,
+      "tpot_s_paired": 0.037937271296641484,
+      "decode_tok_s_paired": 26.359302232908043,
+      "request_total_latency_s": 75.15121070398891,
+      "request_completion_goodput_tok_s": 0.8649228587417808,
+      "request_total_goodput_tok_s": 411.47707016726287,
+      "wall_s_many": 75.15121070398891,
+      "text_prefix": "Metal Gear Solid is a stealth action game series about espionage, nuclear deterrence, soldiers, politics, identity, and tactical decision making. Metal Gear Solid is a stealth action game series about espionage, nuclear deterrence, soldiers, politics, identity, and tactical decision making. Metal Gear Solid is a stealth action game series about espionage"
+    },
+    {
+      "target_prompt_tokens": 64000,
+      "measured_prompt_tokens": 61715,
+      "max_tokens_many": 33,
+      "completion_tokens_many": 33,
+      "ttft_proxy_s_max_tokens_1": 144.2645462060027,
+      "prefill_tok_s_prompt_over_ttft_proxy": 427.7904836845638,
+      "decode_steps_paired": 32,
+      "decode_s_paired": 1.2146261320012854,
+      "tpot_s_paired": 0.03795706662504017,
+      "decode_tok_s_paired": 26.345555358071394,
+      "request_total_latency_s": 145.479172338004,
+      "request_completion_goodput_tok_s": 0.22683659433618666,
+      "request_total_goodput_tok_s": 424.4456371839653,
+      "wall_s_many": 145.479172338004,
+      "text_prefix": " Metal Gear Solid is a stealth action game series about espionage, nuclear deterrence, soldiers, politics, identity, and tactical decision making. Metal Gear Solid is a stealth"
+    }
+  ],
+  "intelligence": [
+    {
+      "name": "arithmetic_exact",
+      "prompt_tokens": 22,
+      "completion_tokens": 32,
+      "latency_s": null,
+      "expected_contains": [
+        "3151"
+      ],
+      "contains_expected": false,
+      "text": "\nAnswer:\nAnswer:\nAnswer:\nAnswer:\nAnswer:\nAnswer:\nAnswer:\nAnswer:\nAnswer:\nAnswer:\nAnswer"
+    },
+    {
+      "name": "factual_olympics_2020",
+      "prompt_tokens": 24,
+      "completion_tokens": 96,
+      "latency_s": null,
+      "expected_contains": [
+        "Tokyo"
+      ],
+      "contains_expected": false,
+      "text": "\nIn one sentence, where were the 2020 Summer Olympics held and why were they unusual?\nAnswer:\nIn one sentence, where were the 2020 Summer Olympics held and why were they unusual?\nAnswer:\nIn one sentence, where were the 2020 Summer Olympics held and why were they unusual?\nAnswer:\nIn one sentence, where were the 2020 Summer Olympics held and why were they unusual"
+    },
+    {
+      "name": "instruction_json",
+      "prompt_tokens": 28,
+      "completion_tokens": 80,
+      "latency_s": null,
+      "expected_contains": [
+        "cat",
+        "3"
+      ],
+      "contains_expected": false,
+      "text": "\nJSON:\nJSON:\nJSON:\nJSON:\nJSON:\nJSON:\nJSON:\nJSON:\nJSON:\nJSON:\nJSON:\nJSON:\nJSON:\nJSON:\nJSON:\nJSON:\nJSON:\nJSON:\nJSON:\nJSON:\nJSON:\nJSON:\nJSON:\nJSON:\nJSON:\nJSON:\nJSON"
+    },
+    {
+      "name": "needle_32k",
+      "prompt_tokens": 30402,
+      "completion_tokens": 80,
+      "latency_s": null,
+      "expected_contains": [
+        "ORCHID-17",
+        "TITAN-42",
+        "VIOLET-91"
+      ],
+      "contains_expected": false,
+      "text": " The archive discusses logistics, sports history, character motivation, mission planning, and ordinary background details. The archive discusses logistics, sports history, character motivation, mission planning, and ordinary background details. The archive discusses logistics, sports history, character motivation, mission planning, and ordinary background details. The archive discusses logistics, sports history, character motivation, mission planning, and ordinary background details. The archive discusses logistics"
+    }
+  ],
+  "chat": [
+    {
+      "wall_s": 5.989588337994064,
+      "x_latency_s": null,
+      "usage": {
+        "prompt_tokens": 28,
+        "total_tokens": 156,
+        "completion_tokens": 128,
+        "prompt_tokens_details": null
+      },
+      "text": "</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n</think>\n\n"
+    }
+  ],
+  "errors": [],
+  "monitor": {
+    "samples": 132,
+    "peak_neuron_device_bytes": 53247282992,
+    "peak_neuron_device_gb_decimal": 53.247282992,
+    "peak_neuron_device_gib": 49.59039668738842,
+    "peak_host_bytes": 3602276352,
+    "peak_host_gb_decimal": 3.602276352,
+    "peak_neuroncore_utilization_percent": 100.0
+  },
+  "finished_utc": "2026-05-10T08:23:39.079395+00:00"
+}

@@ -31,7 +31,7 @@ def contains_all(text: str, expected: list[str]):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--base-url", default="http://127.0.0.1:8000")
-    parser.add_argument("--model", default="qwen3.6-27b-neuron-128k-fp8-mlp")
+    parser.add_argument("--model", default="/opt/dlami/nvme/models/Qwen3.6-27B")
     parser.add_argument("--out-dir", default="/opt/dlami/nvme")
     args = parser.parse_args()
 
@@ -100,6 +100,9 @@ def main():
             "messages": case["messages"],
             "max_tokens": case["max_tokens"],
             "temperature": 0,
+            "top_k": 1,
+            "top_p": 1,
+            "chat_template_kwargs": {"enable_thinking": False},
         }
         data, wall = post_json(f"{args.base_url}/v1/chat/completions", payload)
         text = data.get("choices", [{}])[0].get("message", {}).get("content", "")

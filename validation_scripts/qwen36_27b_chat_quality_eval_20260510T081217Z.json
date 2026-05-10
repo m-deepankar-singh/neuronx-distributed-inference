@@ -1,0 +1,91 @@
+{
+  "metadata": {
+    "started_utc": "2026-05-10T08:12:06.606502+00:00",
+    "model": "/opt/dlami/nvme/models/Qwen3.6-27B",
+    "base_url": "http://127.0.0.1:8000"
+  },
+  "cases": [
+    {
+      "name": "math",
+      "wall_s": 1.710936015995685,
+      "x_latency_s": null,
+      "usage": {
+        "prompt_tokens": 41,
+        "total_tokens": 55,
+        "completion_tokens": 14,
+        "prompt_tokens_details": null
+      },
+      "expected_contains": [
+        "3151"
+      ],
+      "contains_expected": true,
+      "text": "137 * 23 = 3151"
+    },
+    {
+      "name": "olympics",
+      "wall_s": 2.8989685100095812,
+      "x_latency_s": null,
+      "usage": {
+        "prompt_tokens": 43,
+        "total_tokens": 89,
+        "completion_tokens": 46,
+        "prompt_tokens_details": null
+      },
+      "expected_contains": [
+        "Tokyo"
+      ],
+      "contains_expected": true,
+      "text": "The 2020 Summer Olympics were held in **Tokyo, Japan**. They were unusual because they were postponed to 2021 due to the global pandemic, making them the first Olympics to be delayed."
+    },
+    {
+      "name": "json",
+      "wall_s": 2.0633995899988804,
+      "x_latency_s": null,
+      "usage": {
+        "prompt_tokens": 37,
+        "total_tokens": 61,
+        "completion_tokens": 24,
+        "prompt_tokens_details": null
+      },
+      "expected_contains": [
+        "cat",
+        "3"
+      ],
+      "contains_expected": true,
+      "text": "```json\n{\n  \"animal\": \"cat\",\n  \"count\": 3\n}\n```"
+    },
+    {
+      "name": "mgs_summary",
+      "wall_s": 1.9518255279981531,
+      "x_latency_s": null,
+      "usage": {
+        "prompt_tokens": 30,
+        "total_tokens": 51,
+        "completion_tokens": 21,
+        "prompt_tokens_details": null
+      },
+      "expected_contains": [
+        "Metal"
+      ],
+      "contains_expected": true,
+      "text": "Metal Gear Solid is a stealth-action video game series known for its complex narrative and innovative gameplay mechanics."
+    },
+    {
+      "name": "refusal_safe",
+      "wall_s": 2.178268969990313,
+      "x_latency_s": null,
+      "usage": {
+        "prompt_tokens": 35,
+        "total_tokens": 62,
+        "completion_tokens": 27,
+        "prompt_tokens_details": null
+      },
+      "expected_contains": [
+        "key"
+      ],
+      "contains_expected": true,
+      "text": "To store an SSH private key securely, you should keep it in a password-protected file and ensure it has the correct permissions."
+    }
+  ],
+  "finished_utc": "2026-05-10T08:12:17.410391+00:00"
+}
