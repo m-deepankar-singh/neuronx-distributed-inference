@@ -72,3 +72,57 @@ For the current objective, the next implementation branch should keep the
 direct-RHS algebraic reordering but preserve baseline NKI layout and masking
 more strictly.
 
+## Phase 2 Update: Direct-RHS Solve v2
+
+Commit: `756e684` (`codex/qwen36-gdn-direct-rhs-solve-v2`)
+Artifact: `/opt/dlami/nvme/qwen_artifacts/qwen36_27b_128k_fp8_direct_rhs_v2_run1`
+
+Implemented a v2 kernel as
+`src/nki_kernels/nki_deltanet_chunked_direct_rhs_v2.py`. The file starts from
+the baseline-v3 broadcast-input chunk kernel and only reorders the RHS solve:
+
+```text
+baseline: v_new = (N @ v_beta) - (N @ (k_beta * exp_gc)) @ state
+v2:       v_new = N @ (v_beta - ((k_beta * exp_gc) @ state))
+```
+
+Local and remote static checks passed:
+
+```text
+python -m py_compile modeling_qwen35.py nki_deltanet_chunked_direct_rhs_v2.py qwen36_27b_compile_fp8.py
+pytest contrib/models/Qwen3.6-27B/test/unit/test_deltanet_direct_rhs_solve.py -q
+```
+
+Hardware compile attempt 1 succeeded:
+
+```text
+CONTEXT_TRACE_SHAPE {"context_encoding_buckets": [512], "max_context_length": 512, "seq_len": 131072}
+Finished generating HLO for context_encoding_model in 14.312s, input example shape = torch.Size([1, 512])
+Finished generating HLO for token_generation_model in 2.430s, input example shape = torch.Size([1, 1])
+Done Sharding weights in 51.424s
+COMPILE_DONE
+Finished weights loading in 14.031s
+Warmup completed in 1.397s
+LOAD_AFTER_COMPILE_OK
+```
+
+Smoke validation passed through the OpenAI-compatible proxy:
+
+```text
+Prompt: What is 17 * 23? Answer with only the number.
+Response: 391
+Latency: 1.37s
+```
+
+The required cosine/logprob gate remains blocked on this serving path:
+
+```text
+/v1/chat/completions logprobs=True, top_logprobs=20 -> {"error":{"message":"list index out of range", ...}}
+/v1/completions logprobs=20 -> HTTP 400, raw completions disabled by proxy
+/v1/completions prompt_logprobs=20 -> HTTP 400, raw completions disabled by proxy
+```
+
+Because the cosine gate cannot be computed, v2 is **compiled and smoke-tested
+but not shippable under the stated validation rules**. MMLU/GSM8K were not run,
+because the validation sequence requires stopping when an earlier gate is not
+covered.
