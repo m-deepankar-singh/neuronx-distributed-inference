@@ -1,0 +1,153 @@
+{
+  "metadata": {
+    "started_utc": "2026-05-10T09:29:41.394833+00:00",
+    "base_url": "http://127.0.0.1:8000",
+    "model": "/opt/dlami/nvme/models/Qwen3.6-27B",
+    "levels": [
+      1,
+      2,
+      4
+    ],
+    "prompt_tokens_hint": 2048,
+    "max_tokens": 64
+  },
+  "runs": [
+    {
+      "concurrency": 1,
+      "total_wall_s": 6.967366602999391,
+      "successes": 1,
+      "requests": 1,
+      "p50_wall_s": 6.96578085499641,
+      "p95_wall_s": 6.96578085499641,
+      "max_wall_s": 6.96578085499641,
+      "aggregate_prompt_tokens": 2420,
+      "aggregate_completion_tokens": 27,
+      "aggregate_prompt_tok_s": 347.3335246861003,
+      "aggregate_completion_tok_s": 3.8752087464978136,
+      "per_request": [
+        {
+          "request_id": 1000,
+          "ok": true,
+          "wall_s": 6.96578085499641,
+          "usage": {
+            "prompt_tokens": 2420,
+            "total_tokens": 2447,
+            "completion_tokens": 27,
+            "prompt_tokens_details": null
+          },
+          "text_prefix": "Concurrent Qwen serving on Trainium is validated for request id 1000. REQUEST_ID=1000",
+          "error": null
+        }
+      ]
+    },
+    {
+      "concurrency": 2,
+      "total_wall_s": 13.351415131008253,
+      "successes": 2,
+      "requests": 2,
+      "p50_wall_s": 10.01624281200202,
+      "p95_wall_s": 13.350324794999324,
+      "max_wall_s": 13.350324794999324,
+      "aggregate_prompt_tokens": 4840,
+      "aggregate_completion_tokens": 40,
+      "aggregate_prompt_tok_s": 362.5083897480836,
+      "aggregate_completion_tok_s": 2.9959371053560626,
+      "per_request": [
+        {
+          "request_id": 2000,
+          "ok": true,
+          "wall_s": 6.682160829004715,
+          "usage": {
+            "prompt_tokens": 2420,
+            "total_tokens": 2440,
+            "completion_tokens": 20,
+            "prompt_tokens_details": null
+          },
+          "text_prefix": "Concurrent Qwen serving on Trainium is validated; REQUEST_ID=2000.",
+          "error": null
+        },
+        {
+          "request_id": 2001,
+          "ok": true,
+          "wall_s": 13.350324794999324,
+          "usage": {
+            "prompt_tokens": 2420,
+            "total_tokens": 2440,
+            "completion_tokens": 20,
+            "prompt_tokens_details": null
+          },
+          "text_prefix": "Concurrent Qwen serving on Trainium is validated; REQUEST_ID=2001.",
+          "error": null
+        }
+      ]
+    },
+    {
+      "concurrency": 4,
+      "total_wall_s": 26.21507017899421,
+      "successes": 4,
+      "requests": 4,
+      "p50_wall_s": 16.889272838998295,
+      "p95_wall_s": 26.213208783010487,
+      "max_wall_s": 26.213208783010487,
+      "aggregate_prompt_tokens": 9680,
+      "aggregate_completion_tokens": 67,
+      "aggregate_prompt_tok_s": 369.25325524233983,
+      "aggregate_completion_tok_s": 2.555781828640162,
+      "per_request": [
+        {
+          "request_id": 3000,
+          "ok": true,
+          "wall_s": 6.959325956995599,
+          "usage": {
+            "prompt_tokens": 2420,
+            "total_tokens": 2447,
+            "completion_tokens": 27,
+            "prompt_tokens_details": null
+          },
+          "text_prefix": "Concurrent Qwen serving on Trainium is validated for request id 3000. REQUEST_ID=3000",
+          "error": null
+        },
+        {
+          "request_id": 3001,
+          "ok": true,
+          "wall_s": 19.9978989349911,
+          "usage": {
+            "prompt_tokens": 2420,
+            "total_tokens": 2428,
+            "completion_tokens": 8,
+            "prompt_tokens_details": null
+          },
+          "text_prefix": "REQUEST_ID=3001",
+          "error": null
+        },
+        {
+          "request_id": 3002,
+          "ok": true,
+          "wall_s": 13.78064674300549,
+          "usage": {
+            "prompt_tokens": 2420,
+            "total_tokens": 2444,
+            "completion_tokens": 24,
+            "prompt_tokens_details": null
+          },
+          "text_prefix": "Request ID 3002 validates concurrent Qwen serving on Trainium. REQUEST_ID=3002",
+          "error": null
+        },
+        {
+          "request_id": 3003,
+          "ok": true,
+          "wall_s": 26.213208783010487,
+          "usage": {
+            "prompt_tokens": 2420,
+            "total_tokens": 2428,
+            "completion_tokens": 8,
+            "prompt_tokens_details": null
+          },
+          "text_prefix": "REQUEST_ID=3003",
+          "error": null
+        }
+      ]
+    }
+  ],
+  "finished_utc": "2026-05-10T09:30:27.928945+00:00"
+}

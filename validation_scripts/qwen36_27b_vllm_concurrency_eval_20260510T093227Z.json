@@ -1,0 +1,154 @@
+{
+  "metadata": {
+    "started_utc": "2026-05-10T09:31:36.668060+00:00",
+    "base_url": "http://127.0.0.1:8000",
+    "model": "/opt/dlami/nvme/models/Qwen3.6-27B",
+    "levels": [
+      1,
+      2,
+      4
+    ],
+    "prompt_tokens_hint": 256,
+    "max_tokens": 160,
+    "response_mode": "long"
+  },
+  "runs": [
+    {
+      "concurrency": 1,
+      "total_wall_s": 7.2203116080054315,
+      "successes": 1,
+      "requests": 1,
+      "p50_wall_s": 7.218995172996074,
+      "p95_wall_s": 7.218995172996074,
+      "max_wall_s": 7.218995172996074,
+      "aggregate_prompt_tokens": 361,
+      "aggregate_completion_tokens": 160,
+      "aggregate_prompt_tok_s": 49.997842142954845,
+      "aggregate_completion_tok_s": 22.159708429010458,
+      "per_request": [
+        {
+          "request_id": 1000,
+          "ok": true,
+          "wall_s": 7.218995172996074,
+          "usage": {
+            "prompt_tokens": 361,
+            "total_tokens": 521,
+            "completion_tokens": 160,
+            "prompt_tokens_details": null
+          },
+          "text_prefix": "1. REQUEST_ID=1000\n2. REQUEST_ID=1000\n3. REQUEST_ID=1000\n4. REQUEST_ID=1000\n5. REQUEST_ID=1000\n6. REQUEST_ID=1000\n7. REQUEST_ID=1000\n8. REQUEST_ID=1000\n9. REQUEST_ID=1000\n10. REQUEST_ID=1000\n11. REQUEST_ID=1000\n12. REQUEST_ID=1000\n13. REQUE",
+          "error": null
+        }
+      ]
+    },
+    {
+      "concurrency": 2,
+      "total_wall_s": 14.374746670000604,
+      "successes": 2,
+      "requests": 2,
+      "p50_wall_s": 10.782219635999354,
+      "p95_wall_s": 14.373451175008086,
+      "max_wall_s": 14.373451175008086,
+      "aggregate_prompt_tokens": 722,
+      "aggregate_completion_tokens": 320,
+      "aggregate_prompt_tok_s": 50.226972104265236,
+      "aggregate_completion_tok_s": 22.261261874466587,
+      "per_request": [
+        {
+          "request_id": 2000,
+          "ok": true,
+          "wall_s": 7.190988096990623,
+          "usage": {
+            "prompt_tokens": 361,
+            "total_tokens": 521,
+            "completion_tokens": 160,
+            "prompt_tokens_details": null
+          },
+          "text_prefix": "1. REQUEST_ID=2000\n2. REQUEST_ID=2000\n3. REQUEST_ID=2000\n4. REQUEST_ID=2000\n5. REQUEST_ID=2000\n6. REQUEST_ID=2000\n7. REQUEST_ID=2000\n8. REQUEST_ID=2000\n9. REQUEST_ID=2000\n10. REQUEST_ID=2000\n11. REQUEST_ID=2000\n12. REQUEST_ID=2000\n13. REQUE",
+          "error": null
+        },
+        {
+          "request_id": 2001,
+          "ok": true,
+          "wall_s": 14.373451175008086,
+          "usage": {
+            "prompt_tokens": 361,
+            "total_tokens": 521,
+            "completion_tokens": 160,
+            "prompt_tokens_details": null
+          },
+          "text_prefix": "1. REQUEST_ID=2001\n2. REQUEST_ID=2001\n3. REQUEST_ID=2001\n4. REQUEST_ID=2001\n5. REQUEST_ID=2001\n6. REQUEST_ID=2001\n7. REQUEST_ID=2001\n8. REQUEST_ID=2001\n9. REQUEST_ID=2001\n10. REQUEST_ID=2001\n11. REQUEST_ID=2001\n12. REQUEST_ID=2001\n13. REQUE",
+          "error": null
+        }
+      ]
+    },
+    {
+      "concurrency": 4,
+      "total_wall_s": 28.773131712005124,
+      "successes": 4,
+      "requests": 4,
+      "p50_wall_s": 17.986889988998882,
+      "p95_wall_s": 28.771125876999577,
+      "max_wall_s": 28.771125876999577,
+      "aggregate_prompt_tokens": 1444,
+      "aggregate_completion_tokens": 640,
+      "aggregate_prompt_tok_s": 50.185708474601476,
+      "aggregate_completion_tok_s": 22.24297328514193,
+      "per_request": [
+        {
+          "request_id": 3000,
+          "ok": true,
+          "wall_s": 7.204821512990748,
+          "usage": {
+            "prompt_tokens": 361,
+            "total_tokens": 521,
+            "completion_tokens": 160,
+            "prompt_tokens_details": null
+          },
+          "text_prefix": "1. REQUEST_ID=3000\n2. REQUEST_ID=3000\n3. REQUEST_ID=3000\n4. REQUEST_ID=3000\n5. REQUEST_ID=3000\n6. REQUEST_ID=3000\n7. REQUEST_ID=3000\n8. REQUEST_ID=3000\n9. REQUEST_ID=3000\n10. REQUEST_ID=3000\n11. REQUEST_ID=3000\n12. REQUEST_ID=3000\n13. REQUE",
+          "error": null
+        },
+        {
+          "request_id": 3001,
+          "ok": true,
+          "wall_s": 14.39370656599931,
+          "usage": {
+            "prompt_tokens": 361,
+            "total_tokens": 521,
+            "completion_tokens": 160,
+            "prompt_tokens_details": null
+          },
+          "text_prefix": "1. REQUEST_ID=3001\n2. REQUEST_ID=3001\n3. REQUEST_ID=3001\n4. REQUEST_ID=3001\n5. REQUEST_ID=3001\n6. REQUEST_ID=3001\n7. REQUEST_ID=3001\n8. REQUEST_ID=3001\n9. REQUEST_ID=3001\n10. REQUEST_ID=3001\n11. REQUEST_ID=3001\n12. REQUEST_ID=3001\n13. REQUE",
+          "error": null
+        },
+        {
+          "request_id": 3002,
+          "ok": true,
+          "wall_s": 21.580073411998455,
+          "usage": {
+            "prompt_tokens": 361,
+            "total_tokens": 521,
+            "completion_tokens": 160,
+            "prompt_tokens_details": null
+          },
+          "text_prefix": "1. REQUEST_ID=3002\n2. REQUEST_ID=3002\n3. REQUEST_ID=3002\n4. REQUEST_ID=3002\n5. REQUEST_ID=3002\n6. REQUEST_ID=3002\n7. REQUEST_ID=3002\n8. REQUEST_ID=3002\n9. REQUEST_ID=3002\n10. REQUEST_ID=3002\n11. REQUEST_ID=3002\n12. REQUEST_ID=3002\n13. REQUE",
+          "error": null
+        },
+        {
+          "request_id": 3003,
+          "ok": true,
+          "wall_s": 28.771125876999577,
+          "usage": {
+            "prompt_tokens": 361,
+            "total_tokens": 521,
+            "completion_tokens": 160,
+            "prompt_tokens_details": null
+          },
+          "text_prefix": "1. REQUEST_ID=3003\n2. REQUEST_ID=3003\n3. REQUEST_ID=3003\n4. REQUEST_ID=3003\n5. REQUEST_ID=3003\n6. REQUEST_ID=3003\n7. REQUEST_ID=3003\n8. REQUEST_ID=3003\n9. REQUEST_ID=3003\n10. REQUEST_ID=3003\n11. REQUEST_ID=3003\n12. REQUEST_ID=3003\n13. REQUE",
+          "error": null
+        }
+      ]
+    }
+  ],
+  "finished_utc": "2026-05-10T09:32:27.036542+00:00"
+}
