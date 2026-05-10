@@ -262,11 +262,19 @@ class QwenEngine:
         temperature = float(body.get("temperature", 0.0))
         top_p = float(body.get("top_p", 1.0))
         top_k = int(body.get("top_k", 1))
+        # OpenAI temperature=0 means greedy. The Qwen3.6 artifact's NxDI
+        # sampler is traced in do_sample=True mode, so literal temperature 0
+        # corrupts sampling. top_k=1, temperature=1 is deterministic greedy.
+        sampler_temperature = temperature
+        if temperature <= 0.0:
+            sampler_temperature = 1.0
+            top_p = 1.0
+            top_k = 1
         sampling_params = self.prepare_sampling_params(
             batch_size=1,
             top_k=[top_k],
             top_p=[top_p],
-            temperature=[temperature],
+            temperature=[sampler_temperature],
         )
 
         with self.lock:
@@ -309,12 +317,8 @@ class QwenEngine:
                 end = min(start + self.chunk_size, prompt_len)
                 valid = end - start
                 chunk_ids = input_ids[:, start:end]
-                if valid < self.chunk_size:
-                    pad = torch.full((1, self.chunk_size - valid), self.pad_id, dtype=chunk_ids.dtype)
-                    chunk_ids = torch.cat([chunk_ids, pad], dim=1)
-                attn_mask = torch.zeros((1, self.chunk_size), dtype=torch.long)
-                attn_mask[:, :valid] = 1
-                pos = torch.arange(start, start + self.chunk_size, dtype=torch.long).unsqueeze(0)
+                attn_mask = torch.ones((1, valid), dtype=torch.long)
+                pos = torch.arange(start, end, dtype=torch.long).unsqueeze(0)
 
                 t0 = time.perf_counter()
                 with torch.no_grad():

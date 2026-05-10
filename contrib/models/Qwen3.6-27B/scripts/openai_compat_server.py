@@ -140,13 +140,21 @@ class QwenOpenAIServer:
         temperature = float(body.get("temperature", 0.0) or 0.0)
         top_p = float(body.get("top_p", 1.0) or 1.0)
         top_k = int(body.get("top_k", 1) or 1)
+        # NxDI's traced on-device sampler for this artifact uses do_sample=True.
+        # OpenAI temperature=0 means greedy, but passing literal 0 into that
+        # sampler divides logits by zero. top_k=1 with temperature=1 is the
+        # deterministic greedy path used by the validated HF adapter tests.
+        sampler_temperature = temperature
+        if temperature <= 0.0:
+            sampler_temperature = 1.0
+            top_p = 1.0
+            top_k = 1
         sampling_params = self.prepare_sampling_params(
             batch_size=1,
             top_k=[top_k],
             top_p=[top_p],
-            temperature=[temperature],
+            temperature=[sampler_temperature],
         )
-        pad_id = self.tokenizer.pad_token_id
         seq_ids = torch.tensor([0], dtype=torch.int32)
 
         with self.lock:
@@ -158,19 +166,10 @@ class QwenOpenAIServer:
                 end = min(start + self.args.chunk_size, prompt_tokens)
                 valid = end - start
                 chunk_ids = input_ids[:, start:end]
-                if valid < self.args.chunk_size:
-                    pad = torch.full(
-                        (1, self.args.chunk_size - valid),
-                        pad_id,
-                        dtype=chunk_ids.dtype,
-                    )
-                    chunk_ids = torch.cat([chunk_ids, pad], dim=1)
-
-                attention_mask = torch.zeros((1, self.args.chunk_size), dtype=torch.long)
-                attention_mask[:, :valid] = 1
+                attention_mask = torch.ones((1, valid), dtype=torch.long)
                 position_ids = torch.arange(
                     start,
-                    start + self.args.chunk_size,
+                    end,
                     dtype=torch.long,
                 ).unsqueeze(0)
 
@@ -191,19 +190,28 @@ class QwenOpenAIServer:
             new_ids = []
             current_token = first_token
             vocab_size = len(self.tokenizer)
-            eos_id = self.tokenizer.eos_token_id
+            raw_eos_id = self.tokenizer.eos_token_id
+            eos_ids = (
+                set(raw_eos_id)
+                if isinstance(raw_eos_id, (list, tuple, set))
+                else {raw_eos_id}
+            )
             decode_ids = torch.empty((1, 1), dtype=torch.int32)
             decode_position_ids = torch.empty((1, 1), dtype=torch.int32)
             decode_attention_mask = torch.ones(
                 (1, prompt_tokens + max_tokens),
                 dtype=torch.int32,
             )
+            finish_reason = "length"
             with torch.no_grad():
                 for step in range(max_tokens):
+                    if current_token in eos_ids:
+                        finish_reason = "stop"
+                        break
                     if current_token < 0 or current_token >= vocab_size:
                         raise RuntimeError(f"model generated invalid token id: {current_token}")
                     new_ids.append(current_token)
-                    if current_token == eos_id or step == max_tokens - 1:
+                    if step == max_tokens - 1:
                         break
 
                     pos_value = prompt_tokens + step
@@ -236,6 +244,7 @@ class QwenOpenAIServer:
             "completion_tokens": len(new_ids),
             "elapsed": elapsed,
             "tokens": new_ids,
+            "finish_reason": finish_reason,
         }
 
 
@@ -292,7 +301,7 @@ def make_handler(server_state: QwenOpenAIServer):
                                 {
                                     "index": 0,
                                     "text": result["text"],
-                                    "finish_reason": "length",
+                                    "finish_reason": result["finish_reason"],
                                 }
                             ],
                             "usage": {
@@ -330,7 +339,7 @@ def make_handler(server_state: QwenOpenAIServer):
                                         "role": "assistant",
                                         "content": result["text"],
                                     },
-                                    "finish_reason": "length",
+                                    "finish_reason": result["finish_reason"],
                                 }
                             ],
                             "usage": {
