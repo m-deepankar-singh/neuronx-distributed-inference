@@ -27,6 +27,50 @@ def _json_response(handler: BaseHTTPRequestHandler, status: int, payload: dict[s
     handler.wfile.write(body)
 
 
+def _message_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict):
+                text = item.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+            elif isinstance(item, str):
+                parts.append(item)
+        return "\n".join(parts)
+    return str(content)
+
+
+def _normalize_messages_for_qwen(messages: Any) -> Any:
+    """Make common OpenAI message layouts acceptable to the Qwen chat template."""
+    if not isinstance(messages, list):
+        return messages
+
+    system_parts: list[str] = []
+    normal_messages: list[Any] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            normal_messages.append(message)
+            continue
+
+        role = message.get("role")
+        if role in {"system", "developer"}:
+            system_parts.append(_message_text(message.get("content", "")))
+        else:
+            normal_messages.append(message)
+
+    if not system_parts:
+        return messages
+
+    system_message = {
+        "role": "system",
+        "content": "\n\n".join(part for part in system_parts if part),
+    }
+    return [system_message, *normal_messages]
+
+
 class Qwen36ProxyHandler(BaseHTTPRequestHandler):
     backend_url: str = "http://127.0.0.1:8001"
     force_disable_thinking: bool = True
@@ -103,6 +147,7 @@ class Qwen36ProxyHandler(BaseHTTPRequestHandler):
             else:
                 template_kwargs.setdefault("enable_thinking", False)
             payload["chat_template_kwargs"] = template_kwargs
+            payload["messages"] = _normalize_messages_for_qwen(payload.get("messages"))
             raw_body = json.dumps(payload).encode("utf-8")
 
         self._forward("POST", raw_body)

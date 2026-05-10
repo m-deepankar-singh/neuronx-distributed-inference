@@ -122,7 +122,10 @@ python contrib/models/Qwen3.6-27B/vllm/qwen36_chat_proxy.py \
 The proxy forces `chat_template_kwargs={"enable_thinking": false}` for
 `/v1/chat/completions` by default. It rejects raw `/v1/completions` because raw
 prompts bypass the Qwen chat template and can pollute the hybrid model state.
-Use `--allow-thinking` or `--allow-completions` only for explicit debugging.
+It also hoists `system` and `developer` messages to a single leading `system`
+message because the Qwen chat template rejects system messages that appear later
+in the conversation. Use `--allow-thinking` or `--allow-completions` only for
+explicit debugging.
 
 Offline long-prompt smoke:
 
