@@ -79,33 +79,53 @@ class Qwen36ProxyHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args):  # noqa: D401
         print(f"{self.address_string()} - {fmt % args}", flush=True)
 
-    def _forward(self, method: str, body: bytes | None = None):
+    def _copy_response_headers(self, headers: Any, stream: bool):
+        for key, value in headers.items():
+            lowered = key.lower()
+            if lowered in {"transfer-encoding", "connection"}:
+                continue
+            if stream and lowered == "content-length":
+                continue
+            self.send_header(key, value)
+        if stream:
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("X-Accel-Buffering", "no")
+
+    def _forward_stream(self, resp: Any):
+        while True:
+            chunk = resp.readline()
+            if not chunk:
+                break
+            self.wfile.write(chunk)
+            self.wfile.flush()
+
+    def _forward(self, method: str, body: bytes | None = None, stream: bool = False):
         headers = {
             key: value
             for key, value in self.headers.items()
             if key.lower() not in {"host", "content-length", "connection"}
         }
+        if stream:
+            headers["Accept"] = "text/event-stream"
         url = self.backend_url.rstrip("/") + self.path
         req = urllib.request.Request(url, data=body, headers=headers, method=method)
         try:
             with urllib.request.urlopen(req, timeout=None) as resp:
-                response_body = resp.read()
                 self.send_response(resp.status)
-                for key, value in resp.headers.items():
-                    if key.lower() in {"transfer-encoding", "connection"}:
-                        continue
-                    self.send_header(key, value)
+                self._copy_response_headers(resp.headers, stream)
                 self.end_headers()
-                self.wfile.write(response_body)
+                if stream:
+                    self._forward_stream(resp)
+                else:
+                    self.wfile.write(resp.read())
         except urllib.error.HTTPError as exc:
             error_body = exc.read()
             self.send_response(exc.code)
-            for key, value in exc.headers.items():
-                if key.lower() in {"transfer-encoding", "connection"}:
-                    continue
-                self.send_header(key, value)
+            self._copy_response_headers(exc.headers, stream=False)
             self.end_headers()
             self.wfile.write(error_body)
+        except (BrokenPipeError, ConnectionResetError):
+            print("client disconnected during streaming response", flush=True)
 
     def do_GET(self):  # noqa: N802
         self._forward("GET")
@@ -139,6 +159,7 @@ class Qwen36ProxyHandler(BaseHTTPRequestHandler):
                 self._forward("POST", raw_body)
                 return
 
+            stream = bool(payload.get("stream"))
             template_kwargs = payload.get("chat_template_kwargs")
             if not isinstance(template_kwargs, dict):
                 template_kwargs = {}
@@ -149,8 +170,10 @@ class Qwen36ProxyHandler(BaseHTTPRequestHandler):
             payload["chat_template_kwargs"] = template_kwargs
             payload["messages"] = _normalize_messages_for_qwen(payload.get("messages"))
             raw_body = json.dumps(payload).encode("utf-8")
+        else:
+            stream = False
 
-        self._forward("POST", raw_body)
+        self._forward("POST", raw_body, stream=stream)
 
 
 def main() -> int:

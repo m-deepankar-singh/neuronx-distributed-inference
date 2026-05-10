@@ -164,6 +164,21 @@ message because the Qwen chat template rejects system messages that appear later
 in the conversation. Use `--allow-thinking` or `--allow-completions` only for
 explicit debugging.
 
+Streaming chat completions are supported through the proxy:
+
+```bash
+curl -N http://INSTANCE_IP:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "/opt/dlami/nvme/models/Qwen3.6-27B",
+    "messages": [{"role": "user", "content": "Count from 1 to 8, separated by commas."}],
+    "max_tokens": 32,
+    "temperature": 0,
+    "top_k": 1,
+    "stream": true
+  }'
+```
+
 Offline long-prompt smoke:
 
 ```bash
