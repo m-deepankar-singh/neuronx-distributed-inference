@@ -47,6 +47,7 @@ ADDITIONAL_CONFIG="$(
   python3 - <<PY
 import json
 print(json.dumps({
+    "max_prompt_length": int("${CTE_BUCKET}"),
     "override_neuron_config": {
         "tp_degree": int("${TP_DEGREE}"),
         "batch_size": int("${MAX_NUM_SEQS}"),

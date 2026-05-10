@@ -93,6 +93,7 @@ python contrib/models/Qwen3.6-27B/vllm/run_offline_inference.py \
   --max-model-len 131072 \
   --seq-len 131072 \
   --cte-bucket 512 \
+  --chat \
   --prompt "What is 17 * 23? Answer with the number only."
 ```
 

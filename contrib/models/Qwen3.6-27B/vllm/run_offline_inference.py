@@ -19,6 +19,7 @@ def _contrib_root(repo_root: str | None) -> Path:
 
 def _override_config(args: argparse.Namespace) -> dict:
     return {
+        "max_prompt_length": args.cte_bucket,
         "override_neuron_config": {
             "tp_degree": args.tensor_parallel_size,
             "batch_size": args.max_num_seqs,
@@ -43,6 +44,7 @@ def main() -> int:
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--compiled-artifacts", default=None)
     parser.add_argument("--prompt", default="What is 17 * 23? Answer with the number only.")
+    parser.add_argument("--chat", action="store_true")
     parser.add_argument("--max-tokens", type=int, default=64)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-k", type=int, default=1)
@@ -73,6 +75,20 @@ def main() -> int:
 
     from vllm import LLM, SamplingParams  # noqa: WPS433
 
+    prompt = args.prompt
+    if args.chat:
+        from transformers import AutoTokenizer  # noqa: WPS433
+
+        tokenizer = AutoTokenizer.from_pretrained(
+            args.model_path,
+            trust_remote_code=True,
+        )
+        prompt = tokenizer.apply_chat_template(
+            [{"role": "user", "content": args.prompt}],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+
     additional_config = _override_config(args)
     print("VLLM_QWEN36_CONFIG", json.dumps(additional_config, sort_keys=True), flush=True)
 
@@ -94,12 +110,12 @@ def main() -> int:
         max_tokens=args.max_tokens,
     )
     start = time.perf_counter()
-    outputs = llm.generate([args.prompt], sampling)
+    outputs = llm.generate([prompt], sampling)
     elapsed = time.perf_counter() - start
     text = outputs[0].outputs[0].text
     token_ids = outputs[0].outputs[0].token_ids
 
-    print("PROMPT", args.prompt)
+    print("PROMPT", prompt)
     print("OUTPUT", text)
     print("TOKENS", list(token_ids))
     print("ELAPSED_SECONDS", f"{elapsed:.3f}")

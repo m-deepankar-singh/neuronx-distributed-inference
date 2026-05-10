@@ -25,6 +25,13 @@ class Qwen35Config(PretrainedConfig):
         if isinstance(text_config, dict):
             text_config = Qwen35TextConfig(**text_config)
         self.text_config = text_config
+        if text_config is not None:
+            for name, value in text_config.to_dict().items():
+                if name not in {"architectures", "model_type"}:
+                    kwargs.setdefault(name, value)
+            rope_parameters = getattr(text_config, "rope_parameters", None)
+            if isinstance(rope_parameters, dict):
+                kwargs.setdefault("rope_theta", rope_parameters.get("rope_theta"))
         super().__init__(**kwargs)
 
 
