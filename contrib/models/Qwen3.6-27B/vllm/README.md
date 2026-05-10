@@ -215,7 +215,10 @@ Native APC validation run on Trn2 with the FP8 128K artifact:
 - server exact-repeat, `~10.8K` prompt tokens: `26.68s` cold to `1.67s` warm,
   `16.0x` speedup, exact greedy text match;
 - offline exact-repeat, token IDs exposed: `26.19s` cold to `2.38s` warm,
-  `11.0x` speedup, exact greedy token-ID match.
+  `11.0x` speedup, exact greedy token-ID match;
+- offline partial-prefix reuse, token IDs exposed: `25.52s` no-cache target to
+  `1.70s` APC target after a different shared-prefix warmup request, `15.0x`
+  speedup, exact greedy token-ID match.
 
 Validation run on Trn2 with the FP8 128K artifact:
 
