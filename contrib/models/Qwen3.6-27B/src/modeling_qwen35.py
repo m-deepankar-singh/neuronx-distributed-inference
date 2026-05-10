@@ -494,10 +494,9 @@ class NeuronGatedDeltaNet(nn.Module):
         beta_chunks = (
             beta.reshape(B, H, num_chunks, chunk_size)
             .unsqueeze(-1)
-            .expand(-1, -1, -1, -1, v_dim)
         )
-        gc_chunks = g_cs.unsqueeze(-1).expand(-1, -1, -1, -1, v_dim)
-        gl_chunks = g_last_expanded.unsqueeze(-1).expand(-1, -1, -1, -1, v_dim)
+        gc_chunks = g_cs.unsqueeze(-1)
+        gl_chunks = g_last_expanded.unsqueeze(-1)
 
         BH = B * H
         query_chunks = query_chunks.reshape(
@@ -508,10 +507,10 @@ class NeuronGatedDeltaNet(nn.Module):
             BH, num_chunks, chunk_size, v_dim
         ).contiguous()
         beta_chunks = beta_chunks.reshape(
-            BH, num_chunks, chunk_size, v_dim
+            BH, num_chunks, chunk_size, 1
         ).contiguous()
-        gc_chunks = gc_chunks.reshape(BH, num_chunks, chunk_size, v_dim).contiguous()
-        gl_chunks = gl_chunks.reshape(BH, num_chunks, chunk_size, v_dim).contiguous()
+        gc_chunks = gc_chunks.reshape(BH, num_chunks, chunk_size, 1).contiguous()
+        gl_chunks = gl_chunks.reshape(BH, num_chunks, chunk_size, 1).contiguous()
 
         device = query.device
         lower_mask = torch.tril(

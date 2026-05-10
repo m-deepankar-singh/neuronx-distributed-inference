@@ -5,7 +5,8 @@ triangular solve for intra-chunk correction. The caller loops over chunks in
 PyTorch, passing state between calls.
 
 Each kernel call:
-  - Takes one chunk of data: q, k, v, beta, g_cumsum, g_last  (all 128x128)
+  - Takes one chunk of data: q, k, v as (128x128)
+  - Takes scalar per-token gates/decays as (128x1): beta, g_cumsum, g_last
   - Takes recurrent state_in (128x128)
   - Returns chunk output (128x128) and state_out (128x128)
 
@@ -31,9 +32,9 @@ def deltanet_chunk_step(
     query,  # (128, 128) float32 -- one chunk, l2-normed+scaled
     key,  # (128, 128) float32 -- one chunk, l2-normed
     value,  # (128, 128) float32 -- one chunk
-    beta_broadcast,  # (128, 128) float32 -- write gate broadcast to 128
-    g_cumsum,  # (128, 128) float32 -- cumsum of g within chunk, broadcast
-    g_last,  # (128, 128) float32 -- g_cumsum[-1], constant in chunk, broadcast
+    beta_scalar,  # (128, 1) float32 -- write gate per token
+    g_cumsum,  # (128, 1) float32 -- cumsum of g within chunk
+    g_last,  # (128, 1) float32 -- g_cumsum[-1], repeated over rows
     state_in,  # (128, 128) float32 -- recurrent state from previous chunk
     lower_mask,  # (128, 128) float32 -- strict lower triangular
     identity,  # (128, 128) float32 -- identity matrix
@@ -61,14 +62,14 @@ def deltanet_chunk_step(
     v_c = nl.ndarray((P_MAX, dim), dtype=value.dtype, buffer=nl.sbuf)
     nisa.dma_copy(dst=v_c, src=value)
 
-    beta_c = nl.ndarray((P_MAX, dim), dtype=beta_broadcast.dtype, buffer=nl.sbuf)
-    nisa.dma_copy(dst=beta_c, src=beta_broadcast)
+    beta_p = nl.ndarray((P_MAX, 1), dtype=beta_scalar.dtype, buffer=nl.sbuf)
+    nisa.dma_copy(dst=beta_p, src=beta_scalar)
 
-    gc_c = nl.ndarray((P_MAX, dim), dtype=g_cumsum.dtype, buffer=nl.sbuf)
-    nisa.dma_copy(dst=gc_c, src=g_cumsum)
+    gc_p = nl.ndarray((P_MAX, 1), dtype=g_cumsum.dtype, buffer=nl.sbuf)
+    nisa.dma_copy(dst=gc_p, src=g_cumsum)
 
-    gl_c = nl.ndarray((P_MAX, dim), dtype=g_last.dtype, buffer=nl.sbuf)
-    nisa.dma_copy(dst=gl_c, src=g_last)
+    gl_p = nl.ndarray((P_MAX, 1), dtype=g_last.dtype, buffer=nl.sbuf)
+    nisa.dma_copy(dst=gl_p, src=g_last)
 
     state = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.sbuf)
     nisa.dma_copy(dst=state, src=state_in)
@@ -87,24 +88,30 @@ def deltanet_chunk_step(
     # k_beta = K * beta, v_beta = V * beta
     # ============================================================
     k_beta = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.tensor_tensor(dst=k_beta, data1=k_c, data2=beta_c, op=nl.multiply)
+    nisa.tensor_scalar(
+        dst=k_beta,
+        data=k_c,
+        op0=nl.multiply,
+        operand0=beta_p,
+        engine=nisa.vector_engine,
+    )
 
     v_beta = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.tensor_tensor(dst=v_beta, data1=v_c, data2=beta_c, op=nl.multiply)
+    nisa.tensor_scalar(
+        dst=v_beta,
+        data=v_c,
+        op0=nl.multiply,
+        operand0=beta_p,
+        engine=nisa.vector_engine,
+    )
 
     # ============================================================
     # Stable decay factors from cumulative log-decay
     #
-    # The caller passes g_cumsum and g_last broadcast to (128, 128).  Extract
-    # one column and build pairwise decays as exp(gc[i] - gc[j]) so no
-    # individual exp(-gc[j]) term can overflow.
+    # The caller passes g_cumsum and g_last as compact (128, 1) tensors.  Build
+    # pairwise decays as exp(gc[i] - gc[j]) so no individual exp(-gc[j]) term
+    # can overflow.
     # ============================================================
-    gc_p = nl.ndarray((P_MAX, 1), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.tensor_copy(dst=gc_p[0:P_MAX, 0:1], src=gc_c[0:P_MAX, 0:1])
-
-    gl_p = nl.ndarray((P_MAX, 1), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.tensor_copy(dst=gl_p[0:P_MAX, 0:1], src=gl_c[0:P_MAX, 0:1])
-
     exp_gc_p = nl.ndarray((P_MAX, 1), dtype=nl.float32, buffer=nl.sbuf)
     nisa.activation(
         dst=exp_gc_p[0:P_MAX, 0:1],
