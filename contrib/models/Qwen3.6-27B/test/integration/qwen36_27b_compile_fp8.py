@@ -208,6 +208,9 @@ def _build_config(args: argparse.Namespace):
     config_dict.setdefault("use_hybrid_cache_manager", True)
     config_dict.setdefault("use_qwen_hybrid_chunked_prefill", True)
     config_dict.setdefault("use_qwen_hybrid_chunked_prefill_nki", True)
+    config_dict["qwen_ablate_mlp"] = args.ablate == "mlp"
+    config_dict["qwen_ablate_gdn"] = args.ablate == "gdn"
+    config_dict["qwen_ablate_attention"] = args.ablate == "attention"
 
     inf_config = Qwen35InferenceConfig(neuron_config=neuron_config, **config_dict)
     return inf_config, modules_to_not_convert
@@ -226,6 +229,12 @@ def main() -> int:
     parser.add_argument("--force-quantize", action="store_true")
     parser.add_argument("--quantize-only", action="store_true")
     parser.add_argument("--load-after-compile", action="store_true")
+    parser.add_argument(
+        "--ablate",
+        choices=("none", "mlp", "gdn", "attention"),
+        default="none",
+        help="Measurement-only no-op ablation for isolating CTE layer-class cost.",
+    )
     args = parser.parse_args()
 
     repo = _repo_root(args.repo_root)
@@ -242,6 +251,7 @@ def main() -> int:
     inf_config, modules_to_not_convert = _build_config(args)
 
     print("FP8_MODE mlp_only", flush=True)
+    print("ABLATION_MODE", args.ablate, flush=True)
     print("MODEL_PATH", str(model_path), flush=True)
     print("COMPILED_PATH", str(compiled_path), flush=True)
     print("QUANTIZED_CHECKPOINTS_PATH", str(quantized_path), flush=True)

@@ -290,6 +290,7 @@ class NeuronGatedDeltaNet(nn.Module):
         self.use_qwen_hybrid_chunked_prefill_nki = getattr(
             tc, "use_qwen_hybrid_chunked_prefill_nki", False
         )
+        self.qwen_ablate_gdn = getattr(tc, "qwen_ablate_gdn", False)
 
         # KV cache dummy shape info
         self.head_dim = tc.head_dim  # 256
@@ -824,6 +825,42 @@ class NeuronGatedDeltaNet(nn.Module):
         if hybrid_cache_active and past_key_value is not None:
             recurrent_state_cache, conv_state_cache = past_key_value
 
+        if self.qwen_ablate_gdn:
+            output = hidden_states * 0
+            if recurrent_state_cache is not None:
+                new_rec_state = recurrent_state_cache[:batch_size].to(
+                    self.recurrent_state_buffer.dtype
+                )
+            elif seq_ids is not None:
+                new_rec_state = torch.index_select(
+                    self.recurrent_state_buffer, 0, seq_ids
+                )
+            else:
+                new_rec_state = self.recurrent_state_buffer[:batch_size]
+
+            if conv_state_cache is not None:
+                new_conv_state = conv_state_cache[:batch_size].to(
+                    self.conv_state_buffer.dtype
+                )
+            elif seq_ids is not None:
+                new_conv_state = torch.index_select(self.conv_state_buffer, 0, seq_ids)
+            else:
+                new_conv_state = self.conv_state_buffer[:batch_size]
+
+            if hybrid_cache_active:
+                return output, (new_rec_state, new_conv_state), new_rec_state, new_conv_state
+
+            dummy_k = torch.zeros(
+                batch_size,
+                self.kv_heads_per_rank,
+                seq_len,
+                self.head_dim,
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+            dummy_v = torch.zeros_like(dummy_k)
+            return output, (dummy_k, dummy_v), new_rec_state, new_conv_state
+
         # Project inputs
         deltanet_fp32 = os.environ.get("DELTANET_FP32") == "1"
         if deltanet_fp32 and isinstance(self.in_proj_qkv, nn.Linear):
@@ -1214,6 +1251,9 @@ class Qwen35InferenceConfig(InferenceConfig):
         kwargs.setdefault("use_hybrid_cache_manager", False)
         kwargs.setdefault("use_qwen_hybrid_chunked_prefill", False)
         kwargs.setdefault("use_qwen_hybrid_chunked_prefill_nki", False)
+        kwargs.setdefault("qwen_ablate_mlp", False)
+        kwargs.setdefault("qwen_ablate_gdn", False)
+        kwargs.setdefault("qwen_ablate_attention", False)
 
         super().__init__(*args, **kwargs)
 
@@ -1383,6 +1423,7 @@ class NeuronQwen35Attention(NeuronAttentionBase):
 
         # Separate mRoPE module for VL 3D position_ids
         self.mrope_emb = Qwen35MRoPEEmbedding(config)
+        self.qwen_ablate_attention = getattr(config, "qwen_ablate_attention", False)
 
         # Output gate projection: hidden_size -> num_heads * head_dim
         # Populated from the second half of q_proj during state dict conversion.
@@ -1573,6 +1614,12 @@ class NeuronQwen35Attention(NeuronAttentionBase):
             rmsnorm=rmsnorm,
         )
 
+        if self.qwen_ablate_attention:
+            attn_output = hidden_states * 0
+            K = K.to(self.torch_dtype)
+            V = V.to(self.torch_dtype)
+            return attn_output, (K, V), cos_cache, sin_cache
+
         qwen_chunked_prefill_active = (
             past_key_value is not None
             and q_len > 1
@@ -1632,6 +1679,7 @@ class Qwen35MLP(nn.Module):
 
     def __init__(self, config):
         super().__init__()
+        self.qwen_ablate_mlp = getattr(config, "qwen_ablate_mlp", False)
         self.gate_proj = ColumnParallelLinear(
             config.hidden_size,
             config.intermediate_size,
@@ -1652,6 +1700,8 @@ class Qwen35MLP(nn.Module):
         )
 
     def forward(self, hidden_states):
+        if self.qwen_ablate_mlp:
+            return hidden_states * 0
         gate = self.gate_proj(hidden_states)
         up = self.up_proj(hidden_states)
         hidden_states = F.silu(gate) * up
