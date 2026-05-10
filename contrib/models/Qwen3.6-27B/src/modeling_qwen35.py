@@ -54,7 +54,17 @@ from neuronx_distributed.parallel_layers.layers import (
     ParallelEmbedding,
     RowParallelLinear,
 )
+from neuronx_distributed.parallel_layers.mappings import (
+    reduce_from_tensor_model_parallel_region,
+)
 from neuronx_distributed.utils import cpu_mode
+import nki.language as nl
+from nkilib.core.mlp.mlp import mlp as nki_mlp
+from nkilib.core.rmsnorm.rmsnorm_quant import (
+    RmsNormQuantKernelArgs,
+    rmsnorm_quant_kernel,
+)
+from nkilib.core.utils.common_types import ActFnType, NormType, QuantizationType
 
 try:
     from nki import jit as nki_jit  # NKI 0.3.0+ (SDK 2.29)
@@ -87,6 +97,9 @@ from neuronx_distributed_inference.models.model_wrapper import (
     TOKEN_GENERATION_MODEL_TAG,
     DecoderModelInstance,
     ModelWrapper,
+)
+from neuronx_distributed_inference.modules.attention.utils import (
+    preprocess_quantized_linear_layer,
 )
 from neuronx_distributed_inference.modules.attention.attention_base import (
     NeuronAttentionBase,
@@ -1632,31 +1645,157 @@ class Qwen35MLP(nn.Module):
 
     def __init__(self, config):
         super().__init__()
+        self.config = config
+        self.neuron_config = config.neuron_config
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.intermediate_size
+        self.rms_norm_eps = config.rms_norm_eps
+        self.mlp_kernel_enabled = getattr(self.neuron_config, "mlp_kernel_enabled", False)
+        self.quantized_mlp_kernel_enabled = getattr(
+            self.neuron_config, "quantized_mlp_kernel_enabled", False
+        )
+        self.quantize_clamp_bound = getattr(
+            self.neuron_config, "quantize_clamp_bound", float("inf")
+        )
+        if self.quantized_mlp_kernel_enabled and self.quantize_clamp_bound == float("inf"):
+            self.quantize_clamp_bound = 1200.0
+        self.logical_nc_config = getattr(self.neuron_config, "logical_nc_config", 1)
+        self.kernel_act_fn = ActFnType.SiLU
+
         self.gate_proj = ColumnParallelLinear(
-            config.hidden_size,
-            config.intermediate_size,
+            self.hidden_size,
+            self.intermediate_size,
             bias=False,
             gather_output=False,
         )
         self.up_proj = ColumnParallelLinear(
-            config.hidden_size,
-            config.intermediate_size,
+            self.hidden_size,
+            self.intermediate_size,
             bias=False,
             gather_output=False,
         )
         self.down_proj = RowParallelLinear(
-            config.intermediate_size,
-            config.hidden_size,
+            self.intermediate_size,
+            self.hidden_size,
             bias=False,
             input_is_parallel=True,
         )
 
-    def forward(self, hidden_states):
+        if self.mlp_kernel_enabled and self.quantized_mlp_kernel_enabled:
+            setattr(
+                self.gate_proj,
+                "post_create_quantized_module_hook",
+                preprocess_quantized_linear_layer,
+            )
+            setattr(
+                self.up_proj,
+                "post_create_quantized_module_hook",
+                preprocess_quantized_linear_layer,
+            )
+            setattr(
+                self.down_proj,
+                "post_create_quantized_module_hook",
+                preprocess_quantized_linear_layer,
+            )
+
+    def _kernel_enabled_tkg_mlp(self, hidden_states):
+        norm_weights = torch.zeros(
+            size=(1, self.hidden_size),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+        quantization_type = (
+            QuantizationType.ROW
+            if self.quantized_mlp_kernel_enabled
+            else QuantizationType.NONE
+        )
+        gate_w_scale = (
+            self.gate_proj.scale.data if self.quantized_mlp_kernel_enabled else None
+        )
+        up_w_scale = (
+            self.up_proj.scale.data if self.quantized_mlp_kernel_enabled else None
+        )
+        down_w_scale = (
+            self.down_proj.scale.data if self.quantized_mlp_kernel_enabled else None
+        )
+
+        mlp_output = nki_mlp[self.logical_nc_config](
+            hidden_tensor=hidden_states,
+            gate_proj_weights_tensor=self.gate_proj.weight.data,
+            up_proj_weights_tensor=self.up_proj.weight.data,
+            down_proj_weights_tensor=self.down_proj.weight.data,
+            normalization_weights_tensor=norm_weights,
+            normalization_type=NormType.NO_NORM,
+            quantization_type=quantization_type,
+            gate_w_scale=gate_w_scale,
+            up_w_scale=up_w_scale,
+            down_w_scale=down_w_scale,
+            eps=self.rms_norm_eps,
+            activation_fn=self.kernel_act_fn,
+        )
+        output = mlp_output[0] if isinstance(mlp_output, list) else mlp_output
+        return reduce_from_tensor_model_parallel_region(output)
+
+    def _kernel_enabled_quantized_mlp(self, hidden_states):
+        norm_weights = torch.zeros(
+            size=(1, self.hidden_size),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+        quant_args = RmsNormQuantKernelArgs(
+            lower_bound=self.quantize_clamp_bound,
+            norm_type=NormType.NO_NORM,
+            quantization_type=QuantizationType.ROW,
+            eps=self.rms_norm_eps,
+        )
+        hidden_quantized = rmsnorm_quant_kernel[self.logical_nc_config](
+            hidden=hidden_states,
+            ln_w=norm_weights,
+            kargs=quant_args,
+        )
+
+        mlp_output = nki_mlp[self.logical_nc_config](
+            hidden_tensor=hidden_quantized,
+            gate_proj_weights_tensor=self.gate_proj.weight.data,
+            up_proj_weights_tensor=self.up_proj.weight.data,
+            down_proj_weights_tensor=self.down_proj.weight.data,
+            normalization_weights_tensor=None,
+            normalization_type=NormType.NO_NORM,
+            quantization_type=quant_args.quantization_type,
+            gate_w_scale=self.gate_proj.scale.data,
+            up_w_scale=self.up_proj.scale.data,
+            down_w_scale=self.down_proj.scale.data,
+            quant_clipping_bound=self.quantize_clamp_bound,
+            output_dtype={
+                torch.bfloat16: nl.bfloat16,
+                torch.float16: nl.float16,
+                torch.float32: nl.float32,
+            }[hidden_states.dtype],
+            eps=self.rms_norm_eps,
+            force_cte_mode=True,
+            activation_fn=self.kernel_act_fn,
+        )
+        output = mlp_output[0] if isinstance(mlp_output, list) else mlp_output
+        return reduce_from_tensor_model_parallel_region(output)
+
+    def _native_mlp(self, hidden_states):
         gate = self.gate_proj(hidden_states)
         up = self.up_proj(hidden_states)
         hidden_states = F.silu(gate) * up
         hidden_states = self.down_proj(hidden_states)
         return hidden_states
+
+    def forward(self, hidden_states):
+        if (
+            self.mlp_kernel_enabled
+            and self.quantized_mlp_kernel_enabled
+            and not getattr(self.neuron_config, "on_cpu", False)
+        ):
+            batch_seqlen = hidden_states.shape[0] * hidden_states.shape[1]
+            if batch_seqlen <= 128:
+                return self._kernel_enabled_tkg_mlp(hidden_states)
+            return self._kernel_enabled_quantized_mlp(hidden_states)
+        return self._native_mlp(hidden_states)
 
 
 # ============================================================
