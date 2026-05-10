@@ -41,3 +41,14 @@ def register_qwen35_config() -> None:
         AutoConfig.register(Qwen35TextConfig.model_type, Qwen35TextConfig)
     if not _is_registered(Qwen35Config.model_type):
         AutoConfig.register(Qwen35Config.model_type, Qwen35Config)
+
+    try:
+        from vllm.model_executor.models import ModelRegistry
+    except Exception:
+        return
+
+    supported_archs = ModelRegistry.get_supported_archs()
+    qwen3_impl = "vllm.model_executor.models.qwen3:Qwen3ForCausalLM"
+    for arch in ("Qwen3_5ForConditionalGeneration", "Qwen3_5ForCausalLM"):
+        if arch not in supported_archs:
+            ModelRegistry.register_model(arch, qwen3_impl)
