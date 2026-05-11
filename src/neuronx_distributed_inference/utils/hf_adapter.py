@@ -311,10 +311,11 @@ class HuggingFaceGenerationAdapter(PreTrainedModel, GenerationMixin):
                 "medusa_args": (accepted_indices, current_length, medusa_mask, scatter_index),
                 "sampling_params": sampling_params,
                 "input_capture_hook": input_capture_hook,
-                "tensor_capture_hook": tensor_capture_hook,
                 "adapter_ids": adapter_ids
             }
         )
+        if tensor_capture_hook is not None:
+            model_inputs["tensor_capture_hook"] = tensor_capture_hook
 
         tf_args = []
         if self.neuron_config.tensor_replacement_config:
