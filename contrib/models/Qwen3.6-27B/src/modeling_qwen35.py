@@ -1214,6 +1214,8 @@ class Qwen35InferenceConfig(InferenceConfig):
         kwargs.setdefault("use_hybrid_cache_manager", False)
         kwargs.setdefault("use_qwen_hybrid_chunked_prefill", False)
         kwargs.setdefault("use_qwen_hybrid_chunked_prefill_nki", False)
+        kwargs.setdefault("enable_mtp_weight_loading", False)
+        kwargs.setdefault("mtp_num_hidden_layers", kwargs.get("num_nextn_predict_layers", 1))
 
         super().__init__(*args, **kwargs)
 
@@ -2612,6 +2614,20 @@ def convert_qwen35_hf_to_neuron_state_dict(neuron_state_dict, config):
             norm_keys_to_convert.append(f"layers.{l}.self_attn.q_norm.weight")
             norm_keys_to_convert.append(f"layers.{l}.self_attn.k_norm.weight")
     norm_keys_to_convert.append("norm.weight")
+    if getattr(config, "enable_mtp_weight_loading", False):
+        norm_keys_to_convert.extend(
+            [
+                "mtp.norm.weight",
+                "mtp.pre_fc_norm_embedding.weight",
+                "mtp.pre_fc_norm_hidden.weight",
+            ]
+        )
+        for mtp_layer_idx in range(getattr(config, "mtp_num_hidden_layers", 1)):
+            mtp_prefix = f"mtp.layers.{mtp_layer_idx}"
+            norm_keys_to_convert.append(f"{mtp_prefix}.input_layernorm.weight")
+            norm_keys_to_convert.append(f"{mtp_prefix}.post_attention_layernorm.weight")
+            norm_keys_to_convert.append(f"{mtp_prefix}.self_attn.q_norm.weight")
+            norm_keys_to_convert.append(f"{mtp_prefix}.self_attn.k_norm.weight")
 
     for nk in norm_keys_to_convert:
         if nk in neuron_state_dict:
@@ -2716,6 +2732,63 @@ def convert_qwen35_hf_to_neuron_state_dict(neuron_state_dict, config):
         # NxDI: layers.X.mlp.{gate_proj, up_proj, down_proj}.weight
 
         gc.collect()
+
+    if getattr(config, "enable_mtp_weight_loading", False):
+        neuron_state_dict["mtp.rank_util.rank"] = torch.arange(
+            0,
+            config.neuron_config.tp_degree,
+            dtype=torch.int32,
+        )
+        for mtp_layer_idx in range(getattr(config, "mtp_num_hidden_layers", 1)):
+            attn_prefix = f"mtp.layers.{mtp_layer_idx}.self_attn"
+            neuron_state_dict[f"{attn_prefix}.rank_util.rank"] = torch.arange(
+                0,
+                config.neuron_config.tp_degree,
+                dtype=torch.int32,
+            )
+
+            q_norm_key = f"{attn_prefix}.q_norm.weight"
+            k_norm_key = f"{attn_prefix}.k_norm.weight"
+            if q_norm_key in neuron_state_dict:
+                neuron_state_dict[f"{attn_prefix}.q_layernorm.weight"] = (
+                    neuron_state_dict.pop(q_norm_key).detach().clone()
+                )
+            if k_norm_key in neuron_state_dict:
+                neuron_state_dict[f"{attn_prefix}.k_layernorm.weight"] = (
+                    neuron_state_dict.pop(k_norm_key).detach().clone()
+                )
+
+            q_proj_key = f"{attn_prefix}.q_proj.weight"
+            if q_proj_key in neuron_state_dict:
+                q_proj_w = neuron_state_dict.pop(q_proj_key)
+                num_heads = config.num_attention_heads
+                head_dim = config.head_dim
+                q_proj_w = q_proj_w.reshape(num_heads, head_dim * 2, config.hidden_size)
+                query_w = q_proj_w[:, :head_dim, :].reshape(
+                    num_heads * head_dim, config.hidden_size
+                )
+                gate_w = q_proj_w[:, head_dim:, :].reshape(
+                    num_heads * head_dim, config.hidden_size
+                )
+
+                neuron_state_dict[q_proj_key] = query_w
+                neuron_state_dict[f"{attn_prefix}.output_gate_proj.weight"] = gate_w
+
+            if config.neuron_config.fused_qkv:
+                q_key = f"{attn_prefix}.q_proj.weight"
+                k_key = f"{attn_prefix}.k_proj.weight"
+                v_key = f"{attn_prefix}.v_proj.weight"
+                if q_key in neuron_state_dict:
+                    neuron_state_dict[f"{attn_prefix}.Wqkv.weight"] = torch.cat(
+                        [
+                            neuron_state_dict[q_key],
+                            neuron_state_dict[k_key],
+                            neuron_state_dict[v_key],
+                        ]
+                    )
+                    del neuron_state_dict[q_key]
+                    del neuron_state_dict[k_key]
+                    del neuron_state_dict[v_key]
 
     return neuron_state_dict
 
@@ -2953,7 +3026,10 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
             elif k.startswith("model."):
                 new_sd[k.replace("model.", "", 1)] = v
             elif k.startswith("mtp."):
-                continue  # Skip MTP
+                if getattr(config, "enable_mtp_weight_loading", False):
+                    new_sd[k] = v
+                else:
+                    continue  # Skip MTP unless the speculative branch is enabled.
             elif k.startswith("lm_head."):
                 new_sd[k] = v
             else:

@@ -333,7 +333,7 @@ class TestDeltaNetPassthrough(unittest.TestCase):
     """Test that DeltaNet layer weights pass through conversion unchanged."""
 
     def test_deltanet_weights_unchanged(self):
-        config = _make_mini_config()
+        config = _make_mini_config(tp_degree=1)
         sd = _make_mini_state_dict(config)
 
         # Record original DeltaNet weights
@@ -430,6 +430,96 @@ class TestVLPrefixStripping(unittest.TestCase):
 
         result = NeuronQwen35ForCausalLM.convert_hf_to_neuron_state_dict(vl_sd, config)
         self.assertIn("norm.weight", result)
+
+
+class TestMTPWeightConversion(unittest.TestCase):
+    """Test opt-in MTP weight loading for native speculative decoding."""
+
+    def _add_mtp_weights(self, sd, config):
+        H = config.hidden_size
+        I = config.intermediate_size
+        num_heads = config.num_attention_heads
+        num_kv = config.num_key_value_heads
+        head_dim = config.head_dim
+
+        sd["mtp.fc.weight"] = torch.randn(H, H * 2, dtype=torch.bfloat16)
+        sd["mtp.norm.weight"] = torch.zeros(H, dtype=torch.bfloat16)
+        sd["mtp.pre_fc_norm_embedding.weight"] = torch.zeros(H, dtype=torch.bfloat16)
+        sd["mtp.pre_fc_norm_hidden.weight"] = torch.zeros(H, dtype=torch.bfloat16)
+        sd["mtp.layers.0.input_layernorm.weight"] = torch.zeros(
+            H, dtype=torch.bfloat16
+        )
+        sd["mtp.layers.0.post_attention_layernorm.weight"] = torch.zeros(
+            H, dtype=torch.bfloat16
+        )
+        sd["mtp.layers.0.self_attn.q_norm.weight"] = torch.zeros(
+            head_dim, dtype=torch.bfloat16
+        )
+        sd["mtp.layers.0.self_attn.k_norm.weight"] = torch.zeros(
+            head_dim, dtype=torch.bfloat16
+        )
+        sd["mtp.layers.0.self_attn.q_proj.weight"] = torch.randn(
+            num_heads * head_dim * 2, H, dtype=torch.bfloat16
+        )
+        sd["mtp.layers.0.self_attn.k_proj.weight"] = torch.randn(
+            num_kv * head_dim, H, dtype=torch.bfloat16
+        )
+        sd["mtp.layers.0.self_attn.v_proj.weight"] = torch.randn(
+            num_kv * head_dim, H, dtype=torch.bfloat16
+        )
+        sd["mtp.layers.0.self_attn.o_proj.weight"] = torch.randn(
+            H, num_heads * head_dim, dtype=torch.bfloat16
+        )
+        sd["mtp.layers.0.mlp.gate_proj.weight"] = torch.randn(
+            I, H, dtype=torch.bfloat16
+        )
+        sd["mtp.layers.0.mlp.up_proj.weight"] = torch.randn(I, H, dtype=torch.bfloat16)
+        sd["mtp.layers.0.mlp.down_proj.weight"] = torch.randn(
+            H, I, dtype=torch.bfloat16
+        )
+
+    def test_mtp_weights_skipped_by_default(self):
+        config = _make_mini_config()
+        sd = _make_mini_state_dict(config)
+        self._add_mtp_weights(sd, config)
+
+        result = NeuronQwen35ForCausalLM.convert_hf_to_neuron_state_dict(sd, config)
+
+        self.assertNotIn("mtp.fc.weight", result)
+        self.assertNotIn("mtp.layers.0.self_attn.Wqkv.weight", result)
+
+    def test_mtp_weights_convert_when_enabled(self):
+        config = _make_mini_config()
+        config.enable_mtp_weight_loading = True
+        config.mtp_num_hidden_layers = 1
+        sd = _make_mini_state_dict(config)
+        self._add_mtp_weights(sd, config)
+
+        result = NeuronQwen35ForCausalLM.convert_hf_to_neuron_state_dict(sd, config)
+
+        self.assertIn("mtp.fc.weight", result)
+        self.assertIn("mtp.layers.0.self_attn.Wqkv.weight", result)
+        self.assertIn("mtp.layers.0.self_attn.output_gate_proj.weight", result)
+        self.assertIn("mtp.layers.0.self_attn.q_layernorm.weight", result)
+        self.assertIn("mtp.layers.0.self_attn.k_layernorm.weight", result)
+        self.assertNotIn("mtp.layers.0.self_attn.q_norm.weight", result)
+        self.assertNotIn("mtp.layers.0.self_attn.k_norm.weight", result)
+
+        expected_q_dim = config.num_attention_heads * config.head_dim
+        expected_kv_dim = config.num_key_value_heads * config.head_dim
+        expected_wqkv_dim = expected_q_dim + expected_kv_dim + expected_kv_dim
+        self.assertEqual(
+            result["mtp.layers.0.self_attn.Wqkv.weight"].shape,
+            (expected_wqkv_dim, config.hidden_size),
+        )
+        self.assertEqual(
+            result["mtp.layers.0.self_attn.output_gate_proj.weight"].shape,
+            (expected_q_dim, config.hidden_size),
+        )
+        torch.testing.assert_close(
+            result["mtp.norm.weight"],
+            torch.ones_like(result["mtp.norm.weight"]),
+        )
 
 
 if __name__ == "__main__":

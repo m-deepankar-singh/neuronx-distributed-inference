@@ -16,21 +16,22 @@ Status: CPU contract implemented; Trainium integration not wired yet.
   - `mtp.fc.weight` -> `model.fc.weight`
   - `mtp.layers.0.self_attn.q_proj.weight` -> `model.layers.0.self_attn.q_proj.weight`
   - shared `embed_tokens.weight` and `lm_head.weight` stay shared.
+- `Qwen35InferenceConfig(enable_mtp_weight_loading=True)` now preserves and
+  converts native `mtp.*` weights into the same NxDI attention layout used by
+  full-attention layers.
 
 ## Current Gap
 
-The Qwen3.6 contrib converter still skips `mtp.*` weights, and the hybrid cache
-manager currently rejects speculative decoding. This means native MTP weights
-exist in the checkpoint but are not yet loaded into the NxDI/Trainium execution
-path.
+The baseline target model still skips `mtp.*` weights by default, and the hybrid
+cache manager currently rejects speculative decoding. This means native MTP
+weights can now be loaded behind an opt-in flag, but they are not yet wired into
+the NxDI/Trainium execution path.
 
 ## Next Implementation Steps
 
 1. Add a Neuron-side MTP predictor module matching the CPU contract.
-2. Extend conversion to preserve `mtp.*` weights for the MTP branch while keeping
-   the target model unchanged.
-3. Wire the predictor into NxDI speculative decoding with the hybrid cache state.
-4. Validate with greedy baseline comparison, acceptance-rate measurement, and
+2. Wire the predictor into NxDI speculative decoding with the hybrid cache state.
+3. Validate with greedy baseline comparison, acceptance-rate measurement, and
    decode throughput.
 
 The CPU tests are intentionally small and do not attempt full 27B parity. They
