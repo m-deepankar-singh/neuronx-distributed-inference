@@ -70,6 +70,7 @@ def _build_config(args: argparse.Namespace):
         enable_fused_speculation=True,
         enable_eagle_speculation=True,
         speculation_length=args.speculation_length,
+        disable_kv_cache_tiling=True,
     )
 
     target_config_dict = dict(config_dict)
