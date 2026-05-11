@@ -26,6 +26,8 @@ if _CONTRIB_ROOT not in sys.path:
     sys.path.insert(0, _CONTRIB_ROOT)
 
 from src.modeling_qwen35 import (
+    HybridDeltaNetCacheManager,
+    NeuronGatedDeltaNet,
     Qwen35InferenceConfig,
     NeuronQwen35ForCausalLM,
     NeuronQwen35MTPDraftForCausalLM,
@@ -212,7 +214,69 @@ class TestNormConversion(unittest.TestCase):
                 self.assertTrue(
                     torch.allclose(k_w, torch.ones_like(k_w)),
                     f"Layer {l} k_layernorm not converted",
-                )
+            )
+
+
+class TestMTPHybridStateHelpers(unittest.TestCase):
+    """CPU-only guardrails for native MTP + hybrid DeltaNet state handling."""
+
+    def test_recurrent_decode_forward_returns_each_prefix_state(self):
+        torch.manual_seed(0)
+        net = object.__new__(NeuronGatedDeltaNet)
+        batch, heads, seq, dim = 2, 3, 4, 5
+        query = torch.randn(batch, heads, seq, dim)
+        key = torch.randn(batch, heads, seq, dim)
+        value = torch.randn(batch, heads, seq, dim)
+        g = -torch.rand(batch, heads, seq)
+        beta = torch.rand(batch, heads, seq)
+        state = torch.randn(batch, heads, dim, dim)
+
+        out, final_state, step_states = net._recurrent_decode_forward(
+            query,
+            key,
+            value,
+            g,
+            beta,
+            state,
+            return_step_states=True,
+        )
+
+        manual_outputs = []
+        manual_states = []
+        manual_state = state
+        for token_idx in range(seq):
+            token_out, manual_state = net._recurrent_step(
+                query[:, :, token_idx : token_idx + 1],
+                key[:, :, token_idx : token_idx + 1],
+                value[:, :, token_idx : token_idx + 1],
+                g[:, :, token_idx : token_idx + 1],
+                beta[:, :, token_idx : token_idx + 1],
+                manual_state,
+            )
+            manual_outputs.append(token_out)
+            manual_states.append(manual_state)
+
+        torch.testing.assert_close(out, torch.cat(manual_outputs, dim=2))
+        torch.testing.assert_close(final_state, manual_state)
+        torch.testing.assert_close(step_states, torch.stack(manual_states, dim=1))
+
+    def test_select_deltanet_state_for_acceptance(self):
+        recurrent_steps = torch.arange(2 * 3 * 2 * 2 * 2, dtype=torch.float32).view(
+            2, 3, 2, 2, 2
+        )
+        conv_steps = torch.arange(2 * 3 * 4 * 3, dtype=torch.float32).view(2, 3, 4, 3)
+        accepted_lengths = torch.tensor([[1], [3]], dtype=torch.int32)
+
+        recurrent, conv = HybridDeltaNetCacheManager.select_deltanet_state_for_acceptance(
+            recurrent_steps,
+            conv_steps,
+            accepted_lengths,
+        )
+
+        torch.testing.assert_close(recurrent[0], recurrent_steps[0, 0])
+        torch.testing.assert_close(recurrent[1], recurrent_steps[1, 2])
+        torch.testing.assert_close(conv[0], conv_steps[0, 0])
+        torch.testing.assert_close(conv[1], conv_steps[1, 2])
 
 
 class TestQProjSplit(unittest.TestCase):

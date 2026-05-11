@@ -1,6 +1,6 @@
 # Qwen3.6-27B Native MTP Speculative Decode
 
-Status: CPU contract implemented; Trainium integration not wired yet.
+Status: MTP draft/scaffold implemented; hardware compile not attempted yet.
 
 ## What Is Implemented
 
@@ -27,22 +27,27 @@ Status: CPU contract implemented; Trainium integration not wired yet.
 - `NeuronQwen35MTPDraftForCausalLM` exposes Qwen's native MTP predictor as a
   separate NxDI draft model. Its converter keeps only shared `embed_tokens`,
   shared `lm_head`, and native `mtp.*` weights.
+- The EAGLE-style fused-spec path now has a Qwen-specific MTP guardrail for
+  hybrid DeltaNet state: target verification can return per-step recurrent and
+  conv states, and the fused-spec scheduler selects the state at the accepted
+  prefix length before returning cache aliases.
+- `test/integration/qwen36_27b_compile_mtp.py` builds a native-MTP config from
+  the validated hybrid/chunked-prefill baseline settings.
 
 ## Current Gap
 
-The baseline target model still skips `mtp.*` weights by default, and the hybrid
-cache manager currently rejects speculative decoding. This means native MTP
-weights can now be loaded and called behind opt-in hooks, but they are not yet
-connected to the NxDI generation scheduler or vLLM speculative request path.
+The baseline target model still skips `mtp.*` weights by default. Native MTP is
+now connected to the NxDI EAGLE-style fused-spec scheduler behind opt-in flags,
+but no Trainium artifact has been compiled or validated yet. vLLM request-level
+plumbing for `qwen3_next_mtp` remains separate from the NxDI compile path.
 
 ## Next Implementation Steps
 
-1. Wire `NeuronQwen35MTPDraftForCausalLM` into the fused-spec config and compile
-   a small speculation artifact.
-2. Add hybrid-cache state handling for accepted/rejected MTP drafts if the
-   existing EAGLE-style scheduler cannot preserve DeltaNet state correctly.
-3. Validate with greedy baseline comparison, acceptance-rate measurement, and
-   decode throughput.
+1. Compile a small native-MTP speculation artifact with
+   `test/integration/qwen36_27b_compile_mtp.py`.
+2. Validate compile/load, short greedy generation, 762-token exact-match gate,
+   acceptance rate, and decode throughput.
+3. Wire the validated artifact into the vLLM/Neuron serving path.
 
 The CPU tests are intentionally small and do not attempt full 27B parity. They
 are a guardrail for the MTP tensor path before expensive Neuron compile attempts.

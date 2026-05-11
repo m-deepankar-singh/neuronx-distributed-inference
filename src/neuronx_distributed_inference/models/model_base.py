@@ -1022,6 +1022,12 @@ class NeuronBaseModel(nn.Module):
             outputs += [logits]
         outputs += updated_kv_cache
 
+        if (
+            getattr(self.config, "enable_mtp_step_state_output", False)
+            and hasattr(self, "_deltanet_step_states")
+            and not is_for_context_encoding
+        ):
+            outputs += self._deltanet_step_states
         if self.neuron_config.enable_eagle_speculation:
             if is_for_context_encoding:
                 outputs = outputs + [hidden_states] + [self.full_hidden_states]
@@ -1652,6 +1658,44 @@ class NeuronFusedSpecModel(nn.Module):
         if self.config.neuron_config.enable_token_tree:
             assert self.config.neuron_config.token_tree_config
             self.token_tree = TokenTree(self.neuron_config.token_tree_config)
+
+    def _mtp_target_step_state_count(self):
+        if not getattr(self.config, "enable_mtp_speculation", False):
+            return 0
+        if not getattr(self.config, "enable_mtp_step_state_output", False):
+            return 0
+        if not hasattr(self.target_model, "_deltanet_state_params"):
+            return 0
+        return len(self.target_model._deltanet_state_params)
+
+    def _select_mtp_hybrid_target_cache(
+        self,
+        target_cache,
+        target_deltanet_step_states,
+        accepted_lengths,
+    ):
+        kv_mgr = getattr(self.target_model, "kv_mgr", None)
+        if kv_mgr is None or not hasattr(kv_mgr, "layer_types"):
+            return target_cache
+
+        selected_cache = []
+        step_idx = 0
+        for layer_idx, layer_type in enumerate(kv_mgr.layer_types):
+            cache_idx = 2 * layer_idx
+            if layer_type == "linear_attention":
+                recurrent_state, conv_state = kv_mgr.select_deltanet_state_for_acceptance(
+                    target_deltanet_step_states[step_idx],
+                    target_deltanet_step_states[step_idx + 1],
+                    accepted_lengths,
+                )
+                selected_cache.append(recurrent_state)
+                selected_cache.append(conv_state)
+                step_idx += 2
+            else:
+                selected_cache.append(target_cache[cache_idx])
+                selected_cache.append(target_cache[cache_idx + 1])
+
+        return selected_cache
 
     def _select_from(self, to_indices, from_indices, from_values):
         if to_indices.ndim > from_indices.ndim:
@@ -2641,7 +2685,13 @@ class NeuronFusedSpecModel(nn.Module):
             )
         else:
             target_tokens = outputs[0]
-        target_cache = outputs[num_outputs:-1]
+        target_step_state_count = self._mtp_target_step_state_count()
+        if target_step_state_count:
+            target_cache = outputs[num_outputs : -1 - target_step_state_count]
+            target_deltanet_step_states = outputs[-1 - target_step_state_count : -1]
+        else:
+            target_cache = outputs[num_outputs:-1]
+            target_deltanet_step_states = []
         hidden_state = outputs[-1]
 
         prev_hidden = torch.cat([orig_hidden, hidden_state[:, : spec_len - 1, :]], dim=1)
@@ -2721,8 +2771,18 @@ class NeuronFusedSpecModel(nn.Module):
                 .view(self.batch_size, -1)
             )
 
-        index = index.reshape(self.batch_size, -1, 1).expand(self.batch_size, 1, self.rolling_buffer_hidden_size)
-        hidden_state = torch.gather(hidden_state, dim=1, index=index)
+        accepted_lengths = index.reshape(self.batch_size, -1).to(torch.int32)
+        if target_step_state_count:
+            target_cache = self._select_mtp_hybrid_target_cache(
+                target_cache,
+                target_deltanet_step_states,
+                accepted_lengths,
+            )
+
+        hidden_index = accepted_lengths.reshape(self.batch_size, -1, 1).expand(
+            self.batch_size, 1, self.rolling_buffer_hidden_size
+        )
+        hidden_state = torch.gather(hidden_state, dim=1, index=hidden_index)
 
         if self.neuron_config.output_logits:
             draft_logits = torch.cat(draft_logits_list, dim=1)
