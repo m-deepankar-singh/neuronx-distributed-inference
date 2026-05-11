@@ -33,6 +33,10 @@ import torch
 from transformers import AutoTokenizer
 
 
+class BadRequest(ValueError):
+    pass
+
+
 def token_scalar(tokens: Any) -> int:
     if hasattr(tokens, "detach"):
         tokens = tokens.detach().cpu()
@@ -42,9 +46,15 @@ def token_scalar(tokens: Any) -> int:
 
 
 def normalize_messages(messages: list[dict[str, Any]]) -> list[dict[str, str]]:
+    if not isinstance(messages, list):
+        raise BadRequest("messages must be a list")
     normalized: list[dict[str, str]] = []
-    for message in messages:
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            raise BadRequest("each message must be an object")
         role = message.get("role", "user")
+        if role == "system" and index != 0:
+            raise BadRequest("System message must be at the beginning.")
         content = message.get("content", "")
         if isinstance(content, str):
             text = content
@@ -336,7 +346,7 @@ class QwenEngine:
     def render_prompt(self, body: dict[str, Any]) -> str:
         messages = normalize_messages(body.get("messages", []))
         if not messages:
-            raise ValueError("messages must be a non-empty list")
+            raise BadRequest("messages must be a non-empty list")
         enable_thinking = bool(body.get("enable_thinking", False))
         try:
             return self.tokenizer.apply_chat_template(
@@ -670,6 +680,10 @@ class Handler(BaseHTTPRequestHandler):
             }
             print("REQUEST_DONE " + json.dumps(result["timings"]), flush=True)
             self.send_json(200, payload)
+        except BadRequest as exc:
+            self.send_json(400, {"error": {"message": str(exc), "type": "BadRequestError"}})
+        except json.JSONDecodeError as exc:
+            self.send_json(400, {"error": {"message": str(exc), "type": "BadRequestError"}})
         except Exception as exc:
             traceback.print_exc()
             self.send_json(500, {"error": {"message": str(exc), "type": exc.__class__.__name__}})
