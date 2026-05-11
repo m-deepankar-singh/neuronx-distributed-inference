@@ -1,0 +1,42 @@
+{
+  "baseline": "baseline_v3_cold",
+  "baseline_file": "/opt/dlami/nvme/qwen36_perf_baseline_v3_cold.json",
+  "candidate": "direct_rhs_v2_cold",
+  "candidate_file": "/opt/dlami/nvme/qwen36_perf_direct_rhs_v2_cold.json",
+  "rows": [
+    {
+      "baseline_ok": true,
+      "baseline_wall_s": 1.3316488389973529,
+      "candidate_ok": true,
+      "candidate_wall_s": 1.3560730269964552,
+      "name": "math_smoke",
+      "speed_ratio_candidate_over_baseline": 1.0183413128775693
+    },
+    {
+      "baseline_decode_tok_s": 26.554878373838463,
+      "baseline_prefill_tok_s": 429.28945792140934,
+      "baseline_total_decode_request_s": 7.180777171000955,
+      "baseline_ttft_s": 4.7706738709966885,
+      "candidate_decode_tok_s": 26.547168954849518,
+      "candidate_prefill_tok_s": 429.31173362285335,
+      "candidate_total_decode_request_s": 7.181229540001368,
+      "candidate_ttft_s": 4.770426335002412,
+      "decode_speedup": 0.999709679747713,
+      "name": "paired_2048",
+      "prefill_speedup": 1.000051889700604
+    },
+    {
+      "baseline_decode_tok_s": 26.541061238091594,
+      "baseline_prefill_tok_s": 424.988022590125,
+      "baseline_total_decode_request_s": 21.4707186500018,
+      "baseline_ttft_s": 19.059360662999097,
+      "candidate_decode_tok_s": 26.540298595658733,
+      "candidate_prefill_tok_s": 425.0670689126847,
+      "candidate_total_decode_request_s": 21.471948764003173,
+      "candidate_ttft_s": 19.060521485997015,
+      "decode_speedup": 0.9999712655637234,
+      "name": "paired_8192",
+      "prefill_speedup": 1.0001859965889814
+    }
+  ]
+}

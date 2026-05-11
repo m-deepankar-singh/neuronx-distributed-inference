@@ -225,3 +225,47 @@ contrib/models/Qwen3.6-27B/docs/direct_rhs_v2_candidate_downstream_raw.json
 
 With the direct logits gate and downstream delta gate passing, direct-RHS v2 is
 validated against baseline v3 on the stated correctness checks.
+
+## Phase 5 Update: Non-Logits Serving Performance Gate
+
+Ran baseline v3 and direct-RHS v2 sequentially through the production-style
+vLLM backend plus Qwen3.6 OpenAI chat proxy. Prefix caching was enabled, so the
+performance probe used unique repeated filler for each request to avoid APC
+warm-hit contamination in cold-prefill measurements.
+
+Artifacts:
+
+```text
+baseline:  /opt/dlami/nvme/qwen_artifacts/qwen36_27b_128k_fp8_mlp_only_vllm_statereset_run1
+candidate: /opt/dlami/nvme/qwen_artifacts/qwen36_27b_128k_fp8_direct_rhs_v2_run1
+```
+
+Results:
+
+```text
+math smoke:
+  baseline  1.332s, ok=true
+  candidate 1.356s, ok=true
+
+2048-token prompt:
+  baseline  prefill 429.29 tok/s, decode 26.55 tok/s
+  candidate prefill 429.31 tok/s, decode 26.55 tok/s
+  speedup   prefill 1.00005x, decode 0.99971x
+
+8192-token prompt:
+  baseline  prefill 424.99 tok/s, decode 26.54 tok/s
+  candidate prefill 425.07 tok/s, decode 26.54 tok/s
+  speedup   prefill 1.00019x, decode 0.99997x
+```
+
+The direct-RHS v2 artifact is performance-neutral in the production serving
+path. It does not regress throughput, but it also does not provide a measurable
+serving speedup over baseline v3.
+
+Raw reports:
+
+```text
+contrib/models/Qwen3.6-27B/docs/direct_rhs_v2_perf_baseline_v3_cold.json
+contrib/models/Qwen3.6-27B/docs/direct_rhs_v2_perf_candidate_cold.json
+contrib/models/Qwen3.6-27B/docs/direct_rhs_v2_perf_compare.json
+```

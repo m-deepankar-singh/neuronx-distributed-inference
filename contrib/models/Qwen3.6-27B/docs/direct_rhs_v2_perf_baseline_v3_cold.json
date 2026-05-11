@@ -1,0 +1,101 @@
+{
+  "cases": [
+    {
+      "finish_reason": "stop",
+      "name": "math_smoke",
+      "ok": true,
+      "text_len": 3,
+      "text_prefix": "391",
+      "usage": {
+        "completion_tokens": 4,
+        "prompt_tokens": 45,
+        "prompt_tokens_details": null,
+        "total_tokens": 49
+      },
+      "wall_s": 1.3316488389973529
+    },
+    {
+      "completion_tokens_many": 65,
+      "decode": {
+        "finish_reason": "length",
+        "name": "decode_2048",
+        "target_prompt_tokens": 2048,
+        "text_len": 131,
+        "text_prefix": "1. LABEL=baseline_v3_cold_1778473798752_decode_2048 Tokyo hosted the 2020 Olympics.\n2. LABEL=baseline_v3_cold_1778473798752_decode_",
+        "usage": {
+          "completion_tokens": 65,
+          "prompt_tokens": 2048,
+          "prompt_tokens_details": null,
+          "total_tokens": 2113
+        },
+        "wall_s": 7.180777171000955
+      },
+      "decode_prompt_tokens": 2048,
+      "decode_s_minus_ttft": 2.410103300004266,
+      "decode_tok_s_proxy": 26.554878373838463,
+      "decode_total_wall_s": 7.180777171000955,
+      "name": "paired_2048",
+      "prefill_tok_s_proxy": 429.28945792140934,
+      "prompt_tokens_ttft": 2048,
+      "target_prompt_tokens": 2048,
+      "ttft": {
+        "finish_reason": "length",
+        "name": "ttft_2048",
+        "target_prompt_tokens": 2048,
+        "text_len": 3,
+        "text_prefix": "The",
+        "usage": {
+          "completion_tokens": 1,
+          "prompt_tokens": 2048,
+          "prompt_tokens_details": null,
+          "total_tokens": 2049
+        },
+        "wall_s": 4.7706738709966885
+      },
+      "ttft_wall_s": 4.7706738709966885
+    },
+    {
+      "completion_tokens_many": 65,
+      "decode": {
+        "finish_reason": "length",
+        "name": "decode_8192",
+        "target_prompt_tokens": 8192,
+        "text_len": 131,
+        "text_prefix": "1. LABEL=baseline_v3_cold_1778473798752_decode_8192 Tokyo hosted the 2020 Olympics.\n2. LABEL=baseline_v3_cold_1778473798752_decode_",
+        "usage": {
+          "completion_tokens": 65,
+          "prompt_tokens": 8098,
+          "prompt_tokens_details": null,
+          "total_tokens": 8163
+        },
+        "wall_s": 21.4707186500018
+      },
+      "decode_prompt_tokens": 8098,
+      "decode_s_minus_ttft": 2.4113579870027024,
+      "decode_tok_s_proxy": 26.541061238091594,
+      "decode_total_wall_s": 21.4707186500018,
+      "name": "paired_8192",
+      "prefill_tok_s_proxy": 424.988022590125,
+      "prompt_tokens_ttft": 8100,
+      "target_prompt_tokens": 8192,
+      "ttft": {
+        "finish_reason": "length",
+        "name": "ttft_8192",
+        "target_prompt_tokens": 8192,
+        "text_len": 3,
+        "text_prefix": "The",
+        "usage": {
+          "completion_tokens": 1,
+          "prompt_tokens": 8100,
+          "prompt_tokens_details": null,
+          "total_tokens": 8101
+        },
+        "wall_s": 19.059360662999097
+      },
+      "ttft_wall_s": 19.059360662999097
+    }
+  ],
+  "label": "baseline_v3_cold",
+  "started_utc": "2026-05-11T04:29:58.752950+00:00",
+  "unique": "baseline_v3_cold_1778473798752"
+}
