@@ -133,6 +133,11 @@ class HuggingFaceGenerationAdapter(PreTrainedModel, GenerationMixin):
     def generate(self, *args, **kwargs):
         # Keep generation stateless.
         self.neuron_model.reset()
+        if self.neuron_config.enable_fused_speculation and self.neuron_config.speculation_length > 0:
+            generation_config = kwargs.get("generation_config")
+            if generation_config is not None:
+                generation_config.prompt_lookup_num_tokens = self.neuron_config.speculation_length
+            kwargs.setdefault("prompt_lookup_num_tokens", self.neuron_config.speculation_length)
         return super().generate(*args, **kwargs)
 
     # TODO: Remove _sample and define separate flow for on-device sampling that doesn't use HF.

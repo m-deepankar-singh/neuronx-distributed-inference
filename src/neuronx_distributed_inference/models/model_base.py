@@ -2773,10 +2773,14 @@ class NeuronFusedSpecModel(nn.Module):
 
         accepted_lengths = index.reshape(self.batch_size, -1).to(torch.int32)
         if target_step_state_count:
+            # ``index`` is the number of accepted draft tokens. The target
+            # verifier emits those tokens plus one target fallback/bonus token,
+            # and DeltaNet state must advance to that emitted-token boundary.
+            target_state_lengths = accepted_lengths + 1
             target_cache = self._select_mtp_hybrid_target_cache(
                 target_cache,
                 target_deltanet_step_states,
-                accepted_lengths,
+                target_state_lengths,
             )
 
         hidden_index = accepted_lengths.reshape(self.batch_size, -1, 1).expand(
