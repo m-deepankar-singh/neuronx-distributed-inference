@@ -3840,19 +3840,30 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
                             dim=0,
                         )
 
-                chunk_out = self.context_encoding_model(
-                    chunk_input_ids,
-                    chunk_attn_mask,
-                    chunk_pos_ids,
-                    chunk_seq_ids,
-                    chunk_sampling,
-                    chunk_prev_hidden,
-                    chunk_adapter_ids,
-                    *empties,
-                    chunk_mrope,
-                    chunk_vis_emb,
-                    chunk_vis_mask,
-                )
+                if self.neuron_config.enable_fused_speculation:
+                    chunk_out = self.context_encoding_model(
+                        chunk_input_ids,
+                        chunk_attn_mask,
+                        chunk_pos_ids,
+                        chunk_seq_ids,
+                        chunk_sampling,
+                        chunk_prev_hidden,
+                        chunk_adapter_ids,
+                    )
+                else:
+                    chunk_out = self.context_encoding_model(
+                        chunk_input_ids,
+                        chunk_attn_mask,
+                        chunk_pos_ids,
+                        chunk_seq_ids,
+                        chunk_sampling,
+                        chunk_prev_hidden,
+                        chunk_adapter_ids,
+                        *empties,
+                        chunk_mrope,
+                        chunk_vis_emb,
+                        chunk_vis_mask,
+                    )
                 if actual_chunk < ctx_bs:
                     chunk_out = chunk_out[:actual_chunk]
                 output_logits.append(chunk_out)
@@ -3865,20 +3876,32 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
             self.kv_cache_populated = True
             is_run_on_neuron = self.context_encoding_model.is_neuron()
         else:
-            outputs = self.token_generation_model(
-                input_ids,
-                attention_mask,
-                position_ids,
-                seq_ids,
-                sampling_params,
-                prev_hidden,
-                adapter_ids,
-                *empties,
-                mrope_position_ids,
-                vision_embeddings,
-                vision_mask,
-            )
-            is_run_on_neuron = self.token_generation_model.is_neuron()
+            if self.neuron_config.enable_fused_speculation:
+                outputs = self.fused_spec_model(
+                    input_ids,
+                    attention_mask,
+                    position_ids,
+                    seq_ids,
+                    sampling_params,
+                    prev_hidden,
+                    adapter_ids,
+                )
+                is_run_on_neuron = self.fused_spec_model.is_neuron()
+            else:
+                outputs = self.token_generation_model(
+                    input_ids,
+                    attention_mask,
+                    position_ids,
+                    seq_ids,
+                    sampling_params,
+                    prev_hidden,
+                    adapter_ids,
+                    *empties,
+                    mrope_position_ids,
+                    vision_embeddings,
+                    vision_mask,
+                )
+                is_run_on_neuron = self.token_generation_model.is_neuron()
 
         return outputs, is_run_on_neuron
 
