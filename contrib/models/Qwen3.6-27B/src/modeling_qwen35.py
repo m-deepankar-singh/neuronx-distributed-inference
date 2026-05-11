@@ -1759,6 +1759,126 @@ class NeuronQwen35DecoderLayer(nn.Module):
 
 
 # ============================================================
+# MTP Predictor (native speculative decode head)
+# ============================================================
+
+
+class NeuronQwen35MTPDecoderLayer(nn.Module):
+    """Single full-attention MTP layer used by Qwen3.6 native speculation."""
+
+    def __init__(self, config: Qwen35InferenceConfig, mtp_layer_idx: int):
+        super().__init__()
+        self.config = config
+        self.mtp_layer_idx = mtp_layer_idx
+        self.self_attn = NeuronQwen35Attention(config=config)
+        self.mlp = Qwen35MLP(config)
+        self.input_layernorm = get_rmsnorm_cls()(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+        self.post_attention_layernorm = get_rmsnorm_cls()(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask=None,
+        position_ids=None,
+        past_key_value=None,
+        cos_cache=None,
+        sin_cache=None,
+        **kwargs,
+    ):
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states, present_key_value, cos_cache, sin_cache = self.self_attn(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_value=past_key_value,
+            cos_cache=cos_cache,
+            sin_cache=sin_cache,
+            **kwargs,
+        )
+        hidden_states = residual + hidden_states
+
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
+        return hidden_states, present_key_value, cos_cache, sin_cache
+
+
+class NeuronQwen35MTPPredictor(nn.Module):
+    """Native Qwen3.6 MTP predictor.
+
+    The module name is intentionally ``mtp`` when attached to
+    :class:`NeuronQwen35Model`, so checkpoint keys like ``mtp.fc.weight`` and
+    ``mtp.layers.0.self_attn.Wqkv.weight`` load directly after conversion.
+    Shared embedding and lm-head weights stay on the target model; callers pass
+    the input embeddings and run logits through the target ``lm_head``.
+    """
+
+    def __init__(self, config: Qwen35InferenceConfig):
+        super().__init__()
+        self.config = config
+        self.num_mtp_layers = getattr(config, "mtp_num_hidden_layers", 1)
+        self.fc = ColumnParallelLinear(
+            config.hidden_size * 2,
+            config.hidden_size,
+            bias=False,
+            gather_output=True,
+        )
+        self.layers = nn.ModuleList(
+            [
+                NeuronQwen35MTPDecoderLayer(config, mtp_layer_idx)
+                for mtp_layer_idx in range(self.num_mtp_layers)
+            ]
+        )
+        self.norm = get_rmsnorm_cls()(config.hidden_size, eps=config.rms_norm_eps)
+        self.pre_fc_norm_embedding = get_rmsnorm_cls()(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+        self.pre_fc_norm_hidden = get_rmsnorm_cls()(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+
+    def forward(
+        self,
+        inputs_embeds: torch.Tensor,
+        target_hidden_states: torch.Tensor,
+        attention_mask=None,
+        position_ids=None,
+        past_key_values=None,
+        spec_step_idx: int = 0,
+        cos_cache=None,
+        sin_cache=None,
+        **kwargs,
+    ):
+        inputs_embeds = self.pre_fc_norm_embedding(inputs_embeds)
+        target_hidden_states = self.pre_fc_norm_hidden(target_hidden_states)
+        hidden_states = self.fc(
+            torch.cat([inputs_embeds, target_hidden_states], dim=-1)
+        )
+
+        layer_idx = 0 if self.num_mtp_layers == 1 else spec_step_idx % self.num_mtp_layers
+        past_key_value = (
+            past_key_values[layer_idx] if past_key_values is not None else None
+        )
+        hidden_states, present_key_value, cos_cache, sin_cache = self.layers[layer_idx](
+            hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_value=past_key_value,
+            cos_cache=cos_cache,
+            sin_cache=sin_cache,
+            **kwargs,
+        )
+        hidden_states = self.norm(hidden_states)
+        return hidden_states, (present_key_value,), cos_cache, sin_cache
+
+
+# ============================================================
 # Hybrid Cache Manager (opt-in)
 # ============================================================
 
@@ -2102,6 +2222,8 @@ class NeuronQwen35Model(NeuronBaseModel):
             ]
         )
         self.norm = get_rmsnorm_cls()(self.hidden_size, eps=config.rms_norm_eps)
+        if getattr(config, "enable_mtp_weight_loading", False):
+            self.mtp = NeuronQwen35MTPPredictor(config)
         self.lm_head = ColumnParallelLinear(
             config.hidden_size,
             config.vocab_size,
@@ -2734,11 +2856,6 @@ def convert_qwen35_hf_to_neuron_state_dict(neuron_state_dict, config):
         gc.collect()
 
     if getattr(config, "enable_mtp_weight_loading", False):
-        neuron_state_dict["mtp.rank_util.rank"] = torch.arange(
-            0,
-            config.neuron_config.tp_degree,
-            dtype=torch.int32,
-        )
         for mtp_layer_idx in range(getattr(config, "mtp_num_hidden_layers", 1)):
             attn_prefix = f"mtp.layers.{mtp_layer_idx}.self_attn"
             neuron_state_dict[f"{attn_prefix}.rank_util.rank"] = torch.arange(
