@@ -26,6 +26,7 @@ import uuid
 from collections import OrderedDict
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from types import SimpleNamespace
 from typing import Any
 
 import torch
@@ -75,6 +76,9 @@ class QwenEngine:
     ) -> None:
         sys.path.insert(0, contrib_root)
         from src.modeling_qwen35 import NeuronQwen35ForCausalLM
+        from neuronx_distributed_inference.utils.hf_adapter import (
+            HuggingFaceGenerationAdapter,
+        )
         from neuronx_distributed_inference.modules.generation.sampling import (
             prepare_sampling_params,
         )
@@ -102,6 +106,14 @@ class QwenEngine:
         self.model = NeuronQwen35ForCausalLM(compiled_path)
         self.model.load(compiled_path)
         self.model.reset()
+        self.fused_spec_enabled = bool(
+            getattr(self.model.neuron_config, "enable_fused_speculation", False)
+        )
+        self.generation_adapter = (
+            HuggingFaceGenerationAdapter(self.model)
+            if self.fused_spec_enabled
+            else None
+        )
         print(f"LOAD_DONE seconds={time.perf_counter() - t0:.3f}", flush=True)
         print(
             "CONFIG "
@@ -112,6 +124,109 @@ class QwenEngine:
             f"ctx_buckets={self.model.config.neuron_config.context_encoding_buckets}",
             flush=True,
         )
+
+    def _first_generated_token(self, outputs: Any) -> int:
+        if self.fused_spec_enabled:
+            return token_scalar(outputs.fused_outputs[0][:, 0])
+        return token_scalar(outputs.tokens)
+
+    def _decode_fused_spec(
+        self,
+        prefill_outputs: Any,
+        first_token: int,
+        prompt_len: int,
+        max_tokens: int,
+        sampling_params: torch.Tensor,
+        stop_strings: list[str],
+        on_token: Any | None,
+    ) -> tuple[list[int], str, str, list[float]]:
+        assert self.generation_adapter is not None
+
+        generated: list[int] = []
+        completion_text = ""
+        finish_reason = "length"
+        decode_times: list[float] = []
+
+        if first_token in self.eos_ids:
+            return generated, completion_text, "stop", decode_times
+        if first_token < 0 or first_token >= len(self.tokenizer):
+            raise RuntimeError(f"invalid token id generated: {first_token}")
+
+        generated.append(first_token)
+        piece = self.tokenizer.decode([first_token], skip_special_tokens=True)
+        completion_text += piece
+        if on_token is not None and piece:
+            on_token(piece)
+        if stop_strings:
+            matched = next((s for s in stop_strings if s and s in completion_text), None)
+            if matched:
+                completion_text = completion_text.split(matched, 1)[0]
+                return generated, completion_text, "stop", decode_times
+        if len(generated) >= max_tokens:
+            return generated, completion_text, finish_reason, decode_times
+
+        returned_ids = torch.tensor([[first_token]], dtype=torch.long)
+        outputs = prefill_outputs
+        incremental_len = 0
+        model_kwargs: dict[str, Any] = {
+            "attention_mask": torch.ones((1, prompt_len), dtype=torch.long),
+            "sampling_params": sampling_params,
+        }
+
+        while len(generated) < max_tokens:
+            model_kwargs = self.generation_adapter._update_model_kwargs_for_fused_generation(
+                outputs,
+                model_kwargs,
+                incremental_len,
+            )
+            model_inputs = self.generation_adapter.prepare_inputs_for_generation(
+                returned_ids,
+                **model_kwargs,
+            )
+
+            t0 = time.perf_counter()
+            with torch.no_grad():
+                outputs = self.generation_adapter(**model_inputs)
+            decode_times.append(time.perf_counter() - t0)
+
+            accepted_with_padding = outputs.fused_outputs[0]
+            next_pos_ids = outputs.fused_outputs[3]
+            n_matches_tensor = next_pos_ids - model_inputs["position_ids"]
+            n_matches = int(n_matches_tensor.reshape(-1)[0].item())
+            if n_matches <= 0:
+                raise RuntimeError(f"fused speculation returned n_matches={n_matches}")
+
+            accepted = accepted_with_padding[:, :n_matches].to(torch.long)
+            accepted_ids = accepted.reshape(-1).detach().cpu().tolist()
+            incremental_len = n_matches
+
+            for token_id in accepted_ids:
+                if len(generated) >= max_tokens:
+                    break
+                if token_id in self.eos_ids:
+                    finish_reason = "stop"
+                    break
+                if token_id < 0 or token_id >= len(self.tokenizer):
+                    raise RuntimeError(f"invalid token id generated: {token_id}")
+
+                generated.append(token_id)
+                piece = self.tokenizer.decode([token_id], skip_special_tokens=True)
+                completion_text += piece
+                if on_token is not None and piece:
+                    on_token(piece)
+
+                if stop_strings:
+                    matched = next((s for s in stop_strings if s and s in completion_text), None)
+                    if matched:
+                        completion_text = completion_text.split(matched, 1)[0]
+                        finish_reason = "stop"
+                        break
+
+            returned_ids = torch.cat((returned_ids, accepted), dim=1)
+            if finish_reason == "stop":
+                break
+
+        return generated, completion_text, finish_reason, decode_times
 
     def _hash_tokens(self, input_ids: torch.Tensor, prefix_len: int) -> str:
         token_bytes = (
@@ -313,6 +428,7 @@ class QwenEngine:
                 cache_write = False
 
             first_token: int | None = None
+            out: Any | None = None
             for start in range(start_offset, prompt_len, self.chunk_size):
                 end = min(start + self.chunk_size, prompt_len)
                 valid = end - start
@@ -331,7 +447,7 @@ class QwenEngine:
                         return_dict=True,
                     )
                 prefill_times.append(time.perf_counter() - t0)
-                tok = token_scalar(out.tokens)
+                tok = self._first_generated_token(out)
                 if cache_write and end == write_cutoff and valid == self.chunk_size:
                     cache_status["stored"] = self._cache_put(
                         cache_key=cache_key,
@@ -352,58 +468,72 @@ class QwenEngine:
             current_token = first_token
             finish_reason = "length"
             completion_text = ""
-            for step in range(max_tokens):
-                if current_token in self.eos_ids:
-                    finish_reason = "stop"
-                    break
-                if current_token < 0 or current_token >= len(self.tokenizer):
-                    raise RuntimeError(f"invalid token id generated: {current_token}")
-
-                generated.append(current_token)
-                piece = self.tokenizer.decode([current_token], skip_special_tokens=True)
-                completion_text += piece
-                if on_token is not None and piece:
-                    on_token(piece)
-
-                if stop_strings:
-                    matched = next((s for s in stop_strings if s and s in completion_text), None)
-                    if matched:
-                        completion_text = completion_text.split(matched, 1)[0]
+            if self.fused_spec_enabled:
+                generated, completion_text, finish_reason, decode_times = (
+                    self._decode_fused_spec(
+                        prefill_outputs=out if out is not None else SimpleNamespace(state=None),
+                        first_token=first_token,
+                        prompt_len=prompt_len,
+                        max_tokens=max_tokens,
+                        sampling_params=sampling_params,
+                        stop_strings=stop_strings,
+                        on_token=on_token,
+                    )
+                )
+            else:
+                for step in range(max_tokens):
+                    if current_token in self.eos_ids:
                         finish_reason = "stop"
                         break
+                    if current_token < 0 or current_token >= len(self.tokenizer):
+                        raise RuntimeError(f"invalid token id generated: {current_token}")
 
-                if step == max_tokens - 1:
-                    break
+                    generated.append(current_token)
+                    piece = self.tokenizer.decode([current_token], skip_special_tokens=True)
+                    completion_text += piece
+                    if on_token is not None and piece:
+                        on_token(piece)
 
-                pos_value = prompt_len + step
-                ids = torch.tensor([[current_token]], dtype=torch.long)
-                pos = torch.tensor([[pos_value]], dtype=torch.long)
-                attn_mask = torch.zeros((1, self.seq_len), dtype=torch.long)
-                attn_mask[:, : pos_value + 1] = 1
+                    if stop_strings:
+                        matched = next((s for s in stop_strings if s and s in completion_text), None)
+                        if matched:
+                            completion_text = completion_text.split(matched, 1)[0]
+                            finish_reason = "stop"
+                            break
 
-                t0 = time.perf_counter()
-                with torch.no_grad():
-                    out = self.model(
-                        input_ids=ids,
-                        attention_mask=attn_mask,
-                        position_ids=pos,
-                        seq_ids=seq_ids,
-                        sampling_params=sampling_params,
-                        return_dict=True,
-                    )
-                decode_times.append(time.perf_counter() - t0)
-                current_token = token_scalar(out.tokens)
+                    if step == max_tokens - 1:
+                        break
+
+                    pos_value = prompt_len + step
+                    ids = torch.tensor([[current_token]], dtype=torch.long)
+                    pos = torch.tensor([[pos_value]], dtype=torch.long)
+                    attn_mask = torch.zeros((1, self.seq_len), dtype=torch.long)
+                    attn_mask[:, : pos_value + 1] = 1
+
+                    t0 = time.perf_counter()
+                    with torch.no_grad():
+                        out = self.model(
+                            input_ids=ids,
+                            attention_mask=attn_mask,
+                            position_ids=pos,
+                            seq_ids=seq_ids,
+                            sampling_params=sampling_params,
+                            return_dict=True,
+                        )
+                    decode_times.append(time.perf_counter() - t0)
+                    current_token = token_scalar(out.tokens)
 
             usage = {
                 "prompt_tokens": prompt_len,
                 "completion_tokens": len(generated),
                 "total_tokens": prompt_len + len(generated),
             }
+            decode_token_count = max(0, len(generated) - 1)
             timings = {
                 "prefill_seconds": sum(prefill_times),
                 "prefill_tok_s": prompt_len / sum(prefill_times) if prefill_times else 0.0,
                 "decode_seconds": sum(decode_times),
-                "decode_tok_s": len(decode_times) / sum(decode_times) if decode_times else 0.0,
+                "decode_tok_s": decode_token_count / sum(decode_times) if decode_times else 0.0,
                 "chunks": len(prefill_times),
                 "prefix_cache": cache_status,
             }
