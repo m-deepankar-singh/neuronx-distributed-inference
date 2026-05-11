@@ -2771,7 +2771,7 @@ class NeuronQwen35MTPDraftModel(NeuronBaseModel):
         )
         cache_size = self.config.neuron_config.seq_len
         past_key_values = None
-        if self.kv_mgr is not None:
+        if self.kv_mgr is not None and not is_for_context_encoding:
             past_key_values = self.kv_mgr.get_cache(
                 seq_ids=seq_ids.to(torch.int32),
                 seq_len=cache_size,
