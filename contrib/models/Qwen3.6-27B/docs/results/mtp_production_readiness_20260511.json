@@ -1,0 +1,261 @@
+{
+  "started_at": "2026-05-11 14:32:01 +0530",
+  "base": "http://16.26.184.199:8000",
+  "model": "qwen3.6-27b-128k-fp8-mtp",
+  "tests": [
+    {
+      "name": "GET /health",
+      "passed": true,
+      "result": {
+        "ok": true,
+        "status": 200,
+        "wall_seconds": 0.5670412500621751,
+        "usage": null,
+        "timings": null,
+        "finish_reason": null,
+        "content_head": {
+          "status": "ok",
+          "model": "qwen3.6-27b-128k-fp8-mtp"
+        }
+      }
+    },
+    {
+      "name": "GET /v1/models",
+      "passed": true,
+      "result": {
+        "ok": true,
+        "status": 200,
+        "wall_seconds": 0.6143021669704467,
+        "usage": null,
+        "timings": null,
+        "finish_reason": null,
+        "content_head": {
+          "object": "list",
+          "data": [
+            {
+              "id": "qwen3.6-27b-128k-fp8-mtp",
+              "object": "model",
+              "created": 0,
+              "owned_by": "local"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "system-first chat completion",
+      "passed": true,
+      "result": {
+        "ok": true,
+        "status": 200,
+        "wall_seconds": 2.495579957962036,
+        "usage": {
+          "prompt_tokens": 39,
+          "completion_tokens": 12,
+          "total_tokens": 51
+        },
+        "timings": {
+          "prefill_seconds": 1.1884045709884958,
+          "prefill_tok_s": 32.81710702909904,
+          "decode_seconds": 0.2418652760097757,
+          "decode_tok_s": 45.47986458194769,
+          "chunks": 1,
+          "prefix_cache": {
+            "enabled": false,
+            "key": null,
+            "hit": false,
+            "restored_tokens": 0,
+            "stored": false,
+            "stored_tokens": 0,
+            "entries": 0
+          }
+        },
+        "finish_reason": "stop",
+        "content_head": "Tokyo hosted the Tokyo 2020 Olympics."
+      }
+    },
+    {
+      "name": "reject misplaced system message",
+      "passed": true,
+      "result": {
+        "ok": false,
+        "status": 500,
+        "wall_seconds": 0.5268830420682207,
+        "error": {
+          "error": {
+            "message": "System message must be at the beginning.",
+            "type": "TemplateError"
+          }
+        }
+      }
+    },
+    {
+      "name": "stop string handling",
+      "passed": true,
+      "result": {
+        "ok": true,
+        "status": 200,
+        "wall_seconds": 1.8784970419947058,
+        "usage": {
+          "prompt_tokens": 22,
+          "completion_tokens": 3,
+          "total_tokens": 25
+        },
+        "timings": {
+          "prefill_seconds": 1.1879033660079585,
+          "prefill_tok_s": 18.520024969651114,
+          "decode_seconds": 0.08091006400354672,
+          "decode_tok_s": 24.718803830291485,
+          "chunks": 1,
+          "prefix_cache": {
+            "enabled": false,
+            "key": null,
+            "hit": false,
+            "restored_tokens": 0,
+            "stored": false,
+            "stored_tokens": 0,
+            "entries": 0
+          }
+        },
+        "finish_reason": "stop",
+        "content_head": "alpha beta gamma"
+      }
+    },
+    {
+      "name": "stop string removed from response",
+      "passed": true,
+      "result": {
+        "content": "alpha beta gamma"
+      }
+    },
+    {
+      "name": "deterministic greedy repeat x3",
+      "passed": true,
+      "result": {
+        "walls": [
+          7.33564133301843,
+          7.26949641702231,
+          7.269286624970846
+        ],
+        "texts_equal": true,
+        "content_head": "*   **High Performance and Efficiency**: Trainium chips are optimized for large-scale deep learning workloads, delivering up to 2x faster inference performance and up to 40% lower cost compared to comparable GPU-based instances for models like LLMs and computer vision applications.\n*   **Native AWS Integration**: Trainium is deeply integrated with the AWS ecosystem, offering seamless compatibility with Amazon SageMaker, PyTorch, and TensorFlow, along with specialized libraries like Neuron"
+      }
+    },
+    {
+      "name": "long context approx 4096 tokens",
+      "passed": true,
+      "result": {
+        "ok": true,
+        "status": 200,
+        "wall_seconds": 14.532557292026468,
+        "usage": {
+          "prompt_tokens": 4664,
+          "completion_tokens": 32,
+          "total_tokens": 4696
+        },
+        "timings": {
+          "prefill_seconds": 11.936547602032078,
+          "prefill_tok_s": 390.73274413164495,
+          "decode_seconds": 0.6417478660005145,
+          "decode_tok_s": 48.3055755108271,
+          "chunks": 10,
+          "prefix_cache": {
+            "enabled": false,
+            "key": null,
+            "hit": false,
+            "restored_tokens": 0,
+            "stored": false,
+            "stored_tokens": 0,
+            "entries": 0
+          }
+        },
+        "finish_reason": "length",
+        "content_head": "The Tokyo 2020 Olympics, held in 2021 under pandemic restrictions, featured new events such as skateboarding, sport climbing, surfing"
+      }
+    },
+    {
+      "name": "long context approx 16384 tokens",
+      "passed": true,
+      "result": {
+        "ok": true,
+        "status": 200,
+        "wall_seconds": 47.13380620791577,
+        "usage": {
+          "prompt_tokens": 18587,
+          "completion_tokens": 32,
+          "total_tokens": 18619
+        },
+        "timings": {
+          "prefill_seconds": 44.18071192203206,
+          "prefill_tok_s": 420.7039495606458,
+          "decode_seconds": 0.6432872959994711,
+          "decode_tok_s": 48.1899770021659,
+          "chunks": 37,
+          "prefix_cache": {
+            "enabled": false,
+            "key": null,
+            "hit": false,
+            "restored_tokens": 0,
+            "stored": false,
+            "stored_tokens": 0,
+            "entries": 0
+          }
+        },
+        "finish_reason": "length",
+        "content_head": "The Tokyo 2020 Olympics, held in 2021 under pandemic restrictions, featured new events such as skateboarding, sport climbing, surfing"
+      }
+    },
+    {
+      "name": "long context approx 65536 tokens",
+      "passed": true,
+      "result": {
+        "ok": true,
+        "status": 200,
+        "wall_seconds": 178.24182129104156,
+        "usage": {
+          "prompt_tokens": 74279,
+          "completion_tokens": 32,
+          "total_tokens": 74311
+        },
+        "timings": {
+          "prefill_seconds": 174.38937968204846,
+          "prefill_tok_s": 425.9376352816182,
+          "decode_seconds": 0.640459085960174,
+          "decode_tok_s": 48.40277963037234,
+          "chunks": 146,
+          "prefix_cache": {
+            "enabled": false,
+            "key": null,
+            "hit": false,
+            "restored_tokens": 0,
+            "stored": false,
+            "stored_tokens": 0,
+            "entries": 0
+          }
+        },
+        "finish_reason": "length",
+        "content_head": "The Tokyo 2020 Olympics, held in 2021 under pandemic restrictions, featured new events like skateboarding, sport climbing, surfing,"
+      }
+    },
+    {
+      "name": "concurrent x3 serialized correctness",
+      "passed": true,
+      "result": {
+        "wall_seconds": 7.753121750080027,
+        "individual_walls": [
+          5.182979666045867,
+          3.032575250021182,
+          7.186432542046532
+        ],
+        "contents": [
+          "Olympic resilience is the unwavering spirit to rise after every fall.",
+          "Olympic resilience is the unwavering spirit to rise after every fall and strive for excellence despite adversity.",
+          "Olympic resilience is the unwavering spirit to rise after every fall."
+        ]
+      }
+    }
+  ],
+  "finished_at": "2026-05-11 14:36:36 +0530",
+  "passed": 11,
+  "failed": 0
+}
