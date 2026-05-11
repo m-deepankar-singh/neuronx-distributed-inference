@@ -3358,6 +3358,9 @@ class Qwen35DecoderModelInstance(DecoderModelInstance):
         """Override to add DeltaNet state aliases after KV cache aliases."""
         module, input_output_aliases = super().get(bucket_rank, **kwargs)
 
+        if self.neuron_config.enable_fused_speculation or hasattr(module, "target_model"):
+            return module, input_output_aliases
+
         num_output_from_trace = 1 if not self.neuron_config.output_logits else 2
 
         if module.kv_mgr is not None:
