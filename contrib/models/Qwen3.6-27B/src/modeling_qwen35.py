@@ -843,6 +843,7 @@ class NeuronGatedDeltaNet(nn.Module):
             self.use_qwen_hybrid_chunked_prefill
             and past_key_value is not None
             and seq_len > 1
+            and bool(kwargs.get("is_for_context_encoding", False))
         )
         is_decode = past_key_value is not None and not qwen_chunked_prefill_active
 
@@ -1669,9 +1670,11 @@ class NeuronQwen35Attention(NeuronAttentionBase):
             rmsnorm=rmsnorm,
         )
 
+        is_for_context_encoding = bool(kwargs.get("is_for_context_encoding", False))
         qwen_chunked_prefill_active = (
             past_key_value is not None
             and q_len > 1
+            and is_for_context_encoding
             and getattr(self.config, "use_qwen_hybrid_chunked_prefill", False)
         )
 
