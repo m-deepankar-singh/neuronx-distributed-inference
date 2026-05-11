@@ -67,7 +67,11 @@ def _quantized_checkpoint_ready(path: Path) -> bool:
     if path.is_file():
         return True
     if path.is_dir():
-        return any(path.iterdir())
+        return (
+            (path / "model.safetensors").exists()
+            or (path / "model.safetensors.index.json").exists()
+            or (path / "pytorch_model.bin").exists()
+        )
     return False
 
 
