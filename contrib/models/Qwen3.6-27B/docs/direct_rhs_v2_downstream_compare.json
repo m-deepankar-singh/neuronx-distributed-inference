@@ -1,0 +1,30 @@
+{
+  "baseline": "/opt/dlami/nvme/qwen_artifacts/qwen36_27b_128k_fp8_baseline_v3_logits_run1",
+  "candidate": "/opt/dlami/nvme/qwen_artifacts/qwen36_27b_128k_fp8_direct_rhs_v2_logits_run1",
+  "gsm8k": {
+    "abs_delta": 0.0,
+    "baseline_accuracy": 0.55,
+    "baseline_correct": 11,
+    "candidate_accuracy": 0.55,
+    "candidate_correct": 11,
+    "count": 20,
+    "delta": 0.0,
+    "passed_delta_gate": true,
+    "prediction_match_count": 20,
+    "prediction_match_rate": 1.0
+  },
+  "max_delta": 0.01,
+  "mmlu": {
+    "abs_delta": 0.0,
+    "baseline_accuracy": 0.9,
+    "baseline_correct": 36,
+    "candidate_accuracy": 0.9,
+    "candidate_correct": 36,
+    "count": 40,
+    "delta": 0.0,
+    "passed_delta_gate": true,
+    "prediction_match_count": 40,
+    "prediction_match_rate": 1.0
+  },
+  "passed": true
+}

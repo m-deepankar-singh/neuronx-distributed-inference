@@ -1,0 +1,952 @@
+{
+  "chunk_size": 512,
+  "compiled_path": "/opt/dlami/nvme/qwen_artifacts/qwen36_27b_128k_fp8_baseline_v3_logits_run1",
+  "gsm8k": {
+    "accuracy": 0.55,
+    "cases": [
+      {
+        "correct": true,
+        "decode_seconds": 0.07522759800485801,
+        "expected": "18",
+        "index": 0,
+        "prediction": "18",
+        "prefill_seconds": 1.0701364019987523,
+        "prompt_tokens": 95,
+        "text": "18",
+        "tokens": [
+          16,
+          23
+        ]
+      },
+      {
+        "correct": true,
+        "decode_seconds": 0.0381487529957667,
+        "expected": "3",
+        "index": 1,
+        "prediction": "3",
+        "prefill_seconds": 1.0701201699994272,
+        "prompt_tokens": 57,
+        "text": "3",
+        "tokens": [
+          18
+        ]
+      },
+      {
+        "correct": true,
+        "decode_seconds": 0.1871302190120332,
+        "expected": "70000",
+        "index": 2,
+        "prediction": "70000",
+        "prefill_seconds": 1.0707045689996448,
+        "prompt_tokens": 88,
+        "text": "70000",
+        "tokens": [
+          22,
+          15,
+          15,
+          15,
+          15
+        ]
+      },
+      {
+        "correct": true,
+        "decode_seconds": 0.1125100209901575,
+        "expected": "540",
+        "index": 3,
+        "prediction": "540",
+        "prefill_seconds": 1.0704591679968871,
+        "prompt_tokens": 66,
+        "text": "540",
+        "tokens": [
+          20,
+          19,
+          15
+        ]
+      },
+      {
+        "correct": false,
+        "decode_seconds": 0.07494244099507341,
+        "expected": "20",
+        "index": 4,
+        "prediction": "10",
+        "prefill_seconds": 1.0708854210024583,
+        "prompt_tokens": 142,
+        "text": "10",
+        "tokens": [
+          16,
+          15
+        ]
+      },
+      {
+        "correct": false,
+        "decode_seconds": 0.0754269250028301,
+        "expected": "64",
+        "index": 5,
+        "prediction": "72",
+        "prefill_seconds": 1.0709516380011337,
+        "prompt_tokens": 85,
+        "text": "72",
+        "tokens": [
+          22,
+          17
+        ]
+      },
+      {
+        "correct": true,
+        "decode_seconds": 0.11202645699813729,
+        "expected": "260",
+        "index": 6,
+        "prediction": "260",
+        "prefill_seconds": 1.0703915679987404,
+        "prompt_tokens": 71,
+        "text": "260",
+        "tokens": [
+          17,
+          21,
+          15
+        ]
+      },
+      {
+        "correct": false,
+        "decode_seconds": 0.11258756400638958,
+        "expected": "160",
+        "index": 7,
+        "prediction": "140",
+        "prefill_seconds": 1.0705350169955636,
+        "prompt_tokens": 100,
+        "text": "140",
+        "tokens": [
+          16,
+          19,
+          15
+        ]
+      },
+      {
+        "correct": false,
+        "decode_seconds": 0.07485950699629029,
+        "expected": "45",
+        "index": 8,
+        "prediction": "15",
+        "prefill_seconds": 1.0708960729971295,
+        "prompt_tokens": 135,
+        "text": "15",
+        "tokens": [
+          16,
+          20
+        ]
+      },
+      {
+        "correct": true,
+        "decode_seconds": 0.1126938890083693,
+        "expected": "460",
+        "index": 9,
+        "prediction": "460",
+        "prefill_seconds": 1.070450441002322,
+        "prompt_tokens": 91,
+        "text": "460",
+        "tokens": [
+          19,
+          21,
+          15
+        ]
+      },
+      {
+        "correct": false,
+        "decode_seconds": 0.11225501599255949,
+        "expected": "366",
+        "index": 10,
+        "prediction": "312",
+        "prefill_seconds": 1.0705567960030749,
+        "prompt_tokens": 91,
+        "text": "312",
+        "tokens": [
+          18,
+          16,
+          17
+        ]
+      },
+      {
+        "correct": false,
+        "decode_seconds": 0.11241414499090752,
+        "expected": "694",
+        "index": 11,
+        "prediction": "834",
+        "prefill_seconds": 1.070755332999397,
+        "prompt_tokens": 95,
+        "text": "834",
+        "tokens": [
+          23,
+          18,
+          19
+        ]
+      },
+      {
+        "correct": false,
+        "decode_seconds": 0.07494929599488387,
+        "expected": "13",
+        "index": 12,
+        "prediction": "10",
+        "prefill_seconds": 1.070718109003792,
+        "prompt_tokens": 98,
+        "text": "10",
+        "tokens": [
+          16,
+          15
+        ]
+      },
+      {
+        "correct": false,
+        "decode_seconds": 0.07525404599437024,
+        "expected": "18",
+        "index": 13,
+        "prediction": "21",
+        "prefill_seconds": 1.0707020100016962,
+        "prompt_tokens": 88,
+        "text": "21",
+        "tokens": [
+          17,
+          16
+        ]
+      },
+      {
+        "correct": true,
+        "decode_seconds": 0.07525238700327463,
+        "expected": "60",
+        "index": 14,
+        "prediction": "60",
+        "prefill_seconds": 1.0706091939937323,
+        "prompt_tokens": 83,
+        "text": "60",
+        "tokens": [
+          21,
+          15
+        ]
+      },
+      {
+        "correct": true,
+        "decode_seconds": 0.11277056899416493,
+        "expected": "125",
+        "index": 15,
+        "prediction": "125",
+        "prefill_seconds": 1.070944937004242,
+        "prompt_tokens": 125,
+        "text": "125",
+        "tokens": [
+          16,
+          17,
+          20
+        ]
+      },
+      {
+        "correct": true,
+        "decode_seconds": 0.11274103500181809,
+        "expected": "230",
+        "index": 16,
+        "prediction": "230",
+        "prefill_seconds": 1.0705678789963713,
+        "prompt_tokens": 84,
+        "text": "230",
+        "tokens": [
+          17,
+          18,
+          15
+        ]
+      },
+      {
+        "correct": false,
+        "decode_seconds": 0.18721686800563475,
+        "expected": "57500",
+        "index": 17,
+        "prediction": "52500",
+        "prefill_seconds": 1.0707769860018743,
+        "prompt_tokens": 88,
+        "text": "52500",
+        "tokens": [
+          20,
+          17,
+          20,
+          15,
+          15
+        ]
+      },
+      {
+        "correct": true,
+        "decode_seconds": 0.03776944499986712,
+        "expected": "7",
+        "index": 18,
+        "prediction": "7",
+        "prefill_seconds": 1.070318555997801,
+        "prompt_tokens": 59,
+        "text": "7",
+        "tokens": [
+          22
+        ]
+      },
+      {
+        "correct": true,
+        "decode_seconds": 0.03786819499509875,
+        "expected": "6",
+        "index": 19,
+        "prediction": "6",
+        "prefill_seconds": 1.0707104450048064,
+        "prompt_tokens": 96,
+        "text": "6",
+        "tokens": [
+          21
+        ]
+      }
+    ],
+    "correct": 11,
+    "count": 20
+  },
+  "gsm_source": "hf:openai/gsm8k",
+  "mmlu": {
+    "accuracy": 0.9,
+    "cases": [
+      {
+        "correct": true,
+        "expected": "C",
+        "index": 0,
+        "next_token": 34,
+        "prediction": "C",
+        "prefill_seconds": 1.077399557994795,
+        "prompt_tokens": 75,
+        "scores": {
+          "A": 18.968690872192383,
+          "B": 19.712675094604492,
+          "C": 25.772178649902344,
+          "D": 18.69147491455078
+        },
+        "subject": "elementary_mathematics"
+      },
+      {
+        "correct": true,
+        "expected": "C",
+        "index": 1,
+        "next_token": 34,
+        "prediction": "C",
+        "prefill_seconds": 1.0771583370005828,
+        "prompt_tokens": 87,
+        "scores": {
+          "A": 23.046520233154297,
+          "B": 17.90839385986328,
+          "C": 29.473493576049805,
+          "D": 20.990978240966797
+        },
+        "subject": "elementary_mathematics"
+      },
+      {
+        "correct": true,
+        "expected": "D",
+        "index": 2,
+        "next_token": 35,
+        "prediction": "D",
+        "prefill_seconds": 1.0703898309948272,
+        "prompt_tokens": 69,
+        "scores": {
+          "A": 17.45363998413086,
+          "B": 17.31619644165039,
+          "C": 15.60662841796875,
+          "D": 27.161455154418945
+        },
+        "subject": "elementary_mathematics"
+      },
+      {
+        "correct": false,
+        "expected": "B",
+        "index": 3,
+        "next_token": 32,
+        "prediction": "A",
+        "prefill_seconds": 1.0700793389987666,
+        "prompt_tokens": 90,
+        "scores": {
+          "A": 27.474000930786133,
+          "B": 26.959327697753906,
+          "C": 23.419179916381836,
+          "D": 23.04665184020996
+        },
+        "subject": "elementary_mathematics"
+      },
+      {
+        "correct": true,
+        "expected": "B",
+        "index": 4,
+        "next_token": 33,
+        "prediction": "B",
+        "prefill_seconds": 1.0702717759995721,
+        "prompt_tokens": 129,
+        "scores": {
+          "A": 17.87350845336914,
+          "B": 27.15283203125,
+          "C": 16.625656127929688,
+          "D": 19.69179344177246
+        },
+        "subject": "elementary_mathematics"
+      },
+      {
+        "correct": true,
+        "expected": "C",
+        "index": 5,
+        "next_token": 34,
+        "prediction": "C",
+        "prefill_seconds": 1.0699766269972315,
+        "prompt_tokens": 93,
+        "scores": {
+          "A": 25.325847625732422,
+          "B": 25.76983642578125,
+          "C": 26.248546600341797,
+          "D": 24.075496673583984
+        },
+        "subject": "elementary_mathematics"
+      },
+      {
+        "correct": true,
+        "expected": "C",
+        "index": 6,
+        "next_token": 34,
+        "prediction": "C",
+        "prefill_seconds": 1.069907560995489,
+        "prompt_tokens": 91,
+        "scores": {
+          "A": 20.69025230407715,
+          "B": 20.273868560791016,
+          "C": 25.3870849609375,
+          "D": 20.89283561706543
+        },
+        "subject": "elementary_mathematics"
+      },
+      {
+        "correct": true,
+        "expected": "B",
+        "index": 7,
+        "next_token": 33,
+        "prediction": "B",
+        "prefill_seconds": 1.0698448269977234,
+        "prompt_tokens": 80,
+        "scores": {
+          "A": 19.467504501342773,
+          "B": 28.25122833251953,
+          "C": 16.319427490234375,
+          "D": 19.701372146606445
+        },
+        "subject": "elementary_mathematics"
+      },
+      {
+        "correct": true,
+        "expected": "A",
+        "index": 8,
+        "next_token": 32,
+        "prediction": "A",
+        "prefill_seconds": 1.0710312399969553,
+        "prompt_tokens": 224,
+        "scores": {
+          "A": 31.74059295654297,
+          "B": 21.169170379638672,
+          "C": 17.55252456665039,
+          "D": 20.821626663208008
+        },
+        "subject": "high_school_world_history"
+      },
+      {
+        "correct": true,
+        "expected": "B",
+        "index": 9,
+        "next_token": 33,
+        "prediction": "B",
+        "prefill_seconds": 1.0713676269951975,
+        "prompt_tokens": 292,
+        "scores": {
+          "A": 18.991580963134766,
+          "B": 28.812910079956055,
+          "C": 18.195430755615234,
+          "D": 21.907787322998047
+        },
+        "subject": "high_school_world_history"
+      },
+      {
+        "correct": true,
+        "expected": "D",
+        "index": 10,
+        "next_token": 35,
+        "prediction": "D",
+        "prefill_seconds": 2.1405573849988286,
+        "prompt_tokens": 527,
+        "scores": {
+          "A": 20.775419235229492,
+          "B": 22.165218353271484,
+          "C": 22.242916107177734,
+          "D": 31.372852325439453
+        },
+        "subject": "high_school_world_history"
+      },
+      {
+        "correct": true,
+        "expected": "C",
+        "index": 11,
+        "next_token": 34,
+        "prediction": "C",
+        "prefill_seconds": 1.070580630999757,
+        "prompt_tokens": 229,
+        "scores": {
+          "A": 16.208423614501953,
+          "B": 20.51508903503418,
+          "C": 30.720476150512695,
+          "D": 24.46019744873047
+        },
+        "subject": "high_school_world_history"
+      },
+      {
+        "correct": true,
+        "expected": "D",
+        "index": 12,
+        "next_token": 35,
+        "prediction": "D",
+        "prefill_seconds": 1.070839801002876,
+        "prompt_tokens": 301,
+        "scores": {
+          "A": 18.925416946411133,
+          "B": 18.994361877441406,
+          "C": 19.254526138305664,
+          "D": 30.3491268157959
+        },
+        "subject": "high_school_world_history"
+      },
+      {
+        "correct": true,
+        "expected": "C",
+        "index": 13,
+        "next_token": 34,
+        "prediction": "C",
+        "prefill_seconds": 1.0710884710060782,
+        "prompt_tokens": 356,
+        "scores": {
+          "A": 18.622793197631836,
+          "B": 18.249977111816406,
+          "C": 29.856660842895508,
+          "D": 22.84306526184082
+        },
+        "subject": "high_school_world_history"
+      },
+      {
+        "correct": true,
+        "expected": "A",
+        "index": 14,
+        "next_token": 32,
+        "prediction": "A",
+        "prefill_seconds": 1.0712286359994323,
+        "prompt_tokens": 360,
+        "scores": {
+          "A": 31.235055923461914,
+          "B": 18.24098777770996,
+          "C": 16.992023468017578,
+          "D": 18.443450927734375
+        },
+        "subject": "high_school_world_history"
+      },
+      {
+        "correct": true,
+        "expected": "B",
+        "index": 15,
+        "next_token": 33,
+        "prediction": "B",
+        "prefill_seconds": 1.0711467649962287,
+        "prompt_tokens": 293,
+        "scores": {
+          "A": 23.81806182861328,
+          "B": 30.532934188842773,
+          "C": 22.34810447692871,
+          "D": 22.679216384887695
+        },
+        "subject": "high_school_world_history"
+      },
+      {
+        "correct": true,
+        "expected": "A",
+        "index": 16,
+        "next_token": 32,
+        "prediction": "A",
+        "prefill_seconds": 1.0700771109986817,
+        "prompt_tokens": 104,
+        "scores": {
+          "A": 30.572834014892578,
+          "B": 22.80336570739746,
+          "C": 19.6483211517334,
+          "D": 20.89750099182129
+        },
+        "subject": "college_computer_science"
+      },
+      {
+        "correct": true,
+        "expected": "C",
+        "index": 17,
+        "next_token": 34,
+        "prediction": "C",
+        "prefill_seconds": 1.0704066820035223,
+        "prompt_tokens": 183,
+        "scores": {
+          "A": 24.083457946777344,
+          "B": 21.921663284301758,
+          "C": 27.479890823364258,
+          "D": 22.958637237548828
+        },
+        "subject": "college_computer_science"
+      },
+      {
+        "correct": false,
+        "expected": "B",
+        "index": 18,
+        "next_token": 1206,
+        "prediction": "D",
+        "prefill_seconds": 1.071186426001077,
+        "prompt_tokens": 223,
+        "scores": {
+          "A": 23.95710563659668,
+          "B": 24.419130325317383,
+          "C": 22.34049415588379,
+          "D": 24.860219955444336
+        },
+        "subject": "college_computer_science"
+      },
+      {
+        "correct": true,
+        "expected": "A",
+        "index": 19,
+        "next_token": 32,
+        "prediction": "A",
+        "prefill_seconds": 1.0716049510010635,
+        "prompt_tokens": 262,
+        "scores": {
+          "A": 29.361230850219727,
+          "B": 18.550262451171875,
+          "C": 20.54034996032715,
+          "D": 17.540958404541016
+        },
+        "subject": "college_computer_science"
+      },
+      {
+        "correct": true,
+        "expected": "C",
+        "index": 20,
+        "next_token": 34,
+        "prediction": "C",
+        "prefill_seconds": 1.0708386969999992,
+        "prompt_tokens": 88,
+        "scores": {
+          "A": 19.835115432739258,
+          "B": 18.558279037475586,
+          "C": 28.816905975341797,
+          "D": 21.627788543701172
+        },
+        "subject": "college_computer_science"
+      },
+      {
+        "correct": false,
+        "expected": "C",
+        "index": 21,
+        "next_token": 33,
+        "prediction": "B",
+        "prefill_seconds": 1.0710563819957315,
+        "prompt_tokens": 149,
+        "scores": {
+          "A": 22.70659065246582,
+          "B": 27.025386810302734,
+          "C": 24.032806396484375,
+          "D": 23.544580459594727
+        },
+        "subject": "college_computer_science"
+      },
+      {
+        "correct": true,
+        "expected": "C",
+        "index": 22,
+        "next_token": 34,
+        "prediction": "C",
+        "prefill_seconds": 1.0708816179976566,
+        "prompt_tokens": 189,
+        "scores": {
+          "A": 18.840675354003906,
+          "B": 18.350889205932617,
+          "C": 28.66866683959961,
+          "D": 20.39999771118164
+        },
+        "subject": "college_computer_science"
+      },
+      {
+        "correct": true,
+        "expected": "B",
+        "index": 23,
+        "next_token": 33,
+        "prediction": "B",
+        "prefill_seconds": 1.0705474089991185,
+        "prompt_tokens": 98,
+        "scores": {
+          "A": 23.240436553955078,
+          "B": 29.06447982788086,
+          "C": 25.644540786743164,
+          "D": 26.605579376220703
+        },
+        "subject": "college_computer_science"
+      },
+      {
+        "correct": true,
+        "expected": "B",
+        "index": 24,
+        "next_token": 33,
+        "prediction": "B",
+        "prefill_seconds": 1.0700937940055155,
+        "prompt_tokens": 101,
+        "scores": {
+          "A": 23.615610122680664,
+          "B": 24.64825439453125,
+          "C": 23.08445930480957,
+          "D": 22.61482048034668
+        },
+        "subject": "high_school_physics"
+      },
+      {
+        "correct": true,
+        "expected": "A",
+        "index": 25,
+        "next_token": 32,
+        "prediction": "A",
+        "prefill_seconds": 1.0705410340015078,
+        "prompt_tokens": 108,
+        "scores": {
+          "A": 25.100698471069336,
+          "B": 18.75252914428711,
+          "C": 16.976022720336914,
+          "D": 20.841161727905273
+        },
+        "subject": "high_school_physics"
+      },
+      {
+        "correct": true,
+        "expected": "D",
+        "index": 26,
+        "next_token": 35,
+        "prediction": "D",
+        "prefill_seconds": 1.0702055500005372,
+        "prompt_tokens": 150,
+        "scores": {
+          "A": 18.977025985717773,
+          "B": 19.640623092651367,
+          "C": 18.720874786376953,
+          "D": 25.56931495666504
+        },
+        "subject": "high_school_physics"
+      },
+      {
+        "correct": true,
+        "expected": "C",
+        "index": 27,
+        "next_token": 34,
+        "prediction": "C",
+        "prefill_seconds": 1.070762798000942,
+        "prompt_tokens": 191,
+        "scores": {
+          "A": 18.85409927368164,
+          "B": 21.681861877441406,
+          "C": 24.889659881591797,
+          "D": 22.382476806640625
+        },
+        "subject": "high_school_physics"
+      },
+      {
+        "correct": true,
+        "expected": "D",
+        "index": 28,
+        "next_token": 35,
+        "prediction": "D",
+        "prefill_seconds": 1.0704236200035666,
+        "prompt_tokens": 110,
+        "scores": {
+          "A": 15.33344554901123,
+          "B": 19.97197723388672,
+          "C": 23.00289535522461,
+          "D": 23.602794647216797
+        },
+        "subject": "high_school_physics"
+      },
+      {
+        "correct": true,
+        "expected": "C",
+        "index": 29,
+        "next_token": 34,
+        "prediction": "C",
+        "prefill_seconds": 1.070852848002687,
+        "prompt_tokens": 206,
+        "scores": {
+          "A": 17.52181053161621,
+          "B": 17.2827091217041,
+          "C": 25.751474380493164,
+          "D": 20.144222259521484
+        },
+        "subject": "high_school_physics"
+      },
+      {
+        "correct": true,
+        "expected": "A",
+        "index": 30,
+        "next_token": 32,
+        "prediction": "A",
+        "prefill_seconds": 1.0708511819975683,
+        "prompt_tokens": 290,
+        "scores": {
+          "A": 25.456926345825195,
+          "B": 25.077058792114258,
+          "C": 24.011001586914062,
+          "D": 22.57338523864746
+        },
+        "subject": "high_school_physics"
+      },
+      {
+        "correct": false,
+        "expected": "C",
+        "index": 31,
+        "next_token": 32,
+        "prediction": "A",
+        "prefill_seconds": 1.070482670002093,
+        "prompt_tokens": 91,
+        "scores": {
+          "A": 25.561861038208008,
+          "B": 22.2454776763916,
+          "C": 22.66134262084961,
+          "D": 22.51255226135254
+        },
+        "subject": "high_school_physics"
+      },
+      {
+        "correct": true,
+        "expected": "C",
+        "index": 32,
+        "next_token": 34,
+        "prediction": "C",
+        "prefill_seconds": 1.070983896999678,
+        "prompt_tokens": 281,
+        "scores": {
+          "A": 19.335206985473633,
+          "B": 22.573450088500977,
+          "C": 30.993867874145508,
+          "D": 22.40391731262207
+        },
+        "subject": "professional_medicine"
+      },
+      {
+        "correct": true,
+        "expected": "C",
+        "index": 33,
+        "next_token": 34,
+        "prediction": "C",
+        "prefill_seconds": 1.0708051519977744,
+        "prompt_tokens": 191,
+        "scores": {
+          "A": 19.907026290893555,
+          "B": 22.895553588867188,
+          "C": 31.209156036376953,
+          "D": 25.014122009277344
+        },
+        "subject": "professional_medicine"
+      },
+      {
+        "correct": true,
+        "expected": "B",
+        "index": 34,
+        "next_token": 33,
+        "prediction": "B",
+        "prefill_seconds": 1.070565074995102,
+        "prompt_tokens": 222,
+        "scores": {
+          "A": 19.462392807006836,
+          "B": 29.460737228393555,
+          "C": 18.874710083007812,
+          "D": 23.734968185424805
+        },
+        "subject": "professional_medicine"
+      },
+      {
+        "correct": true,
+        "expected": "C",
+        "index": 35,
+        "next_token": 34,
+        "prediction": "C",
+        "prefill_seconds": 1.0710062369980733,
+        "prompt_tokens": 284,
+        "scores": {
+          "A": 17.243671417236328,
+          "B": 20.09001922607422,
+          "C": 28.901504516601562,
+          "D": 22.038373947143555
+        },
+        "subject": "professional_medicine"
+      },
+      {
+        "correct": true,
+        "expected": "D",
+        "index": 36,
+        "next_token": 35,
+        "prediction": "D",
+        "prefill_seconds": 1.0705045079957927,
+        "prompt_tokens": 243,
+        "scores": {
+          "A": 18.723413467407227,
+          "B": 19.488548278808594,
+          "C": 18.950759887695312,
+          "D": 32.12031555175781
+        },
+        "subject": "professional_medicine"
+      },
+      {
+        "correct": true,
+        "expected": "A",
+        "index": 37,
+        "next_token": 32,
+        "prediction": "A",
+        "prefill_seconds": 1.0704332999957842,
+        "prompt_tokens": 127,
+        "scores": {
+          "A": 31.835718154907227,
+          "B": 20.613948822021484,
+          "C": 19.540151596069336,
+          "D": 19.835763931274414
+        },
+        "subject": "professional_medicine"
+      },
+      {
+        "correct": true,
+        "expected": "B",
+        "index": 38,
+        "next_token": 33,
+        "prediction": "B",
+        "prefill_seconds": 1.0709311199971125,
+        "prompt_tokens": 310,
+        "scores": {
+          "A": 21.605148315429688,
+          "B": 29.668956756591797,
+          "C": 19.950708389282227,
+          "D": 24.70610809326172
+        },
+        "subject": "professional_medicine"
+      },
+      {
+        "correct": true,
+        "expected": "C",
+        "index": 39,
+        "next_token": 34,
+        "prediction": "C",
+        "prefill_seconds": 1.070604729000479,
+        "prompt_tokens": 158,
+        "scores": {
+          "A": 19.608619689941406,
+          "B": 22.959075927734375,
+          "C": 28.685651779174805,
+          "D": 21.038774490356445
+        },
+        "subject": "professional_medicine"
+      }
+    ],
+    "correct": 36,
+    "count": 40
+  },
+  "mmlu_source": "hf:cais/mmlu",
+  "model_path": "/opt/dlami/nvme/models/Qwen3.6-27B"
+}

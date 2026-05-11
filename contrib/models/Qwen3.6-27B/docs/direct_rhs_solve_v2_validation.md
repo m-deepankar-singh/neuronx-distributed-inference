@@ -136,3 +136,92 @@ Because the cosine gate cannot be computed, v2 is **compiled and smoke-tested
 but not shippable under the stated validation rules**. MMLU/GSM8K were not run,
 because the validation sequence requires stopping when an earlier gate is not
 covered.
+
+## Phase 3 Update: Direct Logits Artifact Gate
+
+Commit: `487cb59` (`codex/qwen36-logits-validation`)
+
+Added a direct NxDI artifact probe that bypasses the vLLM/OpenAI logprob bug by
+loading artifacts compiled with `neuron_config.output_logits=True`. This path
+compares full final-token logits, top-1 tokens, and top-k overlap directly from
+the compiled NxDI model outputs.
+
+Artifacts:
+
+```text
+baseline:  /opt/dlami/nvme/qwen_artifacts/qwen36_27b_128k_fp8_baseline_v3_logits_run1
+candidate: /opt/dlami/nvme/qwen_artifacts/qwen36_27b_128k_fp8_direct_rhs_v2_logits_run1
+```
+
+Both logits artifacts compiled, sharded, loaded, and warmed successfully:
+
+```text
+baseline:  Finished building model in 542.768s; Done Sharding weights in 51.643s; LOAD_AFTER_COMPILE_OK
+candidate: Finished building model in 303.554s; Done Sharding weights in 50.810s; LOAD_AFTER_COMPILE_OK
+```
+
+The logits dump covered five prompts: short math, Olympics reasoning, a 1,629
+token Metal Gear context prompt, code reasoning, and multilingual recall. The
+candidate matched the baseline top-1 next token and top-20 set for every case:
+
+```text
+average_cosine: 0.9996845960617066
+threshold:      0.999
+passed:         true
+
+case          cosine       top1_match  top20_overlap
+short         0.99914628   true        20/20
+medium        0.99984843   true        20/20
+long          0.99978340   true        20/20
+code          0.99990094   true        20/20
+multilingual  0.99974394   true        20/20
+```
+
+This closes the previously blocked cosine gate for direct-RHS v2. The remaining
+shipping gates are downstream task accuracy checks, for example MMLU-Lite and
+GSM8K subset deltas against baseline v3.
+
+## Phase 4 Update: Downstream Accuracy Delta Gate
+
+Added `validation_scripts/qwen36_downstream_accuracy_probe.py` and ran baseline
+v3 and direct-RHS v2 sequentially against the same public Hugging Face subsets:
+
+```text
+MMLU source:  hf:cais/mmlu
+MMLU rows:    40 across elementary_mathematics, high_school_world_history,
+              college_computer_science, high_school_physics, professional_medicine
+GSM8K source: hf:openai/gsm8k
+GSM8K rows:   first 20 test rows
+max delta:    0.01
+```
+
+The evaluator compares multiple-choice final logits for MMLU and short greedy
+numeric generations for GSM8K. Results:
+
+```text
+MMLU:
+  baseline  36/40 = 0.90
+  candidate 36/40 = 0.90
+  delta      0.00
+  prediction match 40/40
+
+GSM8K:
+  baseline  11/20 = 0.55
+  candidate 11/20 = 0.55
+  delta      0.00
+  prediction match 20/20
+
+overall: PASS
+```
+
+Raw reports:
+
+```text
+contrib/models/Qwen3.6-27B/docs/direct_rhs_v2_logits_compare.json
+contrib/models/Qwen3.6-27B/docs/direct_rhs_v2_downstream_compare.json
+contrib/models/Qwen3.6-27B/docs/direct_rhs_v2_baseline_downstream_raw.json
+contrib/models/Qwen3.6-27B/docs/direct_rhs_v2_candidate_downstream_raw.json
+```
+
+With the direct logits gate and downstream delta gate passing, direct-RHS v2 is
+validated against baseline v3 on the stated correctness checks.

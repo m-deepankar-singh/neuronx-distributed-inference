@@ -1,0 +1,69 @@
+{
+  "average_cosine": 0.9996845960617066,
+  "baseline": "/opt/dlami/nvme/qwen_artifacts/qwen36_27b_128k_fp8_baseline_v3_logits_run1",
+  "candidate": "/opt/dlami/nvme/qwen_artifacts/qwen36_27b_128k_fp8_direct_rhs_v2_logits_run1",
+  "passed": true,
+  "results": [
+    {
+      "baseline_next_token": 18,
+      "baseline_prompt_tokens": 28,
+      "candidate_next_token": 18,
+      "candidate_prompt_tokens": 28,
+      "cosine": 0.9991462826728821,
+      "max_abs": 0.5043373107910156,
+      "name": "short",
+      "top1_match": true,
+      "topk_overlap": 20,
+      "topk_size": 20
+    },
+    {
+      "baseline_next_token": 760,
+      "baseline_prompt_tokens": 33,
+      "candidate_next_token": 760,
+      "candidate_prompt_tokens": 33,
+      "cosine": 0.9998484253883362,
+      "max_abs": 0.18004798889160156,
+      "name": "medium",
+      "top1_match": true,
+      "topk_overlap": 20,
+      "topk_size": 20
+    },
+    {
+      "baseline_next_token": 27775,
+      "baseline_prompt_tokens": 1629,
+      "candidate_next_token": 27775,
+      "candidate_prompt_tokens": 1629,
+      "cosine": 0.9997833967208862,
+      "max_abs": 0.35618019104003906,
+      "name": "long",
+      "top1_match": true,
+      "topk_overlap": 20,
+      "topk_size": 20
+    },
+    {
+      "baseline_next_token": 8160,
+      "baseline_prompt_tokens": 31,
+      "candidate_next_token": 8160,
+      "candidate_prompt_tokens": 31,
+      "cosine": 0.9999009370803833,
+      "max_abs": 0.3268581032752991,
+      "name": "code",
+      "top1_match": true,
+      "topk_overlap": 20,
+      "topk_size": 20
+    },
+    {
+      "baseline_next_token": 8482,
+      "baseline_prompt_tokens": 25,
+      "candidate_next_token": 8482,
+      "candidate_prompt_tokens": 25,
+      "cosine": 0.9997439384460449,
+      "max_abs": 0.2331705093383789,
+      "name": "multilingual",
+      "top1_match": true,
+      "topk_overlap": 20,
+      "topk_size": 20
+    }
+  ],
+  "threshold": 0.999
+}
