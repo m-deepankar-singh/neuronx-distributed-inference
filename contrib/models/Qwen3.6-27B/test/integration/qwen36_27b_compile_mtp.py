@@ -120,7 +120,7 @@ def _build_config(args: argparse.Namespace):
     # contains one MTP layer plus shared embedding/lm_head weights.
     draft_neuron_config.quantized = False
     draft_neuron_config.quantized_checkpoints_path = None
-    draft_neuron_config.modules_to_not_convert = None
+    draft_neuron_config.modules_to_not_convert = ["mtp", "embed_tokens", "lm_head"]
 
     draft_config_dict = dict(config_dict)
     draft_config_dict.update(
