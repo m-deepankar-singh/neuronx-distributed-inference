@@ -22,6 +22,8 @@ Status: CPU contract implemented; Trainium integration not wired yet.
 - `NeuronQwen35Model.compute_mtp_logits(...)` runs the native MTP predictor with
   shared target embeddings and `lm_head`, returning MTP logits, hidden states,
   and MTP cache tensors.
+- `Qwen35InferenceConfig(enable_mtp_hidden_state_output=True)` appends target
+  hidden states as the final model output for a future fused-spec scheduler.
 
 ## Current Gap
 

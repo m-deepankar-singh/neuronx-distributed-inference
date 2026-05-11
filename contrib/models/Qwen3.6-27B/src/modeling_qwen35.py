@@ -1215,6 +1215,7 @@ class Qwen35InferenceConfig(InferenceConfig):
         kwargs.setdefault("use_qwen_hybrid_chunked_prefill", False)
         kwargs.setdefault("use_qwen_hybrid_chunked_prefill_nki", False)
         kwargs.setdefault("enable_mtp_weight_loading", False)
+        kwargs.setdefault("enable_mtp_hidden_state_output", False)
         kwargs.setdefault("mtp_num_hidden_layers", kwargs.get("num_nextn_predict_layers", 1))
 
         super().__init__(*args, **kwargs)
@@ -2607,6 +2608,7 @@ class NeuronQwen35Model(NeuronBaseModel):
             vision_embeddings=vision_embeddings,
             vision_mask=vision_mask,
         )
+        mtp_hidden_states = hidden_states
 
         batch_size = input_ids.shape[0]
         if not getattr(self, "sliced_hidden", False):
@@ -2671,6 +2673,8 @@ class NeuronQwen35Model(NeuronBaseModel):
             and hasattr(self, "_deltanet_updated_states")
         ):
             outputs += self._deltanet_updated_states
+        if getattr(self.config, "enable_mtp_hidden_state_output", False):
+            outputs += [mtp_hidden_states]
 
         return outputs
 
