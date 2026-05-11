@@ -2804,7 +2804,13 @@ class NeuronQwen35MTPDraftModel(NeuronBaseModel):
                 kvcache_buffer=kv_cache,
             )
 
-        if self.on_device_sampling:
+        if is_for_context_encoding:
+            res = torch.zeros(
+                (input_ids.shape[0], 1),
+                dtype=torch.int32,
+                device=input_ids.device,
+            )
+        elif self.on_device_sampling:
             res = self._sample_on_device(
                 logits, sampling_params, True, is_for_context_encoding
             )
