@@ -1,0 +1,172 @@
+{
+  "all_cases_ok": true,
+  "all_concurrency_ok": true,
+  "cases": [
+    {
+      "completion_tokens": 10,
+      "expected": "TOKYO_2020_OK",
+      "name": "exact_repeat_cold",
+      "ok": true,
+      "prompt_tokens": 10601,
+      "text": "TOKYO_2020_OK",
+      "wall_s": 26.577588625019416
+    },
+    {
+      "completion_tokens": 10,
+      "expected": "TOKYO_2020_OK",
+      "name": "exact_repeat_warm",
+      "ok": true,
+      "prompt_tokens": 10601,
+      "text": "TOKYO_2020_OK",
+      "wall_s": 3.070065208012238
+    },
+    {
+      "completion_tokens": 5,
+      "expected": "CROSS_A_OK",
+      "name": "cross_prefix_a_cold",
+      "ok": true,
+      "prompt_tokens": 10376,
+      "text": "CROSS_A_OK",
+      "wall_s": 26.595605874899775
+    },
+    {
+      "completion_tokens": 5,
+      "expected": "CROSS_B_OK",
+      "name": "cross_prefix_b_cold",
+      "ok": true,
+      "prompt_tokens": 10376,
+      "text": "CROSS_B_OK",
+      "wall_s": 26.547509624972008
+    },
+    {
+      "completion_tokens": 5,
+      "expected": "CROSS_A_OK",
+      "name": "cross_prefix_a_warm_after_b",
+      "ok": true,
+      "prompt_tokens": 10376,
+      "text": "CROSS_A_OK",
+      "wall_s": 2.6621081250486895
+    }
+  ],
+  "concurrency": [
+    {
+      "aggregate_completion_tok_s": 2.7906706197802453,
+      "aggregate_completion_tokens": 8,
+      "aggregate_prompt_tok_s": 3620.5462953373963,
+      "aggregate_prompt_tokens": 10379,
+      "cases": [
+        {
+          "completion_tokens": 8,
+          "expected": "APC_REQ_1_0",
+          "name": "concurrent_l1_r0",
+          "ok": true,
+          "prompt_tokens": 10379,
+          "text": "APC_REQ_1_0",
+          "wall_s": 2.8554664999246597
+        }
+      ],
+      "concurrency": 1,
+      "p50_wall_s": 2.8554664999246597,
+      "p95_wall_s": 2.8554664999246597,
+      "requests": 1,
+      "successes": 1,
+      "total_wall_s": 2.866694458061829
+    },
+    {
+      "aggregate_completion_tok_s": 3.660020713425536,
+      "aggregate_completion_tokens": 16,
+      "aggregate_prompt_tok_s": 4748.4193730804545,
+      "aggregate_prompt_tokens": 20758,
+      "cases": [
+        {
+          "completion_tokens": 8,
+          "expected": "APC_REQ_2_0",
+          "name": "concurrent_l2_r0",
+          "ok": true,
+          "prompt_tokens": 10379,
+          "text": "APC_REQ_2_0",
+          "wall_s": 4.370519333984703
+        },
+        {
+          "completion_tokens": 8,
+          "expected": "APC_REQ_2_1",
+          "name": "concurrent_l2_r1",
+          "ok": true,
+          "prompt_tokens": 10379,
+          "text": "APC_REQ_2_1",
+          "wall_s": 2.9087154580047354
+        }
+      ],
+      "concurrency": 2,
+      "p50_wall_s": 3.639617395994719,
+      "p95_wall_s": 4.370519333984703,
+      "requests": 2,
+      "successes": 2,
+      "total_wall_s": 4.371559959021397
+    },
+    {
+      "aggregate_completion_tok_s": 3.6191333913890507,
+      "aggregate_completion_tokens": 32,
+      "aggregate_prompt_tok_s": 4695.37318365337,
+      "aggregate_prompt_tokens": 41516,
+      "cases": [
+        {
+          "completion_tokens": 8,
+          "expected": "APC_REQ_4_0",
+          "name": "concurrent_l4_r0",
+          "ok": true,
+          "prompt_tokens": 10379,
+          "text": "APC_REQ_4_0",
+          "wall_s": 5.812698167050257
+        },
+        {
+          "completion_tokens": 8,
+          "expected": "APC_REQ_4_1",
+          "name": "concurrent_l4_r1",
+          "ok": true,
+          "prompt_tokens": 10379,
+          "text": "APC_REQ_4_1",
+          "wall_s": 4.435327875078656
+        },
+        {
+          "completion_tokens": 8,
+          "expected": "APC_REQ_4_2",
+          "name": "concurrent_l4_r2",
+          "ok": true,
+          "prompt_tokens": 10379,
+          "text": "APC_REQ_4_2",
+          "wall_s": 8.839384666993283
+        },
+        {
+          "completion_tokens": 8,
+          "expected": "APC_REQ_4_3",
+          "name": "concurrent_l4_r3",
+          "ok": true,
+          "prompt_tokens": 10379,
+          "text": "APC_REQ_4_3",
+          "wall_s": 7.271678707911633
+        }
+      ],
+      "concurrency": 4,
+      "p50_wall_s": 6.542188437480945,
+      "p95_wall_s": 8.839384666993283,
+      "requests": 4,
+      "successes": 4,
+      "total_wall_s": 8.841895707999356
+    }
+  ],
+  "cross_prefix_a_text_match": true,
+  "exact_repeat_speedup": 8.657011113528593,
+  "exact_repeat_text_match": true,
+  "metadata": {
+    "base_url": "http://16.26.184.199:8000",
+    "concurrency_levels": [
+      1,
+      2,
+      4
+    ],
+    "model": "/opt/dlami/nvme/models/Qwen3.6-27B",
+    "prefix_repeats": 220,
+    "started_utc": "2026-05-11T09:28:53.614373+00:00"
+  }
+}

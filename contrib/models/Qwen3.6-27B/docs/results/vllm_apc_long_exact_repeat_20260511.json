@@ -1,0 +1,28 @@
+{
+  "label": "LONG_APC_1778491768",
+  "cold": {
+    "name": "long_exact_cold",
+    "wall_s": 62.23262408399023,
+    "text": "LONG_APC_OK",
+    "usage": {
+      "prompt_tokens": 25997,
+      "total_tokens": 26002,
+      "completion_tokens": 5,
+      "prompt_tokens_details": null
+    },
+    "ok": true
+  },
+  "warm": {
+    "name": "long_exact_warm",
+    "wall_s": 2.9241782079916447,
+    "text": "LONG_APC_OK",
+    "usage": {
+      "prompt_tokens": 25997,
+      "total_tokens": 26002,
+      "completion_tokens": 5,
+      "prompt_tokens_details": null
+    },
+    "ok": true
+  },
+  "speedup": 21.282090097625147
+}
