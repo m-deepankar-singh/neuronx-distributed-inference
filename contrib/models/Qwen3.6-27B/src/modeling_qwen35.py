@@ -1689,6 +1689,14 @@ class NeuronQwen35Attention(NeuronAttentionBase):
             tkg_mask = attention_mask
             if tkg_mask is not None and tkg_mask.ndim == 2:
                 tkg_mask = tkg_mask.unsqueeze(1).unsqueeze(2)  # (B, S) -> (B, 1, 1, S)
+            if (
+                active_mask is None
+                and position_ids is not None
+                and position_ids.shape[-1] > 1
+            ):
+                active_mask = (
+                    position_ids[:, :, None] >= position_ids[:, None, :]
+                ).unsqueeze(1)
             attn_output = self.compute_for_token_gen(
                 Q, K, V, position_ids, past_key_value, tkg_mask, active_mask
             )
