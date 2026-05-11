@@ -1877,6 +1877,9 @@ class NeuronQwen35MTPPredictor(nn.Module):
         hidden_states = self.norm(hidden_states)
         return hidden_states, (present_key_value,), cos_cache, sin_cache
 
+    def compute_logits(self, lm_head, hidden_states):
+        return lm_head(hidden_states).float()
+
 
 # ============================================================
 # Hybrid Cache Manager (opt-in)
@@ -2473,6 +2476,61 @@ class NeuronQwen35Model(NeuronBaseModel):
         self._deltanet_updated_states = deltanet_state_tensors
 
         return (hidden_states, next_decoder_cache)
+
+    def compute_mtp_logits(
+        self,
+        input_ids,
+        target_hidden_states,
+        attention_mask=None,
+        position_ids=None,
+        past_key_values=None,
+        spec_step_idx: int = 0,
+        inputs_embeds=None,
+        **kwargs,
+    ):
+        """Run the native MTP predictor with shared target embeddings/lm_head.
+
+        This is the model-local integration seam for Qwen3.6's native MTP
+        speculative decoding. The full NxDI scheduler still needs to call this
+        from a fused-spec generation path; keeping the method separate lets us
+        validate MTP loading and logits before modifying core speculative
+        decoding control flow.
+        """
+        if not hasattr(self, "mtp"):
+            raise RuntimeError(
+                "MTP predictor is not initialized. Set "
+                "enable_mtp_weight_loading=True in Qwen35InferenceConfig."
+            )
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_tokens(input_ids)
+
+        mtp_hidden, mtp_cache, _cos_cache, _sin_cache = self.mtp(
+            inputs_embeds=inputs_embeds,
+            target_hidden_states=target_hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            spec_step_idx=spec_step_idx,
+            **kwargs,
+        )
+        logits = self.mtp.compute_logits(self.lm_head, mtp_hidden)
+        if hasattr(self.lm_head, "pad_size"):
+            if self.lm_head.gather_output:
+                rank_id = torch.tensor(0, device=logits.device, dtype=torch.int32)
+                world_size = 1
+            else:
+                rank_id = self.rank_util.get_rank()
+                world_size = torch.distributed.get_world_size(
+                    group=self.lm_head.tensor_parallel_group
+                )
+            from neuronx_distributed_inference.models.model_base import (
+                mask_padded_logits,
+            )
+
+            logits = mask_padded_logits(
+                logits, rank_id, world_size, pad_size=self.lm_head.pad_size
+            )
+        return logits, mtp_hidden, mtp_cache
 
     def forward(
         self,

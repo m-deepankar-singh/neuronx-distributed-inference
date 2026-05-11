@@ -19,18 +19,21 @@ Status: CPU contract implemented; Trainium integration not wired yet.
 - `Qwen35InferenceConfig(enable_mtp_weight_loading=True)` now preserves and
   converts native `mtp.*` weights into the same NxDI attention layout used by
   full-attention layers.
+- `NeuronQwen35Model.compute_mtp_logits(...)` runs the native MTP predictor with
+  shared target embeddings and `lm_head`, returning MTP logits, hidden states,
+  and MTP cache tensors.
 
 ## Current Gap
 
 The baseline target model still skips `mtp.*` weights by default, and the hybrid
 cache manager currently rejects speculative decoding. This means native MTP
-weights can now be loaded behind an opt-in flag, but they are not yet wired into
-the NxDI/Trainium execution path.
+weights can now be loaded and called behind opt-in hooks, but they are not yet
+connected to the NxDI generation scheduler or vLLM speculative request path.
 
 ## Next Implementation Steps
 
-1. Add a Neuron-side MTP predictor module matching the CPU contract.
-2. Wire the predictor into NxDI speculative decoding with the hybrid cache state.
+1. Wire `compute_mtp_logits(...)` into an NxDI fused-spec generation path.
+2. Add hybrid-cache state handling for accepted/rejected MTP drafts.
 3. Validate with greedy baseline comparison, acceptance-rate measurement, and
    decode throughput.
 
