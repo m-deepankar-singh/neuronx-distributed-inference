@@ -3393,6 +3393,9 @@ class Qwen35ModelWrapper(ModelWrapper):
     def input_generator(self):
         """Generate inputs including mrope_position_ids, vision_embeddings, and vision_mask."""
         base_inputs = super().input_generator()
+        if self.config.neuron_config.enable_fused_speculation:
+            return base_inputs
+
         extended_inputs = []
 
         for bucket_inputs in base_inputs:
