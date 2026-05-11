@@ -28,6 +28,7 @@ if _CONTRIB_ROOT not in sys.path:
 from src.modeling_qwen35 import (
     Qwen35InferenceConfig,
     NeuronQwen35ForCausalLM,
+    NeuronQwen35MTPDraftForCausalLM,
     convert_qwen35_hf_to_neuron_state_dict,
 )
 from neuronx_distributed_inference.models.config import NeuronConfig
@@ -520,6 +521,23 @@ class TestMTPWeightConversion(unittest.TestCase):
             result["mtp.norm.weight"],
             torch.ones_like(result["mtp.norm.weight"]),
         )
+
+    def test_mtp_draft_conversion_keeps_only_shared_and_mtp_weights(self):
+        config = _make_mini_config()
+        config.mtp_num_hidden_layers = 1
+        sd = _make_mini_state_dict(config)
+        self._add_mtp_weights(sd, config)
+
+        result = NeuronQwen35MTPDraftForCausalLM.convert_hf_to_neuron_state_dict(
+            sd, config
+        )
+
+        self.assertIn("embed_tokens.weight", result)
+        self.assertIn("lm_head.weight", result)
+        self.assertIn("mtp.fc.weight", result)
+        self.assertIn("mtp.layers.0.self_attn.Wqkv.weight", result)
+        self.assertNotIn("layers.0.linear_attn.in_proj_qkv.weight", result)
+        self.assertNotIn("layers.3.self_attn.Wqkv.weight", result)
 
 
 if __name__ == "__main__":

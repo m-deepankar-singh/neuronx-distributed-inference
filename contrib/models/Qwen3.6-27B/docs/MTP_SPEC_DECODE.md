@@ -24,6 +24,9 @@ Status: CPU contract implemented; Trainium integration not wired yet.
   and MTP cache tensors.
 - `Qwen35InferenceConfig(enable_mtp_hidden_state_output=True)` appends target
   hidden states as the final model output for a future fused-spec scheduler.
+- `NeuronQwen35MTPDraftForCausalLM` exposes Qwen's native MTP predictor as a
+  separate NxDI draft model. Its converter keeps only shared `embed_tokens`,
+  shared `lm_head`, and native `mtp.*` weights.
 
 ## Current Gap
 
@@ -34,8 +37,10 @@ connected to the NxDI generation scheduler or vLLM speculative request path.
 
 ## Next Implementation Steps
 
-1. Wire `compute_mtp_logits(...)` into an NxDI fused-spec generation path.
-2. Add hybrid-cache state handling for accepted/rejected MTP drafts.
+1. Wire `NeuronQwen35MTPDraftForCausalLM` into the fused-spec config and compile
+   a small speculation artifact.
+2. Add hybrid-cache state handling for accepted/rejected MTP drafts if the
+   existing EAGLE-style scheduler cannot preserve DeltaNet state correctly.
 3. Validate with greedy baseline comparison, acceptance-rate measurement, and
    decode throughput.
 

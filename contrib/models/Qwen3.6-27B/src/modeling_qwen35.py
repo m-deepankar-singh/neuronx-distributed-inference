@@ -27,6 +27,7 @@ Config compatibility notes:
 """
 
 import gc
+import copy
 import math
 import logging
 import os
@@ -1216,6 +1217,7 @@ class Qwen35InferenceConfig(InferenceConfig):
         kwargs.setdefault("use_qwen_hybrid_chunked_prefill_nki", False)
         kwargs.setdefault("enable_mtp_weight_loading", False)
         kwargs.setdefault("enable_mtp_hidden_state_output", False)
+        kwargs.setdefault("is_mtp_draft_model", False)
         kwargs.setdefault("mtp_num_hidden_layers", kwargs.get("num_nextn_predict_layers", 1))
 
         super().__init__(*args, **kwargs)
@@ -2533,6 +2535,223 @@ class NeuronQwen35Model(NeuronBaseModel):
             )
         return logits, mtp_hidden, mtp_cache
 
+
+class NeuronQwen35MTPDraftModel(NeuronBaseModel):
+    """Draft model wrapper for Qwen3.6 native MTP speculative decoding.
+
+    NxDI's fused-spec scheduler expects a separate draft module with a standard
+    ``forward`` contract. The Qwen native MTP head is not a full second model,
+    but this wrapper exposes it as one: shared embeddings + MTP predictor +
+    shared lm_head, with a one-layer KV cache for the MTP full-attention layer.
+    """
+
+    def __init__(self, config: Qwen35InferenceConfig):
+        draft_config = copy.deepcopy(config)
+        mtp_layers = getattr(draft_config, "mtp_num_hidden_layers", 1)
+        draft_config.num_hidden_layers = mtp_layers
+        draft_config.layer_types = ["full_attention"] * mtp_layers
+        draft_config.enable_mtp_weight_loading = True
+        draft_config.is_mtp_draft_model = True
+        draft_config.use_hybrid_cache_manager = False
+        super().__init__(draft_config)
+
+    def setup_attr_for_model(self, config: Qwen35InferenceConfig):
+        self.on_device_sampling = (
+            config.neuron_config.on_device_sampling_config is not None
+        )
+        self.tp_degree = config.neuron_config.tp_degree
+        self.hidden_size = config.hidden_size
+        self.num_attention_heads = config.num_attention_heads
+        self.num_key_value_heads = config.num_key_value_heads
+        self.max_batch_size = config.neuron_config.max_batch_size
+        self.buckets = config.neuron_config.buckets
+
+    def init_model(self, config: Qwen35InferenceConfig):
+        self.padding_idx = config.pad_token_id
+        self.vocab_size = config.vocab_size
+        self.embed_tokens = ParallelEmbedding(
+            config.vocab_size,
+            config.hidden_size,
+            self.padding_idx,
+            dtype=config.neuron_config.torch_dtype,
+            shard_across_embedding=True,
+        )
+        self.mtp = NeuronQwen35MTPPredictor(config)
+        self.lm_head = ColumnParallelLinear(
+            config.hidden_size,
+            config.vocab_size,
+            gather_output=False if self.on_device_sampling else True,
+            bias=False,
+        )
+
+    def forward(
+        self,
+        input_ids,
+        attention_mask,
+        position_ids,
+        seq_ids,
+        sampling_params,
+        prev_hidden=None,
+        adapter_ids=None,
+        accepted_indices=None,
+        current_length=None,
+        medusa_mask=None,
+        scatter_index=None,
+        slot_mapping=None,
+        active_block_table=None,
+        num_queries=None,
+        computed_context_lens=None,
+        tile_q_indices=None,
+        tile_block_tables=None,
+        tile_masks=None,
+        inputs_embeds=None,
+        kv_cache=None,
+        active_mask=None,
+        rotary_position_id=None,
+        vision_embeddings=None,
+        vision_mask=None,
+    ):
+        prev_hidden = self.set_none_if_empty(prev_hidden)
+        kv_cache = self.set_none_if_empty(kv_cache)
+        adapter_ids = self.set_none_if_empty(adapter_ids)
+        active_mask = self.set_none_if_empty(active_mask)
+
+        if prev_hidden is None:
+            raise RuntimeError("Qwen MTP draft model requires target prev_hidden input.")
+
+        is_for_context_encoding = position_ids.shape[-1] != 1 and not (
+            hasattr(self.neuron_config, "speculation_length")
+            and position_ids.shape[-1] == self.neuron_config.speculation_length
+        )
+        cache_size = self.config.neuron_config.seq_len
+        past_key_values = None
+        if self.kv_mgr is not None:
+            past_key_values = self.kv_mgr.get_cache(
+                seq_ids=seq_ids.to(torch.int32),
+                seq_len=cache_size,
+                is_for_context_encoding=is_for_context_encoding,
+                kvcache_buffer=kv_cache,
+            )
+
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_tokens(input_ids)
+
+        logits, mtp_hidden, mtp_cache = self.compute_mtp_logits(
+            input_ids=input_ids,
+            target_hidden_states=prev_hidden,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            adapter_ids=adapter_ids,
+            active_mask=active_mask,
+        )
+
+        updated_kv_cache = ()
+        if self.kv_mgr is not None:
+            updated_kv_cache = self.kv_mgr.update_cache(
+                is_for_context_encoding=is_for_context_encoding,
+                seq_ids=seq_ids.to(torch.int32),
+                position_ids=position_ids,
+                new_key_values=mtp_cache,
+                seq_len=cache_size,
+                kvcache_buffer=kv_cache,
+            )
+
+        if self.on_device_sampling:
+            res = self._sample_on_device(
+                logits, sampling_params, True, is_for_context_encoding
+            )
+        else:
+            res = logits
+
+        outputs = [res]
+        if self.neuron_config.output_logits:
+            outputs += [logits]
+        outputs += updated_kv_cache
+        if is_for_context_encoding:
+            outputs += [mtp_hidden, mtp_hidden]
+        else:
+            outputs += [mtp_hidden]
+        return outputs
+
+    def compute_mtp_logits(
+        self,
+        input_ids,
+        target_hidden_states,
+        attention_mask=None,
+        position_ids=None,
+        past_key_values=None,
+        inputs_embeds=None,
+        **kwargs,
+    ):
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_tokens(input_ids)
+        mtp_hidden, mtp_cache, _cos_cache, _sin_cache = self.mtp(
+            inputs_embeds=inputs_embeds,
+            target_hidden_states=target_hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            **kwargs,
+        )
+        logits = self.mtp.compute_logits(self.lm_head, mtp_hidden)
+        if hasattr(self.lm_head, "pad_size"):
+            if self.lm_head.gather_output:
+                rank_id = torch.tensor(0, device=logits.device, dtype=torch.int32)
+                world_size = 1
+            else:
+                rank_id = self.rank_util.get_rank()
+                world_size = torch.distributed.get_world_size(
+                    group=self.lm_head.tensor_parallel_group
+                )
+            from neuronx_distributed_inference.models.model_base import (
+                mask_padded_logits,
+            )
+
+            logits = mask_padded_logits(
+                logits, rank_id, world_size, pad_size=self.lm_head.pad_size
+            )
+        return logits, mtp_hidden, mtp_cache
+
+
+class NeuronQwen35MTPDraftForCausalLM(NeuronBaseForCausalLM):
+    _model_cls = NeuronQwen35MTPDraftModel
+
+    @classmethod
+    def get_config_cls(cls):
+        return Qwen35InferenceConfig
+
+    @staticmethod
+    def load_hf_model(model_path, **kwargs):
+        from transformers import AutoModelForCausalLM
+
+        kwargs.setdefault("trust_remote_code", True)
+        return AutoModelForCausalLM.from_pretrained(model_path, **kwargs)
+
+    @staticmethod
+    def convert_hf_to_neuron_state_dict(state_dict, config):
+        """Load only shared embeddings/lm_head plus native MTP weights."""
+        config.enable_mtp_weight_loading = True
+        config.is_mtp_draft_model = True
+        new_sd = {}
+        for k, v in state_dict.items():
+            if k.startswith("language_model."):
+                k = k.replace("language_model.", "", 1)
+            elif k.startswith("model.language_model."):
+                k = k.replace("model.language_model.", "", 1)
+            elif k.startswith("model."):
+                k = k.replace("model.", "", 1)
+
+            if (
+                k.startswith("mtp.")
+                or k == "embed_tokens.weight"
+                or k == "lm_head.weight"
+            ):
+                new_sd[k] = v
+
+        return convert_qwen35_hf_to_neuron_state_dict(new_sd, config)
+
     def forward(
         self,
         input_ids,
@@ -2791,13 +3010,14 @@ def convert_qwen35_hf_to_neuron_state_dict(neuron_state_dict, config):
     # is initialized to zeros. Standard NxDI RMSNorm uses `output = norm(x) * weight`
     # where weight is initialized to ones. To convert: new_weight = old_weight + 1.0
     norm_keys_to_convert = []
-    for l in range(config.num_hidden_layers):
-        norm_keys_to_convert.append(f"layers.{l}.input_layernorm.weight")
-        norm_keys_to_convert.append(f"layers.{l}.post_attention_layernorm.weight")
-        if config.layer_types[l] == "full_attention":
-            norm_keys_to_convert.append(f"layers.{l}.self_attn.q_norm.weight")
-            norm_keys_to_convert.append(f"layers.{l}.self_attn.k_norm.weight")
-    norm_keys_to_convert.append("norm.weight")
+    if not getattr(config, "is_mtp_draft_model", False):
+        for l in range(config.num_hidden_layers):
+            norm_keys_to_convert.append(f"layers.{l}.input_layernorm.weight")
+            norm_keys_to_convert.append(f"layers.{l}.post_attention_layernorm.weight")
+            if config.layer_types[l] == "full_attention":
+                norm_keys_to_convert.append(f"layers.{l}.self_attn.q_norm.weight")
+                norm_keys_to_convert.append(f"layers.{l}.self_attn.k_norm.weight")
+        norm_keys_to_convert.append("norm.weight")
     if getattr(config, "enable_mtp_weight_loading", False):
         norm_keys_to_convert.extend(
             [
@@ -2825,7 +3045,7 @@ def convert_qwen35_hf_to_neuron_state_dict(neuron_state_dict, config):
             if "layers.0." in nk or nk == "norm.weight":
                 logger.warning(f"[NORM FIX] key not found: {nk}")
 
-    for l in range(config.num_hidden_layers):
+    for l in range(0 if getattr(config, "is_mtp_draft_model", False) else config.num_hidden_layers):
         layer_type = config.layer_types[l]
 
         # === DeltaNet layers ===
