@@ -27,6 +27,7 @@ Config compatibility notes:
 """
 
 import gc
+import copy
 import math
 import logging
 import os
@@ -421,6 +422,39 @@ class NeuronGatedDeltaNet(nn.Module):
 
         return output.unsqueeze(2), new_state
 
+    def _recurrent_decode_forward(
+        self,
+        query,
+        key,
+        value,
+        g,
+        beta,
+        recurrent_state,
+        return_step_states=False,
+    ):
+        """Run one or more recurrent decode steps from a cached state."""
+        outputs = []
+        step_states = []
+        state = recurrent_state
+        for token_idx in range(query.shape[2]):
+            out, state = self._recurrent_step(
+                query[:, :, token_idx : token_idx + 1],
+                key[:, :, token_idx : token_idx + 1],
+                value[:, :, token_idx : token_idx + 1],
+                g[:, :, token_idx : token_idx + 1],
+                beta[:, :, token_idx : token_idx + 1],
+                state,
+            )
+            outputs.append(out)
+            if return_step_states:
+                step_states.append(state)
+
+        output = torch.cat(outputs, dim=2)
+        recurrent_step_states = None
+        if return_step_states:
+            recurrent_step_states = torch.stack(step_states, dim=1)
+        return output, state, recurrent_step_states
+
     def _nki_recurrent_forward(self, query, key, value, g, beta):
         """Full-sequence recurrent forward using NKI kernel for context encoding."""
         query = l2norm(query, dim=-1)
@@ -809,6 +843,7 @@ class NeuronGatedDeltaNet(nn.Module):
             self.use_qwen_hybrid_chunked_prefill
             and past_key_value is not None
             and seq_len > 1
+            and bool(kwargs.get("is_for_context_encoding", False))
         )
         is_decode = past_key_value is not None and not qwen_chunked_prefill_active
 
@@ -819,6 +854,7 @@ class NeuronGatedDeltaNet(nn.Module):
         # through padding positions (no spurious decay).
         valid_mask_1d = kwargs.get("deltanet_padding_mask", None)  # [B, S, 1] or None
         hybrid_cache_active = self.use_hybrid_cache_manager
+        return_step_states = bool(kwargs.get("return_deltanet_step_states", False))
         recurrent_state_cache = None
         conv_state_cache = None
         if hybrid_cache_active and past_key_value is not None:
@@ -848,6 +884,7 @@ class NeuronGatedDeltaNet(nn.Module):
         # Causal Conv1d on QKV
         mixed = torch.cat([query, key, value], dim=-1)
         mixed = mixed.transpose(1, 2)
+        conv_step_states = None
 
         if is_decode:
             if conv_state_cache is not None:
@@ -863,11 +900,34 @@ class NeuronGatedDeltaNet(nn.Module):
             for k in range(4):
                 conv_out = (
                     conv_out
-                    + w[:, k].unsqueeze(0).unsqueeze(-1) * conv_input[:, :, k : k + 1]
+                    + w[:, k].unsqueeze(0).unsqueeze(-1) * conv_input[:, :, k : k + seq_len]
                 )
             mixed_post_conv = F.silu(conv_out)
 
             new_conv_state = torch.cat([conv_state[:, :, 1:], mixed], dim=-1)
+            conv_step_states = None
+            if return_step_states:
+                state_len = self.conv_kernel_size - 1
+                step_offsets = (
+                    torch.arange(seq_len, device=mixed.device)
+                    .view(1, 1, seq_len, 1)
+                    + 1
+                )
+                state_offsets = torch.arange(state_len, device=mixed.device).view(
+                    1, 1, 1, state_len
+                )
+                gather_idx = step_offsets + state_offsets
+                gather_idx = gather_idx.expand(
+                    batch_size, self.conv_dim, seq_len, state_len
+                )
+                conv_source = conv_input.unsqueeze(2).expand(
+                    batch_size,
+                    self.conv_dim,
+                    seq_len,
+                    conv_input.shape[-1],
+                )
+                conv_step_states = torch.gather(conv_source, 3, gather_idx)
+                conv_step_states = conv_step_states.transpose(1, 2).contiguous()
             alloc_bs = self.conv_state_buffer.shape[0]
             if hybrid_cache_active:
                 new_conv_state = new_conv_state.to(self.conv_state_buffer.dtype)
@@ -1019,6 +1079,7 @@ class NeuronGatedDeltaNet(nn.Module):
         value = value.transpose(1, 2).contiguous().float()
         g = g.transpose(1, 2).contiguous().float()
         beta = beta.transpose(1, 2).contiguous().float()
+        recurrent_step_states = None
 
         if is_decode:
             # TKG: single-step recurrent update
@@ -1031,10 +1092,20 @@ class NeuronGatedDeltaNet(nn.Module):
             else:
                 recurrent_state = self.recurrent_state_buffer[:batch_size].float()
 
-            output, new_state = self._recurrent_step(
-                query, key, value, g, beta, recurrent_state
+            output, new_state, recurrent_step_states = self._recurrent_decode_forward(
+                query,
+                key,
+                value,
+                g,
+                beta,
+                recurrent_state,
+                return_step_states=return_step_states,
             )
             new_state_bf16 = new_state.to(self.recurrent_state_buffer.dtype)
+            if recurrent_step_states is not None:
+                recurrent_step_states = recurrent_step_states.to(
+                    self.recurrent_state_buffer.dtype
+                )
             alloc_bs = self.recurrent_state_buffer.shape[0]
             if hybrid_cache_active:
                 new_rec_state = new_state_bf16
@@ -1154,7 +1225,19 @@ class NeuronGatedDeltaNet(nn.Module):
         output = output.reshape(batch_size, seq_len, self.value_dim)
         output = self.out_proj(output)
 
+        deltanet_step_states = None
+        if return_step_states:
+            deltanet_step_states = (recurrent_step_states, conv_step_states)
+
         if hybrid_cache_active:
+            if return_step_states:
+                return (
+                    output,
+                    (new_rec_state, new_conv_state),
+                    new_rec_state,
+                    new_conv_state,
+                    deltanet_step_states,
+                )
             return output, (new_rec_state, new_conv_state), new_rec_state, new_conv_state
 
         # Return dummy KV for KVCacheManager
@@ -1168,6 +1251,14 @@ class NeuronGatedDeltaNet(nn.Module):
         )
         dummy_v = torch.zeros_like(dummy_k)
 
+        if return_step_states:
+            return (
+                output,
+                (dummy_k, dummy_v),
+                new_rec_state,
+                new_conv_state,
+                deltanet_step_states,
+            )
         return output, (dummy_k, dummy_v), new_rec_state, new_conv_state
 
 
@@ -1214,6 +1305,12 @@ class Qwen35InferenceConfig(InferenceConfig):
         kwargs.setdefault("use_hybrid_cache_manager", False)
         kwargs.setdefault("use_qwen_hybrid_chunked_prefill", False)
         kwargs.setdefault("use_qwen_hybrid_chunked_prefill_nki", False)
+        kwargs.setdefault("enable_mtp_weight_loading", False)
+        kwargs.setdefault("enable_mtp_hidden_state_output", False)
+        kwargs.setdefault("enable_mtp_speculation", False)
+        kwargs.setdefault("enable_mtp_step_state_output", False)
+        kwargs.setdefault("is_mtp_draft_model", False)
+        kwargs.setdefault("mtp_num_hidden_layers", kwargs.get("num_nextn_predict_layers", 1))
 
         super().__init__(*args, **kwargs)
 
@@ -1573,9 +1670,11 @@ class NeuronQwen35Attention(NeuronAttentionBase):
             rmsnorm=rmsnorm,
         )
 
+        is_for_context_encoding = bool(kwargs.get("is_for_context_encoding", False))
         qwen_chunked_prefill_active = (
             past_key_value is not None
             and q_len > 1
+            and is_for_context_encoding
             and getattr(self.config, "use_qwen_hybrid_chunked_prefill", False)
         )
 
@@ -1593,6 +1692,14 @@ class NeuronQwen35Attention(NeuronAttentionBase):
             tkg_mask = attention_mask
             if tkg_mask is not None and tkg_mask.ndim == 2:
                 tkg_mask = tkg_mask.unsqueeze(1).unsqueeze(2)  # (B, S) -> (B, 1, 1, S)
+            if (
+                active_mask is None
+                and position_ids is not None
+                and position_ids.shape[-1] > 1
+            ):
+                active_mask = (
+                    position_ids[:, :, None] >= position_ids[:, None, :]
+                ).unsqueeze(1)
             attn_output = self.compute_for_token_gen(
                 Q, K, V, position_ids, past_key_value, tkg_mask, active_mask
             )
@@ -1710,12 +1817,16 @@ class NeuronQwen35DecoderLayer(nn.Module):
 
         if self.layer_type == "linear_attention":
             # DeltaNet path
-            attn_out, dummy_kv, new_rec_state, new_conv_state = self.linear_attn(
+            linear_outputs = self.linear_attn(
                 hidden_states,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 past_key_value=past_key_value,
                 **kwargs,
+            )
+            attn_out, dummy_kv, new_rec_state, new_conv_state = linear_outputs[:4]
+            deltanet_step_states = (
+                linear_outputs[4] if len(linear_outputs) > 4 else None
             )
             hidden_states = residual + attn_out
             present_key_value = dummy_kv
@@ -1726,6 +1837,7 @@ class NeuronQwen35DecoderLayer(nn.Module):
             )
         else:
             deltanet_states = None
+            deltanet_step_states = None
             # Standard attention path
             hidden_states, present_key_value, cos_cache, sin_cache = self.self_attn(
                 hidden_states=hidden_states,
@@ -1752,8 +1864,132 @@ class NeuronQwen35DecoderLayer(nn.Module):
             sin_cache,
             None,
             deltanet_states,
+            deltanet_step_states,
         )
         return outputs
+
+
+# ============================================================
+# MTP Predictor (native speculative decode head)
+# ============================================================
+
+
+class NeuronQwen35MTPDecoderLayer(nn.Module):
+    """Single full-attention MTP layer used by Qwen3.6 native speculation."""
+
+    def __init__(self, config: Qwen35InferenceConfig, mtp_layer_idx: int):
+        super().__init__()
+        self.config = config
+        self.mtp_layer_idx = mtp_layer_idx
+        self.self_attn = NeuronQwen35Attention(config=config)
+        self.mlp = Qwen35MLP(config)
+        self.input_layernorm = get_rmsnorm_cls()(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+        self.post_attention_layernorm = get_rmsnorm_cls()(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask=None,
+        position_ids=None,
+        past_key_value=None,
+        cos_cache=None,
+        sin_cache=None,
+        **kwargs,
+    ):
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states, present_key_value, cos_cache, sin_cache = self.self_attn(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_value=past_key_value,
+            cos_cache=cos_cache,
+            sin_cache=sin_cache,
+            **kwargs,
+        )
+        hidden_states = residual + hidden_states
+
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
+        return hidden_states, present_key_value, cos_cache, sin_cache
+
+
+class NeuronQwen35MTPPredictor(nn.Module):
+    """Native Qwen3.6 MTP predictor.
+
+    The module name is intentionally ``mtp`` when attached to
+    :class:`NeuronQwen35Model`, so checkpoint keys like ``mtp.fc.weight`` and
+    ``mtp.layers.0.self_attn.Wqkv.weight`` load directly after conversion.
+    Shared embedding and lm-head weights stay on the target model; callers pass
+    the input embeddings and run logits through the target ``lm_head``.
+    """
+
+    def __init__(self, config: Qwen35InferenceConfig):
+        super().__init__()
+        self.config = config
+        self.num_mtp_layers = getattr(config, "mtp_num_hidden_layers", 1)
+        self.fc = ColumnParallelLinear(
+            config.hidden_size * 2,
+            config.hidden_size,
+            bias=False,
+            gather_output=True,
+        )
+        self.layers = nn.ModuleList(
+            [
+                NeuronQwen35MTPDecoderLayer(config, mtp_layer_idx)
+                for mtp_layer_idx in range(self.num_mtp_layers)
+            ]
+        )
+        self.norm = get_rmsnorm_cls()(config.hidden_size, eps=config.rms_norm_eps)
+        self.pre_fc_norm_embedding = get_rmsnorm_cls()(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+        self.pre_fc_norm_hidden = get_rmsnorm_cls()(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+
+    def forward(
+        self,
+        inputs_embeds: torch.Tensor,
+        target_hidden_states: torch.Tensor,
+        attention_mask=None,
+        position_ids=None,
+        past_key_values=None,
+        spec_step_idx: int = 0,
+        cos_cache=None,
+        sin_cache=None,
+        **kwargs,
+    ):
+        inputs_embeds = self.pre_fc_norm_embedding(inputs_embeds)
+        target_hidden_states = self.pre_fc_norm_hidden(target_hidden_states)
+        hidden_states = self.fc(
+            torch.cat([inputs_embeds, target_hidden_states], dim=-1)
+        )
+
+        layer_idx = 0 if self.num_mtp_layers == 1 else spec_step_idx % self.num_mtp_layers
+        past_key_value = (
+            past_key_values[layer_idx] if past_key_values is not None else None
+        )
+        hidden_states, present_key_value, cos_cache, sin_cache = self.layers[layer_idx](
+            hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_value=past_key_value,
+            cos_cache=cos_cache,
+            sin_cache=sin_cache,
+            **kwargs,
+        )
+        hidden_states = self.norm(hidden_states)
+        return hidden_states, (present_key_value,), cos_cache, sin_cache
+
+    def compute_logits(self, lm_head, hidden_states):
+        return lm_head(hidden_states).float()
 
 
 # ============================================================
@@ -1832,14 +2068,22 @@ class HybridDeltaNetCacheManager(KVCacheManager):
     @staticmethod
     def _validate_hybrid_config(config: Qwen35InferenceConfig):
         nc = config.neuron_config
+        allow_native_mtp_speculation = bool(
+            getattr(config, "enable_mtp_speculation", False)
+        )
         unsupported = []
         if nc.is_block_kv_layout:
             unsupported.append("block KV layout")
         if getattr(nc, "kv_quant_config", None) is not None or getattr(nc, "kv_cache_quant", False):
             unsupported.append("KV cache quantization")
-        if nc.enable_fused_speculation or nc.speculation_length > 0 or nc.is_medusa:
+        if (
+            nc.enable_fused_speculation or nc.speculation_length > 0 or nc.is_medusa
+        ) and not allow_native_mtp_speculation:
             unsupported.append("speculative decoding")
-        if getattr(nc, "enable_eagle_speculation", False) or getattr(nc, "is_eagle_draft", False):
+        if (
+            getattr(nc, "enable_eagle_speculation", False)
+            or getattr(nc, "is_eagle_draft", False)
+        ) and not allow_native_mtp_speculation:
             unsupported.append("EAGLE speculation")
         if nc.flash_decoding_enabled:
             unsupported.append("flash decoding")
@@ -1859,6 +2103,33 @@ class HybridDeltaNetCacheManager(KVCacheManager):
 
     def _is_deltanet_layer(self, idx: int) -> bool:
         return self.layer_types[idx] == "linear_attention"
+
+    @staticmethod
+    def select_deltanet_state_for_acceptance(
+        recurrent_step_states: torch.Tensor,
+        conv_step_states: torch.Tensor,
+        accepted_lengths: torch.Tensor,
+    ):
+        """Select DeltaNet state at the accepted speculative prefix length."""
+        accepted_idx = (accepted_lengths.reshape(-1).long() - 1).clamp(min=0)
+        batch = recurrent_step_states.shape[0]
+
+        rec_index = accepted_idx.view(batch, 1, 1, 1, 1).expand(
+            batch,
+            1,
+            recurrent_step_states.shape[2],
+            recurrent_step_states.shape[3],
+            recurrent_step_states.shape[4],
+        )
+        conv_index = accepted_idx.view(batch, 1, 1, 1).expand(
+            batch,
+            1,
+            conv_step_states.shape[2],
+            conv_step_states.shape[3],
+        )
+        recurrent_state = torch.gather(recurrent_step_states, dim=1, index=rec_index)
+        conv_state = torch.gather(conv_step_states, dim=1, index=conv_index)
+        return recurrent_state.squeeze(1), conv_state.squeeze(1)
 
     def get_seq_length(self, past_key_values=None):
         for idx, layer_type in enumerate(self.layer_types):
@@ -2100,6 +2371,8 @@ class NeuronQwen35Model(NeuronBaseModel):
             ]
         )
         self.norm = get_rmsnorm_cls()(self.hidden_size, eps=config.rms_norm_eps)
+        if getattr(config, "enable_mtp_weight_loading", False):
+            self.mtp = NeuronQwen35MTPPredictor(config)
         self.lm_head = ColumnParallelLinear(
             config.hidden_size,
             config.vocab_size,
@@ -2260,8 +2533,13 @@ class NeuronQwen35Model(NeuronBaseModel):
         # Decoder layers
         next_decoder_cache = ()
         deltanet_state_tensors = []
+        deltanet_step_state_tensors = []
         cos_cache = None
         sin_cache = None
+        return_deltanet_step_states = (
+            bool(getattr(self.config, "enable_mtp_step_state_output", False))
+            and not is_for_context_encoding
+        )
 
         # Convert 2D attention_mask to 4D causal mask for CTE
         if (
@@ -2310,6 +2588,7 @@ class NeuronQwen35Model(NeuronBaseModel):
                 windowed_context_encoding_window_idx=windowed_context_encoding_window_idx,
                 padding_mask=padding_mask,
                 deltanet_padding_mask=deltanet_padding_mask,
+                return_deltanet_step_states=return_deltanet_step_states,
                 qwen_chunked_prefill_update=use_qwen_chunked_prefill,
                 qwen_chunked_valid_mask=deltanet_padding_mask.squeeze(-1)
                 if use_qwen_chunked_prefill
@@ -2327,6 +2606,10 @@ class NeuronQwen35Model(NeuronBaseModel):
             if deltanet_states is not None:
                 deltanet_state_tensors.append(deltanet_states[0])
                 deltanet_state_tensors.append(deltanet_states[1])
+            deltanet_step_states = layer_outputs[6] if len(layer_outputs) > 6 else None
+            if deltanet_step_states is not None:
+                deltanet_step_state_tensors.append(deltanet_step_states[0])
+                deltanet_step_state_tensors.append(deltanet_step_states[1])
 
         # Update KV cache
         if update_cache:
@@ -2346,9 +2629,291 @@ class NeuronQwen35Model(NeuronBaseModel):
 
         hidden_states = self.norm(hidden_states)
 
+        self.full_hidden_states = None
+        if self.config.neuron_config.enable_eagle_speculation:
+            self.full_hidden_states = hidden_states
         self._deltanet_updated_states = deltanet_state_tensors
+        self._deltanet_step_states = deltanet_step_state_tensors
 
         return (hidden_states, next_decoder_cache)
+
+    def compute_mtp_logits(
+        self,
+        input_ids,
+        target_hidden_states,
+        attention_mask=None,
+        position_ids=None,
+        past_key_values=None,
+        spec_step_idx: int = 0,
+        inputs_embeds=None,
+        **kwargs,
+    ):
+        """Run the native MTP predictor with shared target embeddings/lm_head.
+
+        This is the model-local integration seam for Qwen3.6's native MTP
+        speculative decoding. The full NxDI scheduler still needs to call this
+        from a fused-spec generation path; keeping the method separate lets us
+        validate MTP loading and logits before modifying core speculative
+        decoding control flow.
+        """
+        if not hasattr(self, "mtp"):
+            raise RuntimeError(
+                "MTP predictor is not initialized. Set "
+                "enable_mtp_weight_loading=True in Qwen35InferenceConfig."
+            )
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_tokens(input_ids)
+
+        mtp_hidden, mtp_cache, _cos_cache, _sin_cache = self.mtp(
+            inputs_embeds=inputs_embeds,
+            target_hidden_states=target_hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            spec_step_idx=spec_step_idx,
+            **kwargs,
+        )
+        logits = self.mtp.compute_logits(self.lm_head, mtp_hidden)
+        if hasattr(self.lm_head, "pad_size"):
+            if self.lm_head.gather_output:
+                rank_id = torch.tensor(0, device=logits.device, dtype=torch.int32)
+                world_size = 1
+            else:
+                rank_id = self.rank_util.get_rank()
+                world_size = torch.distributed.get_world_size(
+                    group=self.lm_head.tensor_parallel_group
+                )
+            from neuronx_distributed_inference.models.model_base import (
+                mask_padded_logits,
+            )
+
+            logits = mask_padded_logits(
+                logits, rank_id, world_size, pad_size=self.lm_head.pad_size
+            )
+        return logits, mtp_hidden, mtp_cache
+
+
+class NeuronQwen35MTPDraftModel(NeuronBaseModel):
+    """Draft model wrapper for Qwen3.6 native MTP speculative decoding.
+
+    NxDI's fused-spec scheduler expects a separate draft module with a standard
+    ``forward`` contract. The Qwen native MTP head is not a full second model,
+    but this wrapper exposes it as one: shared embeddings + MTP predictor +
+    shared lm_head, with a one-layer KV cache for the MTP full-attention layer.
+    """
+
+    def __init__(self, config: Qwen35InferenceConfig):
+        draft_config = copy.deepcopy(config)
+        mtp_layers = getattr(draft_config, "mtp_num_hidden_layers", 1)
+        draft_config.num_hidden_layers = mtp_layers
+        draft_config.layer_types = ["full_attention"] * mtp_layers
+        draft_config.enable_mtp_weight_loading = True
+        draft_config.is_mtp_draft_model = True
+        draft_config.use_hybrid_cache_manager = False
+        super().__init__(draft_config)
+
+    def setup_attr_for_model(self, config: Qwen35InferenceConfig):
+        self.on_device_sampling = (
+            config.neuron_config.on_device_sampling_config is not None
+        )
+        self.tp_degree = config.neuron_config.tp_degree
+        self.hidden_size = config.hidden_size
+        self.num_attention_heads = config.num_attention_heads
+        self.num_key_value_heads = config.num_key_value_heads
+        self.max_batch_size = config.neuron_config.max_batch_size
+        self.buckets = config.neuron_config.buckets
+
+    def init_model(self, config: Qwen35InferenceConfig):
+        self.padding_idx = config.pad_token_id
+        self.vocab_size = config.vocab_size
+        self.embed_tokens = ParallelEmbedding(
+            config.vocab_size,
+            config.hidden_size,
+            self.padding_idx,
+            dtype=config.neuron_config.torch_dtype,
+            shard_across_embedding=True,
+        )
+        self.mtp = NeuronQwen35MTPPredictor(config)
+        self.lm_head = ColumnParallelLinear(
+            config.hidden_size,
+            config.vocab_size,
+            gather_output=False if self.on_device_sampling else True,
+            bias=False,
+        )
+
+    def forward(
+        self,
+        input_ids,
+        attention_mask,
+        position_ids,
+        seq_ids,
+        sampling_params,
+        prev_hidden=None,
+        adapter_ids=None,
+        accepted_indices=None,
+        current_length=None,
+        medusa_mask=None,
+        scatter_index=None,
+        slot_mapping=None,
+        active_block_table=None,
+        num_queries=None,
+        computed_context_lens=None,
+        tile_q_indices=None,
+        tile_block_tables=None,
+        tile_masks=None,
+        inputs_embeds=None,
+        kv_cache=None,
+        active_mask=None,
+        rotary_position_id=None,
+        vision_embeddings=None,
+        vision_mask=None,
+    ):
+        prev_hidden = self.set_none_if_empty(prev_hidden)
+        kv_cache = self.set_none_if_empty(kv_cache)
+        adapter_ids = self.set_none_if_empty(adapter_ids)
+        active_mask = self.set_none_if_empty(active_mask)
+
+        if prev_hidden is None:
+            raise RuntimeError("Qwen MTP draft model requires target prev_hidden input.")
+
+        is_for_context_encoding = position_ids.shape[-1] != 1 and not (
+            hasattr(self.neuron_config, "speculation_length")
+            and position_ids.shape[-1] == self.neuron_config.speculation_length
+        )
+        cache_size = self.config.neuron_config.seq_len
+        past_key_values = None
+        if self.kv_mgr is not None and not is_for_context_encoding:
+            past_key_values = self.kv_mgr.get_cache(
+                seq_ids=seq_ids.to(torch.int32),
+                seq_len=cache_size,
+                is_for_context_encoding=is_for_context_encoding,
+                kvcache_buffer=kv_cache,
+            )
+
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_tokens(input_ids)
+
+        logits, mtp_hidden, mtp_cache = self.compute_mtp_logits(
+            input_ids=input_ids,
+            target_hidden_states=prev_hidden,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            adapter_ids=adapter_ids,
+            active_mask=active_mask,
+        )
+
+        updated_kv_cache = ()
+        if self.kv_mgr is not None:
+            updated_kv_cache = self.kv_mgr.update_cache(
+                is_for_context_encoding=is_for_context_encoding,
+                seq_ids=seq_ids.to(torch.int32),
+                position_ids=position_ids,
+                new_key_values=mtp_cache,
+                seq_len=cache_size,
+                kvcache_buffer=kv_cache,
+            )
+
+        if is_for_context_encoding:
+            res = torch.zeros(
+                (input_ids.shape[0], 1),
+                dtype=torch.int32,
+                device=input_ids.device,
+            )
+        elif self.on_device_sampling:
+            res = self._sample_on_device(
+                logits, sampling_params, True, is_for_context_encoding
+            )
+        else:
+            res = logits
+
+        outputs = [res]
+        if self.neuron_config.output_logits:
+            outputs += [logits]
+        outputs += updated_kv_cache
+        if is_for_context_encoding:
+            outputs += [mtp_hidden, mtp_hidden]
+        else:
+            outputs += [mtp_hidden]
+        return outputs
+
+    def compute_mtp_logits(
+        self,
+        input_ids,
+        target_hidden_states,
+        attention_mask=None,
+        position_ids=None,
+        past_key_values=None,
+        inputs_embeds=None,
+        **kwargs,
+    ):
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_tokens(input_ids)
+        mtp_hidden, mtp_cache, _cos_cache, _sin_cache = self.mtp(
+            inputs_embeds=inputs_embeds,
+            target_hidden_states=target_hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            **kwargs,
+        )
+        logits = self.mtp.compute_logits(self.lm_head, mtp_hidden)
+        if hasattr(self.lm_head, "pad_size"):
+            if self.lm_head.gather_output:
+                rank_id = torch.tensor(0, device=logits.device, dtype=torch.int32)
+                world_size = 1
+            else:
+                rank_id = self.rank_util.get_rank()
+                world_size = torch.distributed.get_world_size(
+                    group=self.lm_head.tensor_parallel_group
+                )
+            from neuronx_distributed_inference.models.model_base import (
+                mask_padded_logits,
+            )
+
+            logits = mask_padded_logits(
+                logits, rank_id, world_size, pad_size=self.lm_head.pad_size
+            )
+        return logits, mtp_hidden, mtp_cache
+
+
+class NeuronQwen35MTPDraftForCausalLM(NeuronBaseForCausalLM):
+    _model_cls = NeuronQwen35MTPDraftModel
+
+    @classmethod
+    def get_config_cls(cls):
+        return Qwen35InferenceConfig
+
+    @staticmethod
+    def load_hf_model(model_path, **kwargs):
+        from transformers import AutoModelForCausalLM
+
+        kwargs.setdefault("trust_remote_code", True)
+        return AutoModelForCausalLM.from_pretrained(model_path, **kwargs)
+
+    @staticmethod
+    def convert_hf_to_neuron_state_dict(state_dict, config):
+        """Load only shared embeddings/lm_head plus native MTP weights."""
+        config.enable_mtp_weight_loading = True
+        config.is_mtp_draft_model = True
+        new_sd = {}
+        for k, v in state_dict.items():
+            if k.startswith("language_model."):
+                k = k.replace("language_model.", "", 1)
+            elif k.startswith("model.language_model."):
+                k = k.replace("model.language_model.", "", 1)
+            elif k.startswith("model."):
+                k = k.replace("model.", "", 1)
+
+            if (
+                k.startswith("mtp.")
+                or k == "embed_tokens.weight"
+                or k == "lm_head.weight"
+            ):
+                new_sd[k] = v
+
+        return convert_qwen35_hf_to_neuron_state_dict(new_sd, config)
 
     def forward(
         self,
@@ -2425,6 +2990,7 @@ class NeuronQwen35Model(NeuronBaseModel):
             vision_embeddings=vision_embeddings,
             vision_mask=vision_mask,
         )
+        mtp_hidden_states = hidden_states
 
         batch_size = input_ids.shape[0]
         if not getattr(self, "sliced_hidden", False):
@@ -2489,6 +3055,16 @@ class NeuronQwen35Model(NeuronBaseModel):
             and hasattr(self, "_deltanet_updated_states")
         ):
             outputs += self._deltanet_updated_states
+        if (
+            getattr(self.config, "enable_mtp_step_state_output", False)
+            and hasattr(self, "_deltanet_step_states")
+        ):
+            outputs += self._deltanet_step_states
+        if getattr(self.config, "enable_mtp_hidden_state_output", False):
+            if is_for_context_encoding:
+                outputs += [mtp_hidden_states, mtp_hidden_states]
+            else:
+                outputs += [mtp_hidden_states]
 
         return outputs
 
@@ -2605,13 +3181,28 @@ def convert_qwen35_hf_to_neuron_state_dict(neuron_state_dict, config):
     # is initialized to zeros. Standard NxDI RMSNorm uses `output = norm(x) * weight`
     # where weight is initialized to ones. To convert: new_weight = old_weight + 1.0
     norm_keys_to_convert = []
-    for l in range(config.num_hidden_layers):
-        norm_keys_to_convert.append(f"layers.{l}.input_layernorm.weight")
-        norm_keys_to_convert.append(f"layers.{l}.post_attention_layernorm.weight")
-        if config.layer_types[l] == "full_attention":
-            norm_keys_to_convert.append(f"layers.{l}.self_attn.q_norm.weight")
-            norm_keys_to_convert.append(f"layers.{l}.self_attn.k_norm.weight")
-    norm_keys_to_convert.append("norm.weight")
+    if not getattr(config, "is_mtp_draft_model", False):
+        for l in range(config.num_hidden_layers):
+            norm_keys_to_convert.append(f"layers.{l}.input_layernorm.weight")
+            norm_keys_to_convert.append(f"layers.{l}.post_attention_layernorm.weight")
+            if config.layer_types[l] == "full_attention":
+                norm_keys_to_convert.append(f"layers.{l}.self_attn.q_norm.weight")
+                norm_keys_to_convert.append(f"layers.{l}.self_attn.k_norm.weight")
+        norm_keys_to_convert.append("norm.weight")
+    if getattr(config, "enable_mtp_weight_loading", False):
+        norm_keys_to_convert.extend(
+            [
+                "mtp.norm.weight",
+                "mtp.pre_fc_norm_embedding.weight",
+                "mtp.pre_fc_norm_hidden.weight",
+            ]
+        )
+        for mtp_layer_idx in range(getattr(config, "mtp_num_hidden_layers", 1)):
+            mtp_prefix = f"mtp.layers.{mtp_layer_idx}"
+            norm_keys_to_convert.append(f"{mtp_prefix}.input_layernorm.weight")
+            norm_keys_to_convert.append(f"{mtp_prefix}.post_attention_layernorm.weight")
+            norm_keys_to_convert.append(f"{mtp_prefix}.self_attn.q_norm.weight")
+            norm_keys_to_convert.append(f"{mtp_prefix}.self_attn.k_norm.weight")
 
     for nk in norm_keys_to_convert:
         if nk in neuron_state_dict:
@@ -2625,7 +3216,7 @@ def convert_qwen35_hf_to_neuron_state_dict(neuron_state_dict, config):
             if "layers.0." in nk or nk == "norm.weight":
                 logger.warning(f"[NORM FIX] key not found: {nk}")
 
-    for l in range(config.num_hidden_layers):
+    for l in range(0 if getattr(config, "is_mtp_draft_model", False) else config.num_hidden_layers):
         layer_type = config.layer_types[l]
 
         # === DeltaNet layers ===
@@ -2717,6 +3308,58 @@ def convert_qwen35_hf_to_neuron_state_dict(neuron_state_dict, config):
 
         gc.collect()
 
+    if getattr(config, "enable_mtp_weight_loading", False):
+        for mtp_layer_idx in range(getattr(config, "mtp_num_hidden_layers", 1)):
+            attn_prefix = f"mtp.layers.{mtp_layer_idx}.self_attn"
+            neuron_state_dict[f"{attn_prefix}.rank_util.rank"] = torch.arange(
+                0,
+                config.neuron_config.tp_degree,
+                dtype=torch.int32,
+            )
+
+            q_norm_key = f"{attn_prefix}.q_norm.weight"
+            k_norm_key = f"{attn_prefix}.k_norm.weight"
+            if q_norm_key in neuron_state_dict:
+                neuron_state_dict[f"{attn_prefix}.q_layernorm.weight"] = (
+                    neuron_state_dict.pop(q_norm_key).detach().clone()
+                )
+            if k_norm_key in neuron_state_dict:
+                neuron_state_dict[f"{attn_prefix}.k_layernorm.weight"] = (
+                    neuron_state_dict.pop(k_norm_key).detach().clone()
+                )
+
+            q_proj_key = f"{attn_prefix}.q_proj.weight"
+            if q_proj_key in neuron_state_dict:
+                q_proj_w = neuron_state_dict.pop(q_proj_key)
+                num_heads = config.num_attention_heads
+                head_dim = config.head_dim
+                q_proj_w = q_proj_w.reshape(num_heads, head_dim * 2, config.hidden_size)
+                query_w = q_proj_w[:, :head_dim, :].reshape(
+                    num_heads * head_dim, config.hidden_size
+                )
+                gate_w = q_proj_w[:, head_dim:, :].reshape(
+                    num_heads * head_dim, config.hidden_size
+                )
+
+                neuron_state_dict[q_proj_key] = query_w
+                neuron_state_dict[f"{attn_prefix}.output_gate_proj.weight"] = gate_w
+
+            if config.neuron_config.fused_qkv:
+                q_key = f"{attn_prefix}.q_proj.weight"
+                k_key = f"{attn_prefix}.k_proj.weight"
+                v_key = f"{attn_prefix}.v_proj.weight"
+                if q_key in neuron_state_dict:
+                    neuron_state_dict[f"{attn_prefix}.Wqkv.weight"] = torch.cat(
+                        [
+                            neuron_state_dict[q_key],
+                            neuron_state_dict[k_key],
+                            neuron_state_dict[v_key],
+                        ]
+                    )
+                    del neuron_state_dict[q_key]
+                    del neuron_state_dict[k_key]
+                    del neuron_state_dict[v_key]
+
     return neuron_state_dict
 
 
@@ -2731,6 +3374,9 @@ class Qwen35DecoderModelInstance(DecoderModelInstance):
     def get(self, bucket_rank, **kwargs):
         """Override to add DeltaNet state aliases after KV cache aliases."""
         module, input_output_aliases = super().get(bucket_rank, **kwargs)
+
+        if self.neuron_config.enable_fused_speculation or hasattr(module, "target_model"):
+            return module, input_output_aliases
 
         num_output_from_trace = 1 if not self.neuron_config.output_logits else 2
 
@@ -2764,6 +3410,9 @@ class Qwen35ModelWrapper(ModelWrapper):
     def input_generator(self):
         """Generate inputs including mrope_position_ids, vision_embeddings, and vision_mask."""
         base_inputs = super().input_generator()
+        if self.config.neuron_config.enable_fused_speculation:
+            return base_inputs
+
         extended_inputs = []
 
         for bucket_inputs in base_inputs:
@@ -2953,7 +3602,10 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
             elif k.startswith("model."):
                 new_sd[k.replace("model.", "", 1)] = v
             elif k.startswith("mtp."):
-                continue  # Skip MTP
+                if getattr(config, "enable_mtp_weight_loading", False):
+                    new_sd[k] = v
+                else:
+                    continue  # Skip MTP unless the speculative branch is enabled.
             elif k.startswith("lm_head."):
                 new_sd[k] = v
             else:
@@ -3188,19 +3840,30 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
                             dim=0,
                         )
 
-                chunk_out = self.context_encoding_model(
-                    chunk_input_ids,
-                    chunk_attn_mask,
-                    chunk_pos_ids,
-                    chunk_seq_ids,
-                    chunk_sampling,
-                    chunk_prev_hidden,
-                    chunk_adapter_ids,
-                    *empties,
-                    chunk_mrope,
-                    chunk_vis_emb,
-                    chunk_vis_mask,
-                )
+                if self.neuron_config.enable_fused_speculation:
+                    chunk_out = self.context_encoding_model(
+                        chunk_input_ids,
+                        chunk_attn_mask,
+                        chunk_pos_ids,
+                        chunk_seq_ids,
+                        chunk_sampling,
+                        chunk_prev_hidden,
+                        chunk_adapter_ids,
+                    )
+                else:
+                    chunk_out = self.context_encoding_model(
+                        chunk_input_ids,
+                        chunk_attn_mask,
+                        chunk_pos_ids,
+                        chunk_seq_ids,
+                        chunk_sampling,
+                        chunk_prev_hidden,
+                        chunk_adapter_ids,
+                        *empties,
+                        chunk_mrope,
+                        chunk_vis_emb,
+                        chunk_vis_mask,
+                    )
                 if actual_chunk < ctx_bs:
                     chunk_out = chunk_out[:actual_chunk]
                 output_logits.append(chunk_out)
@@ -3213,20 +3876,32 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
             self.kv_cache_populated = True
             is_run_on_neuron = self.context_encoding_model.is_neuron()
         else:
-            outputs = self.token_generation_model(
-                input_ids,
-                attention_mask,
-                position_ids,
-                seq_ids,
-                sampling_params,
-                prev_hidden,
-                adapter_ids,
-                *empties,
-                mrope_position_ids,
-                vision_embeddings,
-                vision_mask,
-            )
-            is_run_on_neuron = self.token_generation_model.is_neuron()
+            if self.neuron_config.enable_fused_speculation:
+                outputs = self.fused_spec_model(
+                    input_ids,
+                    attention_mask,
+                    position_ids,
+                    seq_ids,
+                    sampling_params,
+                    prev_hidden,
+                    adapter_ids,
+                )
+                is_run_on_neuron = self.fused_spec_model.is_neuron()
+            else:
+                outputs = self.token_generation_model(
+                    input_ids,
+                    attention_mask,
+                    position_ids,
+                    seq_ids,
+                    sampling_params,
+                    prev_hidden,
+                    adapter_ids,
+                    *empties,
+                    mrope_position_ids,
+                    vision_embeddings,
+                    vision_mask,
+                )
+                is_run_on_neuron = self.token_generation_model.is_neuron()
 
         return outputs, is_run_on_neuron
 

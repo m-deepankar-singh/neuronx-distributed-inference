@@ -133,6 +133,11 @@ class HuggingFaceGenerationAdapter(PreTrainedModel, GenerationMixin):
     def generate(self, *args, **kwargs):
         # Keep generation stateless.
         self.neuron_model.reset()
+        if self.neuron_config.enable_fused_speculation and self.neuron_config.speculation_length > 0:
+            generation_config = kwargs.get("generation_config")
+            if generation_config is not None:
+                generation_config.prompt_lookup_num_tokens = self.neuron_config.speculation_length
+            kwargs.setdefault("prompt_lookup_num_tokens", self.neuron_config.speculation_length)
         return super().generate(*args, **kwargs)
 
     # TODO: Remove _sample and define separate flow for on-device sampling that doesn't use HF.
@@ -278,6 +283,7 @@ class HuggingFaceGenerationAdapter(PreTrainedModel, GenerationMixin):
         scatter_index = kwargs.get("scatter_index", None)
         position_ids = kwargs.get("position_ids", None)
         input_capture_hook = kwargs.get("input_capture_hook", None)
+        tensor_capture_hook = kwargs.get("tensor_capture_hook", None)
 
         if attention_mask is not None and position_ids is None:
             # create position_ids on the fly for batch generation
@@ -310,10 +316,11 @@ class HuggingFaceGenerationAdapter(PreTrainedModel, GenerationMixin):
                 "medusa_args": (accepted_indices, current_length, medusa_mask, scatter_index),
                 "sampling_params": sampling_params,
                 "input_capture_hook": input_capture_hook,
-                "tensor_capture_hook": tensor_capture_hook,
                 "adapter_ids": adapter_ids
             }
         )
+        if tensor_capture_hook is not None:
+            model_inputs["tensor_capture_hook"] = tensor_capture_hook
 
         tf_args = []
         if self.neuron_config.tensor_replacement_config:
