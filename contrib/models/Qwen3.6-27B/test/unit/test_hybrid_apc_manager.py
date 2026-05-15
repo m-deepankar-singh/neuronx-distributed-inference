@@ -21,7 +21,10 @@ _SPEC.loader.exec_module(_HYBRID_APC)
 
 HybridAPCMetadataStore = _HYBRID_APC.HybridAPCMetadataStore
 HybridAPCHitPlan = _HYBRID_APC.HybridAPCHitPlan
+HybridAPCSchedulerBridge = _HYBRID_APC.HybridAPCSchedulerBridge
+HybridAPCSlotAllocator = _HYBRID_APC.HybridAPCSlotAllocator
 apply_hybrid_apc_prefill_plan = _HYBRID_APC.apply_hybrid_apc_prefill_plan
+build_cumulative_prefix_hashes = _HYBRID_APC.build_cumulative_prefix_hashes
 estimate_qwen_gdn_checkpoint_bytes_per_rank = (
     _HYBRID_APC.estimate_qwen_gdn_checkpoint_bytes_per_rank
 )
@@ -430,6 +433,200 @@ class TestHybridAPCPrefillPlanInputs(unittest.TestCase):
         self.assertTrue(
             torch.equal(output["num_queries"], torch.tensor([[3]], dtype=torch.int32))
         )
+
+
+class TestHybridAPCSchedulerBridge(unittest.TestCase):
+    def test_cumulative_prefix_hash_includes_parent_prefix(self):
+        tokens_a = torch.tensor([[1, 2, 3, 4]], dtype=torch.int32)
+        tokens_b = torch.tensor([[9, 8, 3, 4]], dtype=torch.int32)
+
+        hashes_a = build_cumulative_prefix_hashes(tokens_a, block_size=2)
+        hashes_b = build_cumulative_prefix_hashes(tokens_b, block_size=2)
+
+        self.assertNotEqual(hashes_a[4], hashes_b[4])
+
+    def test_bridge_prepares_warm_suffix_and_commits_checkpoint(self):
+        store = _store()
+        allocator = HybridAPCSlotAllocator(num_slots=4)
+        input_ids = torch.arange(256, dtype=torch.int32).unsqueeze(0)
+        hashes = build_cumulative_prefix_hashes(input_ids, block_size=128)
+        restored_key, _checkpoint = _insert(
+            store,
+            128,
+            prefix_hash=hashes[128],
+            gdn_checkpoint_slot=3,
+        )
+        bridge = HybridAPCSchedulerBridge(
+            store=store,
+            slot_allocator=allocator,
+            cache_salt="tenant-a",
+            model_revision="rev-a",
+        )
+
+        prepared = bridge.prepare_request(
+            request_id="req-warm",
+            input_dict={
+                "input_ids": input_ids,
+                "attention_mask": torch.ones((1, 256), dtype=torch.int32),
+                "position_ids": torch.arange(256, dtype=torch.int32).unsqueeze(0),
+            },
+            attention_hit_len=128,
+            cumulative_hashes_by_prefix_len=hashes,
+            attention_block_refs_by_prefix_len={256: (11, 12)},
+        )
+
+        self.assertEqual(prepared.plan.restore_checkpoint_prefix_len, 128)
+        self.assertEqual(prepared.commit_prefix_len, 256)
+        self.assertEqual(prepared.commit_slot, 0)
+        self.assertTrue(
+            torch.equal(
+                prepared.input_dict["input_ids"],
+                torch.arange(128, 256, dtype=torch.int32).unsqueeze(0),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                prepared.input_dict["position_ids"],
+                torch.arange(128, 256, dtype=torch.int32).unsqueeze(0),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                prepared.input_dict["hybrid_restore_mask"],
+                torch.tensor([1], dtype=torch.int32),
+            )
+        )
+        self.assertEqual(store.lookup(restored_key).refcount, 1)
+
+        committed = bridge.commit_prefill(prepared)
+        self.assertIsNotNone(committed)
+        self.assertEqual(committed.gdn_checkpoint_slot, 0)
+        self.assertEqual(committed.attention_block_refs, (11, 12))
+        self.assertEqual(allocator.committed_slots, (0,))
+        self.assertIsNotNone(store.lookup(prepared.commit_key))
+
+        bridge.finish_request("req-warm")
+        self.assertEqual(store.lookup(restored_key).refcount, 0)
+
+    def test_bridge_misses_without_gdn_checkpoint_and_cancels_reserved_slot(self):
+        store = _store()
+        allocator = HybridAPCSlotAllocator(num_slots=2)
+        input_ids = torch.arange(256, dtype=torch.int32).unsqueeze(0)
+        bridge = HybridAPCSchedulerBridge(
+            store=store,
+            slot_allocator=allocator,
+            cache_salt="tenant-a",
+            model_revision="rev-a",
+        )
+
+        prepared = bridge.prepare_request(
+            request_id="req-cold",
+            input_dict={"input_ids": input_ids},
+            attention_hit_len=128,
+        )
+
+        self.assertEqual(prepared.plan.restore_checkpoint_prefix_len, 0)
+        self.assertEqual(prepared.commit_slot, 0)
+        self.assertTrue(
+            torch.equal(prepared.input_dict["input_ids"], input_ids)
+        )
+        self.assertTrue(
+            torch.equal(
+                prepared.input_dict["hybrid_restore_mask"],
+                torch.tensor([0], dtype=torch.int32),
+            )
+        )
+
+        cancelled = bridge.cancel_request(prepared)
+        self.assertEqual(cancelled.state, "CANCELLED")
+        self.assertEqual(allocator.reserved_slots, ())
+        self.assertEqual(allocator.free_slots, (1, 0))
+        self.assertEqual(len(store), 0)
+
+    def test_bridge_salt_mismatch_does_not_restore_slot_zero(self):
+        store = _store()
+        allocator = HybridAPCSlotAllocator(num_slots=2)
+        input_ids = torch.arange(128, dtype=torch.int32).unsqueeze(0)
+        hashes = build_cumulative_prefix_hashes(input_ids, block_size=128)
+        _insert(store, 128, prefix_hash=hashes[128], cache_salt="tenant-a")
+        bridge = HybridAPCSchedulerBridge(
+            store=store,
+            slot_allocator=allocator,
+            cache_salt="tenant-b",
+            model_revision="rev-a",
+        )
+
+        prepared = bridge.prepare_request(
+            request_id="req-salt",
+            input_dict={"input_ids": input_ids},
+            attention_hit_len=128,
+            cumulative_hashes_by_prefix_len=hashes,
+        )
+
+        self.assertIsNone(prepared.plan.checkpoint_key)
+        self.assertEqual(prepared.plan.restore_checkpoint_prefix_len, 0)
+        self.assertTrue(
+            torch.equal(
+                prepared.input_dict["hybrid_restore_slot_ids"],
+                torch.tensor([0], dtype=torch.int32),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                prepared.input_dict["hybrid_restore_mask"],
+                torch.tensor([0], dtype=torch.int32),
+            )
+        )
+
+    def test_bridge_skips_commit_when_checkpoint_already_exists(self):
+        store = _store()
+        allocator = HybridAPCSlotAllocator(num_slots=2)
+        input_ids = torch.arange(128, dtype=torch.int32).unsqueeze(0)
+        hashes = build_cumulative_prefix_hashes(input_ids, block_size=128)
+        _insert(store, 128, prefix_hash=hashes[128], gdn_checkpoint_slot=1)
+        bridge = HybridAPCSchedulerBridge(
+            store=store,
+            slot_allocator=allocator,
+            cache_salt="tenant-a",
+            model_revision="rev-a",
+        )
+
+        prepared = bridge.prepare_request(
+            request_id="req-existing",
+            input_dict={"input_ids": input_ids},
+            attention_hit_len=128,
+            cumulative_hashes_by_prefix_len=hashes,
+        )
+
+        self.assertIsNone(prepared.commit_slot)
+        self.assertEqual(prepared.input_dict["hybrid_commit_mask"].item(), 0)
+        self.assertEqual(allocator.free_slots, (0, 1))
+        self.assertIsNone(bridge.commit_prefill(prepared))
+
+    def test_bridge_finish_releases_uncommitted_reserved_slot(self):
+        store = _store()
+        allocator = HybridAPCSlotAllocator(num_slots=2)
+        input_ids = torch.arange(128, dtype=torch.int32).unsqueeze(0)
+        bridge = HybridAPCSchedulerBridge(
+            store=store,
+            slot_allocator=allocator,
+            cache_salt="tenant-a",
+            model_revision="rev-a",
+        )
+
+        prepared = bridge.prepare_request(
+            request_id="req-no-commit",
+            input_dict={"input_ids": input_ids},
+            attention_hit_len=0,
+        )
+
+        self.assertEqual(prepared.commit_slot, 0)
+        self.assertEqual(allocator.reserved_slots, (0,))
+        finished = bridge.finish_request("req-no-commit")
+
+        self.assertEqual(finished.state, "FINISHED")
+        self.assertEqual(allocator.reserved_slots, ())
+        self.assertEqual(allocator.free_slots, (1, 0))
 
 
 if __name__ == "__main__":

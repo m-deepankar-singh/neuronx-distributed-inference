@@ -11,7 +11,9 @@ accounting.
 
 from __future__ import annotations
 
-from collections import OrderedDict
+import hashlib
+import struct
+from collections import OrderedDict, deque
 from dataclasses import dataclass
 from typing import Hashable, Iterable, NamedTuple
 
@@ -40,6 +42,16 @@ class HybridAPCHitPlan(NamedTuple):
     suffix_len: int
     checkpoint_slot: int | None
     checkpoint_key: HybridPrefixKey | None
+
+
+class HybridAPCPreparedRequest(NamedTuple):
+    request_id: Hashable
+    input_dict: dict[str, torch.Tensor]
+    plan: HybridAPCHitPlan
+    commit_prefix_len: int
+    commit_key: HybridPrefixKey | None
+    commit_slot: int | None
+    attention_block_refs: tuple[int, ...]
 
 
 @dataclass
@@ -176,6 +188,82 @@ def estimate_qwen_hybrid_cache_bytes_per_rank(
     }
 
 
+def _flatten_single_request_tokens(token_ids: torch.Tensor | Iterable[int]) -> torch.Tensor:
+    if isinstance(token_ids, torch.Tensor):
+        tokens = token_ids.detach().cpu()
+    else:
+        tokens = torch.tensor(list(token_ids), dtype=torch.int64)
+    if tokens.ndim == 2 and tokens.shape[0] == 1:
+        tokens = tokens.reshape(-1)
+    elif tokens.ndim != 1:
+        raise ValueError(
+            "token_ids must be a single request tensor with shape [seq] or [1, seq], "
+            f"got {tuple(tokens.shape)}"
+        )
+    return tokens.to(torch.int64).contiguous()
+
+
+def build_cumulative_prefix_hashes(
+    token_ids: torch.Tensor | Iterable[int],
+    *,
+    block_size: int,
+    prefix_lens: Iterable[int] | None = None,
+) -> dict[int, str]:
+    """Build deterministic cumulative prefix hashes at block boundaries.
+
+    This is a local scheduler bridge helper, not a replacement for vLLM's
+    production block hash. It deliberately hashes the parent digest plus the
+    next block's token bytes so a reused final block with a different parent
+    prefix produces a different cumulative hash.
+    """
+
+    block_size = int(block_size)
+    if block_size <= 0:
+        raise ValueError(f"block_size must be positive, got {block_size}")
+
+    tokens = _flatten_single_request_tokens(token_ids)
+    seq_len = int(tokens.numel())
+    if prefix_lens is None:
+        requested_lens = set(range(block_size, seq_len + 1, block_size))
+    else:
+        requested_lens = {int(prefix_len) for prefix_len in prefix_lens}
+    requested_lens = {prefix_len for prefix_len in requested_lens if prefix_len > 0}
+    for prefix_len in requested_lens:
+        if prefix_len > seq_len:
+            raise ValueError(f"prefix_len {prefix_len} exceeds token length {seq_len}")
+        if prefix_len % block_size != 0:
+            raise ValueError(
+                f"prefix_len {prefix_len} must be a multiple of block_size {block_size}"
+            )
+
+    if not requested_lens:
+        return {}
+
+    max_prefix_len = max(requested_lens)
+    parent_digest = b""
+    hashes: dict[int, str] = {}
+    for block_start in range(0, max_prefix_len, block_size):
+        block_end = block_start + block_size
+        block = tokens[block_start:block_end]
+        digest = hashlib.blake2b(digest_size=16)
+        digest.update(parent_digest)
+        digest.update(struct.pack("<QQ", block_size, block_end))
+        digest.update(block.numpy().tobytes())
+        parent_digest = digest.digest()
+        if block_end in requested_lens:
+            hashes[block_end] = parent_digest.hex()
+    return hashes
+
+
+def floor_to_checkpoint_boundary(prefix_len: int, checkpoint_interval: int) -> int:
+    checkpoint_interval = int(checkpoint_interval)
+    if checkpoint_interval <= 0:
+        raise ValueError(
+            f"checkpoint_interval must be positive, got {checkpoint_interval}"
+        )
+    return max(0, int(prefix_len)) // checkpoint_interval * checkpoint_interval
+
+
 def apply_hybrid_apc_prefill_plan(
     input_dict: dict[str, torch.Tensor],
     *,
@@ -301,6 +389,229 @@ def apply_hybrid_apc_prefill_plan(
     output["hybrid_commit_mask"] = _batch_i32(0 if commit_slot is None else 1)
 
     return output
+
+
+class HybridAPCSlotAllocator:
+    """Small checkpoint-slot allocator for local scheduler integration tests."""
+
+    def __init__(self, num_slots: int):
+        num_slots = int(num_slots)
+        if num_slots <= 0:
+            raise ValueError(f"num_slots must be positive, got {num_slots}")
+        self._free = deque(range(num_slots))
+        self._reserved: set[int] = set()
+        self._committed: set[int] = set()
+
+    @property
+    def free_slots(self) -> tuple[int, ...]:
+        return tuple(self._free)
+
+    @property
+    def reserved_slots(self) -> tuple[int, ...]:
+        return tuple(sorted(self._reserved))
+
+    @property
+    def committed_slots(self) -> tuple[int, ...]:
+        return tuple(sorted(self._committed))
+
+    def reserve(self) -> int:
+        if not self._free:
+            raise RuntimeError("no hybrid APC checkpoint slots available")
+        slot = int(self._free.popleft())
+        self._reserved.add(slot)
+        return slot
+
+    def mark_committed(self, slot: int):
+        slot = int(slot)
+        self._reserved.discard(slot)
+        self._committed.add(slot)
+
+    def release(self, slot: int):
+        slot = int(slot)
+        was_known = slot in self._reserved or slot in self._committed
+        self._reserved.discard(slot)
+        self._committed.discard(slot)
+        if was_known and slot not in self._free:
+            self._free.append(slot)
+
+
+class HybridAPCSchedulerBridge:
+    """Local request-prep bridge for production hybrid APC scheduler wiring.
+
+    The real vLLM/NxDI scheduler must supply the attention APC hit length,
+    active attention block refs, and tenant/cache metadata. This bridge performs
+    the Qwen hybrid-specific part: intersect attention hits with GDN checkpoint
+    metadata, materialize suffix model inputs, reserve a GDN checkpoint slot,
+    and commit checkpoint metadata after a successful prefill.
+    """
+
+    def __init__(
+        self,
+        *,
+        store: "HybridAPCMetadataStore",
+        slot_allocator: HybridAPCSlotAllocator,
+        cache_salt: Hashable | None = None,
+        model_revision: str | None = None,
+        layout_version: int | None = None,
+        tp_rank: int | None = None,
+        recurrent_dtype: str | torch.dtype | None = None,
+        conv_dtype: str | torch.dtype | None = None,
+    ):
+        self.store = store
+        self.slot_allocator = slot_allocator
+        self.cache_salt = cache_salt
+        self.model_revision = model_revision
+        self.layout_version = layout_version
+        self.tp_rank = tp_rank
+        self.recurrent_dtype = recurrent_dtype
+        self.conv_dtype = conv_dtype
+
+    def prepare_request(
+        self,
+        *,
+        request_id: Hashable,
+        input_dict: dict[str, torch.Tensor],
+        attention_hit_len: int,
+        request_prefix_len: int | None = None,
+        cumulative_hashes_by_prefix_len: dict[int, Hashable] | None = None,
+        attention_block_refs_by_prefix_len: dict[int, Iterable[int]] | None = None,
+    ) -> HybridAPCPreparedRequest:
+        if "input_ids" not in input_dict:
+            raise KeyError("input_ids is required for hybrid APC request prep")
+        input_ids = input_dict["input_ids"]
+        prompt_len = (
+            int(input_ids.shape[1])
+            if request_prefix_len is None
+            else int(request_prefix_len)
+        )
+        commit_prefix_len = floor_to_checkpoint_boundary(
+            prompt_len,
+            self.store.checkpoint_interval,
+        )
+
+        if cumulative_hashes_by_prefix_len is None:
+            cumulative_hashes_by_prefix_len = build_cumulative_prefix_hashes(
+                input_ids,
+                block_size=self.store.block_size,
+            )
+
+        plan = self.store.compute_hit_plan(
+            cumulative_hashes_by_prefix_len=cumulative_hashes_by_prefix_len,
+            attention_hit_len=attention_hit_len,
+            request_prefix_len=prompt_len,
+            cache_salt=self.cache_salt,
+            model_revision=self.model_revision,
+            layout_version=self.layout_version,
+            tp_rank=self.tp_rank,
+            recurrent_dtype=self.recurrent_dtype,
+            conv_dtype=self.conv_dtype,
+        )
+
+        commit_key = None
+        commit_slot = None
+        attention_block_refs: tuple[int, ...] = ()
+        if commit_prefix_len > 0:
+            if commit_prefix_len not in cumulative_hashes_by_prefix_len:
+                raise ValueError(
+                    f"missing cumulative prefix hash for commit boundary {commit_prefix_len}"
+                )
+            commit_key = self.store.make_key(
+                cumulative_prefix_hash=cumulative_hashes_by_prefix_len[commit_prefix_len],
+                prefix_len=commit_prefix_len,
+                cache_salt=self.cache_salt,
+                model_revision=self.model_revision,
+                layout_version=self.layout_version,
+                tp_rank=self.tp_rank,
+                recurrent_dtype=self.recurrent_dtype,
+                conv_dtype=self.conv_dtype,
+            )
+            if attention_block_refs_by_prefix_len is not None:
+                attention_block_refs = tuple(
+                    int(ref)
+                    for ref in attention_block_refs_by_prefix_len.get(
+                        commit_prefix_len,
+                        (),
+                    )
+                )
+            if not attention_block_refs:
+                attention_block_refs = tuple(
+                    range(commit_prefix_len // self.store.block_size)
+                )
+            if self.store.lookup(commit_key) is None:
+                commit_slot = self.slot_allocator.reserve()
+
+        model_inputs = apply_hybrid_apc_prefill_plan(
+            input_dict,
+            plan=plan,
+            commit_slot=commit_slot,
+            request_prefix_len=prompt_len,
+        )
+        record = self.store.on_request_restore(
+            request_id=request_id,
+            checkpoint_key=plan.checkpoint_key,
+        )
+        if commit_slot is not None:
+            record.reserved_slots.append(commit_slot)
+        self.store.on_prefill_running(request_id)
+
+        return HybridAPCPreparedRequest(
+            request_id=request_id,
+            input_dict=model_inputs,
+            plan=plan,
+            commit_prefix_len=commit_prefix_len,
+            commit_key=commit_key,
+            commit_slot=commit_slot,
+            attention_block_refs=attention_block_refs,
+        )
+
+    def commit_prefill(
+        self,
+        prepared: HybridAPCPreparedRequest,
+        *,
+        attention_block_refs: Iterable[int] | None = None,
+        bytes_used: int = 0,
+    ) -> HybridPrefixCheckpoint | None:
+        if prepared.commit_key is None or prepared.commit_slot is None:
+            return None
+        refs = (
+            tuple(int(ref) for ref in attention_block_refs)
+            if attention_block_refs is not None
+            else prepared.attention_block_refs
+        )
+        checkpoint = self.store.insert(
+            key=prepared.commit_key,
+            attention_block_refs=refs,
+            gdn_checkpoint_slot=prepared.commit_slot,
+            bytes_used=bytes_used,
+        )
+        self.slot_allocator.mark_committed(prepared.commit_slot)
+        record = self.store.on_checkpoint_committed(
+            request_id=prepared.request_id,
+            checkpoint_key=prepared.commit_key,
+        )
+        if prepared.commit_slot in record.reserved_slots:
+            record.reserved_slots.remove(prepared.commit_slot)
+        return checkpoint
+
+    def finish_request(self, request_id: Hashable) -> HybridAPCRequestRecord | None:
+        record = self.store.on_request_finish(request_id)
+        if record is not None:
+            for slot in record.reserved_slots:
+                self.slot_allocator.release(slot)
+        return record
+
+    def cancel_request(
+        self,
+        prepared: HybridAPCPreparedRequest,
+    ) -> HybridAPCRequestRecord | None:
+        record = self.store._requests.get(prepared.request_id)
+        if (
+            prepared.commit_slot is not None
+            and record is not None
+            and prepared.commit_slot in record.reserved_slots
+        ):
+            self.slot_allocator.release(prepared.commit_slot)
+        return self.store.on_request_cancel(prepared.request_id)
 
 
 class HybridAPCMetadataStore:
