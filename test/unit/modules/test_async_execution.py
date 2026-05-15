@@ -7,6 +7,9 @@ import torch
 
 from neuronx_distributed_inference.modules.async_execution import (
     AsyncTensorWrapper,
+    cancel_hybrid_apc_request,
+    execute_model_prefix_caching,
+    finish_hybrid_apc_request,
     prepare_hybrid_apc_model_inputs,
 )
 
@@ -326,3 +329,158 @@ class TestHybridAPCAsyncBridge(unittest.TestCase):
         self.assertTrue(torch.equal(args[9], torch.tensor([7], dtype=torch.int32)))
         self.assertTrue(torch.equal(args[10], torch.tensor([0], dtype=torch.int32)))
         self.assertTrue(torch.equal(args[11], torch.tensor([256], dtype=torch.int32)))
+
+    def test_prefix_caching_execution_prepares_and_finishes_hybrid_apc(self):
+        base = SimpleNamespace(
+            config=SimpleNamespace(use_hybrid_apc_manager=True),
+            neuron_config=SimpleNamespace(
+                enable_fused_speculation=False,
+                enable_eagle_speculation=False,
+            ),
+        )
+        bridge = _FakeHybridBridge()
+        model = _FakePrefixModel()
+        input_dict = _prefix_input_dict()
+        input_dict.update(
+            {
+                "hybrid_apc_bridge": bridge,
+                "request_id": "req-1",
+                "vllm_attention_hit_len": torch.tensor([2], dtype=torch.int32),
+                "cumulative_hashes_by_prefix_len": {2: "h2", 4: "h4"},
+                "attention_block_refs": {4: (11, 12)},
+                "actual_refs": (21, 22),
+            }
+        )
+
+        result, is_neuron = execute_model_prefix_caching(base, model, input_dict)
+
+        self.assertEqual(result, "model-output")
+        self.assertFalse(is_neuron)
+        self.assertEqual(bridge.prepare_kwargs["request_id"], "req-1")
+        self.assertEqual(bridge.prepare_kwargs["attention_hit_len"], 2)
+        self.assertEqual(
+            bridge.prepare_kwargs["cumulative_hashes_by_prefix_len"],
+            {2: "h2", 4: "h4"},
+        )
+        self.assertEqual(
+            bridge.prepare_kwargs["attention_block_refs_by_prefix_len"],
+            {4: (11, 12)},
+        )
+        self.assertTrue(
+            torch.equal(
+                model.calls[0][0],
+                torch.tensor([[12, 13]], dtype=torch.int32),
+            )
+        )
+        self.assertIn("_hybrid_apc_prepared", input_dict)
+
+        finish_hybrid_apc_request(input_dict)
+
+        self.assertEqual(bridge.committed[0][0].request_id, "req-1")
+        self.assertEqual(bridge.committed[0][1], (21, 22))
+        self.assertEqual(bridge.finished, ["req-1"])
+        self.assertNotIn("_hybrid_apc_prepared", input_dict)
+
+    def test_prefix_caching_execution_cancels_hybrid_apc_on_model_failure(self):
+        base = SimpleNamespace(
+            config=SimpleNamespace(use_hybrid_apc_manager=True),
+            neuron_config=SimpleNamespace(
+                enable_fused_speculation=False,
+                enable_eagle_speculation=False,
+            ),
+        )
+        bridge = _FakeHybridBridge()
+        model = _FakePrefixModel(should_fail=True)
+        input_dict = _prefix_input_dict()
+        input_dict.update(
+            {
+                "hybrid_apc_bridge": bridge,
+                "request_id": "req-1",
+                "vllm_attention_hit_len": 2,
+            }
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "model failed"):
+            execute_model_prefix_caching(base, model, input_dict)
+
+        self.assertEqual(bridge.cancelled[0].request_id, "req-1")
+        self.assertNotIn("_hybrid_apc_prepared", input_dict)
+
+    def test_cancel_hybrid_apc_request_is_noop_without_prepared_request(self):
+        input_dict = {}
+
+        cancel_hybrid_apc_request(input_dict)
+
+        self.assertEqual(input_dict, {})
+
+
+def _prefix_input_dict():
+    return {
+        "input_ids": torch.tensor([[10, 11, 12, 13]], dtype=torch.int32),
+        "attention_mask": torch.ones((1, 4), dtype=torch.int32),
+        "position_ids": torch.arange(4, dtype=torch.int32).unsqueeze(0),
+        "seq_ids": torch.tensor([0], dtype=torch.int32),
+        "sampling_params": torch.zeros((1, 1), dtype=torch.int32),
+        "adapter_ids": torch.zeros((1,), dtype=torch.int32),
+        "slot_mapping": torch.arange(4, dtype=torch.int32).unsqueeze(0),
+        "block_table": torch.tensor([[1, 2]], dtype=torch.int32),
+        "full_context_lens": torch.tensor([[4]], dtype=torch.int32),
+        "computed_context_lens": torch.tensor([[0]], dtype=torch.int32),
+    }
+
+
+class _FakeHybridBridge:
+    def __init__(self):
+        self.prepare_kwargs = None
+        self.committed = []
+        self.finished = []
+        self.cancelled = []
+
+    def prepare_request(self, **kwargs):
+        self.prepare_kwargs = kwargs
+        input_dict = dict(kwargs["input_dict"])
+        input_dict.update(
+            {
+                "input_ids": input_dict["input_ids"][:, 2:],
+                "attention_mask": input_dict["attention_mask"][:, 2:],
+                "position_ids": input_dict["position_ids"][:, 2:],
+                "slot_mapping": input_dict["slot_mapping"][:, 2:],
+                "computed_context_lens": torch.tensor([[2]], dtype=torch.int32),
+                "full_context_lens": torch.tensor([[4]], dtype=torch.int32),
+                "num_queries": torch.tensor([[2]], dtype=torch.int32),
+                "hybrid_restore_slot_ids": torch.tensor([5], dtype=torch.int32),
+                "hybrid_restore_mask": torch.tensor([1], dtype=torch.int32),
+                "hybrid_restore_prefix_lens": torch.tensor([2], dtype=torch.int32),
+                "hybrid_commit_slot_ids": torch.tensor([7], dtype=torch.int32),
+                "hybrid_commit_mask": torch.tensor([1], dtype=torch.int32),
+            }
+        )
+        return SimpleNamespace(
+            request_id=kwargs["request_id"],
+            input_dict=input_dict,
+            attention_block_refs=(11, 12),
+        )
+
+    def commit_prefill(self, prepared, *, attention_block_refs=None):
+        self.committed.append((prepared, tuple(attention_block_refs)))
+
+    def finish_request(self, request_id):
+        self.finished.append(request_id)
+
+    def cancel_request(self, prepared):
+        self.cancelled.append(prepared)
+
+
+class _FakePrefixModel:
+    def __init__(self, should_fail=False):
+        self.should_fail = should_fail
+        self.calls = []
+
+    def __call__(self, *args, **kwargs):
+        if self.should_fail:
+            raise RuntimeError("model failed")
+        self.calls.append(args)
+        return "model-output"
+
+    def is_neuron(self):
+        return False

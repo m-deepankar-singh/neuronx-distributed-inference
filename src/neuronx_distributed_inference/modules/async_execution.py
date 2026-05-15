@@ -37,6 +37,105 @@ def _first_present(*values):
     return None
 
 
+def _to_python_int(value: Any) -> int:
+    if isinstance(value, torch.Tensor):
+        return int(value.reshape(-1)[0].item())
+    return int(value)
+
+
+def _get_hybrid_apc_bridge(
+    neuron_base_instance: "NeuronBaseForCausalLM",
+    input_dict: Dict[str, Any],
+):
+    return _first_present(
+        input_dict.get("hybrid_apc_bridge"),
+        getattr(neuron_base_instance, "hybrid_apc_bridge", None),
+    )
+
+
+def prepare_hybrid_apc_request_for_execution(
+    neuron_base_instance: "NeuronBaseForCausalLM",
+    input_dict: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Run scheduler-side hybrid APC request preparation when metadata exists.
+
+    The concrete bridge lives with the Qwen contrib model. This function is
+    intentionally duck-typed so the core async path does not import contrib
+    modules. vLLM/NxDI request prep can opt in by attaching a bridge object plus
+    attention-hit metadata to ``input_dict``.
+    """
+
+    if not _is_hybrid_apc_enabled(neuron_base_instance):
+        return input_dict
+
+    bridge = _get_hybrid_apc_bridge(neuron_base_instance, input_dict)
+    if bridge is None:
+        return input_dict
+
+    request_id = _first_present(
+        input_dict.get("hybrid_request_id"),
+        input_dict.get("request_id"),
+    )
+    attention_hit_len = _first_present(
+        input_dict.get("vllm_attention_hit_len"),
+        input_dict.get("hybrid_attention_hit_len"),
+        input_dict.get("attention_hit_len"),
+    )
+    if request_id is None and attention_hit_len is None:
+        return input_dict
+    if request_id is None:
+        raise ValueError("hybrid APC request prep requires request_id")
+    if attention_hit_len is None:
+        raise ValueError("hybrid APC request prep requires attention hit length")
+
+    prepared = bridge.prepare_request(
+        request_id=request_id,
+        input_dict=input_dict,
+        attention_hit_len=_to_python_int(attention_hit_len),
+        request_prefix_len=input_dict.get("request_prefix_len"),
+        cumulative_hashes_by_prefix_len=_first_present(
+            input_dict.get("vllm_or_local_prefix_hashes"),
+            input_dict.get("cumulative_hashes_by_prefix_len"),
+            input_dict.get("hybrid_cumulative_hashes_by_prefix_len"),
+        ),
+        attention_block_refs_by_prefix_len=_first_present(
+            input_dict.get("attention_block_refs"),
+            input_dict.get("attention_block_refs_by_prefix_len"),
+            input_dict.get("hybrid_attention_block_refs_by_prefix_len"),
+        ),
+    )
+    input_dict["_hybrid_apc_bridge"] = bridge
+    input_dict["_hybrid_apc_prepared"] = prepared
+    return prepared.input_dict
+
+
+def finish_hybrid_apc_request(input_dict: Dict[str, Any]):
+    bridge = input_dict.pop("_hybrid_apc_bridge", None)
+    prepared = input_dict.pop("_hybrid_apc_prepared", None)
+    if bridge is None or prepared is None:
+        return
+
+    actual_refs = _first_present(
+        input_dict.get("actual_refs"),
+        input_dict.get("actual_attention_block_refs"),
+        input_dict.get("hybrid_actual_attention_block_refs"),
+        getattr(prepared, "attention_block_refs", None),
+    )
+    try:
+        bridge.commit_prefill(prepared, attention_block_refs=actual_refs)
+    except Exception:
+        bridge.cancel_request(prepared)
+        raise
+    bridge.finish_request(prepared.request_id)
+
+
+def cancel_hybrid_apc_request(input_dict: Dict[str, Any]):
+    bridge = input_dict.pop("_hybrid_apc_bridge", None)
+    prepared = input_dict.pop("_hybrid_apc_prepared", None)
+    if bridge is not None and prepared is not None:
+        bridge.cancel_request(prepared)
+
+
 def prepare_hybrid_apc_model_inputs(
     neuron_base_instance: "NeuronBaseForCausalLM",
     input_dict: Dict[str, Any],
@@ -209,60 +308,69 @@ def execute_model_prefix_caching(
     input_dict: Dict[str, Any],
     pad_type: str = "first_fit",
 ) -> Tuple[AsyncTensorWrapper, bool]:
-    if "num_queries" not in input_dict:
-        full_context_lens = input_dict["full_context_lens"]
-        computed_context_lens = input_dict["computed_context_lens"]
-        num_queries = full_context_lens - computed_context_lens
-        input_dict["num_queries"] = num_queries
-
-    if (
-        not neuron_base_instance.neuron_config.enable_fused_speculation
-        and not neuron_base_instance.neuron_config.enable_eagle_speculation
-    ):
-        hybrid_apc_args = prepare_hybrid_apc_model_inputs(
-            neuron_base_instance, input_dict
+    original_input_dict = input_dict
+    try:
+        input_dict = prepare_hybrid_apc_request_for_execution(
+            neuron_base_instance,
+            input_dict,
         )
-        return model_to_execute(
-            input_dict["input_ids"],
-            input_dict["attention_mask"],
-            input_dict["position_ids"],
-            input_dict["seq_ids"],
-            input_dict["sampling_params"],
-            torch.empty(0),  # prev_hidden
-            input_dict["adapter_ids"],
-            torch.empty(0),  # accepted_indices
-            torch.empty(0),  # current_length
-            torch.empty(0),  # medusa_mask
-            torch.empty(0),  # scatter_index
-            input_dict["slot_mapping"],
-            input_dict["block_table"],
-            input_dict["num_queries"],
-            input_dict["computed_context_lens"],
-            *hybrid_apc_args,
-            pad_type=pad_type
-        ), model_to_execute.is_neuron()
-    elif neuron_base_instance.neuron_config.enable_eagle_speculation:
-        return model_to_execute(
-            input_dict["input_ids"],
-            input_dict["attention_mask"],
-            input_dict["position_ids"],
-            input_dict["seq_ids"],
-            input_dict["sampling_params"],
-            torch.empty(0),  # prev_hidden
-            input_dict["adapter_ids"],
-            input_dict["slot_mapping"],
-            input_dict["block_table"],
-            input_dict["num_queries"],
-            input_dict["computed_context_lens"],
-            torch.empty(0),  # target_input_ids
-            torch.empty(0),  # target_attention_mask
-            torch.empty(0),  # target_position_ids
-            torch.empty(0),  # target_slot_mapping
-            torch.empty(0),  # target_active_block_table
-            pad_type=pad_type
-        ), model_to_execute.is_neuron()
-    else:
-        raise NotImplementedError("Non-EAGLE fused speculation with prefix caching does not support async mode.")
+        if "num_queries" not in input_dict:
+            full_context_lens = input_dict["full_context_lens"]
+            computed_context_lens = input_dict["computed_context_lens"]
+            num_queries = full_context_lens - computed_context_lens
+            input_dict["num_queries"] = num_queries
+
+        if (
+            not neuron_base_instance.neuron_config.enable_fused_speculation
+            and not neuron_base_instance.neuron_config.enable_eagle_speculation
+        ):
+            hybrid_apc_args = prepare_hybrid_apc_model_inputs(
+                neuron_base_instance, input_dict
+            )
+            return model_to_execute(
+                input_dict["input_ids"],
+                input_dict["attention_mask"],
+                input_dict["position_ids"],
+                input_dict["seq_ids"],
+                input_dict["sampling_params"],
+                torch.empty(0),  # prev_hidden
+                input_dict["adapter_ids"],
+                torch.empty(0),  # accepted_indices
+                torch.empty(0),  # current_length
+                torch.empty(0),  # medusa_mask
+                torch.empty(0),  # scatter_index
+                input_dict["slot_mapping"],
+                input_dict["block_table"],
+                input_dict["num_queries"],
+                input_dict["computed_context_lens"],
+                *hybrid_apc_args,
+                pad_type=pad_type
+            ), model_to_execute.is_neuron()
+        elif neuron_base_instance.neuron_config.enable_eagle_speculation:
+            return model_to_execute(
+                input_dict["input_ids"],
+                input_dict["attention_mask"],
+                input_dict["position_ids"],
+                input_dict["seq_ids"],
+                input_dict["sampling_params"],
+                torch.empty(0),  # prev_hidden
+                input_dict["adapter_ids"],
+                input_dict["slot_mapping"],
+                input_dict["block_table"],
+                input_dict["num_queries"],
+                input_dict["computed_context_lens"],
+                torch.empty(0),  # target_input_ids
+                torch.empty(0),  # target_attention_mask
+                torch.empty(0),  # target_position_ids
+                torch.empty(0),  # target_slot_mapping
+                torch.empty(0),  # target_active_block_table
+                pad_type=pad_type
+            ), model_to_execute.is_neuron()
+        else:
+            raise NotImplementedError("Non-EAGLE fused speculation with prefix caching does not support async mode.")
+    except Exception:
+        cancel_hybrid_apc_request(original_input_dict)
+        raise
 
 
 def execute_model(
@@ -337,18 +445,23 @@ def causal_lm_async_execution(
     prefill_outputs = None
     is_run_on_neuron = None
     if is_prefill:
-        prefill_outputs, is_run_on_neuron = execute_model(
-            neuron_base_instance, neuron_base_instance.context_encoding_model, inputs
-        )
+        try:
+            prefill_outputs, is_run_on_neuron = execute_model(
+                neuron_base_instance, neuron_base_instance.context_encoding_model, inputs
+            )
 
-        # Sequence IDs from vLLM will be in sorted order, but the maximum range of sequence IDs is
-        # not [0, num_requested_prefills] but [0, max_num_seqs]. To prevent out-of-bound accesses,
-        # we convert the sequence IDs to their argsorted values.
-        _seq_ids = torch.argsort(inputs["seq_ids"])
+            # Sequence IDs from vLLM will be in sorted order, but the maximum range of sequence IDs is
+            # not [0, num_requested_prefills] but [0, max_num_seqs]. To prevent out-of-bound accesses,
+            # we convert the sequence IDs to their argsorted values.
+            _seq_ids = torch.argsort(inputs["seq_ids"])
 
-        outputs = prefill_outputs.sync_async_result_to_cpu(
-            _seq_ids, is_fused_speculation=is_fused_speculation, is_prefix_caching=is_prefix_caching
-        )
+            outputs = prefill_outputs.sync_async_result_to_cpu(
+                _seq_ids, is_fused_speculation=is_fused_speculation, is_prefix_caching=is_prefix_caching
+            )
+            finish_hybrid_apc_request(inputs)
+        except Exception:
+            cancel_hybrid_apc_request(inputs)
+            raise
 
         # clean up async state
         neuron_base_instance.prior_outputs = None
