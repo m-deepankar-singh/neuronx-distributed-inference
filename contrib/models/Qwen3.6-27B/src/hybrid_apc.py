@@ -176,6 +176,133 @@ def estimate_qwen_hybrid_cache_bytes_per_rank(
     }
 
 
+def apply_hybrid_apc_prefill_plan(
+    input_dict: dict[str, torch.Tensor],
+    *,
+    plan: HybridAPCHitPlan,
+    commit_slot: int | None = None,
+    request_prefix_len: int | None = None,
+) -> dict[str, torch.Tensor]:
+    """Materialize model inputs for a scheduler-selected hybrid APC hit plan.
+
+    The serving scheduler owns prefix hashing, attention block-table selection,
+    checkpoint lookup, and checkpoint-slot reservation. This helper only applies
+    the chosen restore boundary to the token tensors and emits explicit
+    restore/commit control tensors. GDN state is restored only when the plan has
+    a checkpoint slot; slot ID presence alone is never treated as a cache hit.
+    """
+
+    if "input_ids" not in input_dict:
+        raise KeyError("input_ids is required to apply a hybrid APC prefill plan")
+
+    input_ids = input_dict["input_ids"]
+    if input_ids.ndim != 2:
+        raise ValueError(f"input_ids must be [batch, seq], got {tuple(input_ids.shape)}")
+
+    batch_size, available_len = input_ids.shape
+    prompt_len = available_len if request_prefix_len is None else int(request_prefix_len)
+    restore_len = int(plan.restore_checkpoint_prefix_len)
+    if prompt_len < 0:
+        raise ValueError(f"request_prefix_len must be non-negative, got {prompt_len}")
+    if restore_len < 0 or restore_len > prompt_len:
+        raise ValueError(
+            "restore_checkpoint_prefix_len must be in [0, request_prefix_len], "
+            f"got {restore_len} and {prompt_len}"
+        )
+    if prompt_len > available_len:
+        raise ValueError(
+            f"request_prefix_len {prompt_len} exceeds input_ids length {available_len}"
+        )
+    if plan.checkpoint_slot is None and restore_len != 0:
+        raise ValueError("restore checkpoint prefix length requires a checkpoint slot")
+    if plan.checkpoint_slot is not None and restore_len == 0:
+        raise ValueError("checkpoint slot restore requires a positive prefix length")
+
+    output = dict(input_dict)
+    suffix_len = prompt_len - restore_len
+    device = input_ids.device
+
+    output["input_ids"] = input_ids[:, restore_len:prompt_len]
+
+    attention_mask = input_dict.get("attention_mask")
+    if (
+        isinstance(attention_mask, torch.Tensor)
+        and attention_mask.ndim >= 2
+        and attention_mask.shape[0] == batch_size
+        and attention_mask.shape[1] >= prompt_len
+    ):
+        output["attention_mask"] = attention_mask[:, restore_len:prompt_len]
+
+    inputs_embeds = input_dict.get("inputs_embeds")
+    if (
+        isinstance(inputs_embeds, torch.Tensor)
+        and inputs_embeds.ndim >= 3
+        and inputs_embeds.shape[0] == batch_size
+        and inputs_embeds.shape[1] >= prompt_len
+    ):
+        output["inputs_embeds"] = inputs_embeds[:, restore_len:prompt_len]
+
+    slot_mapping = input_dict.get("slot_mapping")
+    if (
+        isinstance(slot_mapping, torch.Tensor)
+        and slot_mapping.ndim >= 2
+        and slot_mapping.shape[0] == batch_size
+        and slot_mapping.shape[1] >= prompt_len
+    ):
+        output["slot_mapping"] = slot_mapping[:, restore_len:prompt_len]
+
+    position_template = input_dict.get("position_ids")
+    position_dtype = (
+        position_template.dtype
+        if isinstance(position_template, torch.Tensor)
+        else torch.int64
+    )
+    position_ids = torch.arange(
+        restore_len,
+        prompt_len,
+        dtype=position_dtype,
+        device=device,
+    ).unsqueeze(0)
+    output["position_ids"] = position_ids.expand(batch_size, suffix_len).contiguous()
+
+    for key in ("rotary_position_id", "rotary_position_ids"):
+        value = input_dict.get(key)
+        if not isinstance(value, torch.Tensor):
+            continue
+        if (
+            value.ndim == 2
+            and value.shape[0] == batch_size
+            and value.shape[1] >= prompt_len
+        ):
+            output[key] = value[:, restore_len:prompt_len]
+        elif (
+            value.ndim == 3
+            and value.shape[1] == batch_size
+            and value.shape[2] >= prompt_len
+        ):
+            output[key] = value[:, :, restore_len:prompt_len]
+
+    def _batch_i32(value: int) -> torch.Tensor:
+        return torch.full((batch_size,), int(value), dtype=torch.int32, device=device)
+
+    def _batch_i32_col(value: int) -> torch.Tensor:
+        return torch.full((batch_size, 1), int(value), dtype=torch.int32, device=device)
+
+    restore_enabled = plan.checkpoint_slot is not None
+    output["computed_context_lens"] = _batch_i32_col(restore_len)
+    output["full_context_lens"] = _batch_i32_col(prompt_len)
+    output["num_queries"] = _batch_i32_col(suffix_len)
+    output["hybrid_restore_slot_ids"] = _batch_i32(
+        0 if plan.checkpoint_slot is None else int(plan.checkpoint_slot)
+    )
+    output["hybrid_restore_mask"] = _batch_i32(1 if restore_enabled else 0)
+    output["hybrid_restore_prefix_lens"] = _batch_i32(restore_len)
+    output["hybrid_commit_slot_ids"] = _batch_i32(0 if commit_slot is None else commit_slot)
+    output["hybrid_commit_mask"] = _batch_i32(0 if commit_slot is None else 1)
+
+    return output
+
+
 class HybridAPCMetadataStore:
     """CPU-side lifecycle store for hybrid prefix-boundary checkpoints."""
 

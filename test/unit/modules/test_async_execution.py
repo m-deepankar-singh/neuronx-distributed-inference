@@ -299,6 +299,7 @@ class TestHybridAPCAsyncBridge(unittest.TestCase):
             "seq_ids": torch.tensor([3, 4], dtype=torch.int32),
             "computed_context_lens": torch.tensor([[256], [0]], dtype=torch.int32),
             "hybrid_restore_slot_ids": torch.tensor([7, 0], dtype=torch.int32),
+            "hybrid_restore_mask": torch.tensor([1, 0], dtype=torch.int32),
             "hybrid_commit_slot_ids": torch.tensor([8, 9], dtype=torch.int32),
             "hybrid_commit_mask": torch.tensor([1, 0], dtype=torch.int32),
         }
@@ -311,3 +312,17 @@ class TestHybridAPCAsyncBridge(unittest.TestCase):
         self.assertTrue(torch.equal(args[11], torch.tensor([256, 0], dtype=torch.int32)))
         self.assertTrue(torch.equal(args[12], torch.tensor([8, 9], dtype=torch.int32)))
         self.assertTrue(torch.equal(args[13], torch.tensor([1, 0], dtype=torch.int32)))
+
+    def test_bridge_does_not_infer_restore_mask_from_slot_presence(self):
+        base = SimpleNamespace(config=SimpleNamespace(use_hybrid_apc_manager=True))
+        input_dict = {
+            "seq_ids": torch.tensor([3], dtype=torch.int32),
+            "computed_context_lens": torch.tensor([[256]], dtype=torch.int32),
+            "hybrid_restore_slot_ids": torch.tensor([7], dtype=torch.int32),
+        }
+
+        args = prepare_hybrid_apc_model_inputs(base, input_dict)
+
+        self.assertTrue(torch.equal(args[9], torch.tensor([7], dtype=torch.int32)))
+        self.assertTrue(torch.equal(args[10], torch.tensor([0], dtype=torch.int32)))
+        self.assertTrue(torch.equal(args[11], torch.tensor([256], dtype=torch.int32)))

@@ -73,17 +73,12 @@ def prepare_hybrid_apc_model_inputs(
         batch_size=batch_size,
         default=0,
     )
-    if "hybrid_restore_mask" in input_dict:
-        restore_mask = _batch_vector(
-            input_dict,
-            "hybrid_restore_mask",
-            batch_size=batch_size,
-            default=0,
-        )
-    else:
-        restore_mask = torch.zeros((batch_size,), dtype=torch.int32)
-        if "hybrid_restore_slot_ids" in input_dict:
-            restore_mask = (restore_prefix_lens > 0).to(torch.int32)
+    restore_mask = _batch_vector(
+        input_dict,
+        "hybrid_restore_mask",
+        batch_size=batch_size,
+        default=0,
+    )
 
     if "hybrid_restore_prefix_lens" in input_dict:
         restore_prefix_lens = _batch_vector(

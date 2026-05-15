@@ -6,6 +6,8 @@ import sys
 import unittest
 import importlib.util
 
+import torch
+
 
 _CONTRIB_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if _CONTRIB_ROOT not in sys.path:
@@ -18,6 +20,8 @@ sys.modules[_SPEC.name] = _HYBRID_APC
 _SPEC.loader.exec_module(_HYBRID_APC)
 
 HybridAPCMetadataStore = _HYBRID_APC.HybridAPCMetadataStore
+HybridAPCHitPlan = _HYBRID_APC.HybridAPCHitPlan
+apply_hybrid_apc_prefill_plan = _HYBRID_APC.apply_hybrid_apc_prefill_plan
 estimate_qwen_gdn_checkpoint_bytes_per_rank = (
     _HYBRID_APC.estimate_qwen_gdn_checkpoint_bytes_per_rank
 )
@@ -275,6 +279,157 @@ class TestHybridAPCMetadataStore(unittest.TestCase):
         self.assertEqual(totals["num_gdn_checkpoints"], 4)
         self.assertEqual(totals["gdn_checkpoint_bytes"], per_checkpoint * 4)
         self.assertGreater(totals["gdn_checkpoint_bytes"], totals["attention_kv_bytes"])
+
+
+class TestHybridAPCPrefillPlanInputs(unittest.TestCase):
+    def test_prefill_plan_materializes_suffix_restore_and_commit(self):
+        plan = HybridAPCHitPlan(
+            attention_hit_len=2,
+            recurrent_hit_len=2,
+            conv_hit_len=2,
+            usable_hit_len=2,
+            restore_checkpoint_prefix_len=2,
+            residual_replay_len=0,
+            suffix_len=3,
+            checkpoint_slot=5,
+            checkpoint_key=None,
+        )
+        input_dict = {
+            "input_ids": torch.tensor([[10, 11, 12, 13, 14]], dtype=torch.int32),
+            "attention_mask": torch.tensor([[1, 1, 1, 1, 1]], dtype=torch.int32),
+            "position_ids": torch.arange(5, dtype=torch.int32).unsqueeze(0),
+            "slot_mapping": torch.tensor([[0, 1, 2, 3, 4]], dtype=torch.int32),
+        }
+
+        output = apply_hybrid_apc_prefill_plan(
+            input_dict,
+            plan=plan,
+            commit_slot=7,
+        )
+
+        self.assertTrue(
+            torch.equal(output["input_ids"], torch.tensor([[12, 13, 14]], dtype=torch.int32))
+        )
+        self.assertTrue(
+            torch.equal(output["attention_mask"], torch.tensor([[1, 1, 1]], dtype=torch.int32))
+        )
+        self.assertTrue(
+            torch.equal(output["position_ids"], torch.tensor([[2, 3, 4]], dtype=torch.int32))
+        )
+        self.assertTrue(
+            torch.equal(output["slot_mapping"], torch.tensor([[2, 3, 4]], dtype=torch.int32))
+        )
+        self.assertTrue(
+            torch.equal(output["computed_context_lens"], torch.tensor([[2]], dtype=torch.int32))
+        )
+        self.assertTrue(
+            torch.equal(output["full_context_lens"], torch.tensor([[5]], dtype=torch.int32))
+        )
+        self.assertTrue(
+            torch.equal(output["num_queries"], torch.tensor([[3]], dtype=torch.int32))
+        )
+        self.assertTrue(
+            torch.equal(output["hybrid_restore_slot_ids"], torch.tensor([5], dtype=torch.int32))
+        )
+        self.assertTrue(
+            torch.equal(output["hybrid_restore_mask"], torch.tensor([1], dtype=torch.int32))
+        )
+        self.assertTrue(
+            torch.equal(output["hybrid_restore_prefix_lens"], torch.tensor([2], dtype=torch.int32))
+        )
+        self.assertTrue(
+            torch.equal(output["hybrid_commit_slot_ids"], torch.tensor([7], dtype=torch.int32))
+        )
+        self.assertTrue(
+            torch.equal(output["hybrid_commit_mask"], torch.tensor([1], dtype=torch.int32))
+        )
+
+    def test_prefill_plan_does_not_restore_without_checkpoint_slot(self):
+        plan = HybridAPCHitPlan(
+            attention_hit_len=0,
+            recurrent_hit_len=0,
+            conv_hit_len=0,
+            usable_hit_len=0,
+            restore_checkpoint_prefix_len=0,
+            residual_replay_len=0,
+            suffix_len=3,
+            checkpoint_slot=None,
+            checkpoint_key=None,
+        )
+        input_dict = {
+            "input_ids": torch.tensor([[10, 11, 12]], dtype=torch.int32),
+            "position_ids": torch.arange(3, dtype=torch.int32).unsqueeze(0),
+        }
+
+        output = apply_hybrid_apc_prefill_plan(input_dict, plan=plan)
+
+        self.assertTrue(
+            torch.equal(output["input_ids"], torch.tensor([[10, 11, 12]], dtype=torch.int32))
+        )
+        self.assertTrue(
+            torch.equal(output["hybrid_restore_slot_ids"], torch.tensor([0], dtype=torch.int32))
+        )
+        self.assertTrue(
+            torch.equal(output["hybrid_restore_mask"], torch.tensor([0], dtype=torch.int32))
+        )
+        self.assertTrue(
+            torch.equal(output["hybrid_commit_mask"], torch.tensor([0], dtype=torch.int32))
+        )
+
+    def test_prefill_plan_rejects_restore_boundary_without_checkpoint_slot(self):
+        plan = HybridAPCHitPlan(
+            attention_hit_len=2,
+            recurrent_hit_len=0,
+            conv_hit_len=0,
+            usable_hit_len=0,
+            restore_checkpoint_prefix_len=2,
+            residual_replay_len=0,
+            suffix_len=1,
+            checkpoint_slot=None,
+            checkpoint_key=None,
+        )
+
+        with self.assertRaisesRegex(ValueError, "requires a checkpoint slot"):
+            apply_hybrid_apc_prefill_plan(
+                {"input_ids": torch.tensor([[10, 11, 12]], dtype=torch.int32)},
+                plan=plan,
+            )
+
+    def test_prefill_plan_uses_restore_boundary_for_residual_replay(self):
+        plan = HybridAPCHitPlan(
+            attention_hit_len=5,
+            recurrent_hit_len=4,
+            conv_hit_len=4,
+            usable_hit_len=5,
+            restore_checkpoint_prefix_len=4,
+            residual_replay_len=1,
+            suffix_len=2,
+            checkpoint_slot=9,
+            checkpoint_key=None,
+        )
+        input_dict = {
+            "input_ids": torch.tensor([[10, 11, 12, 13, 14, 15, 16]], dtype=torch.int32),
+            "position_ids": torch.arange(7, dtype=torch.int32).unsqueeze(0),
+        }
+
+        output = apply_hybrid_apc_prefill_plan(
+            input_dict,
+            plan=plan,
+            commit_slot=10,
+        )
+
+        self.assertTrue(
+            torch.equal(output["input_ids"], torch.tensor([[14, 15, 16]], dtype=torch.int32))
+        )
+        self.assertTrue(
+            torch.equal(output["position_ids"], torch.tensor([[4, 5, 6]], dtype=torch.int32))
+        )
+        self.assertTrue(
+            torch.equal(output["computed_context_lens"], torch.tensor([[4]], dtype=torch.int32))
+        )
+        self.assertTrue(
+            torch.equal(output["num_queries"], torch.tensor([[3]], dtype=torch.int32))
+        )
 
 
 if __name__ == "__main__":
