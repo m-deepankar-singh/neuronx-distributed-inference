@@ -308,6 +308,14 @@ def _generation_metrics_from_vllm_output(
     }
 
 
+def _merge_generation_metrics(metrics: dict, generation_metrics: dict) -> None:
+    for key, value in generation_metrics.items():
+        if key == "prefill_latency_ms" and value is not None:
+            metrics[key] = value
+        elif metrics.get(key) is None:
+            metrics[key] = value
+
+
 def _validate_hybrid_apc_args(args: argparse.Namespace):
     if not args.enable_hybrid_apc:
         return
@@ -580,9 +588,7 @@ def main() -> int:
         generated_token_count=len(token_ids),
         hbm_usage=_hbm_usage_if_available(),
     )
-    for key, value in generation_metrics.items():
-        if metrics.get(key) is None:
-            metrics[key] = value
+    _merge_generation_metrics(metrics, generation_metrics)
 
     print("PROMPT", prompt)
     print("OUTPUT", text)

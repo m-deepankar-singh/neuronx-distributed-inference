@@ -135,7 +135,7 @@ class TestColdPrefillStrictFinal(unittest.TestCase):
         self.assertIn("exactness", hybrid_apc)
         self.assertIn("--compiled-artifacts", hybrid_apc)
         self.assertIn("/tmp/artifacts-2k", hybrid_apc)
-        self.assertIn("--cold-zero-conv-fast-path", hybrid_apc)
+        self.assertNotIn("--cold-zero-conv-fast-path", hybrid_apc)
         self.assertIn("--max-num-seqs", hybrid_apc)
         self.assertIn("--hybrid-apc-require-vllm-metadata", hybrid_apc)
         self.assertIn("--output-json", hybrid_apc)

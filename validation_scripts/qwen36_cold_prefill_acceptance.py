@@ -35,6 +35,7 @@ EXPECTED_GDN_CTE_KERNEL_BY_VARIANT = {
     "I_262k_recovery_block256": "fused_initial_state",
     "J_262k_recovery_block128": "fused_initial_state",
     "K_short_text_compact_pytorch_chunk": "pytorch_chunk",
+    "M_short_text_compact_fused_cold_zero_ablation": "fused_initial_state",
 }
 EXPECTED_FEATURE_LAUNCH_PROFILE_BY_VARIANT = {
     "A_single512_old_chunked": {
@@ -71,13 +72,13 @@ EXPECTED_FEATURE_LAUNCH_PROFILE_BY_VARIANT = {
         "cte_buckets": (128, 256, 512, 1024),
         "text_only_cte_enabled": True,
         "compact_mask_enabled": True,
-        "cold_zero_conv_fast_path_enabled": True,
+        "cold_zero_conv_fast_path_enabled": False,
     },
     "G_tile_block_sweep": {
         "cte_buckets": (128, 256, 512, 1024),
         "text_only_cte_enabled": True,
         "compact_mask_enabled": True,
-        "cold_zero_conv_fast_path_enabled": True,
+        "cold_zero_conv_fast_path_enabled": False,
     },
 }
 LONG_ARTIFACT_GENERATION_TARGETS = (
@@ -381,7 +382,7 @@ def _hybrid_apc_config_matches_strict_final(report: dict[str, Any]) -> bool:
         "enable_vllm_chunked_prefill": True,
         "text_only_cte": True,
         "compact_cte_attention_mask": True,
-        "cold_zero_conv_fast_path": True,
+        "cold_zero_conv_fast_path": False,
         "hybrid_apc_require_vllm_metadata": True,
         "max_num_seqs": 1,
         "block_size": 128,
@@ -1775,12 +1776,10 @@ def evaluate(
         f"no short-prompt rows found for <= {SHORT_PROMPT_LIMIT} tokens",
     )
 
-    baseline_actual_tps_values = [
-        value
-        for (variant, _prompt), variant_rows in grouped.items()
-        if variant == baseline_variant
-        for value in _metric_values(variant_rows, "actual_tok_per_s")
-    ]
+    baseline_actual_tps_values = _metric_values(
+        grouped.get((baseline_variant, 2048), []),
+        "actual_tok_per_s",
+    )
     baseline_cold_tok_per_s = _p50(baseline_actual_tps_values)
     baseline_cold_gate = None
     if baseline_cold_tok_per_s_target is not None:
@@ -1795,13 +1794,14 @@ def evaluate(
             "tolerance": baseline_cold_tok_per_s_tolerance,
             "lower_tok_per_s": lower,
             "upper_tok_per_s": upper,
+            "baseline_prompt_len": 2048,
             "baseline_p50_actual_tok_per_s": baseline_cold_tok_per_s,
         }
         _require(
             baseline_cold_tok_per_s is not None
             and lower <= baseline_cold_tok_per_s <= upper,
             failures,
-            "baseline cold tok/s did not reproduce the expected target range",
+            "2048-token baseline cold tok/s did not reproduce the expected target range",
         )
 
     baseline_cold_prompt_checks = []
@@ -1817,7 +1817,7 @@ def evaluate(
                 continue
             values = _metric_values(
                 grouped.get((baseline_variant, prompt_len), []),
-                "actual_tok_per_s",
+                "bucket_tok_per_s",
             )
             prompt_p50 = _p50(values)
             within_range = prompt_p50 is not None and lower <= prompt_p50 <= upper
@@ -1826,7 +1826,8 @@ def evaluate(
                     "variant": baseline_variant,
                     "prompt_len": prompt_len,
                     "sample_count": len(values),
-                    "p50_actual_tok_per_s": prompt_p50,
+                    "metric": "bucket_tok_per_s",
+                    "p50_bucket_tok_per_s": prompt_p50,
                     "lower_tok_per_s": lower,
                     "upper_tok_per_s": upper,
                     "within_target_range": within_range,
@@ -1836,7 +1837,7 @@ def evaluate(
                 failures.append(
                     (
                         f"{baseline_variant} prompt={prompt_len} baseline cold "
-                        "tok/s did not reproduce the expected target range"
+                        "bucket tok/s did not reproduce the expected target range"
                     )
                 )
 
@@ -2352,7 +2353,7 @@ def evaluate(
             "C_short_text_only_old_chunked",
         ),
         (
-            "compact CTE mask",
+            "compact CTE mask guardrail",
             "C_short_text_only_old_chunked",
             "D_short_text_compact_old_chunked",
         ),
@@ -2362,7 +2363,7 @@ def evaluate(
             "E_short_text_compact_fused",
         ),
         (
-            "cold-zero conv fast path",
+            "cold-zero conv guardrail (disabled in strict-final)",
             "E_short_text_compact_fused",
             "F_short_text_compact_fused_cold_zero",
         ),

@@ -350,7 +350,7 @@ def _strict_final_complete_rows(acceptance):
             "cte_buckets": [128, 256, 512, 1024],
             "text_only": True,
             "compact": True,
-            "cold_zero": True,
+            "cold_zero": False,
             "kernel": "fused_initial_state",
         },
         "G_tile_block_sweep": {
@@ -359,7 +359,7 @@ def _strict_final_complete_rows(acceptance):
             "cte_buckets": [128, 256, 512, 1024],
             "text_only": True,
             "compact": True,
-            "cold_zero": True,
+            "cold_zero": False,
             "kernel": "fused_initial_state",
         },
     }
@@ -479,7 +479,7 @@ def _strict_final_hybrid_apc_report(
             "enable_vllm_chunked_prefill": True,
             "text_only_cte": True,
             "compact_cte_attention_mask": True,
-            "cold_zero_conv_fast_path": True,
+            "cold_zero_conv_fast_path": False,
             "hybrid_apc_require_vllm_metadata": True,
             "max_num_seqs": 1,
             "block_size": 128,
@@ -661,7 +661,7 @@ class TestColdPrefillAcceptance(unittest.TestCase):
 
     def test_strict_final_requires_hybrid_apc_strict_config(self):
         hybrid_report = _strict_final_hybrid_apc_report()
-        hybrid_report["validation_config"]["cold_zero_conv_fast_path"] = False
+        hybrid_report["validation_config"]["cold_zero_conv_fast_path"] = True
 
         report = self.acceptance.evaluate(
             _strict_final_complete_rows(self.acceptance),
@@ -950,7 +950,7 @@ class TestColdPrefillAcceptance(unittest.TestCase):
             "fail",
         )
 
-    def test_strict_final_checks_baseline_target_on_each_short_prompt(self):
+    def test_strict_final_checks_baseline_bucket_target_on_each_short_prompt(self):
         rows = _strict_final_complete_rows(self.acceptance)
         for row in rows:
             if (
@@ -958,7 +958,7 @@ class TestColdPrefillAcceptance(unittest.TestCase):
                 and row["target_prompt_tokens"] == 384
                 and row["max_tokens"] == 1
             ):
-                row["metrics"]["actual_tok_per_s"] = 200.0
+                row["metrics"]["bucket_tok_per_s"] = 200.0
 
         report = self.acceptance.evaluate(
             rows,
@@ -974,7 +974,7 @@ class TestColdPrefillAcceptance(unittest.TestCase):
         self.assertFalse(report["passed"])
         self.assertTrue(
             any(
-                "prompt=384 baseline cold tok/s" in failure
+                "prompt=384 baseline cold bucket tok/s" in failure
                 for failure in report["failures"]
             )
         )
@@ -987,7 +987,9 @@ class TestColdPrefillAcceptance(unittest.TestCase):
     def test_acceptance_can_require_baseline_cold_tok_per_s_target(self):
         rows = [
             _row("A_single512_old_chunked", 128, 100.0, 420.0),
+            _row("A_single512_old_chunked", 2048, 4876.0, 420.0),
             _row("F_short_text_compact_fused_cold_zero", 128, 60.0, 700.0),
+            _row("F_short_text_compact_fused_cold_zero", 2048, 4500.0, 455.0),
         ]
 
         report = self.acceptance.evaluate(
@@ -1010,8 +1012,10 @@ class TestColdPrefillAcceptance(unittest.TestCase):
 
     def test_acceptance_fails_when_baseline_cold_tok_per_s_target_misses(self):
         rows = [
-            _row("A_single512_old_chunked", 128, 100.0, 300.0),
+            _row("A_single512_old_chunked", 128, 100.0, 420.0),
+            _row("A_single512_old_chunked", 2048, 6826.0, 300.0),
             _row("F_short_text_compact_fused_cold_zero", 128, 60.0, 700.0),
+            _row("F_short_text_compact_fused_cold_zero", 2048, 4500.0, 455.0),
         ]
 
         report = self.acceptance.evaluate(
@@ -2420,7 +2424,10 @@ class TestColdPrefillAcceptance(unittest.TestCase):
         deltas = {item["name"]: item for item in report["feature_delta_checks"]}
         self.assertEqual(deltas["dynamic CTE buckets"]["status"], "pass")
         self.assertEqual(deltas["text-only CTE"]["status"], "pass")
-        self.assertEqual(deltas["cold-zero conv fast path"]["status"], "pass")
+        self.assertEqual(
+            deltas["cold-zero conv guardrail (disabled in strict-final)"]["status"],
+            "pass",
+        )
         self.assertEqual(deltas["tile/block sweep"]["status"], "skip")
         self.assertEqual(
             deltas["text-only CTE"]["prompt_checks"][0]["latency_ratio"],
@@ -2630,7 +2637,7 @@ class TestColdPrefillAcceptance(unittest.TestCase):
             report["expected_feature_launch_profile_by_variant"][
                 "F_short_text_compact_fused_cold_zero"
             ]["cold_zero_conv_fast_path_enabled"],
-            True,
+            False,
         )
         self.assertEqual(
             report["expected_gdn_cte_kernel_by_variant"]["E_short_text_compact_fused"],

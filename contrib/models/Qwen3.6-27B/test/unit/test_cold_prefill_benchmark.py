@@ -310,7 +310,20 @@ class TestColdPrefillBenchmark(unittest.TestCase):
                 "USE_PYTORCH_CHUNK": "1",
             },
         )
+        self.assertNotIn(
+            "--cold-zero-conv-fast-path",
+            specs["F_short_text_compact_fused_cold_zero"]["flags"],
+        )
+        self.assertNotIn(
+            "--cold-zero-conv-fast-path",
+            specs["G_tile_block_sweep"]["flags"],
+        )
+        self.assertIn(
+            "--cold-zero-conv-fast-path",
+            specs["M_short_text_compact_fused_cold_zero_ablation"]["flags"],
+        )
         self.assertTrue(specs["K_short_text_compact_pytorch_chunk"]["optional"])
+        self.assertTrue(specs["M_short_text_compact_fused_cold_zero_ablation"]["optional"])
 
     def test_dense_mask_fallback_variant_disables_chunked_prefill(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -468,8 +481,8 @@ class TestColdPrefillBenchmark(unittest.TestCase):
         stdout = "\n".join(
             [
                 "TOKENS [1, 2]",
-                'COLD_PREFILL_METRICS {"prefill_latency_ms": 100.0, "decode_tok_per_s": null}',
-                'GENERATION_METRICS {"first_token_latency_ms": 100.0, "decode_tok_per_s": 42.0}',
+                'COLD_PREFILL_METRICS {"prefill_latency_ms": 500.0, "decode_tok_per_s": null}',
+                'GENERATION_METRICS {"prefill_latency_ms": 100.0, "first_token_latency_ms": 100.0, "decode_tok_per_s": 42.0}',
                 'GDN_STATE_DIFF {"recurrent_max_abs_diff": 0.001, "conv_max_abs_diff": 0.002}',
             ]
         )
@@ -501,6 +514,7 @@ class TestColdPrefillBenchmark(unittest.TestCase):
         self.assertTrue(row["artifact_load_success"])
         self.assertEqual(row["token_ids"], [1, 2])
         self.assertEqual(row["generation_metrics"]["decode_tok_per_s"], 42.0)
+        self.assertEqual(row["metrics"]["prefill_latency_ms"], 100.0)
         self.assertEqual(row["metrics"]["decode_tok_per_s"], 42.0)
         self.assertEqual(row["metrics"]["first_token_latency_ms"], 100.0)
         self.assertEqual(row["gdn_state_diff"]["recurrent_max_abs_diff"], 0.001)

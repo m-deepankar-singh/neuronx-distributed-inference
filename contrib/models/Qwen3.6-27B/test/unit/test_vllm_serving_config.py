@@ -219,6 +219,26 @@ class TestVllmServingConfig(unittest.TestCase):
         self.assertAlmostEqual(metrics["end_to_end_generated_tok_per_s"], 5 / 1.2)
         self.assertEqual(metrics["metrics_source"], "vllm_request_metrics")
 
+    def test_generation_prefill_latency_overwrites_elapsed_request_latency(self):
+        metrics = {
+            "prefill_latency_ms": 1200.0,
+            "request_latency_ms": 1200.0,
+            "decode_tok_per_s": None,
+        }
+        generation_metrics = {
+            "prefill_latency_ms": 250.0,
+            "first_token_latency_ms": 250.0,
+            "decode_tok_per_s": 42.0,
+            "request_latency_ms": 1200.0,
+        }
+
+        self.runner._merge_generation_metrics(metrics, generation_metrics)
+
+        self.assertEqual(metrics["prefill_latency_ms"], 250.0)
+        self.assertEqual(metrics["first_token_latency_ms"], 250.0)
+        self.assertEqual(metrics["decode_tok_per_s"], 42.0)
+        self.assertEqual(metrics["request_latency_ms"], 1200.0)
+
     def test_generation_metrics_missing_vllm_timestamps_stay_null_for_decode(self):
         metrics = self.runner._generation_metrics_from_vllm_output(
             SimpleNamespace(metrics=None),

@@ -1064,6 +1064,7 @@ class NeuronGatedDeltaNet(nn.Module):
                             mixed,
                             self._conv1d_weight(),
                             conv_state,
+                            conv_input,
                         )
                     )
                     state_source = conv_input

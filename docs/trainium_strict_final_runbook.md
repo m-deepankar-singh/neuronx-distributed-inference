@@ -130,7 +130,7 @@ Confirm the generated commands include:
 - `--ctx-batch-size 1`
 - 8K and 32K artifact overrides in the matrix command
 - 128K and 262K artifact overrides in the long-context command
-- hybrid APC exactness command with `--cold-zero-conv-fast-path`
+- hybrid APC exactness command without `--cold-zero-conv-fast-path`
 - acceptance command with `--strict-final`
 
 ## 6. Run Strict-Final Collection
@@ -214,7 +214,7 @@ $QWEN36_OUT/qwen36_cold_prefill_strict_acceptance.json
 Common blockers:
 
 - Baseline `A_single512_old_chunked` does not reproduce the documented ~420 tok/s
-  cold baseline.
+  2048-token actual tok/s or the short-prompt bucket-normalized tok/s gate.
 - Missing HBM usage in `COLD_PREFILL_METRICS`.
 - Missing GDN recurrent/conv state diff fields.
 - 128K or 262K artifact row did not load/run.

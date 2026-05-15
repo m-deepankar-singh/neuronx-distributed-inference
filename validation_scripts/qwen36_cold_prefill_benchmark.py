@@ -282,7 +282,6 @@ def _variant_specs():
             "flags": [
                 "--text-only-cte",
                 "--compact-cte-attention-mask",
-                "--cold-zero-conv-fast-path",
             ],
             "env": fused_env,
             "tile_sweep": False,
@@ -293,10 +292,21 @@ def _variant_specs():
             "flags": [
                 "--text-only-cte",
                 "--compact-cte-attention-mask",
-                "--cold-zero-conv-fast-path",
             ],
             "env": fused_env,
             "tile_sweep": True,
+        },
+        {
+            "name": "M_short_text_compact_fused_cold_zero_ablation",
+            "cte": ["--cte-bucket-profile", "short"],
+            "flags": [
+                "--text-only-cte",
+                "--compact-cte-attention-mask",
+                "--cold-zero-conv-fast-path",
+            ],
+            "env": fused_env,
+            "tile_sweep": False,
+            "optional": True,
         },
         {
             "name": "H_128k_candidate",
@@ -609,7 +619,9 @@ def _run_case(
     row["generation_metrics"] = _extract_generation_metrics(proc.stdout)
     if row["metrics"] is not None and row["generation_metrics"] is not None:
         for key, value in row["generation_metrics"].items():
-            if row["metrics"].get(key) is None:
+            if key == "prefill_latency_ms" and value is not None:
+                row["metrics"][key] = value
+            elif row["metrics"].get(key) is None:
                 row["metrics"][key] = value
     row["gdn_state_diff"] = _extract_gdn_state_diff(proc.stdout)
     if row["gdn_state_diff"] is None:

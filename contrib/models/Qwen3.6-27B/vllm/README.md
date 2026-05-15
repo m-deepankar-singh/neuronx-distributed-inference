@@ -166,9 +166,16 @@ Use one of the explicit profiles when compiling artifacts:
 --cte-bucket-profile 262k      # [256]
 ```
 
-`--cold-zero-conv-fast-path` is only for a cold-only CTE artifact whose suffix
-prefill always starts at position 0. Leave it disabled for APC or partial-prefix
-serving because restored GDN conv state must be consumed exactly.
+`--cold-zero-conv-fast-path` is a manual ablation flag, not part of the
+strict-final Trainium path. The guard is disabled while Torch is tracing so a
+compiled graph cannot bake in the zero-prefix branch and then reuse it for a
+continuation chunk or partial-prefix suffix. Leave it disabled for the first
+strict-final run and for APC/partial-prefix serving unless separate zero-prefix
+and stateful CTE graphs are introduced.
+
+The launcher defaults to `TEXT_ONLY_CTE=1`, which is the intended profile for
+this cold-prefill benchmark. A service that accepts real vision inputs needs a
+separate multimodal artifact/config launched with `--no-text-only-cte`.
 
 Long-prompt precompiled artifact path:
 
@@ -497,10 +504,12 @@ including the 262K block-128 comparison, required long-artifact launch profiles
 for 128K, block 256 then 128 with CTE profile `262k`/`[256]` for 262K),
 matching baseline rows for long-context token exactness, a hybrid APC exactness
 report proving full-prefix and partial-prefix token matches with cold-prefill
-metrics and the strict cold-zero/chunked/text-only/compact validation config, and an explicit
+metrics and the strict cold-zero-disabled/chunked/text-only/compact validation
+config, and an explicit
 `--baseline-cold-tok-per-s-target` near the documented 420 tok/s cold baseline.
-Strict-final checks that baseline target both as an aggregate and on each fixed
-short baseline prompt. For 8K+ rows, strict-final also requires concrete
+Strict-final checks that baseline target on the 2048-token baseline actual tok/s
+row and uses bucket-normalized tok/s for each fixed short baseline prompt. For
+8K+ rows, strict-final also requires concrete
 `cte_attention_mask_path` / `dense_cte_mask_fallback` evidence showing the row
 did not use the dense 4D SxS fallback path.
 Use `--strict-min-samples` to raise that repeated-sample threshold.
@@ -614,12 +623,18 @@ prompt-token accuracy, 2K regression, exactness, HBM, GDN kernel identity, GDN
 state diff, and 128K/262K artifact checks.
 It also includes `feature_delta_checks` for the A->G matrix so you can see the
 per-step latency/token-throughput evidence for dynamic buckets, text-only CTE,
-compact masks, fused GDN CTE, cold-zero conv, and tile/block sweeps. Pass
+compact-mask guardrails, fused GDN CTE, cold-zero guardrails, and tile/block
+sweeps. Pass
 `--require-feature-deltas` to fail the report when any populated A->G step
 regresses. When HBM usage is present, an increased target HBM footprint also
 marks that feature step as regressed, and each feature-delta row includes the
 HBM byte delta for audit. The tile/block sweep keeps every tile profile in
 `tile_case_checks` and uses the best p50 profile per prompt for the gate.
+Most A-G rows enable vLLM chunked prefill, so disabling the compact-mask flag is
+not necessarily a dense-mask performance delta; `L_small_dense_mask_fallback` is
+the explicit dense fallback check. The optional
+`M_short_text_compact_fused_cold_zero_ablation` row is the isolated cold-zero
+conv experiment after strict-final passes without that flag.
 
 ## Next Milestone
 

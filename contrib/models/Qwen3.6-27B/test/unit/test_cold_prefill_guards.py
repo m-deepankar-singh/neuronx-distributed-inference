@@ -129,10 +129,10 @@ class TestColdZeroConvFastPath(unittest.TestCase):
             )
         )
 
-    def test_guard_disables_hybrid_apc_fast_path_while_tracing(self):
+    def test_guard_disables_fast_path_while_tracing(self):
         config = SimpleNamespace(
             use_cold_zero_conv_fast_path=True,
-            use_hybrid_apc_manager=True,
+            use_hybrid_apc_manager=False,
         )
         recurrent_cache = torch.zeros(1, 2, 3, 4)
         conv_cache = torch.zeros(1, 5, 3)
@@ -144,9 +144,67 @@ class TestColdZeroConvFastPath(unittest.TestCase):
                     torch.arange(8).unsqueeze(0),
                     recurrent_cache,
                     conv_cache,
-                    hybrid_restore_mask=torch.zeros(1, dtype=torch.int32),
                 )
             )
+
+    def test_guard_keeps_chunk_continuation_stateful_for_long_prompt(self):
+        torch.manual_seed(2)
+        channels = 4
+        state_len = 3
+        chunk_len = 1024
+        prompt_len = chunk_len * 2
+        mixed = torch.randn(1, channels, prompt_len)
+        conv_weight = torch.randn(channels, 1, state_len + 1)
+        recurrent_cache = torch.zeros(1, 2, 3, 4)
+        initial_conv_state = torch.zeros(1, channels, state_len)
+        fast_config = SimpleNamespace(
+            use_cold_zero_conv_fast_path=True,
+            use_hybrid_apc_manager=False,
+        )
+        stateful_config = SimpleNamespace(
+            use_cold_zero_conv_fast_path=False,
+            use_hybrid_apc_manager=False,
+        )
+
+        def run_chunks(config):
+            conv_state = initial_conv_state.clone()
+            decisions = []
+            outputs = []
+            for start in range(0, prompt_len, chunk_len):
+                chunk = mixed[:, :, start : start + chunk_len]
+                position_ids = torch.arange(start, start + chunk_len).unsqueeze(0)
+                use_fast = safe_cold_zero_conv_fast_path(
+                    config,
+                    position_ids,
+                    recurrent_cache,
+                    conv_state,
+                )
+                decisions.append(use_fast)
+                if use_fast:
+                    outputs.append(depthwise_causal_conv1d_from_zero(chunk, conv_weight))
+                    state_source = chunk
+                else:
+                    conv_input = torch.cat([conv_state, chunk], dim=-1)
+                    outputs.append(
+                        depthwise_causal_conv1d_with_state(
+                            chunk,
+                            conv_weight,
+                            conv_state,
+                            conv_input,
+                        )
+                    )
+                    state_source = conv_input
+                conv_state = state_source[:, :, -state_len:].contiguous()
+            return decisions, torch.cat(outputs, dim=-1)
+
+        fast_decisions, fast_outputs = run_chunks(fast_config)
+        stateful_decisions, stateful_outputs = run_chunks(stateful_config)
+
+        self.assertEqual(fast_decisions, [True, False])
+        self.assertEqual(stateful_decisions, [False, False])
+        self.assertTrue(
+            torch.allclose(fast_outputs, stateful_outputs, atol=1e-6, rtol=1e-6)
+        )
 
 
 class TestCompactCteMaskGuard(unittest.TestCase):

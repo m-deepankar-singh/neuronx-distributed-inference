@@ -149,7 +149,6 @@ def _build_commands(args: argparse.Namespace) -> dict[str, list[str]]:
         "1024",
         "--text-only-cte",
         "--compact-cte-attention-mask",
-        "--cold-zero-conv-fast-path",
         "--hybrid-apc-require-vllm-metadata",
         "--max-tokens",
         "32",

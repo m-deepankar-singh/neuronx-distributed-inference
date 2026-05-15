@@ -42,11 +42,11 @@ def safe_cold_zero_conv_fast_path(
 ) -> bool:
     if not getattr(config, "use_cold_zero_conv_fast_path", False):
         return False
+    if torch.jit.is_tracing():
+        return False
     if position_ids is None:
         return False
     if recurrent_state_cache is None or conv_state_cache is None:
-        return False
-    if getattr(config, "use_hybrid_apc_manager", False) and torch.jit.is_tracing():
         return False
     if not bool((position_ids[:, :1].long() == 0).all().item()):
         return False
@@ -77,11 +77,17 @@ def depthwise_causal_conv1d_from_zero(mixed, conv_weight):
     )[:, :, :seq_len]
 
 
-def depthwise_causal_conv1d_with_state(mixed, conv_weight, conv_state):
+def depthwise_causal_conv1d_with_state(
+    mixed,
+    conv_weight,
+    conv_state,
+    conv_input=None,
+):
     seq_len = mixed.shape[-1]
     conv_out = torch.zeros_like(mixed)
     weight = conv_weight.squeeze(1)
-    conv_input = torch.cat([conv_state, mixed], dim=-1)
+    if conv_input is None:
+        conv_input = torch.cat([conv_state, mixed], dim=-1)
     for k in range(conv_weight.shape[-1]):
         conv_out = (
             conv_out
