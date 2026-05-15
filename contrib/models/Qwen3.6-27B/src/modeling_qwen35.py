@@ -77,6 +77,11 @@ from src.nki_kernels.nki_deltanet_fused import (
     _make_lower_mask_diag,
     _make_identity,
 )
+from src.hybrid_apc import (
+    HybridAPCMetadataStore,
+    HybridAPCSchedulerBridge,
+    HybridAPCSlotAllocator,
+)
 
 from neuronx_distributed_inference.models.config import (
     InferenceConfig,
@@ -1382,6 +1387,11 @@ class Qwen35InferenceConfig(InferenceConfig):
         kwargs.setdefault("max_gdn_checkpoint_slots", 8)
         kwargs.setdefault("hybrid_apc_layout_version", 1)
         kwargs.setdefault("hybrid_apc_allow_residual_replay", False)
+        kwargs.setdefault("hybrid_apc_cache_salt", None)
+        kwargs.setdefault(
+            "hybrid_apc_model_revision",
+            kwargs.get("_name_or_path", kwargs.get("model_revision", "unknown")),
+        )
         kwargs.setdefault(
             "hybrid_recurrent_cache_dtype",
             kwargs.get("gdn_recurrent_cache_dtype", "float32"),
@@ -3536,6 +3546,70 @@ class Qwen35ModelWrapper(ModelWrapper):
 
 class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
     _model_cls = NeuronQwen35Model
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._init_hybrid_apc_scheduler_bridge()
+
+    def _init_hybrid_apc_scheduler_bridge(self):
+        self.hybrid_apc_store = None
+        self.hybrid_apc_slot_allocator = None
+        self.hybrid_apc_bridge = None
+        if not getattr(self.config, "use_hybrid_apc_manager", False):
+            return
+
+        required_gdn_layers = tuple(
+            idx
+            for idx, layer_type in enumerate(self.config.layer_types)
+            if layer_type == "linear_attention"
+        )
+        if not required_gdn_layers:
+            raise ValueError("hybrid APC requires at least one GDN layer")
+
+        tp_rank = 0
+        try:
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                tp_rank = int(parallel_state.get_tensor_model_parallel_rank())
+        except Exception:
+            tp_rank = 0
+
+        block_size = int(
+            getattr(
+                self.neuron_config,
+                "pa_block_size",
+                self.config.gdn_checkpoint_interval,
+            )
+        )
+        self.hybrid_apc_store = HybridAPCMetadataStore(
+            required_gdn_layers=required_gdn_layers,
+            block_size=block_size,
+            checkpoint_interval=self.config.gdn_checkpoint_interval,
+            max_checkpoints=self.config.max_gdn_checkpoint_slots,
+            layout_version=self.config.hybrid_apc_layout_version,
+            model_revision=self.config.hybrid_apc_model_revision,
+            tp_rank=tp_rank,
+            recurrent_dtype=self.config.hybrid_recurrent_cache_dtype,
+            conv_dtype=self.config.hybrid_conv_cache_dtype,
+            allow_residual_replay=self.config.hybrid_apc_allow_residual_replay,
+        )
+        self.hybrid_apc_slot_allocator = HybridAPCSlotAllocator(
+            self.config.max_gdn_checkpoint_slots
+        )
+        self.hybrid_apc_bridge = HybridAPCSchedulerBridge(
+            store=self.hybrid_apc_store,
+            slot_allocator=self.hybrid_apc_slot_allocator,
+            cache_salt=self.config.hybrid_apc_cache_salt,
+            model_revision=self.config.hybrid_apc_model_revision,
+            layout_version=self.config.hybrid_apc_layout_version,
+            tp_rank=tp_rank,
+            recurrent_dtype=self.config.hybrid_recurrent_cache_dtype,
+            conv_dtype=self.config.hybrid_conv_cache_dtype,
+        )
+
+    def on_attention_block_evicted(self, block_ref: int):
+        if self.hybrid_apc_store is None:
+            return []
+        return self.hybrid_apc_store.on_attention_block_evicted(block_ref)
 
     def get_model_wrapper_cls(self):
         """Return custom ModelWrapper with DeltaNet state aliasing."""

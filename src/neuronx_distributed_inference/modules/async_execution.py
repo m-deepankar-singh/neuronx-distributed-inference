@@ -43,6 +43,21 @@ def _to_python_int(value: Any) -> int:
     return int(value)
 
 
+def _single_batch_value(value: Any):
+    if value is None:
+        return None
+    if isinstance(value, torch.Tensor):
+        flat = value.reshape(-1)
+        if flat.numel() != 1:
+            return None
+        return flat[0]
+    return value
+
+
+def _single_batch_tensor(value: Any) -> bool:
+    return isinstance(value, torch.Tensor) and value.ndim >= 1 and value.shape[0] == 1
+
+
 def _get_hybrid_apc_bridge(
     neuron_base_instance: "NeuronBaseForCausalLM",
     input_dict: Dict[str, Any],
@@ -76,11 +91,19 @@ def prepare_hybrid_apc_request_for_execution(
         input_dict.get("hybrid_request_id"),
         input_dict.get("request_id"),
     )
+    if request_id is None:
+        seq_id = _single_batch_value(input_dict.get("seq_ids"))
+        if seq_id is not None:
+            request_id = ("seq_id", _to_python_int(seq_id))
+
     attention_hit_len = _first_present(
         input_dict.get("vllm_attention_hit_len"),
         input_dict.get("hybrid_attention_hit_len"),
         input_dict.get("attention_hit_len"),
     )
+    if attention_hit_len is None:
+        attention_hit_len = _single_batch_value(input_dict.get("computed_context_lens"))
+
     if request_id is None and attention_hit_len is None:
         return input_dict
     if request_id is None:
@@ -88,16 +111,62 @@ def prepare_hybrid_apc_request_for_execution(
     if attention_hit_len is None:
         raise ValueError("hybrid APC request prep requires attention hit length")
 
+    request_prefix_len = _first_present(
+        input_dict.get("request_prefix_len"),
+        input_dict.get("hybrid_request_prefix_len"),
+        input_dict.get("prompt_len"),
+        _single_batch_value(input_dict.get("full_context_lens")),
+    )
+    if request_prefix_len is not None:
+        request_prefix_len = _to_python_int(request_prefix_len)
+
+    cumulative_hashes_by_prefix_len = _first_present(
+        input_dict.get("vllm_or_local_prefix_hashes"),
+        input_dict.get("cumulative_hashes_by_prefix_len"),
+        input_dict.get("hybrid_cumulative_hashes_by_prefix_len"),
+    )
+    full_input_ids = _first_present(
+        input_dict.get("hybrid_full_input_ids"),
+        input_dict.get("full_input_ids"),
+        input_dict.get("prompt_input_ids"),
+    )
+    bridge_input_dict = input_dict
+    if full_input_ids is not None:
+        if not _single_batch_tensor(full_input_ids):
+            return input_dict
+        bridge_input_dict = dict(input_dict)
+        bridge_input_dict["input_ids"] = full_input_ids
+        for source_key, target_key in (
+            ("hybrid_full_attention_mask", "attention_mask"),
+            ("full_attention_mask", "attention_mask"),
+            ("hybrid_full_position_ids", "position_ids"),
+            ("full_position_ids", "position_ids"),
+            ("hybrid_full_slot_mapping", "slot_mapping"),
+            ("full_slot_mapping", "slot_mapping"),
+        ):
+            value = input_dict.get(source_key)
+            if value is not None:
+                bridge_input_dict[target_key] = value
+    elif request_prefix_len is not None:
+        input_ids = input_dict.get("input_ids")
+        if (
+            isinstance(input_ids, torch.Tensor)
+            and input_ids.ndim >= 2
+            and input_ids.shape[1] < request_prefix_len
+        ):
+            # The live prefix-caching request has already been sliced to the
+            # attention suffix. Without full prompt tokens the bridge cannot
+            # compute or apply an exact GDN checkpoint boundary.
+            return input_dict
+    if not _single_batch_tensor(bridge_input_dict.get("input_ids")):
+        return input_dict
+
     prepared = bridge.prepare_request(
         request_id=request_id,
-        input_dict=input_dict,
+        input_dict=bridge_input_dict,
         attention_hit_len=_to_python_int(attention_hit_len),
-        request_prefix_len=input_dict.get("request_prefix_len"),
-        cumulative_hashes_by_prefix_len=_first_present(
-            input_dict.get("vllm_or_local_prefix_hashes"),
-            input_dict.get("cumulative_hashes_by_prefix_len"),
-            input_dict.get("hybrid_cumulative_hashes_by_prefix_len"),
-        ),
+        request_prefix_len=request_prefix_len,
+        cumulative_hashes_by_prefix_len=cumulative_hashes_by_prefix_len,
         attention_block_refs_by_prefix_len=_first_present(
             input_dict.get("attention_block_refs"),
             input_dict.get("attention_block_refs_by_prefix_len"),

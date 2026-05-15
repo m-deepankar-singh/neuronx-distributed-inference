@@ -406,6 +406,86 @@ class TestHybridAPCAsyncBridge(unittest.TestCase):
         self.assertEqual(bridge.cancelled[0].request_id, "req-1")
         self.assertNotIn("_hybrid_apc_prepared", input_dict)
 
+    def test_prefix_caching_execution_uses_model_registered_bridge_and_derived_hit(self):
+        bridge = _FakeHybridBridge()
+        base = SimpleNamespace(
+            config=SimpleNamespace(use_hybrid_apc_manager=True),
+            neuron_config=SimpleNamespace(
+                enable_fused_speculation=False,
+                enable_eagle_speculation=False,
+            ),
+            hybrid_apc_bridge=bridge,
+        )
+        model = _FakePrefixModel()
+        input_dict = _prefix_input_dict()
+
+        result, is_neuron = execute_model_prefix_caching(base, model, input_dict)
+
+        self.assertEqual(result, "model-output")
+        self.assertFalse(is_neuron)
+        self.assertEqual(bridge.prepare_kwargs["request_id"], ("seq_id", 0))
+        self.assertEqual(bridge.prepare_kwargs["attention_hit_len"], 0)
+
+    def test_prefix_caching_execution_uses_full_prompt_tokens_for_suffix_request(self):
+        bridge = _FakeHybridBridge()
+        base = SimpleNamespace(
+            config=SimpleNamespace(use_hybrid_apc_manager=True),
+            neuron_config=SimpleNamespace(
+                enable_fused_speculation=False,
+                enable_eagle_speculation=False,
+            ),
+            hybrid_apc_bridge=bridge,
+        )
+        model = _FakePrefixModel()
+        input_dict = _prefix_input_dict()
+        input_dict["input_ids"] = torch.tensor([[12, 13]], dtype=torch.int32)
+        input_dict["attention_mask"] = torch.ones((1, 2), dtype=torch.int32)
+        input_dict["position_ids"] = torch.tensor([[2, 3]], dtype=torch.int32)
+        input_dict["slot_mapping"] = torch.tensor([[2, 3]], dtype=torch.int32)
+        input_dict["computed_context_lens"] = torch.tensor([[2]], dtype=torch.int32)
+        input_dict["hybrid_full_input_ids"] = torch.tensor(
+            [[10, 11, 12, 13]],
+            dtype=torch.int32,
+        )
+
+        execute_model_prefix_caching(base, model, input_dict)
+
+        self.assertTrue(
+            torch.equal(
+                bridge.prepare_kwargs["input_dict"]["input_ids"],
+                torch.tensor([[10, 11, 12, 13]], dtype=torch.int32),
+            )
+        )
+        self.assertEqual(bridge.prepare_kwargs["attention_hit_len"], 2)
+
+    def test_prefix_caching_execution_skips_hybrid_apc_for_suffix_without_full_prompt(self):
+        bridge = _FakeHybridBridge()
+        base = SimpleNamespace(
+            config=SimpleNamespace(use_hybrid_apc_manager=True),
+            neuron_config=SimpleNamespace(
+                enable_fused_speculation=False,
+                enable_eagle_speculation=False,
+            ),
+            hybrid_apc_bridge=bridge,
+        )
+        model = _FakePrefixModel()
+        input_dict = _prefix_input_dict()
+        input_dict["input_ids"] = torch.tensor([[12, 13]], dtype=torch.int32)
+        input_dict["attention_mask"] = torch.ones((1, 2), dtype=torch.int32)
+        input_dict["position_ids"] = torch.tensor([[2, 3]], dtype=torch.int32)
+        input_dict["slot_mapping"] = torch.tensor([[2, 3]], dtype=torch.int32)
+        input_dict["computed_context_lens"] = torch.tensor([[2]], dtype=torch.int32)
+
+        execute_model_prefix_caching(base, model, input_dict)
+
+        self.assertIsNone(bridge.prepare_kwargs)
+        self.assertTrue(
+            torch.equal(
+                model.calls[0][0],
+                torch.tensor([[12, 13]], dtype=torch.int32),
+            )
+        )
+
     def test_cancel_hybrid_apc_request_is_noop_without_prepared_request(self):
         input_dict = {}
 
