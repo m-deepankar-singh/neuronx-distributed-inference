@@ -436,6 +436,19 @@ class TestHybridAPCPrefillPlanInputs(unittest.TestCase):
 
 
 class TestHybridAPCSchedulerBridge(unittest.TestCase):
+    def test_slot_allocator_validates_lifecycle(self):
+        allocator = HybridAPCSlotAllocator(num_slots=2)
+
+        with self.assertRaisesRegex(ValueError, "outside"):
+            allocator.validate_slot_range(2)
+        with self.assertRaisesRegex(ValueError, "not reserved"):
+            allocator.mark_committed(1)
+
+        slot = allocator.reserve()
+        allocator.mark_committed(slot)
+
+        self.assertEqual(allocator.committed_slots, (slot,))
+
     def test_cumulative_prefix_hash_includes_parent_prefix(self):
         tokens_a = torch.tensor([[1, 2, 3, 4]], dtype=torch.int32)
         tokens_b = torch.tensor([[9, 8, 3, 4]], dtype=torch.int32)

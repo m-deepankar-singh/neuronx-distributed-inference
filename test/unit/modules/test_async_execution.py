@@ -331,6 +331,50 @@ class TestHybridAPCAsyncBridge(unittest.TestCase):
         self.assertTrue(torch.equal(args[10], torch.tensor([0], dtype=torch.int32)))
         self.assertTrue(torch.equal(args[11], torch.tensor([256], dtype=torch.int32)))
 
+    def test_bridge_rejects_active_slot_out_of_range(self):
+        base = SimpleNamespace(
+            config=SimpleNamespace(
+                use_hybrid_apc_manager=True,
+                max_gdn_checkpoint_slots=2,
+            )
+        )
+        input_dict = {
+            "seq_ids": torch.tensor([0], dtype=torch.int32),
+            "hybrid_restore_slot_ids": torch.tensor([2], dtype=torch.int32),
+            "hybrid_restore_mask": torch.tensor([1], dtype=torch.int32),
+        }
+
+        with self.assertRaisesRegex(ValueError, "outside \\[0, 2\\)"):
+            prepare_hybrid_apc_model_inputs(base, input_dict)
+
+    def test_bridge_validates_active_slots_against_allocator(self):
+        base = SimpleNamespace(
+            config=SimpleNamespace(
+                use_hybrid_apc_manager=True,
+                max_gdn_checkpoint_slots=10,
+            ),
+            hybrid_apc_slot_allocator=SimpleNamespace(
+                committed_slots=(5,),
+                reserved_slots=(7,),
+            ),
+        )
+        input_dict = {
+            "seq_ids": torch.tensor([0], dtype=torch.int32),
+            "computed_context_lens": torch.tensor([[128]], dtype=torch.int32),
+            "hybrid_restore_slot_ids": torch.tensor([5], dtype=torch.int32),
+            "hybrid_restore_mask": torch.tensor([1], dtype=torch.int32),
+            "hybrid_commit_slot_ids": torch.tensor([7], dtype=torch.int32),
+            "hybrid_commit_mask": torch.tensor([1], dtype=torch.int32),
+        }
+
+        args = prepare_hybrid_apc_model_inputs(base, input_dict)
+        self.assertTrue(torch.equal(args[9], torch.tensor([5], dtype=torch.int32)))
+        self.assertTrue(torch.equal(args[12], torch.tensor([7], dtype=torch.int32)))
+
+        input_dict["hybrid_commit_slot_ids"] = torch.tensor([6], dtype=torch.int32)
+        with self.assertRaisesRegex(ValueError, "not a reserved checkpoint slot"):
+            prepare_hybrid_apc_model_inputs(base, input_dict)
+
     def test_prefix_caching_execution_prepares_and_finishes_hybrid_apc(self):
         base = SimpleNamespace(
             config=SimpleNamespace(use_hybrid_apc_manager=True),

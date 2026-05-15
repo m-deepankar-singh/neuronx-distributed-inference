@@ -253,6 +253,73 @@ def cancel_hybrid_apc_request(input_dict: Dict[str, Any]):
         bridge.cancel_request(prepared)
 
 
+def _active_hybrid_apc_slots(
+    slot_ids: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    name: str,
+) -> list[int]:
+    slot_ids = slot_ids.reshape(-1).to(torch.int64)
+    mask = mask.reshape(-1).to(torch.bool)
+    if slot_ids.shape != mask.shape:
+        raise ValueError(f"{name} slot ids and mask must have matching shape")
+    return [int(slot.item()) for slot in slot_ids[mask]]
+
+
+def _validate_hybrid_apc_slot_inputs(
+    neuron_base_instance: "NeuronBaseForCausalLM",
+    *,
+    restore_slot_ids: torch.Tensor,
+    restore_mask: torch.Tensor,
+    commit_slot_ids: torch.Tensor,
+    commit_mask: torch.Tensor,
+):
+    """Validate active checkpoint slots before the traced model clamps them."""
+
+    active_restore_slots = _active_hybrid_apc_slots(
+        restore_slot_ids,
+        restore_mask,
+        name="hybrid restore",
+    )
+    active_commit_slots = _active_hybrid_apc_slots(
+        commit_slot_ids,
+        commit_mask,
+        name="hybrid commit",
+    )
+    if not active_restore_slots and not active_commit_slots:
+        return
+
+    max_slots = getattr(neuron_base_instance.config, "max_gdn_checkpoint_slots", None)
+    if max_slots is not None:
+        max_slots = int(max_slots)
+        for kind, slots in (
+            ("restore", active_restore_slots),
+            ("commit", active_commit_slots),
+        ):
+            for slot in slots:
+                if slot < 0 or slot >= max_slots:
+                    raise ValueError(
+                        f"hybrid APC {kind} slot {slot} is outside [0, {max_slots})"
+                    )
+
+    allocator = getattr(neuron_base_instance, "hybrid_apc_slot_allocator", None)
+    if allocator is None:
+        return
+
+    committed_slots = set(getattr(allocator, "committed_slots", ()))
+    reserved_slots = set(getattr(allocator, "reserved_slots", ()))
+    for slot in active_restore_slots:
+        if slot not in committed_slots:
+            raise ValueError(
+                f"hybrid APC restore slot {slot} is not a committed checkpoint slot"
+            )
+    for slot in active_commit_slots:
+        if slot not in reserved_slots:
+            raise ValueError(
+                f"hybrid APC commit slot {slot} is not a reserved checkpoint slot"
+            )
+
+
 def prepare_hybrid_apc_model_inputs(
     neuron_base_instance: "NeuronBaseForCausalLM",
     input_dict: Dict[str, Any],
@@ -319,6 +386,14 @@ def prepare_hybrid_apc_model_inputs(
         )
     else:
         commit_mask = torch.zeros((batch_size,), dtype=torch.int32)
+
+    _validate_hybrid_apc_slot_inputs(
+        neuron_base_instance,
+        restore_slot_ids=restore_slot_ids,
+        restore_mask=restore_mask,
+        commit_slot_ids=commit_slot_ids,
+        commit_mask=commit_mask,
+    )
 
     llava_args = input_dict.get("llava_args") or []
     rotary_position_id = _first_present(

@@ -398,6 +398,7 @@ class HybridAPCSlotAllocator:
         num_slots = int(num_slots)
         if num_slots <= 0:
             raise ValueError(f"num_slots must be positive, got {num_slots}")
+        self.num_slots = num_slots
         self._free = deque(range(num_slots))
         self._reserved: set[int] = set()
         self._committed: set[int] = set()
@@ -423,16 +424,28 @@ class HybridAPCSlotAllocator:
 
     def mark_committed(self, slot: int):
         slot = int(slot)
+        self.validate_slot_range(slot)
+        if slot not in self._reserved and slot not in self._committed:
+            raise ValueError(f"hybrid APC checkpoint slot {slot} is not reserved")
         self._reserved.discard(slot)
         self._committed.add(slot)
 
     def release(self, slot: int):
         slot = int(slot)
+        self.validate_slot_range(slot)
         was_known = slot in self._reserved or slot in self._committed
         self._reserved.discard(slot)
         self._committed.discard(slot)
         if was_known and slot not in self._free:
             self._free.append(slot)
+
+    def validate_slot_range(self, slot: int):
+        slot = int(slot)
+        if slot < 0 or slot >= self.num_slots:
+            raise ValueError(
+                f"hybrid APC checkpoint slot {slot} is outside "
+                f"[0, {self.num_slots})"
+            )
 
 
 class HybridAPCSchedulerBridge:
@@ -523,6 +536,8 @@ class HybridAPCSchedulerBridge:
             recurrent_dtype=self.recurrent_dtype,
             conv_dtype=self.conv_dtype,
         )
+        if plan.checkpoint_slot is not None:
+            self.slot_allocator.validate_slot_range(plan.checkpoint_slot)
 
         commit_key = None
         commit_slot = None
