@@ -31,7 +31,7 @@ import math
 import logging
 import os
 import sys
-from typing import List, Optional, Tuple
+from typing import List, NamedTuple, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -228,6 +228,106 @@ def get_rmsnorm_cls():
 
 def l2norm(x, dim=-1, eps=1e-6):
     return F.normalize(x, p=2, dim=dim, eps=eps)
+
+
+class GDNAPCReusePlan(NamedTuple):
+    """Exact hybrid-APC reuse plan for attention KV plus GDN checkpoints."""
+
+    attention_hit_len: int
+    recurrent_hit_len: int
+    conv_hit_len: int
+    reusable_prefix_len: int
+    restore_checkpoint_prefix_len: int
+    residual_replay_len: int
+    suffix_len: int
+
+
+def _non_negative_len(name: str, value: int) -> int:
+    value = int(value)
+    if value < 0:
+        raise ValueError(f"{name} must be non-negative, got {value}")
+    return value
+
+
+def _normalize_hybrid_cache_dtype(name: str, value, default: str) -> str:
+    if value is None:
+        value = default
+    if isinstance(value, torch.dtype):
+        if value == torch.float32:
+            return "float32"
+        if value == torch.bfloat16:
+            return "bfloat16"
+    normalized = str(value).lower()
+    aliases = {
+        "fp32": "float32",
+        "float32": "float32",
+        "torch.float32": "float32",
+        "bf16": "bfloat16",
+        "bfloat16": "bfloat16",
+        "torch.bfloat16": "bfloat16",
+    }
+    if normalized not in aliases:
+        raise ValueError(
+            f"{name} must be one of fp32/float32 or bf16/bfloat16, got {value}"
+        )
+    return aliases[normalized]
+
+
+def _torch_dtype_from_hybrid_cache_dtype(value: str) -> torch.dtype:
+    value = _normalize_hybrid_cache_dtype("hybrid cache dtype", value, "bfloat16")
+    if value == "float32":
+        return torch.float32
+    if value == "bfloat16":
+        return torch.bfloat16
+    raise AssertionError(f"unexpected hybrid cache dtype {value}")
+
+
+def plan_gdn_apc_reuse(
+    *,
+    attention_hit_len: int,
+    recurrent_hit_len: int,
+    conv_hit_len: int,
+    request_prefix_len: int,
+    gdn_checkpoint_interval: int,
+) -> GDNAPCReusePlan:
+    """Plan exact prefix reuse for Qwen hybrid APC.
+
+    Attention KV can be reused up to the vLLM APC hit, but DeltaNet can only
+    resume exactly from a boundary with both recurrent and conv checkpoint
+    state. When the attention hit is inside a GDN interval, restore the nearest
+    earlier checkpoint and replay the residual tokens before running the suffix.
+    """
+    attention_hit_len = _non_negative_len("attention_hit_len", attention_hit_len)
+    recurrent_hit_len = _non_negative_len("recurrent_hit_len", recurrent_hit_len)
+    conv_hit_len = _non_negative_len("conv_hit_len", conv_hit_len)
+    request_prefix_len = _non_negative_len("request_prefix_len", request_prefix_len)
+    gdn_checkpoint_interval = int(gdn_checkpoint_interval)
+    if gdn_checkpoint_interval <= 0:
+        raise ValueError(
+            f"gdn_checkpoint_interval must be positive, got {gdn_checkpoint_interval}"
+        )
+
+    reusable_prefix_len = min(
+        attention_hit_len,
+        recurrent_hit_len,
+        conv_hit_len,
+        request_prefix_len,
+    )
+    restore_checkpoint_prefix_len = (
+        reusable_prefix_len // gdn_checkpoint_interval
+    ) * gdn_checkpoint_interval
+    residual_replay_len = reusable_prefix_len - restore_checkpoint_prefix_len
+    suffix_len = request_prefix_len - reusable_prefix_len
+
+    return GDNAPCReusePlan(
+        attention_hit_len=attention_hit_len,
+        recurrent_hit_len=recurrent_hit_len,
+        conv_hit_len=conv_hit_len,
+        reusable_prefix_len=reusable_prefix_len,
+        restore_checkpoint_prefix_len=restore_checkpoint_prefix_len,
+        residual_replay_len=residual_replay_len,
+        suffix_len=suffix_len,
+    )
 
 
 # ============================================================
@@ -1212,10 +1312,62 @@ class Qwen35InferenceConfig(InferenceConfig):
         kwargs.setdefault("linear_value_head_dim", 128)
         kwargs.setdefault("linear_conv_kernel_dim", 4)
         kwargs.setdefault("use_hybrid_cache_manager", False)
+        kwargs.setdefault("use_hybrid_apc_manager", False)
         kwargs.setdefault("use_qwen_hybrid_chunked_prefill", False)
         kwargs.setdefault("use_qwen_hybrid_chunked_prefill_nki", False)
+        kwargs.setdefault("gdn_checkpoint_interval", 256)
+        kwargs.setdefault(
+            "hybrid_recurrent_cache_dtype",
+            kwargs.get("gdn_recurrent_cache_dtype", "float32"),
+        )
+        kwargs.setdefault(
+            "hybrid_conv_cache_dtype",
+            kwargs.get("gdn_conv_cache_dtype", "bfloat16"),
+        )
+        kwargs.setdefault(
+            "gdn_recurrent_cache_dtype", kwargs["hybrid_recurrent_cache_dtype"]
+        )
+        kwargs.setdefault("gdn_conv_cache_dtype", kwargs["hybrid_conv_cache_dtype"])
+        kwargs.setdefault("hybrid_cache_mode", "all")
+        kwargs.setdefault(
+            "hybrid_cache_prefix_boundary_only",
+            kwargs.get("hybrid_cache_block_boundary_only", True),
+        )
+        kwargs.setdefault(
+            "hybrid_cache_block_boundary_only",
+            kwargs["hybrid_cache_prefix_boundary_only"],
+        )
+        kwargs.setdefault("hybrid_cache_validate_exact", False)
 
         super().__init__(*args, **kwargs)
+
+        self.gdn_checkpoint_interval = int(self.gdn_checkpoint_interval)
+        if self.gdn_checkpoint_interval <= 0:
+            raise ValueError(
+                "gdn_checkpoint_interval must be positive, "
+                f"got {self.gdn_checkpoint_interval}"
+            )
+        self.hybrid_recurrent_cache_dtype = _normalize_hybrid_cache_dtype(
+            "hybrid_recurrent_cache_dtype",
+            self.hybrid_recurrent_cache_dtype,
+            "float32",
+        )
+        self.hybrid_conv_cache_dtype = _normalize_hybrid_cache_dtype(
+            "hybrid_conv_cache_dtype",
+            self.hybrid_conv_cache_dtype,
+            "bfloat16",
+        )
+        self.gdn_recurrent_cache_dtype = self.hybrid_recurrent_cache_dtype
+        self.gdn_conv_cache_dtype = self.hybrid_conv_cache_dtype
+        self.hybrid_cache_block_boundary_only = (
+            self.hybrid_cache_prefix_boundary_only
+        )
+        if self.use_hybrid_cache_manager and self.use_hybrid_apc_manager:
+            raise ValueError(
+                "use_hybrid_cache_manager and use_hybrid_apc_manager are mutually exclusive"
+            )
+        if self.use_hybrid_apc_manager and self.hybrid_cache_mode != "all":
+            raise ValueError("use_hybrid_apc_manager requires hybrid_cache_mode='all'")
 
         # Attention output gate
         self.attn_output_gate = getattr(self, "attn_output_gate", True)
@@ -1503,6 +1655,11 @@ class NeuronQwen35Attention(NeuronAttentionBase):
         k_cache, v_cache = past_key_value
         B, q_heads, q_len, head_dim = Q.shape
         kv_heads = K.shape[1]
+        if k_cache.shape[0] != B:
+            # The cache is allocated at kv_cache_batch_size, while CTE can trace a
+            # smaller active batch. Keep attention reshapes on the active batch.
+            k_cache = k_cache[:B]
+            v_cache = v_cache[:B]
         cache_len = k_cache.shape[2]
 
         pos = position_ids.long()
@@ -1762,7 +1919,14 @@ class NeuronQwen35DecoderLayer(nn.Module):
 
 
 class HybridDeltaNetCacheManager(KVCacheManager):
-    """Layer-type-aware cache manager for Qwen3.5/Qwen3.6 hybrid dense models."""
+    """Opt-in local/static cache manager for Qwen hybrid dense models.
+
+    This manager stores DeltaNet recurrent/conv state by batch row and delegates
+    full-attention layers to the legacy KV manager. It is intentionally not a
+    production vLLM APC manager: block ownership, prefix hashes, refcounts,
+    eviction, continuous batching, and tenant isolation must remain in the
+    vLLM/NxDI block-cache lifecycle.
+    """
 
     def __init__(self, config: Qwen35InferenceConfig, num_kv_head, **kwargs):
         self.layer_types = list(config.layer_types)
@@ -1775,6 +1939,12 @@ class HybridDeltaNetCacheManager(KVCacheManager):
             else config.neuron_config.torch_dtype
         )
         cache_dtype = getattr(self, "cache_dtype", dtype)
+        recurrent_cache_dtype = _torch_dtype_from_hybrid_cache_dtype(
+            config.hybrid_recurrent_cache_dtype
+        )
+        conv_cache_dtype = _torch_dtype_from_hybrid_cache_dtype(
+            config.hybrid_conv_cache_dtype
+        )
         max_batch_size = (
             config.neuron_config.kv_cache_batch_size
             + config.neuron_config.kv_cache_padding_size
@@ -1812,10 +1982,16 @@ class HybridDeltaNetCacheManager(KVCacheManager):
         for layer_idx, layer_type in enumerate(self.layer_types):
             if layer_type == "linear_attention":
                 params.append(
-                    nn.Parameter(torch.zeros(recurrent_shape, dtype=dtype), requires_grad=False)
+                    nn.Parameter(
+                        torch.zeros(recurrent_shape, dtype=recurrent_cache_dtype),
+                        requires_grad=False,
+                    )
                 )
                 params.append(
-                    nn.Parameter(torch.zeros(conv_shape, dtype=dtype), requires_grad=False)
+                    nn.Parameter(
+                        torch.zeros(conv_shape, dtype=conv_cache_dtype),
+                        requires_grad=False,
+                    )
                 )
             else:
                 k_shape = self.k_shapes[layer_idx] if hasattr(self, "k_shapes") else self.k_shape
@@ -2112,6 +2288,12 @@ class NeuronQwen35Model(NeuronBaseModel):
 
     def init_inference_optimization(self, config: Qwen35InferenceConfig):
         super().init_inference_optimization(config)
+        if getattr(config, "use_hybrid_apc_manager", False):
+            raise NotImplementedError(
+                "use_hybrid_apc_manager is a guarded production-mode flag. "
+                "The vLLM/NxDI block-hash lifecycle must be wired to GDN "
+                "recurrent and conv checkpoints before it can be enabled."
+            )
         if getattr(config, "use_hybrid_cache_manager", False):
             self.kv_mgr = HybridDeltaNetCacheManager(
                 config,

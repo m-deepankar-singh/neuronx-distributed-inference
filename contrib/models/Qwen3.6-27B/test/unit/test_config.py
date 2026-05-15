@@ -143,6 +143,46 @@ class TestDeltaNetConfig(unittest.TestCase):
         config = _make_config()
         self.assertEqual(config.linear_conv_kernel_dim, 4)
 
+    def test_gdn_apc_checkpoint_defaults(self):
+        config = _make_config()
+        self.assertFalse(config.use_hybrid_cache_manager)
+        self.assertFalse(config.use_hybrid_apc_manager)
+        self.assertEqual(config.gdn_checkpoint_interval, 256)
+        self.assertEqual(config.gdn_recurrent_cache_dtype, "float32")
+        self.assertEqual(config.gdn_conv_cache_dtype, "bfloat16")
+        self.assertEqual(config.hybrid_recurrent_cache_dtype, "float32")
+        self.assertEqual(config.hybrid_conv_cache_dtype, "bfloat16")
+        self.assertEqual(config.hybrid_cache_mode, "all")
+        self.assertTrue(config.hybrid_cache_prefix_boundary_only)
+        self.assertTrue(config.hybrid_cache_block_boundary_only)
+
+    def test_gdn_checkpoint_interval_must_be_positive(self):
+        with self.assertRaisesRegex(ValueError, "gdn_checkpoint_interval"):
+            _make_config(gdn_checkpoint_interval=0)
+
+    def test_hybrid_cache_dtype_aliases_are_normalized(self):
+        config = _make_config(
+            hybrid_recurrent_cache_dtype="fp32",
+            hybrid_conv_cache_dtype="bf16",
+        )
+        self.assertEqual(config.hybrid_recurrent_cache_dtype, "float32")
+        self.assertEqual(config.hybrid_conv_cache_dtype, "bfloat16")
+
+    def test_hybrid_cache_dtype_rejects_fp8(self):
+        with self.assertRaisesRegex(ValueError, "hybrid_recurrent_cache_dtype"):
+            _make_config(hybrid_recurrent_cache_dtype="fp8")
+
+    def test_hybrid_apc_rejects_non_all_mode(self):
+        with self.assertRaisesRegex(ValueError, "hybrid_cache_mode='all'"):
+            _make_config(use_hybrid_apc_manager=True, hybrid_cache_mode="align")
+
+    def test_static_and_apc_managers_are_mutually_exclusive(self):
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+            _make_config(
+                use_hybrid_cache_manager=True,
+                use_hybrid_apc_manager=True,
+            )
+
 
 class TestRoPEConfig(unittest.TestCase):
     """Test partial RoPE configuration."""

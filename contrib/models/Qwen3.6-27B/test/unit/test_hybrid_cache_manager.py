@@ -14,7 +14,11 @@ if _CONTRIB_ROOT not in sys.path:
     sys.path.insert(0, _CONTRIB_ROOT)
 
 from neuronx_distributed_inference.models.config import NeuronConfig
-from src.modeling_qwen35 import HybridDeltaNetCacheManager, Qwen35InferenceConfig
+from src.modeling_qwen35 import (
+    HybridDeltaNetCacheManager,
+    Qwen35InferenceConfig,
+    plan_gdn_apc_reuse,
+)
 
 
 def _make_config(**overrides):
@@ -84,6 +88,8 @@ class TestHybridDeltaNetCacheManager(unittest.TestCase):
         self.assertEqual(len(mgr.past_key_values), config.num_hidden_layers * 2)
         self.assertEqual(list(mgr.past_key_values[0].shape), [2, 48, 128, 128])
         self.assertEqual(list(mgr.past_key_values[1].shape), [2, 10240, 3])
+        self.assertEqual(mgr.past_key_values[0].dtype, torch.float32)
+        self.assertEqual(mgr.past_key_values[1].dtype, torch.bfloat16)
         self.assertEqual(mgr.layer_types[3], "full_attention")
         self.assertEqual(mgr.past_key_values[6].dim(), 4)
         self.assertEqual(mgr.past_key_values[7].shape[2], 16)
@@ -269,8 +275,10 @@ class TestHybridDeltaNetCacheManager(unittest.TestCase):
 
     def test_rejects_unsupported_hybrid_modes(self):
         unsupported_cases = [
+            ({"is_block_kv_layout": True}, "block KV layout"),
             ({"padding_side": "left"}, "left padding"),
             ({"flash_decoding_enabled": True}, "flash decoding"),
+            ({"is_continuous_batching": True}, "continuous batching"),
         ]
 
         for neuron_overrides, expected_error in unsupported_cases:
@@ -308,6 +316,53 @@ class TestHybridDeltaNetCacheManager(unittest.TestCase):
     def test_legacy_config_default_is_disabled(self):
         config = _make_config(use_hybrid_cache_manager=False)
         self.assertFalse(config.use_hybrid_cache_manager)
+
+    def test_gdn_apc_plan_uses_intersection_across_state_families(self):
+        plan = plan_gdn_apc_reuse(
+            attention_hit_len=2048,
+            recurrent_hit_len=1536,
+            conv_hit_len=1792,
+            request_prefix_len=2304,
+            gdn_checkpoint_interval=256,
+        )
+
+        self.assertEqual(plan.reusable_prefix_len, 1536)
+        self.assertEqual(plan.restore_checkpoint_prefix_len, 1536)
+        self.assertEqual(plan.residual_replay_len, 0)
+        self.assertEqual(plan.suffix_len, 768)
+
+    def test_gdn_apc_plan_replays_residual_after_prior_checkpoint(self):
+        plan = plan_gdn_apc_reuse(
+            attention_hit_len=1152,
+            recurrent_hit_len=1152,
+            conv_hit_len=1152,
+            request_prefix_len=1408,
+            gdn_checkpoint_interval=256,
+        )
+
+        self.assertEqual(plan.reusable_prefix_len, 1152)
+        self.assertEqual(plan.restore_checkpoint_prefix_len, 1024)
+        self.assertEqual(plan.residual_replay_len, 128)
+        self.assertEqual(plan.suffix_len, 256)
+
+    def test_gdn_apc_plan_validates_lengths(self):
+        with self.assertRaisesRegex(ValueError, "gdn_checkpoint_interval"):
+            plan_gdn_apc_reuse(
+                attention_hit_len=1,
+                recurrent_hit_len=1,
+                conv_hit_len=1,
+                request_prefix_len=1,
+                gdn_checkpoint_interval=0,
+            )
+
+        with self.assertRaisesRegex(ValueError, "attention_hit_len"):
+            plan_gdn_apc_reuse(
+                attention_hit_len=-1,
+                recurrent_hit_len=1,
+                conv_hit_len=1,
+                request_prefix_len=1,
+                gdn_checkpoint_interval=256,
+            )
 
 
 if __name__ == "__main__":

@@ -30,6 +30,57 @@ using the current AWS guide, then run the contrib registry patch below.
   `NEURON_COMPILED_ARTIFACTS`.
 - Run a short OpenAI-compatible smoke prompt.
 
+## Hybrid APC Production Boundary
+
+Qwen3.6-27B is a hybrid model, so attention prefix caching alone is not a
+complete production APC contract. The current stack has strong serving
+primitives for attention-only models: block KV, block tables, slot mapping,
+prefix caching, continuous batching, chunked prefill, and decode. For hybrid
+attention plus GDN recurrence, the attention KV path is production-shaped, but
+the GDN state path is still model-specific glue.
+
+Current readiness:
+
+| Layer | Current support | Production readiness |
+| --- | ---: | ---: |
+| Attention KV cache | Good | High on the existing NxDI/vLLM block-KV path |
+| vLLM APC for attention blocks | Working baseline | Medium/high |
+| GDN recurrent state cache | Implemented locally | Low/medium |
+| GDN conv state cache | Implemented locally | Low/medium |
+| Hybrid APC across attention + GDN | Not fully implemented | Low |
+| Continuous batching with exact hybrid prefix reuse | Not supported by the local manager | Low |
+| Speculation, FP8 cache, tiling, flash decode with hybrid state | Explicitly rejected by the local manager | Low |
+
+The `HybridDeltaNetCacheManager` is therefore a contrib-local static/stateful
+cache manager, not a production hybrid APC manager. It proves the model can
+preserve recurrent and conv state, but it is batch-row based rather than
+vLLM block-hash, refcount, eviction, and tenant-isolation based.
+
+Production hybrid APC must define the usable prefix as the intersection of:
+
+1. attention KV block hit;
+2. GDN recurrent prefix-boundary checkpoint hit;
+3. GDN conv prefix-boundary checkpoint hit.
+
+For each GDN layer, the reusable checkpoint object needs:
+
+```text
+recurrent_state: [local_value_heads, key_dim, value_dim]
+conv_state:      [conv_dim, conv_kernel_size - 1]
+```
+
+The recurrent state should stay FP32 for exact cold-vs-warm agreement until
+BF16 equivalence is proven. Conv state can follow the model-compatible dtype,
+but exactness still needs token-level validation. If the attention APC hit lands
+inside a GDN checkpoint interval, restore the nearest earlier full GDN
+checkpoint, replay the residual tokens, then run the suffix.
+
+The launchers expose `--enable-hybrid-apc` and explicit hybrid cache dtype
+knobs, but the model intentionally treats `use_hybrid_apc_manager=True` as a
+guarded production-mode flag until the vLLM/NxDI cumulative-prefix hash
+lifecycle is wired to GDN prefix-boundary checkpoints. Enabling it before that
+integration should fail loudly rather than silently running attention-only APC.
+
 ## Chunked Prefill Note
 
 The Neuron plugin disables vLLM chunked prefill by default and installs a custom
@@ -106,10 +157,14 @@ contrib/models/Qwen3.6-27B/vllm/start_vllm_server.sh \
   --max-model-len 131072 \
   --seq-len 131072 \
   --cte-bucket 512 \
-  --block-size 256 \
+  --block-size 128 \
   --enable-vllm-chunked-prefill \
   --enable-prefix-caching \
-  --mamba-cache-mode align \
+  --gdn-checkpoint-interval 256 \
+  --hybrid-gdn-recurrent-cache-dtype float32 \
+  --hybrid-gdn-conv-cache-dtype bfloat16 \
+  --mamba-cache-mode all \
+  --mamba-ssm-cache-dtype float32 \
   --port 8000
 ```
 
@@ -118,6 +173,21 @@ Standard vLLM APC reuses attention KV blocks; Qwen3.6 also needs DeltaNet
 recurrent state and conv state at block boundaries. If native APC does not
 produce exact greedy matches and a clear warm-hit speedup, the next step is a
 hybrid APC path that caches those GDN states alongside attention KV.
+
+For APC experiments, do not treat `256` as the only block size. It can be useful
+for long-context amortization, but it is coarse for chat-style prefix reuse.
+Run explicit sweeps at `64` and `128`; include `32` when hit granularity matters
+enough to justify possible block-table/layout overhead. Keep the GDN checkpoint
+interval separate from the attention block size.
+
+Immediate Trainium experiments:
+
+```text
+262K TP=4, block_size=256, CTE buckets [256]
+262K TP=4, block_size=128, CTE buckets [256]
+128K TP=4, block_size=128, CTE buckets [256,512]
+128K TP=4, block_size=256, CTE buckets [256,512]
+```
 
 Production chat proxy:
 
@@ -177,9 +247,9 @@ python validation_scripts/qwen36_vllm_prefix_cache_offline.py \
   --max-model-len 131072 \
   --seq-len 131072 \
   --cte-bucket 512 \
-  --block-size 256 \
+  --block-size 128 \
   --enable-vllm-chunked-prefill \
-  --mamba-cache-mode align
+  --mamba-cache-mode all
 ```
 
 Offline partial-prefix validation:
@@ -192,9 +262,9 @@ python validation_scripts/qwen36_vllm_prefix_cache_partial_offline.py \
   --max-model-len 131072 \
   --seq-len 131072 \
   --cte-bucket 512 \
-  --block-size 256 \
+  --block-size 128 \
   --enable-vllm-chunked-prefill \
-  --mamba-cache-mode align
+  --mamba-cache-mode all
 ```
 
 Server-side prefix-cache validation through the guarded proxy:
@@ -257,6 +327,18 @@ python contrib/models/Qwen3.6-27B/vllm/run_offline_inference.py \
 
 ## Next Milestone
 
-Validate native vLLM prefix caching with the token-exact offline harness. If it
-does not pass, implement hybrid APC by saving/restoring DeltaNet recurrent and
-conv state at block boundaries.
+Harden hybrid APC before optimizing speculative decode or cache quantization.
+The required production contract is a unified prefix-cache object whose
+attention KV, GDN recurrent state, and GDN conv state are jointly addressable,
+evictable, restorable, and exact under continuous batching.
+
+Recommended order:
+
+1. Hybrid APC exactness: cold vs warm greedy token IDs, partial-prefix reuse,
+   multi-hit chat history, continuous batching movement, and eviction pressure.
+2. Dynamic CTE buckets once cache correctness is locked.
+3. Attention block-size sweeps at `64` and `128`, with `32` included for
+   granularity-sensitive chat workloads.
+4. FP8 KV/cache only after the BF16/FP32 baseline is exact.
+5. MTP/spec decode after recurrent-state rollback semantics are explicit.
+6. GDN kernel fusion after serving-state semantics are correct.

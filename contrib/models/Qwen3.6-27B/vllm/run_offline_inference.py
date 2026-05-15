@@ -18,6 +18,10 @@ def _contrib_root(repo_root: str | None) -> Path:
 
 
 def _override_config(args: argparse.Namespace) -> dict:
+    recurrent_cache_dtype = (
+        args.hybrid_gdn_recurrent_cache_dtype or args.gdn_recurrent_cache_dtype
+    )
+    conv_cache_dtype = args.hybrid_gdn_conv_cache_dtype or args.gdn_conv_cache_dtype
     neuron_config = {
         "tp_degree": args.tensor_parallel_size,
         "batch_size": args.max_num_seqs,
@@ -32,11 +36,19 @@ def _override_config(args: argparse.Namespace) -> dict:
         "logical_nc_config": args.logical_nc_config,
         "torch_dtype": "bfloat16",
         "save_sharded_checkpoint": True,
+        "pa_block_size": args.block_size,
     }
+    if (
+        args.enable_prefix_caching
+        or args.enable_hybrid_apc
+        or args.enable_vllm_chunked_prefill
+    ):
+        neuron_config["is_block_kv_layout"] = True
+    if args.enable_prefix_caching or args.enable_hybrid_apc:
+        neuron_config["is_prefix_caching"] = True
     if args.enable_vllm_chunked_prefill:
         neuron_config.update(
             {
-                "is_block_kv_layout": True,
                 "chunked_prefill_config": {
                     "max_num_seqs": args.max_num_seqs,
                     "tkg_model_enabled": True,
@@ -47,6 +59,16 @@ def _override_config(args: argparse.Namespace) -> dict:
         )
     return {
         "max_prompt_length": args.cte_bucket,
+        "use_hybrid_apc_manager": args.enable_hybrid_apc,
+        "gdn_checkpoint_interval": args.gdn_checkpoint_interval,
+        "gdn_recurrent_cache_dtype": recurrent_cache_dtype,
+        "gdn_conv_cache_dtype": conv_cache_dtype,
+        "hybrid_recurrent_cache_dtype": recurrent_cache_dtype,
+        "hybrid_conv_cache_dtype": conv_cache_dtype,
+        "hybrid_cache_mode": args.hybrid_cache_mode,
+        "hybrid_cache_prefix_boundary_only": args.hybrid_cache_prefix_boundary_only,
+        "hybrid_cache_block_boundary_only": args.hybrid_cache_prefix_boundary_only,
+        "hybrid_cache_validate_exact": args.hybrid_cache_validate_exact,
         "override_neuron_config": neuron_config,
     }
 
@@ -60,9 +82,25 @@ def main() -> int:
     parser.add_argument("--chat", action="store_true")
     parser.add_argument("--enable-vllm-chunked-prefill", action="store_true")
     parser.add_argument("--enable-prefix-caching", action="store_true")
+    parser.add_argument("--enable-hybrid-apc", action="store_true")
     parser.add_argument("--mamba-cache-mode", default=None)
     parser.add_argument("--mamba-cache-dtype", default=None)
     parser.add_argument("--mamba-ssm-cache-dtype", default=None)
+    parser.add_argument("--gdn-checkpoint-interval", type=int, default=256)
+    parser.add_argument("--gdn-recurrent-cache-dtype", default="float32")
+    parser.add_argument("--gdn-conv-cache-dtype", default="bfloat16")
+    parser.add_argument("--hybrid-gdn-recurrent-cache-dtype", default=None)
+    parser.add_argument("--hybrid-gdn-conv-cache-dtype", default=None)
+    parser.add_argument("--hybrid-cache-mode", default="all")
+    parser.add_argument(
+        "--hybrid-cache-prefix-boundary-only",
+        "--hybrid-cache-block-boundary-only",
+        dest="hybrid_cache_prefix_boundary_only",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument("--hybrid-cache-validate-exact", action="store_true")
+    parser.add_argument("--num-gpu-blocks-override", type=int, default=None)
     parser.add_argument("--max-tokens", type=int, default=64)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-k", type=int, default=1)
@@ -72,7 +110,7 @@ def main() -> int:
     parser.add_argument("--max-model-len", type=int, default=512)
     parser.add_argument("--seq-len", type=int, default=512)
     parser.add_argument("--cte-bucket", type=int, default=512)
-    parser.add_argument("--block-size", type=int, default=256)
+    parser.add_argument("--block-size", type=int, default=128)
     args = parser.parse_args()
 
     contrib_root = _contrib_root(args.repo_root)
@@ -126,15 +164,33 @@ def main() -> int:
         "enable_chunked_prefill": args.enable_vllm_chunked_prefill,
         "additional_config": additional_config,
     }
-    if args.mamba_cache_mode is not None:
+    recurrent_cache_dtype = (
+        args.hybrid_gdn_recurrent_cache_dtype or args.gdn_recurrent_cache_dtype
+    )
+    if args.enable_prefix_caching or args.enable_hybrid_apc:
+        llm_kwargs["mamba_cache_mode"] = args.mamba_cache_mode or "all"
+        llm_kwargs["mamba_ssm_cache_dtype"] = (
+            args.mamba_ssm_cache_dtype or recurrent_cache_dtype
+        )
+    elif args.mamba_cache_mode is not None:
         llm_kwargs["mamba_cache_mode"] = args.mamba_cache_mode
     if args.mamba_cache_dtype is not None:
         llm_kwargs["mamba_cache_dtype"] = args.mamba_cache_dtype
-    if args.mamba_ssm_cache_dtype is not None:
+    if (
+        args.mamba_ssm_cache_dtype is not None
+        and "mamba_ssm_cache_dtype" not in llm_kwargs
+    ):
         llm_kwargs["mamba_ssm_cache_dtype"] = args.mamba_ssm_cache_dtype
+    if args.num_gpu_blocks_override is not None:
+        llm_kwargs["num_gpu_blocks_override"] = args.num_gpu_blocks_override
+    if (
+        args.enable_prefix_caching
+        or args.enable_hybrid_apc
+        or args.enable_vllm_chunked_prefill
+    ):
+        llm_kwargs["block_size"] = args.block_size
     if args.enable_vllm_chunked_prefill:
         llm_kwargs["max_num_batched_tokens"] = args.cte_bucket
-        llm_kwargs["block_size"] = args.block_size
     llm = LLM(**llm_kwargs)
 
     sampling = SamplingParams(
