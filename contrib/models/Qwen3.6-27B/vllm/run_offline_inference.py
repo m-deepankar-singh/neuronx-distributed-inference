@@ -17,7 +17,46 @@ def _contrib_root(repo_root: str | None) -> Path:
     return Path(__file__).resolve().parents[1]
 
 
+def _parse_int_list(values: list[str] | None) -> list[int] | None:
+    if values is None:
+        return None
+    tokens: list[str] = []
+    for value in values:
+        tokens.extend(value.replace(",", " ").split())
+    return [int(token) for token in tokens]
+
+
+def _cte_buckets(args: argparse.Namespace) -> list[int]:
+    profile_buckets = {
+        "short": [128, 256, 512, 1024],
+        "general": [256, 512, 1024, 2048],
+        "long": [4096, 8192, 16384, 32768],
+        "262k": [256],
+    }
+    if args.cte_bucket_profile != "single":
+        buckets = list(profile_buckets[args.cte_bucket_profile])
+    else:
+        buckets = _parse_int_list(args.cte_buckets) or [args.cte_bucket]
+    buckets = sorted(set(buckets))
+    if not buckets:
+        raise ValueError("At least one CTE bucket is required")
+    for bucket in buckets:
+        if bucket <= 0:
+            raise ValueError(f"CTE buckets must be positive, got {bucket}")
+        if bucket % 128 != 0:
+            raise ValueError(
+                f"CTE bucket {bucket} is not 128-aligned; DeltaNet CTE uses 128-token chunks"
+            )
+    if buckets[-1] > args.seq_len:
+        raise ValueError(
+            f"Largest CTE bucket {buckets[-1]} exceeds --seq-len {args.seq_len}"
+        )
+    return buckets
+
+
 def _override_config(args: argparse.Namespace) -> dict:
+    cte_buckets = _cte_buckets(args)
+    max_cte_bucket = cte_buckets[-1]
     recurrent_cache_dtype = (
         args.hybrid_gdn_recurrent_cache_dtype or args.gdn_recurrent_cache_dtype
     )
@@ -25,14 +64,14 @@ def _override_config(args: argparse.Namespace) -> dict:
     neuron_config = {
         "tp_degree": args.tensor_parallel_size,
         "batch_size": args.max_num_seqs,
-        "ctx_batch_size": 1,
+        "ctx_batch_size": args.ctx_batch_size,
         "tkg_batch_size": args.max_num_seqs,
         "seq_len": args.seq_len,
         "max_length": args.seq_len,
-        "max_context_length": args.cte_bucket,
-        "context_encoding_buckets": [args.cte_bucket],
+        "max_context_length": max_cte_bucket,
+        "context_encoding_buckets": cte_buckets,
         "token_generation_buckets": [args.seq_len],
-        "enable_bucketing": False,
+        "enable_bucketing": len(cte_buckets) > 1,
         "logical_nc_config": args.logical_nc_config,
         "torch_dtype": "bfloat16",
         "save_sharded_checkpoint": True,
@@ -52,14 +91,17 @@ def _override_config(args: argparse.Namespace) -> dict:
                 "chunked_prefill_config": {
                     "max_num_seqs": args.max_num_seqs,
                     "tkg_model_enabled": True,
-                    "kernel_q_tile_size": 128,
-                    "kernel_kv_tile_size": 1024,
+                    "kernel_q_tile_size": args.kernel_q_tile_size,
+                    "kernel_kv_tile_size": args.kernel_kv_tile_size,
                 },
             }
         )
     return {
-        "max_prompt_length": args.cte_bucket,
+        "max_prompt_length": max_cte_bucket,
         "use_hybrid_apc_manager": args.enable_hybrid_apc,
+        "use_text_only_cte_inputs": args.text_only_cte,
+        "use_compact_cte_attention_mask": args.compact_cte_attention_mask,
+        "use_cold_zero_conv_fast_path": args.cold_zero_conv_fast_path,
         "gdn_checkpoint_interval": args.gdn_checkpoint_interval,
         "gdn_recurrent_cache_dtype": recurrent_cache_dtype,
         "gdn_conv_cache_dtype": conv_cache_dtype,
@@ -107,10 +149,34 @@ def main() -> int:
     parser.add_argument("--tensor-parallel-size", type=int, default=4)
     parser.add_argument("--logical-nc-config", type=int, default=2)
     parser.add_argument("--max-num-seqs", type=int, default=1)
+    parser.add_argument("--ctx-batch-size", type=int, default=1)
     parser.add_argument("--max-model-len", type=int, default=512)
     parser.add_argument("--seq-len", type=int, default=512)
     parser.add_argument("--cte-bucket", type=int, default=512)
+    parser.add_argument("--cte-buckets", nargs="+", default=None)
+    parser.add_argument(
+        "--cte-bucket-profile",
+        choices=("single", "short", "general", "long", "262k"),
+        default="single",
+    )
     parser.add_argument("--block-size", type=int, default=128)
+    parser.add_argument("--kernel-q-tile-size", type=int, default=128)
+    parser.add_argument("--kernel-kv-tile-size", type=int, default=1024)
+    parser.add_argument(
+        "--text-only-cte",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--compact-cte-attention-mask",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--cold-zero-conv-fast-path",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
     args = parser.parse_args()
 
     contrib_root = _contrib_root(args.repo_root)
@@ -152,6 +218,7 @@ def main() -> int:
 
     additional_config = _override_config(args)
     print("VLLM_QWEN36_CONFIG", json.dumps(additional_config, sort_keys=True), flush=True)
+    max_cte_bucket = max(_cte_buckets(args))
 
     llm_kwargs = {
         "model": str(Path(args.model_path).expanduser().resolve()),
@@ -190,7 +257,7 @@ def main() -> int:
     ):
         llm_kwargs["block_size"] = args.block_size
     if args.enable_vllm_chunked_prefill:
-        llm_kwargs["max_num_batched_tokens"] = args.cte_bucket
+        llm_kwargs["max_num_batched_tokens"] = max_cte_bucket
     llm = LLM(**llm_kwargs)
 
     sampling = SamplingParams(

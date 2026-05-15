@@ -676,7 +676,7 @@ class NeuronGatedDeltaNet(nn.Module):
         return output, last_recurrent_state
 
     def _fused_chunked_forward(
-        self, query, key, value, g, beta, output_final_state=False
+        self, query, key, value, g, beta, output_final_state=False, initial_state=None
     ):
         """Fused single-kernel chunked forward for CTE — SSD-style.
 
@@ -689,6 +689,9 @@ class NeuronGatedDeltaNet(nn.Module):
           2. State in SBUF across all chunks (biggest perf win)
           3. In-kernel cumsum (avoids PyTorch cumsum overhead)
           4. tensor_scalar for broadcasts (no explicit loops)
+
+        initial_state is the restored GDN recurrent checkpoint for warm or
+        partial-prefix suffix prefill. Cold prefill passes zeros.
         """
         chunk_size = 128
 
@@ -720,6 +723,12 @@ class NeuronGatedDeltaNet(nn.Module):
         # g and beta: (BH, S) -> (BH, S, 1) for the kernel's (S, 1) input layout
         g_flat = g.reshape(BH, total_seq_len).unsqueeze(-1).contiguous()
         beta_flat = beta.reshape(BH, total_seq_len).unsqueeze(-1).contiguous()
+        if initial_state is None:
+            initial_state_flat = torch.zeros(
+                BH, k_dim, v_dim, dtype=torch.float32, device=query.device
+            )
+        else:
+            initial_state_flat = initial_state.reshape(BH, k_dim, v_dim).float().contiguous()
 
         # Create constant mask tensors (shared across all B*H calls)
         device = query.device
@@ -742,6 +751,7 @@ class NeuronGatedDeltaNet(nn.Module):
                 value_flat[bh],  # (S, 128)
                 g_flat[bh],  # (S, 1) — RAW g, not cumsum
                 beta_flat[bh],  # (S, 1) — sigmoid(b)
+                initial_state_flat[bh],  # (128, 128) recurrent checkpoint
                 lower_mask,  # (128, 128)
                 identity_mat,  # (128, 128)
                 lower_mask_diag,  # (128, 128)
@@ -991,30 +1001,44 @@ class NeuronGatedDeltaNet(nn.Module):
                 new_conv_state = new_conv_state + self.conv_state_buffer * 0
         else:
             if qwen_chunked_prefill_active and conv_state_cache is not None:
-                conv_state = conv_state_cache[:batch_size]
-                if position_ids is not None:
-                    reset_mask = (position_ids[:, :1].long() == 0).to(
-                        dtype=conv_state.dtype, device=conv_state.device
+                cold_prefill_from_zero = getattr(
+                    self.config, "use_cold_zero_conv_fast_path", False
+                )
+                if cold_prefill_from_zero:
+                    mixed_post_conv = F.silu(
+                        F.conv1d(
+                            mixed,
+                            self._conv1d_weight(),
+                            bias=None,
+                            padding=self.conv_kernel_size - 1,
+                            groups=self.conv_dim,
+                        )[:, :, :seq_len]
                     )
-                    conv_state = conv_state * (1.0 - reset_mask[:, None, :])
-                conv_input = torch.cat([conv_state, mixed], dim=-1)
-                w = self._conv1d_weight().squeeze(1)
-                conv_out = torch.zeros_like(mixed)
-                for k in range(self.conv_kernel_size):
-                    conv_out = conv_out + w[:, k].unsqueeze(0).unsqueeze(-1) * conv_input[
-                        :, :, k : k + seq_len
-                    ]
-                mixed_post_conv = F.silu(conv_out)
+                    state_source = mixed
+                else:
+                    conv_state = conv_state_cache[:batch_size]
+                    conv_input = torch.cat([conv_state, mixed], dim=-1)
+                    w = self._conv1d_weight().squeeze(1)
+                    conv_out = torch.zeros_like(mixed)
+                    for k in range(self.conv_kernel_size):
+                        conv_out = (
+                            conv_out
+                            + w[:, k].unsqueeze(0).unsqueeze(-1)
+                            * conv_input[:, :, k : k + seq_len]
+                        )
+                    mixed_post_conv = F.silu(conv_out)
+                    state_source = conv_input
+
+                state_len = self.conv_kernel_size - 1
                 if valid_mask_1d is not None:
-                    state_len = self.conv_kernel_size - 1
                     num_valid = valid_mask_1d.squeeze(-1).sum(dim=-1, keepdim=True).long()
-                    idx_base = (state_len + num_valid - state_len).clamp(min=0)
+                    idx_base = (state_source.shape[-1] - seq_len + num_valid - state_len).clamp(min=0)
                     offsets = torch.arange(state_len, device=mixed.device).unsqueeze(0)
                     gather_idx = idx_base + offsets
                     gather_idx = gather_idx.unsqueeze(1).expand(-1, self.conv_dim, -1)
-                    new_conv_state = torch.gather(conv_input, 2, gather_idx)
+                    new_conv_state = torch.gather(state_source, 2, gather_idx)
                 else:
-                    new_conv_state = conv_input[:, :, -self.conv_kernel_size + 1 :].contiguous()
+                    new_conv_state = state_source[:, :, -state_len:].contiguous()
             else:
                 mixed_post_conv = F.silu(
                     F.conv1d(
@@ -1028,17 +1052,18 @@ class NeuronGatedDeltaNet(nn.Module):
 
                 if valid_mask_1d is not None:
                     # valid_mask_1d is [B, S, 1]; count valid tokens per batch
+                    state_len = self.conv_kernel_size - 1
                     num_valid = (
                         valid_mask_1d.squeeze(-1).sum(dim=-1, keepdim=True).long()
                     )  # [B, 1]
-                    idx_base = num_valid - 3
+                    idx_base = num_valid - state_len
                     idx_base = idx_base.clamp(min=0)
-                    offsets = torch.arange(3, device=mixed.device).unsqueeze(0)
-                    gather_idx = idx_base + offsets  # [B, 3]
+                    offsets = torch.arange(state_len, device=mixed.device).unsqueeze(0)
+                    gather_idx = idx_base + offsets  # [B, state_len]
                     gather_idx = gather_idx.unsqueeze(1).expand(-1, self.conv_dim, -1)
                     new_conv_state = torch.gather(mixed, 2, gather_idx)
                 else:
-                    new_conv_state = mixed[:, :, -3:].contiguous()
+                    new_conv_state = mixed[:, :, -self.conv_kernel_size + 1 :].contiguous()
 
             alloc_bs = self.conv_state_buffer.shape[0]
             if hybrid_cache_active:
@@ -1169,7 +1194,10 @@ class NeuronGatedDeltaNet(nn.Module):
                         dtype=initial_state.dtype, device=initial_state.device
                     )
                     initial_state = initial_state * (1.0 - reset_mask[:, :, None, None])
-                if self.use_qwen_hybrid_chunked_prefill_nki:
+                if use_nki_chunked or (
+                    self.use_qwen_hybrid_chunked_prefill_nki
+                    and os.environ.get("USE_NKI_FUSED", "1") == "0"
+                ):
                     output, final_state = self._nki_chunked_forward(
                         query,
                         key,
@@ -1179,8 +1207,18 @@ class NeuronGatedDeltaNet(nn.Module):
                         output_final_state=True,
                         initial_state=initial_state,
                     )
-                else:
+                elif use_pytorch_chunk:
                     output, final_state = self._chunk_forward(
+                        query,
+                        key,
+                        value,
+                        g,
+                        beta,
+                        output_final_state=True,
+                        initial_state=initial_state,
+                    )
+                else:
+                    output, final_state = self._fused_chunked_forward(
                         query,
                         key,
                         value,
@@ -1338,6 +1376,9 @@ class Qwen35InferenceConfig(InferenceConfig):
             kwargs["hybrid_cache_prefix_boundary_only"],
         )
         kwargs.setdefault("hybrid_cache_validate_exact", False)
+        kwargs.setdefault("use_text_only_cte_inputs", True)
+        kwargs.setdefault("use_compact_cte_attention_mask", True)
+        kwargs.setdefault("use_cold_zero_conv_fast_path", False)
 
         super().__init__(*args, **kwargs)
 
@@ -2445,11 +2486,23 @@ class NeuronQwen35Model(NeuronBaseModel):
         cos_cache = None
         sin_cache = None
 
-        # Convert 2D attention_mask to 4D causal mask for CTE
+        # Keep CTE masks compact on the Neuron paths. Qwen attention prefill
+        # applies causal masking inside the attention kernel/path, while DeltaNet
+        # consumes deltanet_padding_mask separately. Dense SxS masks are only a
+        # small fallback path and are not viable for long-context CTE.
+        use_compact_cte_attention_mask = getattr(
+            self.config, "use_compact_cte_attention_mask", True
+        )
+        use_neuron_cte_attention = use_qwen_chunked_prefill or getattr(
+            self.config.neuron_config, "is_block_kv_layout", False
+        )
+        # Convert 2D attention_mask to 4D causal mask for the small fallback path.
         if (
             attention_mask is not None
             and attention_mask.ndim == 2
             and is_for_context_encoding
+            and not use_compact_cte_attention_mask
+            and not use_neuron_cte_attention
         ):
             causal = torch.ones(
                 (seq_length, seq_length),
@@ -2964,15 +3017,21 @@ class Qwen35ModelWrapper(ModelWrapper):
                     .contiguous()
                 )
 
-                vision_embeddings = torch.zeros(
-                    (batch_size, n_active_tokens, self.config.hidden_size),
-                    dtype=self.config.neuron_config.torch_dtype,
-                )
-                vision_mask = torch.full(
-                    (batch_size, n_active_tokens, 1),
-                    fill_value=n_active_tokens - 1,
-                    dtype=torch.int32,
-                )
+                if getattr(self.config, "use_text_only_cte_inputs", True):
+                    vision_embeddings = torch.zeros(
+                        (0,), dtype=self.config.neuron_config.torch_dtype
+                    )
+                    vision_mask = torch.zeros((0,), dtype=torch.int32)
+                else:
+                    vision_embeddings = torch.zeros(
+                        (batch_size, n_active_tokens, self.config.hidden_size),
+                        dtype=self.config.neuron_config.torch_dtype,
+                    )
+                    vision_mask = torch.full(
+                        (batch_size, n_active_tokens, 1),
+                        fill_value=n_active_tokens - 1,
+                        dtype=torch.int32,
+                    )
             else:
                 mrope_position_ids = torch.zeros((0,), dtype=torch.int32)
                 vision_embeddings = torch.zeros(
@@ -3051,6 +3110,10 @@ class Qwen35ModelWrapper(ModelWrapper):
                     vision_embeddings = torch.cat([current_vis_emb, pad_emb], dim=1)
                 elif current_vis_emb is not None and current_vis_emb.ndim == 3:
                     vision_embeddings = current_vis_emb[:, :padded_seq_len]
+                elif getattr(self.config, "use_text_only_cte_inputs", True):
+                    vision_embeddings = torch.zeros(
+                        (0,), dtype=self.config.neuron_config.torch_dtype
+                    )
                 else:
                     vision_embeddings = torch.zeros(
                         (batch_size, padded_seq_len, self.config.hidden_size),
@@ -3070,6 +3133,8 @@ class Qwen35ModelWrapper(ModelWrapper):
                     vision_mask = torch.cat([current_vis_mask, pad_mask], dim=1)
                 elif current_vis_mask is not None and current_vis_mask.ndim == 3:
                     vision_mask = current_vis_mask[:, :padded_seq_len]
+                elif getattr(self.config, "use_text_only_cte_inputs", True):
+                    vision_mask = torch.zeros((0,), dtype=torch.int32)
                 else:
                     vision_mask = torch.full(
                         (batch_size, padded_seq_len, 1),
@@ -3084,9 +3149,10 @@ class Qwen35ModelWrapper(ModelWrapper):
                     vision_mask,
                 )
 
-                padded_args = list(padded_args)
-                padded_args[23] = padded_args[23].clamp(max=padded_seq_len - 1)
-                padded_args = tuple(padded_args)
+                if vision_mask.ndim == 3:
+                    padded_args = list(padded_args)
+                    padded_args[23] = padded_args[23].clamp(max=padded_seq_len - 1)
+                    padded_args = tuple(padded_args)
 
         return padded_args
 
@@ -3227,15 +3293,21 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
             else:
                 mrope_position_ids = None
         elif is_prefill:
-            vision_embeddings = torch.zeros(
-                (batch_size, seq_len, self.config.hidden_size),
-                dtype=self.config.neuron_config.torch_dtype,
-            )
-            vision_mask = torch.full(
-                (batch_size, seq_len, 1),
-                fill_value=seq_len - 1,
-                dtype=torch.int32,
-            )
+            if getattr(self.config, "use_text_only_cte_inputs", True):
+                vision_embeddings = torch.zeros(
+                    (0,), dtype=self.config.neuron_config.torch_dtype
+                )
+                vision_mask = torch.zeros((0,), dtype=torch.int32)
+            else:
+                vision_embeddings = torch.zeros(
+                    (batch_size, seq_len, self.config.hidden_size),
+                    dtype=self.config.neuron_config.torch_dtype,
+                )
+                vision_mask = torch.full(
+                    (batch_size, seq_len, 1),
+                    fill_value=seq_len - 1,
+                    dtype=torch.int32,
+                )
             mrope_position_ids = None
         else:
             vision_embeddings = torch.zeros((0,), dtype=torch.float32)

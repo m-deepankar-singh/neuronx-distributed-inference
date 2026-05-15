@@ -67,6 +67,7 @@ def deltanet_fused_chunked_fwd(
     value: nl.ndarray,  # (S, 128) float32
     g_in: nl.ndarray,  # (S, 1)   float32 — per-token log-decay (NOT cumsum)
     beta_in: nl.ndarray,  # (S, 1)   float32 — per-token write gate
+    initial_state: nl.ndarray,  # (128, 128) float32 — recurrent checkpoint or zeros
     lower_mask: nl.ndarray,  # (128, 128) float32 — strict lower tri
     identity: nl.ndarray,  # (128, 128) float32 — identity
     lower_mask_diag: nl.ndarray,  # (128, 128) float32 — lower tri with diag
@@ -83,6 +84,7 @@ def deltanet_fused_chunked_fwd(
       - key must be l2-normed
       - g_in is RAW log-decay (cumsum computed in-kernel via tensor_tensor_scan)
       - beta_in is sigmoid(b) (write gate)
+      - initial_state is zero for cold prefill, or the restored GDN checkpoint
 
     Returns:
         output:      (S, 128) float32
@@ -120,7 +122,7 @@ def deltanet_fused_chunked_fwd(
     # Initialize recurrent state in SBUF — persists across ALL chunks
     # ================================================================
     state = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.memset(dst=state, value=0.0)
+    nisa.dma_copy(dst=state, src=initial_state)
 
     # ================================================================
     # Sequential chunk processing

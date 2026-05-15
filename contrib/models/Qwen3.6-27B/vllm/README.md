@@ -130,9 +130,31 @@ contrib/models/Qwen3.6-27B/vllm/start_vllm_server.sh \
   --compiled-artifacts /opt/dlami/nvme/qwen_artifacts/qwen36_27b_128k_fp8_mlp_only_vllm_statereset_run1 \
   --max-model-len 131072 \
   --seq-len 131072 \
-  --cte-bucket 512 \
+  --cte-buckets 128,256,512 \
   --port 8000
 ```
+
+Cold-prefill bucket waste is the first performance target. CTE buckets must stay
+128-aligned because the fused DeltaNet CTE path operates in 128-token chunks.
+Use one of the explicit profiles when compiling artifacts:
+
+```bash
+# Short-prompt latency
+--cte-bucket-profile short     # [128,256,512,1024]
+
+# General production
+--cte-bucket-profile general   # [256,512,1024,2048]
+
+# Long-context artifact
+--cte-bucket-profile long      # [4096,8192,16384,32768]
+
+# 262K load experiment
+--cte-bucket-profile 262k      # [256]
+```
+
+`--cold-zero-conv-fast-path` is only for a cold-only CTE artifact whose suffix
+prefill always starts at position 0. Leave it disabled for APC or partial-prefix
+serving because restored GDN conv state must be consumed exactly.
 
 Long-prompt precompiled artifact path:
 
@@ -142,7 +164,7 @@ contrib/models/Qwen3.6-27B/vllm/start_vllm_server.sh \
   --compiled-artifacts /opt/dlami/nvme/qwen_artifacts/qwen36_27b_128k_fp8_mlp_only_vllm_statereset_run1 \
   --max-model-len 131072 \
   --seq-len 131072 \
-  --cte-bucket 512 \
+  --cte-buckets 256,512 \
   --block-size 256 \
   --enable-vllm-chunked-prefill \
   --port 8000
@@ -156,7 +178,7 @@ contrib/models/Qwen3.6-27B/vllm/start_vllm_server.sh \
   --compiled-artifacts /opt/dlami/nvme/qwen_artifacts/qwen36_27b_128k_fp8_mlp_only_vllm_statereset_run1 \
   --max-model-len 131072 \
   --seq-len 131072 \
-  --cte-bucket 512 \
+  --cte-buckets 256,512 \
   --block-size 128 \
   --enable-vllm-chunked-prefill \
   --enable-prefix-caching \
@@ -170,9 +192,10 @@ contrib/models/Qwen3.6-27B/vllm/start_vllm_server.sh \
 
 Treat this as an experiment, not a production mode, until validation passes.
 Standard vLLM APC reuses attention KV blocks; Qwen3.6 also needs DeltaNet
-recurrent state and conv state at block boundaries. If native APC does not
-produce exact greedy matches and a clear warm-hit speedup, the next step is a
-hybrid APC path that caches those GDN states alongside attention KV.
+recurrent state and conv state as prefix-boundary checkpoints keyed by the
+cumulative prefix hash. If native APC does not produce exact greedy matches and
+a clear warm-hit speedup, the next step is a hybrid APC path that restores those
+GDN checkpoints alongside attention KV.
 
 For APC experiments, do not treat `256` as the only block size. It can be useful
 for long-context amortization, but it is coarse for chat-style prefix reuse.
@@ -320,25 +343,34 @@ python contrib/models/Qwen3.6-27B/vllm/run_offline_inference.py \
   --compiled-artifacts /opt/dlami/nvme/qwen_artifacts/qwen36_27b_128k_fp8_mlp_only_vllm_statereset_run1 \
   --max-model-len 131072 \
   --seq-len 131072 \
-  --cte-bucket 512 \
+  --cte-buckets 128,256,512 \
   --chat \
   --prompt "What is 17 * 23? Answer with the number only."
 ```
 
 ## Next Milestone
 
-Harden hybrid APC before optimizing speculative decode or cache quantization.
-The required production contract is a unified prefix-cache object whose
-attention KV, GDN recurrent state, and GDN conv state are jointly addressable,
-evictable, restorable, and exact under continuous batching.
+For cold-prefill latency, fix bucket waste before speculative decode or cache
+quantization. The serving entrypoints now support multi-bucket CTE artifacts,
+text-only CTE inputs, compact CTE masks, context-batch profiles, and attention
+tile overrides.
+
+For warm-prefix production APC, the required contract remains a unified
+prefix-cache object whose attention KV, GDN recurrent state, and GDN conv state
+are jointly addressable, evictable, restorable, and exact under continuous
+batching.
 
 Recommended order:
 
-1. Hybrid APC exactness: cold vs warm greedy token IDs, partial-prefix reuse,
+1. Dynamic CTE buckets: start with `[128,256,512]` for 2K short-prompt tests,
+   `[256,512]` for 128K, and `[256]` for the 262K TP=4 load experiment.
+2. Fused GDN CTE path validation: qwen chunked-prefill should use fused
+   DeltaNet with restored initial state by default.
+3. Text-only CTE and compact-mask validation: no full dummy vision reductions
+   and no dense 4D causal masks in normal text serving.
+4. Hybrid APC exactness: cold vs warm greedy token IDs, partial-prefix reuse,
    multi-hit chat history, continuous batching movement, and eviction pressure.
-2. Dynamic CTE buckets once cache correctness is locked.
-3. Attention block-size sweeps at `64` and `128`, with `32` included for
+5. Attention block-size sweeps at `64` and `128`, with `32` included for
    granularity-sensitive chat workloads.
-4. FP8 KV/cache only after the BF16/FP32 baseline is exact.
-5. MTP/spec decode after recurrent-state rollback semantics are explicit.
-6. GDN kernel fusion after serving-state semantics are correct.
+6. FP8 KV/cache only after the BF16/FP32 baseline is exact.
+7. MTP/spec decode after recurrent-state rollback semantics are explicit.

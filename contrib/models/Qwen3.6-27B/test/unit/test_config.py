@@ -155,6 +155,9 @@ class TestDeltaNetConfig(unittest.TestCase):
         self.assertEqual(config.hybrid_cache_mode, "all")
         self.assertTrue(config.hybrid_cache_prefix_boundary_only)
         self.assertTrue(config.hybrid_cache_block_boundary_only)
+        self.assertTrue(config.use_text_only_cte_inputs)
+        self.assertTrue(config.use_compact_cte_attention_mask)
+        self.assertFalse(config.use_cold_zero_conv_fast_path)
 
     def test_gdn_checkpoint_interval_must_be_positive(self):
         with self.assertRaisesRegex(ValueError, "gdn_checkpoint_interval"):

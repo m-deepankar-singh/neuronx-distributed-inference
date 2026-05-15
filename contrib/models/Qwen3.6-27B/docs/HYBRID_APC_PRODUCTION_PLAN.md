@@ -40,7 +40,8 @@ HybridPrefixCheckpoint
     valid_state_mask
 ```
 
-The usable hit is the deepest block boundary where all required state exists:
+The usable hit is the deepest cumulative-prefix boundary where all required
+state exists:
 
 ```text
 usable_hit_len =
@@ -56,7 +57,7 @@ from 12K.
 
 ## Qwen3.6 GDN State
 
-At every reusable GDN block boundary, cache:
+At every reusable cumulative-prefix boundary, cache:
 
 ```text
 recurrent_state: [num_local_value_heads, key_dim, value_dim]
