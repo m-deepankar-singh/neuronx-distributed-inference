@@ -39,6 +39,7 @@ def _args(**overrides):
         hybrid_gdn_conv_cache_dtype=None,
         gdn_conv_cache_dtype="bfloat16",
         gdn_checkpoint_interval=256,
+        max_gdn_checkpoint_slots=8,
         hybrid_cache_mode="all",
         hybrid_cache_prefix_boundary_only=True,
         hybrid_cache_validate_exact=False,
@@ -85,6 +86,32 @@ class TestVllmServingConfig(unittest.TestCase):
         self.assertFalse(config["use_text_only_cte_inputs"])
         self.assertFalse(config["use_compact_cte_attention_mask"])
         self.assertTrue(config["use_cold_zero_conv_fast_path"])
+
+    def test_hybrid_apc_requires_checkpoint_interval_equal_block_size(self):
+        with self.assertRaisesRegex(ValueError, "gdn-checkpoint-interval"):
+            self.runner._override_config(
+                _args(
+                    enable_hybrid_apc=True,
+                    enable_prefix_caching=True,
+                    block_size=128,
+                    gdn_checkpoint_interval=256,
+                )
+            )
+
+    def test_hybrid_apc_enables_prefix_caching_and_slots(self):
+        args = _args(
+            enable_hybrid_apc=True,
+            enable_prefix_caching=False,
+            block_size=256,
+            gdn_checkpoint_interval=256,
+            max_gdn_checkpoint_slots=3,
+        )
+
+        config = self.runner._override_config(args)
+
+        self.assertTrue(args.enable_prefix_caching)
+        self.assertTrue(config["use_hybrid_apc_manager"])
+        self.assertEqual(config["max_gdn_checkpoint_slots"], 3)
 
 
 if __name__ == "__main__":

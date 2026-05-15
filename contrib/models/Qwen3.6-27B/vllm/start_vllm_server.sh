@@ -22,6 +22,7 @@ MAMBA_CACHE_DTYPE=""
 MAMBA_SSM_CACHE_DTYPE=""
 BLOCK_SIZE=""
 GDN_CHECKPOINT_INTERVAL="256"
+MAX_GDN_CHECKPOINT_SLOTS="8"
 GDN_RECURRENT_CACHE_DTYPE="float32"
 GDN_CONV_CACHE_DTYPE="bfloat16"
 HYBRID_GDN_RECURRENT_CACHE_DTYPE=""
@@ -58,6 +59,7 @@ while [[ $# -gt 0 ]]; do
     --mamba-ssm-cache-dtype) MAMBA_SSM_CACHE_DTYPE="$2"; shift 2 ;;
     --block-size) BLOCK_SIZE="$2"; shift 2 ;;
     --gdn-checkpoint-interval) GDN_CHECKPOINT_INTERVAL="$2"; shift 2 ;;
+    --max-gdn-checkpoint-slots) MAX_GDN_CHECKPOINT_SLOTS="$2"; shift 2 ;;
     --gdn-recurrent-cache-dtype) GDN_RECURRENT_CACHE_DTYPE="$2"; shift 2 ;;
     --gdn-conv-cache-dtype) GDN_CONV_CACHE_DTYPE="$2"; shift 2 ;;
     --hybrid-gdn-recurrent-cache-dtype) HYBRID_GDN_RECURRENT_CACHE_DTYPE="$2"; shift 2 ;;
@@ -109,6 +111,16 @@ if [[ -z "${HYBRID_GDN_CONV_CACHE_DTYPE}" ]]; then
 fi
 if [[ "${ENABLE_PREFIX_CACHING}" == "1" || "${ENABLE_HYBRID_APC}" == "1" ]]; then
   ENABLE_PREFIX_CACHING="1"
+fi
+if [[ "${ENABLE_HYBRID_APC}" == "1" ]]; then
+  if [[ "${HYBRID_CACHE_MODE}" != "all" ]]; then
+    echo "ERROR: --enable-hybrid-apc requires --hybrid-cache-mode all" >&2
+    exit 2
+  fi
+  if [[ "${GDN_CHECKPOINT_INTERVAL}" != "${BLOCK_SIZE}" ]]; then
+    echo "ERROR: --enable-hybrid-apc v0 requires --gdn-checkpoint-interval to equal --block-size" >&2
+    exit 2
+  fi
 fi
 if [[ "${ENABLE_PREFIX_CACHING}" == "1" && -z "${MAMBA_CACHE_MODE}" ]]; then
   MAMBA_CACHE_MODE="all"
@@ -203,6 +215,7 @@ print(json.dumps({
     "use_compact_cte_attention_mask": "${COMPACT_CTE_ATTENTION_MASK}" == "1",
     "use_cold_zero_conv_fast_path": "${COLD_ZERO_CONV_FAST_PATH}" == "1",
     "gdn_checkpoint_interval": int("${GDN_CHECKPOINT_INTERVAL}"),
+    "max_gdn_checkpoint_slots": int("${MAX_GDN_CHECKPOINT_SLOTS}"),
     "gdn_recurrent_cache_dtype": "${HYBRID_GDN_RECURRENT_CACHE_DTYPE}",
     "gdn_conv_cache_dtype": "${HYBRID_GDN_CONV_CACHE_DTYPE}",
     "hybrid_recurrent_cache_dtype": "${HYBRID_GDN_RECURRENT_CACHE_DTYPE}",
@@ -234,6 +247,7 @@ echo "TEXT_ONLY_CTE=${TEXT_ONLY_CTE}"
 echo "COMPACT_CTE_ATTENTION_MASK=${COMPACT_CTE_ATTENTION_MASK}"
 echo "COLD_ZERO_CONV_FAST_PATH=${COLD_ZERO_CONV_FAST_PATH}"
 echo "GDN_CHECKPOINT_INTERVAL=${GDN_CHECKPOINT_INTERVAL}"
+echo "MAX_GDN_CHECKPOINT_SLOTS=${MAX_GDN_CHECKPOINT_SLOTS}"
 echo "HYBRID_GDN_RECURRENT_CACHE_DTYPE=${HYBRID_GDN_RECURRENT_CACHE_DTYPE}"
 echo "HYBRID_GDN_CONV_CACHE_DTYPE=${HYBRID_GDN_CONV_CACHE_DTYPE}"
 echo "ADDITIONAL_CONFIG=${ADDITIONAL_CONFIG}"

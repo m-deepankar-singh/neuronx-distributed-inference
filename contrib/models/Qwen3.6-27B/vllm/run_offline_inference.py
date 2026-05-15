@@ -54,7 +54,21 @@ def _cte_buckets(args: argparse.Namespace) -> list[int]:
     return buckets
 
 
+def _validate_hybrid_apc_args(args: argparse.Namespace):
+    if not args.enable_hybrid_apc:
+        return
+    if args.hybrid_cache_mode != "all":
+        raise ValueError("--enable-hybrid-apc requires --hybrid-cache-mode all")
+    if args.gdn_checkpoint_interval != args.block_size:
+        raise ValueError(
+            "--enable-hybrid-apc v0 requires --gdn-checkpoint-interval "
+            "to equal --block-size"
+        )
+    args.enable_prefix_caching = True
+
+
 def _override_config(args: argparse.Namespace) -> dict:
+    _validate_hybrid_apc_args(args)
     cte_buckets = _cte_buckets(args)
     max_cte_bucket = cte_buckets[-1]
     recurrent_cache_dtype = (
@@ -103,6 +117,7 @@ def _override_config(args: argparse.Namespace) -> dict:
         "use_compact_cte_attention_mask": args.compact_cte_attention_mask,
         "use_cold_zero_conv_fast_path": args.cold_zero_conv_fast_path,
         "gdn_checkpoint_interval": args.gdn_checkpoint_interval,
+        "max_gdn_checkpoint_slots": args.max_gdn_checkpoint_slots,
         "gdn_recurrent_cache_dtype": recurrent_cache_dtype,
         "gdn_conv_cache_dtype": conv_cache_dtype,
         "hybrid_recurrent_cache_dtype": recurrent_cache_dtype,
@@ -129,6 +144,7 @@ def main() -> int:
     parser.add_argument("--mamba-cache-dtype", default=None)
     parser.add_argument("--mamba-ssm-cache-dtype", default=None)
     parser.add_argument("--gdn-checkpoint-interval", type=int, default=256)
+    parser.add_argument("--max-gdn-checkpoint-slots", type=int, default=8)
     parser.add_argument("--gdn-recurrent-cache-dtype", default="float32")
     parser.add_argument("--gdn-conv-cache-dtype", default="bfloat16")
     parser.add_argument("--hybrid-gdn-recurrent-cache-dtype", default=None)

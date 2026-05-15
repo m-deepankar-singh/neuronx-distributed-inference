@@ -148,6 +148,9 @@ class TestDeltaNetConfig(unittest.TestCase):
         self.assertFalse(config.use_hybrid_cache_manager)
         self.assertFalse(config.use_hybrid_apc_manager)
         self.assertEqual(config.gdn_checkpoint_interval, 256)
+        self.assertEqual(config.max_gdn_checkpoint_slots, 8)
+        self.assertEqual(config.hybrid_apc_layout_version, 1)
+        self.assertFalse(config.hybrid_apc_allow_residual_replay)
         self.assertEqual(config.gdn_recurrent_cache_dtype, "float32")
         self.assertEqual(config.gdn_conv_cache_dtype, "bfloat16")
         self.assertEqual(config.hybrid_recurrent_cache_dtype, "float32")
@@ -178,6 +181,13 @@ class TestDeltaNetConfig(unittest.TestCase):
     def test_hybrid_apc_rejects_non_all_mode(self):
         with self.assertRaisesRegex(ValueError, "hybrid_cache_mode='all'"):
             _make_config(use_hybrid_apc_manager=True, hybrid_cache_mode="align")
+
+    def test_hybrid_apc_rejects_residual_replay_in_v0(self):
+        with self.assertRaisesRegex(ValueError, "reserved for v1"):
+            _make_config(
+                use_hybrid_apc_manager=True,
+                hybrid_apc_allow_residual_replay=True,
+            )
 
     def test_static_and_apc_managers_are_mutually_exclusive(self):
         with self.assertRaisesRegex(ValueError, "mutually exclusive"):

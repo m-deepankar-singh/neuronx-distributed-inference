@@ -76,10 +76,12 @@ inside a GDN checkpoint interval, restore the nearest earlier full GDN
 checkpoint, replay the residual tokens, then run the suffix.
 
 The launchers expose `--enable-hybrid-apc` and explicit hybrid cache dtype
-knobs, but the model intentionally treats `use_hybrid_apc_manager=True` as a
-guarded production-mode flag until the vLLM/NxDI cumulative-prefix hash
-lifecycle is wired to GDN prefix-boundary checkpoints. Enabling it before that
-integration should fail loudly rather than silently running attention-only APC.
+knobs. In the current v0 implementation, `use_hybrid_apc_manager=True` creates
+a bounded GDN checkpoint-slot bank and adds restore/commit tensors to the model
+signature. The serving request-prep path must still fill those tensors from the
+vLLM/NxDI cumulative-prefix hash lifecycle; otherwise the default zero masks run
+as attention KV plus normal active-row GDN state with no GDN checkpoint reuse.
+For v0, `gdn_checkpoint_interval` must equal the vLLM block size.
 
 ## Chunked Prefill Note
 

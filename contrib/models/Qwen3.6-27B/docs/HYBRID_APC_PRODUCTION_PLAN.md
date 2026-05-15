@@ -126,6 +126,23 @@ attention-only false hit cannot happen
 concurrent requests do not leak state
 ```
 
+Current v0 branch status:
+
+```text
+implemented:
+  HybridAPCMetadataStore for cumulative-prefix checkpoint metadata
+  bounded model-side HybridGDNCheckpointCache tensor bank
+  model restore/commit slot inputs
+  use_hybrid_apc_manager initialization without the old guard
+  v0 launcher validation requiring checkpoint interval == block size
+
+still required before production:
+  vLLM/NxDI request-prep integration that fills restore/commit tensors
+  exactness harness on Trainium artifacts
+  cancellation/refcount callbacks from the serving scheduler
+  long-context HBM tuning for checkpoint slot count and commit policy
+```
+
 ### Sprint 2: Dynamic CTE Buckets
 
 Build:

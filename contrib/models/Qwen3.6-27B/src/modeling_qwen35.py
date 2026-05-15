@@ -384,6 +384,7 @@ class NeuronGatedDeltaNet(nn.Module):
         self.layer_idx = layer_idx
         self.rms_norm_eps = tc.rms_norm_eps
         self.use_hybrid_cache_manager = getattr(tc, "use_hybrid_cache_manager", False)
+        self.use_hybrid_apc_manager = getattr(tc, "use_hybrid_apc_manager", False)
         self.use_qwen_hybrid_chunked_prefill = getattr(
             tc, "use_qwen_hybrid_chunked_prefill", False
         )
@@ -471,13 +472,23 @@ class NeuronGatedDeltaNet(nn.Module):
         # State buffers for CTE -> TKG carry-over
         alloc_batch_size = getattr(config.neuron_config, "max_batch_size", 1)
         self._phase_batch_size = getattr(config.neuron_config, "batch_size", 1)
+        recurrent_buffer_dtype = (
+            _torch_dtype_from_hybrid_cache_dtype(config.hybrid_recurrent_cache_dtype)
+            if self.use_hybrid_apc_manager
+            else config.neuron_config.torch_dtype
+        )
+        conv_buffer_dtype = (
+            _torch_dtype_from_hybrid_cache_dtype(config.hybrid_conv_cache_dtype)
+            if self.use_hybrid_apc_manager
+            else config.neuron_config.torch_dtype
+        )
         self.recurrent_state_buffer = nn.Parameter(
             torch.zeros(
                 alloc_batch_size,
                 self.num_v_heads,
                 self.head_k_dim,
                 self.head_v_dim,
-                dtype=config.neuron_config.torch_dtype,
+                dtype=recurrent_buffer_dtype,
             ),
             requires_grad=False,
         )
@@ -486,7 +497,7 @@ class NeuronGatedDeltaNet(nn.Module):
                 alloc_batch_size,
                 self.conv_dim,
                 self.conv_kernel_size - 1,
-                dtype=config.neuron_config.torch_dtype,
+                dtype=conv_buffer_dtype,
             ),
             requires_grad=False,
         )
@@ -928,10 +939,17 @@ class NeuronGatedDeltaNet(nn.Module):
         # zeros the decay gate so the recurrent state is preserved unchanged
         # through padding positions (no spurious decay).
         valid_mask_1d = kwargs.get("deltanet_padding_mask", None)  # [B, S, 1] or None
-        hybrid_cache_active = self.use_hybrid_cache_manager
+        static_hybrid_cache_active = self.use_hybrid_cache_manager
         recurrent_state_cache = None
         conv_state_cache = None
-        if hybrid_cache_active and past_key_value is not None:
+        if static_hybrid_cache_active and past_key_value is not None:
+            recurrent_state_cache, conv_state_cache = past_key_value
+        elif (
+            self.use_hybrid_apc_manager
+            and past_key_value is not None
+            and len(past_key_value) == 2
+            and getattr(past_key_value[1], "dim", lambda: 0)() == 3
+        ):
             recurrent_state_cache, conv_state_cache = past_key_value
 
         # Project inputs
@@ -979,7 +997,7 @@ class NeuronGatedDeltaNet(nn.Module):
 
             new_conv_state = torch.cat([conv_state[:, :, 1:], mixed], dim=-1)
             alloc_bs = self.conv_state_buffer.shape[0]
-            if hybrid_cache_active:
+            if static_hybrid_cache_active:
                 new_conv_state = new_conv_state.to(self.conv_state_buffer.dtype)
             elif seq_ids is not None:
                 # BS=1 optimization: scatter to index 0 of size-1 buffer = direct replacement
@@ -1017,6 +1035,13 @@ class NeuronGatedDeltaNet(nn.Module):
                     state_source = mixed
                 else:
                     conv_state = conv_state_cache[:batch_size]
+                    if position_ids is not None:
+                        reset_mask = (position_ids[:, :1].long() == 0).to(
+                            dtype=conv_state.dtype, device=conv_state.device
+                        )
+                        conv_state = conv_state * (
+                            1.0 - reset_mask[:, :, None]
+                        )
                     conv_input = torch.cat([conv_state, mixed], dim=-1)
                     w = self._conv1d_weight().squeeze(1)
                     conv_out = torch.zeros_like(mixed)
@@ -1066,7 +1091,7 @@ class NeuronGatedDeltaNet(nn.Module):
                     new_conv_state = mixed[:, :, -self.conv_kernel_size + 1 :].contiguous()
 
             alloc_bs = self.conv_state_buffer.shape[0]
-            if hybrid_cache_active:
+            if static_hybrid_cache_active:
                 new_conv_state = new_conv_state.to(self.conv_state_buffer.dtype)
             elif seq_ids is not None:
                 # BS=1 optimization: scatter to index 0 = direct replacement
@@ -1161,7 +1186,7 @@ class NeuronGatedDeltaNet(nn.Module):
             )
             new_state_bf16 = new_state.to(self.recurrent_state_buffer.dtype)
             alloc_bs = self.recurrent_state_buffer.shape[0]
-            if hybrid_cache_active:
+            if static_hybrid_cache_active:
                 new_rec_state = new_state_bf16
             elif seq_ids is not None:
                 # BS=1 optimization: scatter to index 0 of size-1 buffer = direct replacement
@@ -1255,7 +1280,7 @@ class NeuronGatedDeltaNet(nn.Module):
             if final_state is not None:
                 final_state_bf16 = final_state.to(self.recurrent_state_buffer.dtype)
                 alloc_bs = self.recurrent_state_buffer.shape[0]
-                if hybrid_cache_active:
+                if static_hybrid_cache_active:
                     new_rec_state = final_state_bf16
                 elif seq_ids is not None:
                     # BS=1 optimization: scatter to index 0 of size-1 buffer = direct replacement
@@ -1292,7 +1317,7 @@ class NeuronGatedDeltaNet(nn.Module):
         output = output.reshape(batch_size, seq_len, self.value_dim)
         output = self.out_proj(output)
 
-        if hybrid_cache_active:
+        if static_hybrid_cache_active:
             return output, (new_rec_state, new_conv_state), new_rec_state, new_conv_state
 
         # Return dummy KV for KVCacheManager
@@ -1354,6 +1379,9 @@ class Qwen35InferenceConfig(InferenceConfig):
         kwargs.setdefault("use_qwen_hybrid_chunked_prefill", False)
         kwargs.setdefault("use_qwen_hybrid_chunked_prefill_nki", False)
         kwargs.setdefault("gdn_checkpoint_interval", 256)
+        kwargs.setdefault("max_gdn_checkpoint_slots", 8)
+        kwargs.setdefault("hybrid_apc_layout_version", 1)
+        kwargs.setdefault("hybrid_apc_allow_residual_replay", False)
         kwargs.setdefault(
             "hybrid_recurrent_cache_dtype",
             kwargs.get("gdn_recurrent_cache_dtype", "float32"),
@@ -1388,6 +1416,13 @@ class Qwen35InferenceConfig(InferenceConfig):
                 "gdn_checkpoint_interval must be positive, "
                 f"got {self.gdn_checkpoint_interval}"
             )
+        self.max_gdn_checkpoint_slots = int(self.max_gdn_checkpoint_slots)
+        if self.max_gdn_checkpoint_slots <= 0:
+            raise ValueError(
+                "max_gdn_checkpoint_slots must be positive, "
+                f"got {self.max_gdn_checkpoint_slots}"
+            )
+        self.hybrid_apc_layout_version = int(self.hybrid_apc_layout_version)
         self.hybrid_recurrent_cache_dtype = _normalize_hybrid_cache_dtype(
             "hybrid_recurrent_cache_dtype",
             self.hybrid_recurrent_cache_dtype,
@@ -1409,6 +1444,20 @@ class Qwen35InferenceConfig(InferenceConfig):
             )
         if self.use_hybrid_apc_manager and self.hybrid_cache_mode != "all":
             raise ValueError("use_hybrid_apc_manager requires hybrid_cache_mode='all'")
+        if self.use_hybrid_apc_manager:
+            pa_block_size = getattr(self.neuron_config, "pa_block_size", None)
+            if pa_block_size is not None and self.gdn_checkpoint_interval != int(
+                pa_block_size
+            ):
+                raise ValueError(
+                    "use_hybrid_apc_manager v0 requires "
+                    "gdn_checkpoint_interval == pa_block_size"
+                )
+            if self.hybrid_apc_allow_residual_replay:
+                raise ValueError(
+                    "hybrid_apc_allow_residual_replay is reserved for v1; "
+                    "v0 restores only exact checkpoint boundaries"
+                )
 
         # Attention output gate
         self.attn_output_gate = getattr(self, "attn_output_gate", True)
@@ -2282,6 +2331,213 @@ class HybridDeltaNetCacheManager(KVCacheManager):
         return latest_recurrent + recurrent_cache * 0, latest_conv + conv_cache * 0
 
 
+class HybridGDNCheckpointCache(nn.Module):
+    """Bounded device-side GDN prefix checkpoint bank.
+
+    Metadata owns prefix hashes, refcounts, and eviction. This module only owns
+    recurrent/conv tensors addressed by checkpoint slot IDs supplied by the
+    scheduler/request-prep path.
+    """
+
+    def __init__(self, config: Qwen35InferenceConfig):
+        super().__init__()
+        self.gdn_layer_ids = tuple(
+            idx
+            for idx, layer_type in enumerate(config.layer_types)
+            if layer_type == "linear_attention"
+        )
+        if not self.gdn_layer_ids:
+            raise ValueError("HybridGDNCheckpointCache requires GDN layers")
+        self.layer_to_bank_index = {
+            layer_id: bank_idx for bank_idx, layer_id in enumerate(self.gdn_layer_ids)
+        }
+        self.num_checkpoint_slots = int(config.max_gdn_checkpoint_slots)
+        if self.num_checkpoint_slots <= 0:
+            raise ValueError("max_gdn_checkpoint_slots must be positive")
+
+        tp_degree = config.neuron_config.tp_degree
+        if config.linear_num_value_heads % tp_degree != 0:
+            raise ValueError("linear_num_value_heads must be divisible by tp_degree")
+        if config.linear_num_key_heads % tp_degree != 0:
+            raise ValueError("linear_num_key_heads must be divisible by tp_degree")
+
+        self.local_num_value_heads = config.linear_num_value_heads // tp_degree
+        self.local_num_key_heads = config.linear_num_key_heads // tp_degree
+        self.key_dim = config.linear_key_head_dim
+        self.value_dim = config.linear_value_head_dim
+        self.conv_dim = (
+            2 * self.local_num_key_heads * config.linear_key_head_dim
+            + self.local_num_value_heads * config.linear_value_head_dim
+        )
+        self.conv_state_len = config.linear_conv_kernel_dim - 1
+        self.recurrent_dtype = _torch_dtype_from_hybrid_cache_dtype(
+            config.hybrid_recurrent_cache_dtype
+        )
+        self.conv_dtype = _torch_dtype_from_hybrid_cache_dtype(
+            config.hybrid_conv_cache_dtype
+        )
+
+        recurrent_shape = (
+            self.num_checkpoint_slots,
+            self.local_num_value_heads,
+            self.key_dim,
+            self.value_dim,
+        )
+        conv_shape = (
+            self.num_checkpoint_slots,
+            self.conv_dim,
+            self.conv_state_len,
+        )
+        self.recurrent_slots = nn.ParameterList(
+            [
+                nn.Parameter(
+                    torch.zeros(recurrent_shape, dtype=self.recurrent_dtype),
+                    requires_grad=False,
+                )
+                for _ in self.gdn_layer_ids
+            ]
+        )
+        self.conv_slots = nn.ParameterList(
+            [
+                nn.Parameter(
+                    torch.zeros(conv_shape, dtype=self.conv_dtype),
+                    requires_grad=False,
+                )
+                for _ in self.gdn_layer_ids
+            ]
+        )
+
+    @property
+    def checkpoint_params(self):
+        params = []
+        for recurrent_slot, conv_slot in zip(self.recurrent_slots, self.conv_slots):
+            params.append(recurrent_slot)
+            params.append(conv_slot)
+        return params
+
+    def bytes_per_checkpoint_per_rank(self) -> int:
+        recurrent_numel = (
+            len(self.gdn_layer_ids)
+            * self.local_num_value_heads
+            * self.key_dim
+            * self.value_dim
+        )
+        conv_numel = len(self.gdn_layer_ids) * self.conv_dim * self.conv_state_len
+        recurrent_bytes = 4 if self.recurrent_dtype == torch.float32 else 2
+        conv_bytes = 4 if self.conv_dtype == torch.float32 else 2
+        return recurrent_numel * recurrent_bytes + conv_numel * conv_bytes
+
+    def _safe_slot_ids(self, slot_ids: torch.Tensor) -> torch.Tensor:
+        return slot_ids.long().clamp(min=0, max=self.num_checkpoint_slots - 1)
+
+    @staticmethod
+    def _active_rows(
+        state: torch.Tensor,
+        seq_ids: torch.Tensor | None,
+        batch_size: int,
+    ) -> torch.Tensor:
+        if seq_ids is not None and state.shape[0] > batch_size:
+            return torch.index_select(state, 0, seq_ids.long())
+        return state[:batch_size]
+
+    def restore_to_active_rows(
+        self,
+        *,
+        layers: nn.ModuleList,
+        seq_ids: torch.Tensor | None,
+        checkpoint_slot_ids: torch.Tensor | None,
+        restore_mask: torch.Tensor | None,
+    ) -> dict[int, tuple[torch.Tensor, torch.Tensor]] | None:
+        if checkpoint_slot_ids is None or restore_mask is None:
+            return None
+        batch_size = int(checkpoint_slot_ids.shape[0])
+        slot_ids = self._safe_slot_ids(checkpoint_slot_ids)
+        restore_mask = restore_mask.to(torch.bool)
+        rec_mask = restore_mask.view(batch_size, 1, 1, 1)
+        conv_mask = restore_mask.view(batch_size, 1, 1)
+
+        restored = {}
+        for bank_idx, layer_id in enumerate(self.gdn_layer_ids):
+            linear_attn = layers[layer_id].linear_attn
+            active_recurrent = self._active_rows(
+                linear_attn.recurrent_state_buffer, seq_ids, batch_size
+            )
+            active_conv = self._active_rows(
+                linear_attn.conv_state_buffer, seq_ids, batch_size
+            )
+            slot_recurrent = torch.index_select(
+                self.recurrent_slots[bank_idx], 0, slot_ids
+            ).to(active_recurrent.dtype)
+            slot_conv = torch.index_select(self.conv_slots[bank_idx], 0, slot_ids).to(
+                active_conv.dtype
+            )
+            restored[layer_id] = (
+                torch.where(rec_mask, slot_recurrent, active_recurrent),
+                torch.where(conv_mask, slot_conv, active_conv),
+            )
+        return restored
+
+    def commit_from_active_rows(
+        self,
+        *,
+        layer_state_pairs: list[tuple[int, torch.Tensor, torch.Tensor]],
+        seq_ids: torch.Tensor | None,
+        checkpoint_slot_ids: torch.Tensor | None,
+        commit_mask: torch.Tensor | None,
+    ) -> list[torch.Tensor]:
+        if checkpoint_slot_ids is None or commit_mask is None:
+            return self.identity_outputs()
+        batch_size = int(checkpoint_slot_ids.shape[0])
+        slot_ids = self._safe_slot_ids(checkpoint_slot_ids)
+        commit_mask = commit_mask.to(torch.bool)
+        rec_mask = commit_mask.view(batch_size, 1, 1, 1)
+        conv_mask = commit_mask.view(batch_size, 1, 1)
+
+        state_by_layer = {
+            layer_id: (recurrent_state, conv_state)
+            for layer_id, recurrent_state, conv_state in layer_state_pairs
+        }
+        outputs = []
+        for bank_idx, layer_id in enumerate(self.gdn_layer_ids):
+            recurrent_slots = self.recurrent_slots[bank_idx]
+            conv_slots = self.conv_slots[bank_idx]
+            if layer_id not in state_by_layer:
+                outputs.append(recurrent_slots * 1)
+                outputs.append(conv_slots * 1)
+                continue
+
+            recurrent_state, conv_state = state_by_layer[layer_id]
+            recurrent_rows = self._active_rows(recurrent_state, seq_ids, batch_size).to(
+                recurrent_slots.dtype
+            )
+            conv_rows = self._active_rows(conv_state, seq_ids, batch_size).to(
+                conv_slots.dtype
+            )
+
+            old_recurrent_rows = torch.index_select(recurrent_slots, 0, slot_ids)
+            old_conv_rows = torch.index_select(conv_slots, 0, slot_ids)
+            recurrent_rows = torch.where(rec_mask, recurrent_rows, old_recurrent_rows)
+            conv_rows = torch.where(conv_mask, conv_rows, old_conv_rows)
+
+            recurrent_index = slot_ids.view(-1, 1, 1, 1).expand_as(recurrent_rows)
+            conv_index = slot_ids.view(-1, 1, 1).expand_as(conv_rows)
+            outputs.append(
+                torch.scatter(
+                    recurrent_slots,
+                    dim=0,
+                    index=recurrent_index,
+                    src=recurrent_rows,
+                )
+            )
+            outputs.append(
+                torch.scatter(conv_slots, dim=0, index=conv_index, src=conv_rows)
+            )
+        return outputs
+
+    def identity_outputs(self) -> list[torch.Tensor]:
+        return [param * 1 for param in self.checkpoint_params]
+
+
 # ============================================================
 # Model
 # ============================================================
@@ -2330,12 +2586,8 @@ class NeuronQwen35Model(NeuronBaseModel):
     def init_inference_optimization(self, config: Qwen35InferenceConfig):
         super().init_inference_optimization(config)
         if getattr(config, "use_hybrid_apc_manager", False):
-            raise NotImplementedError(
-                "use_hybrid_apc_manager is a guarded production-mode flag. "
-                "The vLLM/NxDI block-hash lifecycle must be wired to GDN "
-                "recurrent and conv checkpoints before it can be enabled."
-            )
-        if getattr(config, "use_hybrid_cache_manager", False):
+            self.hybrid_gdn_checkpoint_cache = HybridGDNCheckpointCache(config)
+        elif getattr(config, "use_hybrid_cache_manager", False):
             self.kv_mgr = HybridDeltaNetCacheManager(
                 config,
                 num_kv_head=self.num_key_value_heads,
@@ -2355,6 +2607,12 @@ class NeuronQwen35Model(NeuronBaseModel):
                 params.append(layer.linear_attn.recurrent_state_buffer)
                 params.append(layer.linear_attn.conv_state_buffer)
         return params
+
+    @property
+    def _hybrid_gdn_checkpoint_params(self):
+        if not hasattr(self, "hybrid_gdn_checkpoint_cache"):
+            return []
+        return self.hybrid_gdn_checkpoint_cache.checkpoint_params
 
     def encode_vision_to_input(self, inputs_embeds, vision_embeddings, vision_mask):
         """Scatter vision embeddings into text input embeddings at image token positions."""
@@ -2383,6 +2641,11 @@ class NeuronQwen35Model(NeuronBaseModel):
         is_for_context_encoding=False,
         vision_embeddings=None,
         vision_mask=None,
+        hybrid_restore_slot_ids=None,
+        hybrid_restore_mask=None,
+        hybrid_restore_prefix_lens=None,
+        hybrid_commit_slot_ids=None,
+        hybrid_commit_mask=None,
         local_attn_mask=None,
         windowed_context_encoding_window_idx=-1,
         padding_mask=None,
@@ -2483,8 +2746,37 @@ class NeuronQwen35Model(NeuronBaseModel):
         # Decoder layers
         next_decoder_cache = ()
         deltanet_state_tensors = []
+        deltanet_layer_state_pairs = []
         cos_cache = None
         sin_cache = None
+        restored_gdn_states = None
+        if getattr(self.config, "use_hybrid_apc_manager", False) and hasattr(
+            self, "hybrid_gdn_checkpoint_cache"
+        ):
+            if hybrid_restore_prefix_lens is not None and position_ids is not None:
+                # Host-side request prep must set suffix position_ids to the
+                # restored cumulative-prefix boundary. This is a no-op on
+                # default zero masks, but it keeps the contract explicit.
+                if (
+                    not torch.jit.is_tracing()
+                    and hybrid_restore_mask is not None
+                    and bool(hybrid_restore_mask.to(torch.bool).any().item())
+                ):
+                    expected = hybrid_restore_prefix_lens.long()
+                    observed = position_ids[:, 0].long()
+                    if not torch.equal(observed, expected):
+                        raise ValueError(
+                            "hybrid APC restore prefix lens must match "
+                            "position_ids[:, 0]"
+                        )
+            restored_gdn_states = (
+                self.hybrid_gdn_checkpoint_cache.restore_to_active_rows(
+                    layers=self.layers,
+                    seq_ids=seq_ids,
+                    checkpoint_slot_ids=hybrid_restore_slot_ids,
+                    restore_mask=hybrid_restore_mask,
+                )
+            )
 
         # Keep CTE masks compact on the Neuron paths. Qwen attention prefill
         # applies causal masking inside the attention kernel/path, while DeltaNet
@@ -2522,6 +2814,8 @@ class NeuronQwen35Model(NeuronBaseModel):
             past_key_value = (
                 past_key_values[idx] if past_key_values is not None else None
             )
+            if restored_gdn_states is not None and idx in restored_gdn_states:
+                past_key_value = restored_gdn_states[idx]
 
             layer_outputs = decoder_layer(
                 hidden_states,
@@ -2562,6 +2856,9 @@ class NeuronQwen35Model(NeuronBaseModel):
             if deltanet_states is not None:
                 deltanet_state_tensors.append(deltanet_states[0])
                 deltanet_state_tensors.append(deltanet_states[1])
+                deltanet_layer_state_pairs.append(
+                    (idx, deltanet_states[0], deltanet_states[1])
+                )
 
         # Update KV cache
         if update_cache:
@@ -2577,6 +2874,18 @@ class NeuronQwen35Model(NeuronBaseModel):
                 if use_qwen_chunked_prefill
                 else None,
                 **kwargs,
+            )
+
+        if getattr(self.config, "use_hybrid_apc_manager", False) and hasattr(
+            self, "hybrid_gdn_checkpoint_cache"
+        ):
+            self._hybrid_gdn_checkpoint_updated_states = (
+                self.hybrid_gdn_checkpoint_cache.commit_from_active_rows(
+                    layer_state_pairs=deltanet_layer_state_pairs,
+                    seq_ids=seq_ids,
+                    checkpoint_slot_ids=hybrid_commit_slot_ids,
+                    commit_mask=hybrid_commit_mask,
+                )
             )
 
         hidden_states = self.norm(hidden_states)
@@ -2611,6 +2920,11 @@ class NeuronQwen35Model(NeuronBaseModel):
         rotary_position_id=None,
         vision_embeddings=None,
         vision_mask=None,
+        hybrid_restore_slot_ids=None,
+        hybrid_restore_mask=None,
+        hybrid_restore_prefix_lens=None,
+        hybrid_commit_slot_ids=None,
+        hybrid_commit_mask=None,
     ):
         """Override base forward to append DeltaNet state tensors to output."""
         prev_hidden = self.set_none_if_empty(prev_hidden)
@@ -2632,6 +2946,11 @@ class NeuronQwen35Model(NeuronBaseModel):
         rotary_position_id = self.set_none_if_empty(rotary_position_id)
         vision_embeddings = self.set_none_if_empty(vision_embeddings)
         vision_mask = self.set_none_if_empty(vision_mask)
+        hybrid_restore_slot_ids = self.set_none_if_empty(hybrid_restore_slot_ids)
+        hybrid_restore_mask = self.set_none_if_empty(hybrid_restore_mask)
+        hybrid_restore_prefix_lens = self.set_none_if_empty(hybrid_restore_prefix_lens)
+        hybrid_commit_slot_ids = self.set_none_if_empty(hybrid_commit_slot_ids)
+        hybrid_commit_mask = self.set_none_if_empty(hybrid_commit_mask)
 
         is_for_context_encoding = position_ids.shape[-1] != 1 and not (
             hasattr(self.neuron_config, "speculation_length")
@@ -2659,6 +2978,11 @@ class NeuronQwen35Model(NeuronBaseModel):
             else scatter_index,
             vision_embeddings=vision_embeddings,
             vision_mask=vision_mask,
+            hybrid_restore_slot_ids=hybrid_restore_slot_ids,
+            hybrid_restore_mask=hybrid_restore_mask,
+            hybrid_restore_prefix_lens=hybrid_restore_prefix_lens,
+            hybrid_commit_slot_ids=hybrid_commit_slot_ids,
+            hybrid_commit_mask=hybrid_commit_mask,
         )
 
         batch_size = input_ids.shape[0]
@@ -2724,6 +3048,11 @@ class NeuronQwen35Model(NeuronBaseModel):
             and hasattr(self, "_deltanet_updated_states")
         ):
             outputs += self._deltanet_updated_states
+        if (
+            getattr(self.config, "use_hybrid_apc_manager", False)
+            and hasattr(self, "_hybrid_gdn_checkpoint_updated_states")
+        ):
+            outputs += self._hybrid_gdn_checkpoint_updated_states
 
         return outputs
 
@@ -2983,6 +3312,10 @@ class Qwen35DecoderModelInstance(DecoderModelInstance):
             for i, param in enumerate(module._deltanet_state_params):
                 input_output_aliases[param] = state_start_idx + i
 
+            checkpoint_start_idx = state_start_idx + len(module._deltanet_state_params)
+            for i, param in enumerate(getattr(module, "_hybrid_gdn_checkpoint_params", [])):
+                input_output_aliases[param] = checkpoint_start_idx + i
+
         return module, input_output_aliases
 
 
@@ -3045,6 +3378,11 @@ class Qwen35ModelWrapper(ModelWrapper):
             padded.append(mrope_position_ids)  # position 21
             padded.append(vision_embeddings)  # position 22
             padded.append(vision_mask)  # position 23
+            padded.append(torch.zeros((batch_size,), dtype=torch.int32))  # restore slots
+            padded.append(torch.zeros((batch_size,), dtype=torch.int32))  # restore mask
+            padded.append(torch.zeros((batch_size,), dtype=torch.int32))  # restore prefix
+            padded.append(torch.zeros((batch_size,), dtype=torch.int32))  # commit slots
+            padded.append(torch.zeros((batch_size,), dtype=torch.int32))  # commit mask
 
             extended_inputs.append(tuple(padded))
 
@@ -3055,6 +3393,11 @@ class Qwen35ModelWrapper(ModelWrapper):
         orig_mrope = args[21] if len(args) >= 22 else None
         orig_vis_emb = args[22] if len(args) >= 23 else None
         orig_vis_mask = args[23] if len(args) >= 24 else None
+        orig_restore_slots = args[24] if len(args) >= 25 else None
+        orig_restore_mask = args[25] if len(args) >= 26 else None
+        orig_restore_prefix = args[26] if len(args) >= 27 else None
+        orig_commit_slots = args[27] if len(args) >= 28 else None
+        orig_commit_mask = args[28] if len(args) >= 29 else None
 
         padded_args = super().pad_inputs(*args, pad_type=pad_type)
 
@@ -3153,6 +3496,35 @@ class Qwen35ModelWrapper(ModelWrapper):
                     padded_args = list(padded_args)
                     padded_args[23] = padded_args[23].clamp(max=padded_seq_len - 1)
                     padded_args = tuple(padded_args)
+
+        if len(padded_args) >= 24:
+            padded_batch_size = padded_args[0].shape[0]
+
+            def _pad_vector(value, dtype=torch.int32):
+                if value is None or not hasattr(value, "ndim") or value.ndim == 0:
+                    return torch.zeros((padded_batch_size,), dtype=dtype)
+                value = value.to(dtype)
+                if value.shape[0] == padded_batch_size:
+                    return value
+                if value.shape[0] > padded_batch_size:
+                    return value[:padded_batch_size]
+                pad = torch.zeros(
+                    (padded_batch_size - value.shape[0],),
+                    dtype=value.dtype,
+                )
+                return torch.cat([value, pad], dim=0)
+
+            hybrid_args = (
+                _pad_vector(orig_restore_slots),
+                _pad_vector(orig_restore_mask),
+                _pad_vector(orig_restore_prefix),
+                _pad_vector(orig_commit_slots),
+                _pad_vector(orig_commit_mask),
+            )
+            if len(padded_args) >= 29:
+                padded_args = (*padded_args[:24], *hybrid_args)
+            else:
+                padded_args = (*padded_args, *hybrid_args)
 
         return padded_args
 
@@ -3255,6 +3627,20 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
                 tkg_param.data = new_state
                 cte_param.data = new_state
 
+        checkpoint_start = state_start + len(tkg_params)
+        tkg_checkpoint_params = getattr(tkg_model, "_hybrid_gdn_checkpoint_params", [])
+        cte_checkpoint_params = getattr(cte_model, "_hybrid_gdn_checkpoint_params", [])
+        if (
+            len(tkg_checkpoint_params) > 0
+            and checkpoint_start + len(tkg_checkpoint_params) <= len(outputs)
+        ):
+            for i, (tkg_param, cte_param) in enumerate(
+                zip(tkg_checkpoint_params, cte_checkpoint_params)
+            ):
+                new_state = outputs[checkpoint_start + i]
+                tkg_param.data = new_state
+                cte_param.data = new_state
+
     def get_required_kwargs(self):
         """Return extra kwargs for HF generation loop."""
         return ["llava_args"]
@@ -3275,6 +3661,11 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
         full_context_lens=None,
         computed_context_lens=None,
         tf_args=None,
+        hybrid_restore_slot_ids=None,
+        hybrid_restore_mask=None,
+        hybrid_restore_prefix_lens=None,
+        hybrid_commit_slot_ids=None,
+        hybrid_commit_mask=None,
     ):
         """Override to pass all 24 positional args explicitly."""
         is_prefill = self._is_prefill(position_ids) or (
@@ -3327,6 +3718,16 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
             mrope_position_ids = torch.zeros((0,), dtype=torch.int32)
 
         empties = [torch.empty(0) for _ in range(14)]
+        if hybrid_restore_slot_ids is None:
+            hybrid_restore_slot_ids = torch.zeros((batch_size,), dtype=torch.int32)
+        if hybrid_restore_mask is None:
+            hybrid_restore_mask = torch.zeros((batch_size,), dtype=torch.int32)
+        if hybrid_restore_prefix_lens is None:
+            hybrid_restore_prefix_lens = torch.zeros((batch_size,), dtype=torch.int32)
+        if hybrid_commit_slot_ids is None:
+            hybrid_commit_slot_ids = torch.zeros((batch_size,), dtype=torch.int32)
+        if hybrid_commit_mask is None:
+            hybrid_commit_mask = torch.zeros((batch_size,), dtype=torch.int32)
 
         if is_prefill:
             ctx_bs = self.context_encoding_model.neuron_config.batch_size
@@ -3341,6 +3742,11 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
                 chunk_pos_ids = position_ids[cb:cb_end]
                 chunk_seq_ids = seq_ids[cb:cb_end]
                 chunk_sampling = sampling_params[cb:cb_end]
+                chunk_restore_slots = hybrid_restore_slot_ids[cb:cb_end]
+                chunk_restore_mask = hybrid_restore_mask[cb:cb_end]
+                chunk_restore_prefix = hybrid_restore_prefix_lens[cb:cb_end]
+                chunk_commit_slots = hybrid_commit_slot_ids[cb:cb_end]
+                chunk_commit_mask = hybrid_commit_mask[cb:cb_end]
                 chunk_prev_hidden = (
                     prev_hidden[cb:cb_end]
                     if prev_hidden is not None
@@ -3387,6 +3793,26 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
                     chunk_seq_ids = torch.cat([chunk_seq_ids, pad_seq], dim=0)
                     chunk_sampling = torch.cat(
                         [chunk_sampling, chunk_sampling[:1].expand(pad_n, -1)], dim=0
+                    )
+                    chunk_restore_slots = torch.cat(
+                        [chunk_restore_slots, torch.zeros(pad_n, dtype=chunk_restore_slots.dtype)],
+                        dim=0,
+                    )
+                    chunk_restore_mask = torch.cat(
+                        [chunk_restore_mask, torch.zeros(pad_n, dtype=chunk_restore_mask.dtype)],
+                        dim=0,
+                    )
+                    chunk_restore_prefix = torch.cat(
+                        [chunk_restore_prefix, torch.zeros(pad_n, dtype=chunk_restore_prefix.dtype)],
+                        dim=0,
+                    )
+                    chunk_commit_slots = torch.cat(
+                        [chunk_commit_slots, torch.zeros(pad_n, dtype=chunk_commit_slots.dtype)],
+                        dim=0,
+                    )
+                    chunk_commit_mask = torch.cat(
+                        [chunk_commit_mask, torch.zeros(pad_n, dtype=chunk_commit_mask.dtype)],
+                        dim=0,
                     )
                     if (
                         chunk_prev_hidden is not None
@@ -3454,6 +3880,11 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
                     chunk_mrope,
                     chunk_vis_emb,
                     chunk_vis_mask,
+                    chunk_restore_slots,
+                    chunk_restore_mask,
+                    chunk_restore_prefix,
+                    chunk_commit_slots,
+                    chunk_commit_mask,
                 )
                 if actual_chunk < ctx_bs:
                     chunk_out = chunk_out[:actual_chunk]
@@ -3479,6 +3910,11 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
                 mrope_position_ids,
                 vision_embeddings,
                 vision_mask,
+                hybrid_restore_slot_ids,
+                hybrid_restore_mask,
+                hybrid_restore_prefix_lens,
+                hybrid_commit_slot_ids,
+                hybrid_commit_mask,
             )
             is_run_on_neuron = self.token_generation_model.is_neuron()
 
