@@ -62,9 +62,32 @@ def _get_hybrid_apc_bridge(
     neuron_base_instance: "NeuronBaseForCausalLM",
     input_dict: Dict[str, Any],
 ):
-    return _first_present(
+    bridge = _first_present(
         input_dict.get("hybrid_apc_bridge"),
         getattr(neuron_base_instance, "hybrid_apc_bridge", None),
+    )
+    if bridge is None:
+        ensure_bridge = getattr(
+            neuron_base_instance,
+            "ensure_hybrid_apc_scheduler_bridge",
+            None,
+        )
+        if ensure_bridge is not None:
+            bridge = ensure_bridge()
+    return bridge
+
+
+def _requires_external_hybrid_apc_metadata(
+    neuron_base_instance: "NeuronBaseForCausalLM",
+    bridge: Any,
+) -> bool:
+    return bool(
+        getattr(
+            neuron_base_instance.config,
+            "hybrid_apc_require_vllm_metadata",
+            False,
+        )
+        or getattr(bridge, "requires_external_metadata", False)
     )
 
 
@@ -84,7 +107,16 @@ def prepare_hybrid_apc_request_for_execution(
         return input_dict
 
     bridge = _get_hybrid_apc_bridge(neuron_base_instance, input_dict)
+    requires_external_metadata = _requires_external_hybrid_apc_metadata(
+        neuron_base_instance,
+        bridge,
+    )
     if bridge is None:
+        if requires_external_metadata:
+            raise ValueError(
+                "hybrid APC requires a scheduler bridge attached to the model "
+                "or input_dict"
+            )
         return input_dict
 
     request_id = _first_present(
@@ -104,7 +136,7 @@ def prepare_hybrid_apc_request_for_execution(
     if attention_hit_len is None:
         attention_hit_len = _single_batch_value(input_dict.get("computed_context_lens"))
 
-    if request_id is None and attention_hit_len is None:
+    if request_id is None and attention_hit_len is None and not requires_external_metadata:
         return input_dict
     if request_id is None:
         raise ValueError("hybrid APC request prep requires request_id")
@@ -133,6 +165,11 @@ def prepare_hybrid_apc_request_for_execution(
     bridge_input_dict = input_dict
     if full_input_ids is not None:
         if not _single_batch_tensor(full_input_ids):
+            if requires_external_metadata:
+                raise ValueError(
+                    "hybrid APC v0 request prep supports one request at a time; "
+                    "vectorized continuous-batching metadata is not wired yet"
+                )
             return input_dict
         bridge_input_dict = dict(input_dict)
         bridge_input_dict["input_ids"] = full_input_ids
@@ -157,8 +194,19 @@ def prepare_hybrid_apc_request_for_execution(
             # The live prefix-caching request has already been sliced to the
             # attention suffix. Without full prompt tokens the bridge cannot
             # compute or apply an exact GDN checkpoint boundary.
+            if requires_external_metadata:
+                raise ValueError(
+                    "hybrid APC production mode received suffix-only input "
+                    "without hybrid_full_input_ids/full_input_ids; request prep "
+                    "must attach full prompt tokens before suffix slicing"
+                )
             return input_dict
     if not _single_batch_tensor(bridge_input_dict.get("input_ids")):
+        if requires_external_metadata:
+            raise ValueError(
+                "hybrid APC v0 request prep supports one request at a time; "
+                "vectorized continuous-batching metadata is not wired yet"
+            )
         return input_dict
 
     prepared = bridge.prepare_request(

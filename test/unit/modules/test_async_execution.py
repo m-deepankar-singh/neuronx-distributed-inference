@@ -11,6 +11,7 @@ from neuronx_distributed_inference.modules.async_execution import (
     execute_model_prefix_caching,
     finish_hybrid_apc_request,
     prepare_hybrid_apc_model_inputs,
+    prepare_hybrid_apc_request_for_execution,
 )
 
 
@@ -492,6 +493,39 @@ class TestHybridAPCAsyncBridge(unittest.TestCase):
         cancel_hybrid_apc_request(input_dict)
 
         self.assertEqual(input_dict, {})
+
+    def test_strict_hybrid_apc_requires_attached_bridge(self):
+        base = SimpleNamespace(
+            config=SimpleNamespace(
+                use_hybrid_apc_manager=True,
+                hybrid_apc_require_vllm_metadata=True,
+            )
+        )
+
+        with self.assertRaisesRegex(ValueError, "requires a scheduler bridge"):
+            prepare_hybrid_apc_request_for_execution(base, _prefix_input_dict())
+
+    def test_strict_hybrid_apc_rejects_suffix_without_full_prompt(self):
+        bridge = _FakeHybridBridge()
+        bridge.requires_external_metadata = True
+        base = SimpleNamespace(
+            config=SimpleNamespace(
+                use_hybrid_apc_manager=True,
+                hybrid_apc_require_vllm_metadata=True,
+            ),
+            hybrid_apc_bridge=bridge,
+        )
+        input_dict = _prefix_input_dict()
+        input_dict["input_ids"] = torch.tensor([[12, 13]], dtype=torch.int32)
+        input_dict["attention_mask"] = torch.ones((1, 2), dtype=torch.int32)
+        input_dict["position_ids"] = torch.tensor([[2, 3]], dtype=torch.int32)
+        input_dict["slot_mapping"] = torch.tensor([[2, 3]], dtype=torch.int32)
+        input_dict["computed_context_lens"] = torch.tensor([[2]], dtype=torch.int32)
+        input_dict["request_id"] = "req-strict"
+        input_dict["vllm_attention_hit_len"] = torch.tensor([2], dtype=torch.int32)
+
+        with self.assertRaisesRegex(ValueError, "suffix-only input"):
+            prepare_hybrid_apc_request_for_execution(base, input_dict)
 
 
 def _prefix_input_dict():

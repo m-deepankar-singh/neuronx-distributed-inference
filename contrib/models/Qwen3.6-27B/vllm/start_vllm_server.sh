@@ -30,6 +30,7 @@ HYBRID_GDN_CONV_CACHE_DTYPE=""
 HYBRID_CACHE_MODE="all"
 HYBRID_CACHE_PREFIX_BOUNDARY_ONLY="1"
 HYBRID_CACHE_VALIDATE_EXACT="0"
+HYBRID_APC_REQUIRE_VLLM_METADATA="1"
 NUM_GPU_BLOCKS_OVERRIDE=""
 KERNEL_Q_TILE_SIZE="128"
 KERNEL_KV_TILE_SIZE="1024"
@@ -68,6 +69,8 @@ while [[ $# -gt 0 ]]; do
     --hybrid-cache-prefix-boundary-only|--hybrid-cache-block-boundary-only) HYBRID_CACHE_PREFIX_BOUNDARY_ONLY="1"; shift ;;
     --no-hybrid-cache-prefix-boundary-only|--no-hybrid-cache-block-boundary-only) HYBRID_CACHE_PREFIX_BOUNDARY_ONLY="0"; shift ;;
     --hybrid-cache-validate-exact) HYBRID_CACHE_VALIDATE_EXACT="1"; shift ;;
+    --hybrid-apc-require-vllm-metadata) HYBRID_APC_REQUIRE_VLLM_METADATA="1"; shift ;;
+    --no-hybrid-apc-require-vllm-metadata|--allow-hybrid-apc-local-hash-fallback) HYBRID_APC_REQUIRE_VLLM_METADATA="0"; shift ;;
     --num-gpu-blocks-override) NUM_GPU_BLOCKS_OVERRIDE="$2"; shift 2 ;;
     --kernel-q-tile-size) KERNEL_Q_TILE_SIZE="$2"; shift 2 ;;
     --kernel-kv-tile-size) KERNEL_KV_TILE_SIZE="$2"; shift 2 ;;
@@ -224,6 +227,9 @@ print(json.dumps({
     "hybrid_cache_prefix_boundary_only": "${HYBRID_CACHE_PREFIX_BOUNDARY_ONLY}" == "1",
     "hybrid_cache_block_boundary_only": "${HYBRID_CACHE_PREFIX_BOUNDARY_ONLY}" == "1",
     "hybrid_cache_validate_exact": "${HYBRID_CACHE_VALIDATE_EXACT}" == "1",
+    "hybrid_apc_require_vllm_metadata": enable_hybrid_apc and "${HYBRID_APC_REQUIRE_VLLM_METADATA}" == "1",
+    "hybrid_apc_allow_local_hash_fallback": not (enable_hybrid_apc and "${HYBRID_APC_REQUIRE_VLLM_METADATA}" == "1"),
+    "hybrid_apc_require_attention_block_refs": enable_hybrid_apc and "${HYBRID_APC_REQUIRE_VLLM_METADATA}" == "1",
     "override_neuron_config": neuron_config,
 }))
 PY
@@ -250,6 +256,7 @@ echo "GDN_CHECKPOINT_INTERVAL=${GDN_CHECKPOINT_INTERVAL}"
 echo "MAX_GDN_CHECKPOINT_SLOTS=${MAX_GDN_CHECKPOINT_SLOTS}"
 echo "HYBRID_GDN_RECURRENT_CACHE_DTYPE=${HYBRID_GDN_RECURRENT_CACHE_DTYPE}"
 echo "HYBRID_GDN_CONV_CACHE_DTYPE=${HYBRID_GDN_CONV_CACHE_DTYPE}"
+echo "HYBRID_APC_REQUIRE_VLLM_METADATA=${HYBRID_APC_REQUIRE_VLLM_METADATA}"
 echo "ADDITIONAL_CONFIG=${ADDITIONAL_CONFIG}"
 
 VLLM_ARGS=(

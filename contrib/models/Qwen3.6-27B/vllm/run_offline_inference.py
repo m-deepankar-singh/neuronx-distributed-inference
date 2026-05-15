@@ -126,6 +126,9 @@ def _override_config(args: argparse.Namespace) -> dict:
         "hybrid_cache_prefix_boundary_only": args.hybrid_cache_prefix_boundary_only,
         "hybrid_cache_block_boundary_only": args.hybrid_cache_prefix_boundary_only,
         "hybrid_cache_validate_exact": args.hybrid_cache_validate_exact,
+        "hybrid_apc_require_vllm_metadata": args.hybrid_apc_require_vllm_metadata,
+        "hybrid_apc_allow_local_hash_fallback": not args.hybrid_apc_require_vllm_metadata,
+        "hybrid_apc_require_attention_block_refs": args.hybrid_apc_require_vllm_metadata,
         "override_neuron_config": neuron_config,
     }
 
@@ -158,6 +161,14 @@ def main() -> int:
         default=True,
     )
     parser.add_argument("--hybrid-cache-validate-exact", action="store_true")
+    parser.add_argument(
+        "--hybrid-apc-require-vllm-metadata",
+        action="store_true",
+        help=(
+            "Require serving-provided vLLM cumulative prefix hashes and attention "
+            "block refs instead of the local token-hash validation fallback."
+        ),
+    )
     parser.add_argument("--num-gpu-blocks-override", type=int, default=None)
     parser.add_argument("--max-tokens", type=int, default=64)
     parser.add_argument("--temperature", type=float, default=0.0)

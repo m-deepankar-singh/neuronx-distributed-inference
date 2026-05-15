@@ -83,6 +83,18 @@ vLLM/NxDI cumulative-prefix hash lifecycle; otherwise the default zero masks run
 as attention KV plus normal active-row GDN state with no GDN checkpoint reuse.
 For v0, `gdn_checkpoint_interval` must equal the vLLM block size.
 
+The production server launcher enables strict hybrid APC metadata by default.
+That means request prep must provide vLLM/NxDI cumulative prefix hashes and real
+attention block refs; local token-hash fallback is reserved for controlled
+validation via `--allow-hybrid-apc-local-hash-fallback`. The live scheduler
+integration should pass the full prompt before suffix slicing using
+`hybrid_full_input_ids`/`full_input_ids`, attach `vllm_attention_hit_len`, pass
+`cumulative_hashes_by_prefix_len`, and pass actual attention block refs at
+commit time through `actual_attention_block_refs` or
+`hybrid_actual_attention_block_refs`. Attention KV eviction should call the
+model/store `on_attention_block_evicted` callback so GDN checkpoints do not
+outlive the KV blocks they depend on.
+
 ## Chunked Prefill Note
 
 The Neuron plugin disables vLLM chunked prefill by default and installs a custom

@@ -543,6 +543,49 @@ class TestHybridAPCSchedulerBridge(unittest.TestCase):
         self.assertEqual(allocator.free_slots, (1, 0))
         self.assertEqual(len(store), 0)
 
+    def test_bridge_can_require_scheduler_prefix_hashes(self):
+        bridge = HybridAPCSchedulerBridge(
+            store=_store(),
+            slot_allocator=HybridAPCSlotAllocator(num_slots=2),
+            cache_salt="tenant-a",
+            model_revision="rev-a",
+            allow_local_hash_fallback=False,
+        )
+
+        with self.assertRaisesRegex(ValueError, "requires vLLM cumulative prefix hashes"):
+            bridge.prepare_request(
+                request_id="req-strict",
+                input_dict={"input_ids": torch.arange(128, dtype=torch.int32).unsqueeze(0)},
+                attention_hit_len=0,
+            )
+
+    def test_bridge_can_require_attention_refs_on_commit(self):
+        store = _store()
+        input_ids = torch.arange(128, dtype=torch.int32).unsqueeze(0)
+        hashes = build_cumulative_prefix_hashes(input_ids, block_size=128)
+        bridge = HybridAPCSchedulerBridge(
+            store=store,
+            slot_allocator=HybridAPCSlotAllocator(num_slots=2),
+            cache_salt="tenant-a",
+            model_revision="rev-a",
+            allow_local_hash_fallback=False,
+            require_attention_block_refs=True,
+        )
+
+        prepared = bridge.prepare_request(
+            request_id="req-refs",
+            input_dict={"input_ids": input_ids},
+            attention_hit_len=0,
+            cumulative_hashes_by_prefix_len=hashes,
+        )
+
+        with self.assertRaisesRegex(ValueError, "requires real attention block refs"):
+            bridge.commit_prefill(prepared)
+
+        committed = bridge.commit_prefill(prepared, attention_block_refs=(31,))
+
+        self.assertEqual(committed.attention_block_refs, (31,))
+
     def test_bridge_salt_mismatch_does_not_restore_slot_zero(self):
         store = _store()
         allocator = HybridAPCSlotAllocator(num_slots=2)

@@ -1388,6 +1388,9 @@ class Qwen35InferenceConfig(InferenceConfig):
         kwargs.setdefault("hybrid_apc_layout_version", 1)
         kwargs.setdefault("hybrid_apc_allow_residual_replay", False)
         kwargs.setdefault("hybrid_apc_cache_salt", None)
+        kwargs.setdefault("hybrid_apc_require_vllm_metadata", False)
+        kwargs.setdefault("hybrid_apc_allow_local_hash_fallback", True)
+        kwargs.setdefault("hybrid_apc_require_attention_block_refs", False)
         kwargs.setdefault(
             "hybrid_apc_model_revision",
             kwargs.get("_name_or_path", kwargs.get("model_revision", "unknown")),
@@ -1448,6 +1451,18 @@ class Qwen35InferenceConfig(InferenceConfig):
         self.hybrid_cache_block_boundary_only = (
             self.hybrid_cache_prefix_boundary_only
         )
+        self.hybrid_apc_require_vllm_metadata = bool(
+            self.hybrid_apc_require_vllm_metadata
+        )
+        self.hybrid_apc_allow_local_hash_fallback = bool(
+            self.hybrid_apc_allow_local_hash_fallback
+        )
+        self.hybrid_apc_require_attention_block_refs = bool(
+            self.hybrid_apc_require_attention_block_refs
+        )
+        if self.hybrid_apc_require_vllm_metadata:
+            self.hybrid_apc_allow_local_hash_fallback = False
+            self.hybrid_apc_require_attention_block_refs = True
         if self.use_hybrid_cache_manager and self.use_hybrid_apc_manager:
             raise ValueError(
                 "use_hybrid_cache_manager and use_hybrid_apc_manager are mutually exclusive"
@@ -3604,12 +3619,31 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
             tp_rank=tp_rank,
             recurrent_dtype=self.config.hybrid_recurrent_cache_dtype,
             conv_dtype=self.config.hybrid_conv_cache_dtype,
+            allow_local_hash_fallback=self.config.hybrid_apc_allow_local_hash_fallback,
+            require_attention_block_refs=self.config.hybrid_apc_require_attention_block_refs,
         )
+
+    def ensure_hybrid_apc_scheduler_bridge(self):
+        if not getattr(self.config, "use_hybrid_apc_manager", False):
+            return None
+        if getattr(self, "hybrid_apc_bridge", None) is None:
+            self._init_hybrid_apc_scheduler_bridge()
+        return self.hybrid_apc_bridge
 
     def on_attention_block_evicted(self, block_ref: int):
         if self.hybrid_apc_store is None:
             return []
         return self.hybrid_apc_store.on_attention_block_evicted(block_ref)
+
+    def on_attention_blocks_evicted(self, block_refs):
+        invalidated = []
+        if self.hybrid_apc_store is None:
+            return invalidated
+        for block_ref in block_refs:
+            invalidated.extend(
+                self.hybrid_apc_store.on_attention_block_evicted(block_ref)
+            )
+        return invalidated
 
     def get_model_wrapper_cls(self):
         """Return custom ModelWrapper with DeltaNet state aliasing."""

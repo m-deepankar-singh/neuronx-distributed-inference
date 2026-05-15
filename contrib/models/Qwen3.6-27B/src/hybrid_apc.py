@@ -456,6 +456,8 @@ class HybridAPCSchedulerBridge:
         tp_rank: int | None = None,
         recurrent_dtype: str | torch.dtype | None = None,
         conv_dtype: str | torch.dtype | None = None,
+        allow_local_hash_fallback: bool = True,
+        require_attention_block_refs: bool = False,
     ):
         self.store = store
         self.slot_allocator = slot_allocator
@@ -465,6 +467,15 @@ class HybridAPCSchedulerBridge:
         self.tp_rank = tp_rank
         self.recurrent_dtype = recurrent_dtype
         self.conv_dtype = conv_dtype
+        self.allow_local_hash_fallback = bool(allow_local_hash_fallback)
+        self.require_attention_block_refs = bool(require_attention_block_refs)
+
+    @property
+    def requires_external_metadata(self) -> bool:
+        return (
+            not self.allow_local_hash_fallback
+            or self.require_attention_block_refs
+        )
 
     def prepare_request(
         self,
@@ -490,6 +501,12 @@ class HybridAPCSchedulerBridge:
         )
 
         if cumulative_hashes_by_prefix_len is None:
+            if not self.allow_local_hash_fallback:
+                raise ValueError(
+                    "hybrid APC production mode requires vLLM cumulative prefix "
+                    "hashes; set hybrid_apc_allow_local_hash_fallback=True only "
+                    "for controlled local validation"
+                )
             cumulative_hashes_by_prefix_len = build_cumulative_prefix_hashes(
                 input_ids,
                 block_size=self.store.block_size,
@@ -533,7 +550,7 @@ class HybridAPCSchedulerBridge:
                         (),
                     )
                 )
-            if not attention_block_refs:
+            if not attention_block_refs and not self.require_attention_block_refs:
                 attention_block_refs = tuple(
                     range(commit_prefix_len // self.store.block_size)
                 )
@@ -578,6 +595,11 @@ class HybridAPCSchedulerBridge:
             if attention_block_refs is not None
             else prepared.attention_block_refs
         )
+        if self.require_attention_block_refs and not refs:
+            raise ValueError(
+                "hybrid APC checkpoint commit requires real attention block refs "
+                "from the vLLM/NxDI APC allocator"
+            )
         checkpoint = self.store.insert(
             key=prepared.commit_key,
             attention_block_refs=refs,
