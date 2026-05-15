@@ -174,11 +174,14 @@ def _build_config(args: argparse.Namespace):
     num_layers = int(config_dict["num_hidden_layers"])
     modules_to_not_convert = _mlp_only_modules_to_not_convert(num_layers)
 
+    batch_size = args.batch_size or max(args.ctx_batch_size, args.tkg_batch_size or 1)
+    tkg_batch_size = args.tkg_batch_size or batch_size
+
     neuron_config = NeuronConfig(
         tp_degree=args.tp_degree,
-        batch_size=1,
-        ctx_batch_size=1,
-        tkg_batch_size=1,
+        batch_size=batch_size,
+        ctx_batch_size=args.ctx_batch_size,
+        tkg_batch_size=tkg_batch_size,
         seq_len=args.seq_len,
         max_context_length=args.cte_bucket,
         max_length=args.seq_len,
@@ -223,6 +226,9 @@ def main() -> int:
     parser.add_argument("--cte-bucket", type=int, default=512)
     parser.add_argument("--tp-degree", type=int, default=4)
     parser.add_argument("--logical-nc-config", type=int, default=2)
+    parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--ctx-batch-size", type=int, default=1)
+    parser.add_argument("--tkg-batch-size", type=int, default=None)
     parser.add_argument("--force-quantize", action="store_true")
     parser.add_argument("--quantize-only", action="store_true")
     parser.add_argument("--load-after-compile", action="store_true")
@@ -240,6 +246,8 @@ def main() -> int:
     quantized_path = Path(args.quantized_checkpoints_path).expanduser().resolve()
 
     inf_config, modules_to_not_convert = _build_config(args)
+    batch_size = args.batch_size or max(args.ctx_batch_size, args.tkg_batch_size or 1)
+    tkg_batch_size = args.tkg_batch_size or batch_size
 
     print("FP8_MODE mlp_only", flush=True)
     print("MODEL_PATH", str(model_path), flush=True)
@@ -253,6 +261,19 @@ def main() -> int:
                 "seq_len": args.seq_len,
                 "max_context_length": args.cte_bucket,
                 "context_encoding_buckets": [args.cte_bucket],
+            },
+            sort_keys=True,
+        ),
+        flush=True,
+    )
+    print(
+        "NEURON_BATCH_CONFIG",
+        json.dumps(
+            {
+                "batch_size": batch_size,
+                "ctx_batch_size": args.ctx_batch_size,
+                "tkg_batch_size": tkg_batch_size,
+                "tp_degree": args.tp_degree,
             },
             sort_keys=True,
         ),

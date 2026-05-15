@@ -13,7 +13,10 @@ import sys
 import unittest
 from unittest.mock import MagicMock
 
+import pytest
 import torch
+
+pytest.importorskip("neuronx_distributed_inference")
 
 # Ensure the contrib root (Qwen3.6-27B/) is on sys.path
 _CONTRIB_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))

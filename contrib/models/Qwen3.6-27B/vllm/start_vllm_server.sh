@@ -37,6 +37,7 @@ KERNEL_KV_TILE_SIZE="1024"
 TEXT_ONLY_CTE="1"
 COMPACT_CTE_ATTENTION_MASK="1"
 COLD_ZERO_CONV_FAST_PATH="0"
+DRY_RUN="0"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -80,6 +81,7 @@ while [[ $# -gt 0 ]]; do
     --no-compact-cte-attention-mask) COMPACT_CTE_ATTENTION_MASK="0"; shift ;;
     --cold-zero-conv-fast-path) COLD_ZERO_CONV_FAST_PATH="1"; shift ;;
     --no-cold-zero-conv-fast-path) COLD_ZERO_CONV_FAST_PATH="0"; shift ;;
+    --dry-run) DRY_RUN="1"; shift ;;
     --host) HOST="$2"; shift 2 ;;
     --port) PORT="$2"; shift 2 ;;
     *) echo "Unknown argument: $1" >&2; exit 2 ;;
@@ -96,10 +98,27 @@ CONTRIB_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 export PYTHONPATH="${SCRIPT_DIR}:${CONTRIB_ROOT}:${PYTHONPATH:-}"
 export VLLM_NEURON_FRAMEWORK="neuronx-distributed-inference"
 export VLLM_PLUGINS="${VLLM_PLUGINS:-neuron}"
+export USE_NKI_FUSED="${USE_NKI_FUSED:-1}"
+export USE_NKI_CHUNKED="${USE_NKI_CHUNKED:-0}"
+export USE_PYTORCH_CHUNK="${USE_PYTORCH_CHUNK:-0}"
+
+if [[ "${USE_PYTORCH_CHUNK}" == "1" ]]; then
+  GDN_CTE_KERNEL="pytorch_chunk"
+elif [[ "${USE_NKI_FUSED}" != "0" ]]; then
+  GDN_CTE_KERNEL="fused_initial_state"
+elif [[ "${USE_NKI_CHUNKED}" == "1" ]]; then
+  GDN_CTE_KERNEL="nki_chunked"
+elif [[ "${USE_NKI:-0}" == "1" ]]; then
+  GDN_CTE_KERNEL="nki_recurrent"
+else
+  GDN_CTE_KERNEL="fused_initial_state"
+fi
+export GDN_CTE_KERNEL
 
 if [[ -n "${COMPILED_ARTIFACTS}" ]]; then
   export NEURON_COMPILED_ARTIFACTS="${COMPILED_ARTIFACTS}"
 fi
+export QWEN36_MODEL_PATH="${MODEL_PATH}"
 if [[ -z "${BLOCK_SIZE}" ]]; then
   BLOCK_SIZE="128"
 fi
@@ -235,6 +254,29 @@ print(json.dumps({
 PY
 )"
 
+COLD_PREFILL_CONFIG="$(
+  python3 - <<PY
+import json
+
+print(json.dumps({
+    "cte_buckets": json.loads('${CTE_BUCKETS_JSON}'),
+    "ctx_batch_size": int("${CTX_BATCH_SIZE}"),
+    "block_size": int("${BLOCK_SIZE}"),
+    "kernel_q_tile_size": int("${KERNEL_Q_TILE_SIZE}"),
+    "kernel_kv_tile_size": int("${KERNEL_KV_TILE_SIZE}"),
+    "text_only_cte_enabled": "${TEXT_ONLY_CTE}" == "1",
+    "compact_mask_enabled": "${COMPACT_CTE_ATTENTION_MASK}" == "1",
+    "chunked_prefill_enabled": "${ENABLE_CHUNKED_PREFILL}" == "1",
+    "cold_zero_conv_fast_path_enabled": "${COLD_ZERO_CONV_FAST_PATH}" == "1",
+    "use_nki_fused": "${GDN_CTE_KERNEL}" == "fused_initial_state",
+    "gdn_cte_kernel": "${GDN_CTE_KERNEL}",
+    "max_model_len": int("${MAX_MODEL_LEN}"),
+    "seq_len": int("${SEQ_LEN}"),
+}, sort_keys=True))
+PY
+)"
+export QWEN36_COLD_PREFILL_CONFIG="${COLD_PREFILL_CONFIG}"
+
 echo "Starting vLLM for Qwen3.6-27B"
 echo "MODEL_PATH=${MODEL_PATH}"
 echo "NEURON_COMPILED_ARTIFACTS=${NEURON_COMPILED_ARTIFACTS:-}"
@@ -252,11 +294,16 @@ echo "KERNEL_KV_TILE_SIZE=${KERNEL_KV_TILE_SIZE}"
 echo "TEXT_ONLY_CTE=${TEXT_ONLY_CTE}"
 echo "COMPACT_CTE_ATTENTION_MASK=${COMPACT_CTE_ATTENTION_MASK}"
 echo "COLD_ZERO_CONV_FAST_PATH=${COLD_ZERO_CONV_FAST_PATH}"
+echo "USE_NKI_FUSED=${USE_NKI_FUSED}"
+echo "USE_NKI_CHUNKED=${USE_NKI_CHUNKED}"
+echo "USE_PYTORCH_CHUNK=${USE_PYTORCH_CHUNK}"
+echo "GDN_CTE_KERNEL=${GDN_CTE_KERNEL}"
 echo "GDN_CHECKPOINT_INTERVAL=${GDN_CHECKPOINT_INTERVAL}"
 echo "MAX_GDN_CHECKPOINT_SLOTS=${MAX_GDN_CHECKPOINT_SLOTS}"
 echo "HYBRID_GDN_RECURRENT_CACHE_DTYPE=${HYBRID_GDN_RECURRENT_CACHE_DTYPE}"
 echo "HYBRID_GDN_CONV_CACHE_DTYPE=${HYBRID_GDN_CONV_CACHE_DTYPE}"
 echo "HYBRID_APC_REQUIRE_VLLM_METADATA=${HYBRID_APC_REQUIRE_VLLM_METADATA}"
+echo "COLD_PREFILL_CONFIG=${COLD_PREFILL_CONFIG}"
 echo "ADDITIONAL_CONFIG=${ADDITIONAL_CONFIG}"
 
 VLLM_ARGS=(
@@ -298,6 +345,13 @@ if [[ "${ENABLE_CHUNKED_PREFILL}" == "1" ]]; then
   )
 else
   VLLM_ARGS+=(--no-enable-chunked-prefill)
+fi
+
+if [[ "${DRY_RUN}" == "1" ]]; then
+  printf 'VLLM_COMMAND='
+  printf '%q ' python "${SCRIPT_DIR}/serve_qwen36.py" "${VLLM_ARGS[@]}"
+  printf '\n'
+  exit 0
 fi
 
 exec python "${SCRIPT_DIR}/serve_qwen36.py" "${VLLM_ARGS[@]}"

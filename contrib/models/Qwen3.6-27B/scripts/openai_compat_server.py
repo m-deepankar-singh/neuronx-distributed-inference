@@ -11,6 +11,7 @@ the stock Neuron inference venv. It supports non-streaming:
 
 import argparse
 import json
+import os
 import sys
 import threading
 import time
@@ -58,11 +59,171 @@ def _token_scalar(tokens: Any) -> int:
     return int(tokens.reshape(-1)[0].item())
 
 
+def _load_cold_prefill_config() -> Dict[str, Any]:
+    raw = os.getenv("QWEN36_COLD_PREFILL_CONFIG", "{}")
+    try:
+        config = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    return config if isinstance(config, dict) else {}
+
+
+def _selected_cte_bucket(actual_prompt_len: int, buckets: List[int]) -> int:
+    for bucket in buckets:
+        if actual_prompt_len <= bucket:
+            return bucket
+    return buckets[-1]
+
+
+def _bucketed_prefill_work(
+    actual_prompt_len: int,
+    buckets: List[int],
+    *,
+    chunked_prefill_enabled: bool,
+) -> Dict[str, Any]:
+    if not buckets:
+        return {}
+    max_bucket = buckets[-1]
+    if actual_prompt_len <= max_bucket or not chunked_prefill_enabled:
+        selected = _selected_cte_bucket(actual_prompt_len, buckets)
+        return {
+            "selected_cte_bucket": selected,
+            "selected_cte_buckets": [selected],
+            "num_cte_chunks": 1,
+            "bucket_work_tokens": selected,
+            "padding_tokens": max(selected - actual_prompt_len, 0),
+        }
+
+    remaining = actual_prompt_len
+    selected_buckets = []
+    bucket_work_tokens = 0
+    while remaining > 0:
+        chunk_tokens = min(remaining, max_bucket)
+        selected = _selected_cte_bucket(chunk_tokens, buckets)
+        selected_buckets.append(selected)
+        bucket_work_tokens += selected
+        remaining -= chunk_tokens
+    return {
+        "selected_cte_bucket": selected_buckets[-1],
+        "selected_cte_buckets": selected_buckets,
+        "num_cte_chunks": len(selected_buckets),
+        "bucket_work_tokens": bucket_work_tokens,
+        "padding_tokens": max(bucket_work_tokens - actual_prompt_len, 0),
+    }
+
+
+def _hbm_usage_if_available():
+    try:
+        import torch_xla.core.xla_model as xm
+
+        device = xm.xla_device()
+        return xm.get_memory_info(device)
+    except Exception:
+        return None
+
+
+def _cold_prefill_metrics(
+    *,
+    request_id: str,
+    route: str,
+    actual_prompt_len: int,
+    prefill_elapsed_seconds: float,
+    config: Dict[str, Any],
+    fallback_chunk_size: int,
+) -> Dict[str, Any]:
+    buckets = [int(bucket) for bucket in config.get("cte_buckets") or []]
+    if not buckets and fallback_chunk_size > 0:
+        buckets = [int(fallback_chunk_size)]
+    bucket_work = _bucketed_prefill_work(
+        actual_prompt_len,
+        buckets,
+        chunked_prefill_enabled=bool(config.get("chunked_prefill_enabled", True)),
+    )
+    bucket_work_tokens = bucket_work.get("bucket_work_tokens", 0)
+    padding_tokens = bucket_work.get("padding_tokens", 0)
+    return {
+        "request_id": request_id,
+        "route": route,
+        "actual_prompt_len": actual_prompt_len,
+        **bucket_work,
+        "padding_ratio": (
+            padding_tokens / bucket_work_tokens if bucket_work_tokens else None
+        ),
+        "ctx_batch_size": config.get("ctx_batch_size"),
+        "block_size": config.get("block_size"),
+        "kernel_q_tile_size": config.get("kernel_q_tile_size"),
+        "kernel_kv_tile_size": config.get("kernel_kv_tile_size"),
+        "text_only_cte_enabled": config.get("text_only_cte_enabled"),
+        "compact_mask_enabled": config.get("compact_mask_enabled"),
+        "chunked_prefill_enabled": config.get("chunked_prefill_enabled", True),
+        "cold_zero_conv_fast_path_enabled": config.get(
+            "cold_zero_conv_fast_path_enabled"
+        ),
+        "use_nki_fused": config.get("use_nki_fused"),
+        "gdn_cte_kernel": config.get("gdn_cte_kernel"),
+        "max_model_len": config.get("max_model_len"),
+        "seq_len": config.get("seq_len"),
+        "prefill_latency_ms": prefill_elapsed_seconds * 1000.0,
+        "actual_tok_per_s": (
+            actual_prompt_len / prefill_elapsed_seconds
+            if prefill_elapsed_seconds > 0
+            else None
+        ),
+        "bucket_tok_per_s": (
+            bucket_work_tokens / prefill_elapsed_seconds
+            if prefill_elapsed_seconds > 0 and bucket_work_tokens
+            else None
+        ),
+        "hbm_usage": _hbm_usage_if_available(),
+    }
+
+
+def _generation_metrics(
+    *,
+    request_id: str,
+    route: str,
+    prompt_tokens: int,
+    completion_tokens: int,
+    max_tokens: int,
+    prefill_elapsed_seconds: float,
+    request_elapsed_seconds: float,
+    first_token_id: int | None,
+    finish_reason: str,
+) -> Dict[str, Any]:
+    decode_elapsed_seconds = max(request_elapsed_seconds - prefill_elapsed_seconds, 0.0)
+    decode_tokens = max(completion_tokens - 1, 0)
+    return {
+        "request_id": request_id,
+        "route": route,
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "max_tokens": max_tokens,
+        "first_token_id": first_token_id,
+        "finish_reason": finish_reason,
+        "request_latency_ms": request_elapsed_seconds * 1000.0,
+        "first_token_latency_ms": prefill_elapsed_seconds * 1000.0,
+        "prefill_latency_ms": prefill_elapsed_seconds * 1000.0,
+        "decode_latency_ms": decode_elapsed_seconds * 1000.0,
+        "decode_tokens": decode_tokens,
+        "decode_tok_per_s": (
+            decode_tokens / decode_elapsed_seconds
+            if decode_elapsed_seconds > 0 and decode_tokens
+            else None
+        ),
+        "end_to_end_generated_tok_per_s": (
+            completion_tokens / request_elapsed_seconds
+            if request_elapsed_seconds > 0 and completion_tokens
+            else None
+        ),
+    }
+
+
 class QwenOpenAIServer:
     def __init__(self, args: argparse.Namespace):
         self.args = args
         self.model_id = args.model_id
         self.lock = threading.Lock()
+        self.cold_prefill_config = _load_cold_prefill_config()
         self._load_model()
 
     def _load_model(self):
@@ -115,7 +276,7 @@ class QwenOpenAIServer:
             lines.append("assistant:")
             return "\n".join(lines)
 
-    def _generate(self, prompt: str, body: Dict[str, Any]) -> Dict[str, Any]:
+    def _generate(self, prompt: str, body: Dict[str, Any], route: str) -> Dict[str, Any]:
         max_tokens = int(body.get("max_tokens", body.get("max_completion_tokens", 128)) or 128)
         if max_tokens <= 0:
             raise ValueError("max_tokens must be positive")
@@ -161,6 +322,7 @@ class QwenOpenAIServer:
             if hasattr(self.model, "reset"):
                 self.model.reset()
             t0 = time.perf_counter()
+            prefill_t0 = time.perf_counter()
             first_token = None
             for start in range(0, prompt_tokens, self.args.chunk_size):
                 end = min(start + self.args.chunk_size, prompt_tokens)
@@ -183,9 +345,24 @@ class QwenOpenAIServer:
                         return_dict=True,
                     )
                 first_token = _token_scalar(out.tokens)
+            prefill_elapsed = time.perf_counter() - prefill_t0
 
             if first_token is None:
                 raise RuntimeError("prefill produced no token")
+            request_id = f"nxdi-{uuid.uuid4().hex}"
+            cold_metrics = _cold_prefill_metrics(
+                request_id=request_id,
+                route=route,
+                actual_prompt_len=prompt_tokens,
+                prefill_elapsed_seconds=prefill_elapsed,
+                config=self.cold_prefill_config,
+                fallback_chunk_size=self.args.chunk_size,
+            )
+            print(
+                "COLD_PREFILL_METRICS",
+                json.dumps(cold_metrics, sort_keys=True),
+                flush=True,
+            )
 
             new_ids = []
             current_token = first_token
@@ -228,6 +405,22 @@ class QwenOpenAIServer:
                     )
                     current_token = _token_scalar(out.tokens)
             elapsed = time.perf_counter() - t0
+            generation_metrics = _generation_metrics(
+                request_id=request_id,
+                route=route,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=len(new_ids),
+                max_tokens=max_tokens,
+                prefill_elapsed_seconds=prefill_elapsed,
+                request_elapsed_seconds=elapsed,
+                first_token_id=first_token,
+                finish_reason=finish_reason,
+            )
+            print(
+                "GENERATION_METRICS",
+                json.dumps(generation_metrics, sort_keys=True),
+                flush=True,
+            )
 
         invalid = [tok for tok in new_ids if tok < 0 or tok >= vocab_size]
         if invalid:
@@ -243,6 +436,8 @@ class QwenOpenAIServer:
             "prompt_tokens": prompt_tokens,
             "completion_tokens": len(new_ids),
             "elapsed": elapsed,
+            "prefill_elapsed": prefill_elapsed,
+            "generation_metrics": generation_metrics,
             "tokens": new_ids,
             "finish_reason": finish_reason,
         }
@@ -288,7 +483,11 @@ def make_handler(server_state: QwenOpenAIServer):
                     raise ValueError("stream=true is not supported by this minimal server yet")
 
                 if self.path == "/v1/completions":
-                    result = server_state._generate(_first_text_prompt(body.get("prompt", "")), body)
+                    result = server_state._generate(
+                        _first_text_prompt(body.get("prompt", "")),
+                        body,
+                        self.path,
+                    )
                     _json_response(
                         self,
                         200,
@@ -323,6 +522,7 @@ def make_handler(server_state: QwenOpenAIServer):
                             enable_thinking=bool(body.get("enable_thinking", False)),
                         ),
                         body,
+                        self.path,
                     )
                     _json_response(
                         self,

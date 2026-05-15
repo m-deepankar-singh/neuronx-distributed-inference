@@ -82,6 +82,14 @@ from src.hybrid_apc import (
     HybridAPCSchedulerBridge,
     HybridAPCSlotAllocator,
 )
+from src.cold_prefill_utils import (
+    depthwise_causal_conv1d_from_zero as _depthwise_causal_conv1d_from_zero,
+    depthwise_causal_conv1d_with_state as _depthwise_causal_conv1d_with_state,
+    gdn_cte_kernel_from_env as _gdn_cte_kernel_from_env,
+    prepare_cte_attention_mask as _prepare_cte_attention_mask,
+    safe_cold_zero_conv_fast_path as _safe_cold_zero_conv_fast_path,
+    validate_text_only_cte_vision_inputs as _validate_text_only_cte_vision_inputs,
+)
 
 from neuronx_distributed_inference.models.config import (
     InferenceConfig,
@@ -104,6 +112,7 @@ from neuronx_distributed_inference.models.layer_boundary_marker import (
 )
 
 logger = logging.getLogger(__name__)
+
 
 try:
     _flash_fwd_call = nki_jit()(attention_isa_kernel)
@@ -1024,18 +1033,20 @@ class NeuronGatedDeltaNet(nn.Module):
                 new_conv_state = new_conv_state + self.conv_state_buffer * 0
         else:
             if qwen_chunked_prefill_active and conv_state_cache is not None:
-                cold_prefill_from_zero = getattr(
-                    self.config, "use_cold_zero_conv_fast_path", False
+                cold_prefill_from_zero = _safe_cold_zero_conv_fast_path(
+                    self.config,
+                    position_ids,
+                    recurrent_state_cache,
+                    conv_state_cache,
+                    kwargs.get("hybrid_restore_mask", None),
+                    kwargs.get("hybrid_restore_prefix_lens", None),
                 )
                 if cold_prefill_from_zero:
                     mixed_post_conv = F.silu(
-                        F.conv1d(
+                        _depthwise_causal_conv1d_from_zero(
                             mixed,
                             self._conv1d_weight(),
-                            bias=None,
-                            padding=self.conv_kernel_size - 1,
-                            groups=self.conv_dim,
-                        )[:, :, :seq_len]
+                        )
                     )
                     state_source = mixed
                 else:
@@ -1048,15 +1059,13 @@ class NeuronGatedDeltaNet(nn.Module):
                             1.0 - reset_mask[:, :, None]
                         )
                     conv_input = torch.cat([conv_state, mixed], dim=-1)
-                    w = self._conv1d_weight().squeeze(1)
-                    conv_out = torch.zeros_like(mixed)
-                    for k in range(self.conv_kernel_size):
-                        conv_out = (
-                            conv_out
-                            + w[:, k].unsqueeze(0).unsqueeze(-1)
-                            * conv_input[:, :, k : k + seq_len]
+                    mixed_post_conv = F.silu(
+                        _depthwise_causal_conv1d_with_state(
+                            mixed,
+                            self._conv1d_weight(),
+                            conv_state,
                         )
-                    mixed_post_conv = F.silu(conv_out)
+                    )
                     state_source = conv_input
 
                 state_len = self.conv_kernel_size - 1
@@ -1422,6 +1431,7 @@ class Qwen35InferenceConfig(InferenceConfig):
         kwargs.setdefault("use_cold_zero_conv_fast_path", False)
 
         super().__init__(*args, **kwargs)
+        logger.info("GDN_CTE_KERNEL=%s", _gdn_cte_kernel_from_env())
 
         self.gdn_checkpoint_interval = int(self.gdn_checkpoint_interval)
         if self.gdn_checkpoint_interval <= 0:
@@ -2714,6 +2724,12 @@ class NeuronQwen35Model(NeuronBaseModel):
         # Vision embedding injection. Text-only calls still pass dummy vision
         # tensors to keep the traced input signature stable; those tensors have
         # one dummy entry per text token and must not overwrite text embeddings.
+        _validate_text_only_cte_vision_inputs(
+            self.config,
+            is_for_context_encoding,
+            vision_embeddings,
+            vision_mask,
+        )
         if (vision_embeddings is not None) and (vision_mask is not None):
             if vision_embeddings.dtype != self.config.neuron_config.torch_dtype:
                 vision_embeddings = vision_embeddings.to(
@@ -2813,23 +2829,13 @@ class NeuronQwen35Model(NeuronBaseModel):
         use_neuron_cte_attention = use_qwen_chunked_prefill or getattr(
             self.config.neuron_config, "is_block_kv_layout", False
         )
-        # Convert 2D attention_mask to 4D causal mask for the small fallback path.
-        if (
-            attention_mask is not None
-            and attention_mask.ndim == 2
-            and is_for_context_encoding
-            and not use_compact_cte_attention_mask
-            and not use_neuron_cte_attention
-        ):
-            causal = torch.ones(
-                (seq_length, seq_length),
-                dtype=torch.bool,
-                device=attention_mask.device,
-            ).tril()
-            padding_4d = attention_mask[:, None, None, :].to(torch.bool)
-            attention_mask = (causal[None, None, :, :] & padding_4d).to(
-                attention_mask.dtype
-            )
+        attention_mask = _prepare_cte_attention_mask(
+            attention_mask,
+            is_for_context_encoding=is_for_context_encoding,
+            seq_length=seq_length,
+            use_compact_cte_attention_mask=use_compact_cte_attention_mask,
+            use_neuron_cte_attention=use_neuron_cte_attention,
+        )
 
         # Pre-compute mRoPE cos/sin
         if rotary_position_ids is not None and rotary_position_ids.ndim == 3:
@@ -2868,6 +2874,8 @@ class NeuronQwen35Model(NeuronBaseModel):
                 qwen_chunked_valid_mask=deltanet_padding_mask.squeeze(-1)
                 if use_qwen_chunked_prefill
                 else None,
+                hybrid_restore_mask=hybrid_restore_mask,
+                hybrid_restore_prefix_lens=hybrid_restore_prefix_lens,
                 **kwargs,
             )
 

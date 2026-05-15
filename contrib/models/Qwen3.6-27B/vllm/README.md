@@ -244,6 +244,7 @@ Then expose the guarded OpenAI-compatible endpoint on port 8000:
 
 ```bash
 python contrib/models/Qwen3.6-27B/vllm/qwen36_chat_proxy.py \
+  --model-path /opt/dlami/nvme/models/Qwen3.6-27B \
   --backend-url http://127.0.0.1:8001 \
   --port 8000
 ```
@@ -255,6 +256,12 @@ It also hoists `system` and `developer` messages to a single leading `system`
 message because the Qwen chat template rejects system messages that appear later
 in the conversation. Use `--allow-thinking` or `--allow-completions` only for
 explicit debugging.
+
+When `QWEN36_COLD_PREFILL_CONFIG` is present from the launcher, the proxy logs
+`COLD_PREFILL_PROXY_REQUEST` and `COLD_PREFILL_PROXY_RESPONSE` rows with prompt
+length, selected CTE buckets, padding, tile sizes, block size, feature flags,
+and backend latency. Passing `--model-path` lets the proxy count prompt tokens
+with the tokenizer instead of a whitespace fallback.
 
 Offline long-prompt smoke:
 
@@ -334,6 +341,12 @@ python validation_scripts/qwen36_hybrid_apc_validation.py hbm \
   --checkpoint-intervals 128 256 512
 ```
 
+The exactness harness emits `COLD_PREFILL_METRICS` JSON lines for the cold
+full-prefix and partial-prefix requests before the final report. Those lines use
+the same metric schema as the offline benchmark runner and include HBM usage
+when the Trainium runtime exposes it, so they can be archived with the
+acceptance evidence.
+
 Native APC validation run on Trn2 with the FP8 128K artifact:
 
 - server exact-repeat, `~10.8K` prompt tokens: `26.68s` cold to `1.67s` warm,
@@ -378,6 +391,235 @@ python contrib/models/Qwen3.6-27B/vllm/run_offline_inference.py \
   --chat \
   --prompt "What is 17 * 23? Answer with the number only."
 ```
+
+## Cold-Prefill Benchmark
+
+Use launcher dry-run mode to inspect generated config without starting vLLM:
+
+```bash
+USE_PYTORCH_CHUNK=1 contrib/models/Qwen3.6-27B/vllm/start_vllm_server.sh \
+  --model-path /opt/dlami/nvme/models/Qwen3.6-27B \
+  --cte-bucket-profile short \
+  --dry-run
+```
+
+Run the cold-prefill matrix with deterministic one-token generation and write
+JSON output for acceptance gates:
+
+```bash
+python validation_scripts/qwen36_cold_prefill_benchmark.py \
+  --model-path /opt/dlami/nvme/models/Qwen3.6-27B \
+  --compiled-artifacts /opt/dlami/nvme/qwen_artifacts/qwen36_27b_2k \
+  --compiled-artifacts-by-len \
+    8192=/opt/dlami/nvme/qwen_artifacts/qwen36_27b_8k \
+    32768=/opt/dlami/nvme/qwen_artifacts/qwen36_27b_32k \
+  --prompt-lengths 128 256 384 512 1024 2048 8192 32768 \
+  --repetitions 5 \
+  --output-json /tmp/qwen36_cold_prefill_matrix.json
+```
+
+By default the benchmark emits both `--max-tokens 1` rows for pure prefill
+timing and `--max-tokens 32` rows for end-to-end timing. Override with
+`--max-tokens-values` when narrowing a run. Use `--repetitions` to collect
+enough samples for the acceptance report's p50/p95 latency summaries. When the
+model tokenizer can be loaded from `--model-path`, prompt files are calibrated
+to the requested target lengths and rows record `prompt_token_count`; otherwise
+the runner's `actual_prompt_len` metric is used by acceptance. Runtime failures
+are kept as rows and written to `--output-json` so artifact-load and DMA-spill
+gates have evidence; pass `--fail-fast` only for interactive debugging. Use
+`--compiled-artifacts-by-len LEN=PATH ...` when one matrix spans artifacts
+compiled for different `seq_len` values; rows record the selected artifact path
+so baseline/candidate comparisons can enforce the same prompt/model/artifact
+inputs.
+
+For long-context artifact checks, include the explicit 128K and 262K candidate
+profiles:
+
+```bash
+python validation_scripts/qwen36_cold_prefill_benchmark.py \
+  --model-path /opt/dlami/nvme/models/Qwen3.6-27B \
+  --compiled-artifacts /opt/dlami/nvme/qwen_artifacts/qwen36_27b_2k \
+  --compiled-artifacts-by-len \
+    131072=/opt/dlami/nvme/qwen_artifacts/qwen36_27b_128k \
+    262144=/opt/dlami/nvme/qwen_artifacts/qwen36_27b_262k \
+  --prompt-lengths 128 256 384 512 2048 \
+  --include-128k \
+  --include-262k \
+  --variants A_single512_old_chunked H_128k_candidate I_262k_recovery_block256 J_262k_recovery_block128 \
+  --repetitions 3 \
+  --output-json /tmp/qwen36_cold_prefill_long_context.json
+```
+
+Evaluate the matrix gates:
+
+```bash
+python validation_scripts/qwen36_cold_prefill_acceptance.py \
+  /tmp/qwen36_cold_prefill_matrix.json \
+  /tmp/qwen36_cold_prefill_long_context.json \
+  --short-latency-speedup 1.5 \
+  --baseline-cold-tok-per-s-target 420 \
+  --baseline-cold-tok-per-s-tolerance 0.15 \
+  --bucket-tok-regression-tolerance 0.20 \
+  --prompt-token-tolerance 0.05 \
+  --require-prompt-token-counts \
+  --prefill-max-tokens 1 \
+  --require-feature-deltas \
+  --hbm-regression-tolerance 0.0
+```
+
+For a final sign-off run, add `--strict-final`. That preset requires prompt
+rows for the fixed 128/256/384/512/1K/2K/8K/32K suite, prompt token counts,
+the full A-G matrix on that fixed suite for both `max_tokens=1` and
+`max_tokens=32`, row evidence for greedy sampling (`temperature=0`, `top_k=1`),
+the complete cold-prefill instrumentation payload on every row,
+benchmark schema/provenance fields on every row,
+normalized launch-shape evidence (`tensor_parallel_size=4`,
+`logical_nc_config=2`, `max_num_seqs=1`, `ctx_batch_size=1`),
+positive `artifact_load_success` evidence on every compiled-artifact row,
+positive `compiled_artifacts_path_exists` and
+`compiled_artifacts_path_nonempty` evidence captured by the benchmark for every
+compiled-artifact row,
+explicit runtime `returncode=0` evidence on every row,
+non-empty runtime `output_tail` evidence for DMA-spill auditing,
+compiled-artifact consistency for the required 2K/8K/32K/128K/262K sequence
+lengths,
+generation latency/decode metrics and token exactness for
+end-to-end rows including 128K/262K artifact candidates, at least three repeated
+samples per required prefill row, per required 2K/8K tile-sweep case, and per
+`max_tokens=32` generation row, including each required G tile-sweep case for
+both prefill and generation, explicit p50/p95 prefill latency summaries for
+each required row and G tile case, all required 2K/8K tile-sweep cases, A-G launch
+profiles, repeated small dense-mask fallback rows at 256 and 512 tokens with
+token exactness against the A-G matrix, feature-delta checks, HBM usage on every row,
+GDN CTE kernel identity, GDN state diff fields on each candidate row, 128K and 262K artifact rows
+including the 262K block-128 comparison, required long-artifact launch profiles
+(`128/1024` q/kv tiles with block 128 and CTE buckets `256,512,1024,2048`
+for 128K, block 256 then 128 with CTE profile `262k`/`[256]` for 262K),
+matching baseline rows for long-context token exactness, a hybrid APC exactness
+report proving full-prefix and partial-prefix token matches with cold-prefill
+metrics and the strict cold-zero/chunked/text-only/compact validation config, and an explicit
+`--baseline-cold-tok-per-s-target` near the documented 420 tok/s cold baseline.
+Strict-final checks that baseline target both as an aggregate and on each fixed
+short baseline prompt. For 8K+ rows, strict-final also requires concrete
+`cte_attention_mask_path` / `dense_cte_mask_fallback` evidence showing the row
+did not use the dense 4D SxS fallback path.
+Use `--strict-min-samples` to raise that repeated-sample threshold.
+`--strict-final` already requires HBM usage and GDN recurrent/conv state-diff
+fields; HBM regression is checked on optimized candidate rows, while dense
+fallback rows are treated as correctness controls. For exploratory non-strict runs, add `--require-hbm-usage` and
+`--require-gdn-state-diff` once those fields are captured. The benchmark
+harness captures a runtime line shaped as
+`GDN_STATE_DIFF {"recurrent_max_abs_diff": ..., "conv_max_abs_diff": ...}` and
+mirrors it into the row metrics consumed by the acceptance gate. It also accepts
+`gdn_recurrent_state_max_abs_diff` / `gdn_conv_state_max_abs_diff` aliases,
+normalizes them to canonical recurrent/conv keys, and preserves the raw payload
+for audit provenance. If a debug hook writes state diffs to a sidecar instead
+of stdout, pass `--gdn-state-diff-json /path/to/state_diff.json` to the
+benchmark or strict-final orchestrator. The sidecar may be a keyed object using
+`variant|prompt_len|max_tokens|repetition` keys, optionally with
+`|q_tile|kv_tile|block_size` suffixes for tile sweeps, or a list of row records
+containing those fields plus `gdn_state_diff`.
+For final long-artifact acceptance, also pass `--require-128k` and
+`--require-262k` against a matrix that includes the baseline rows plus
+`H_128k_candidate`, `I_262k_recovery_block256`, and
+`J_262k_recovery_block128`. If a long artifact run has no matching baseline
+row, the acceptance report still enforces artifact load/run and DMA-spill
+checks, and records long-context token exactness as skipped for that prompt
+length.
+
+To build the fixed-suite matrix, long-artifact matrix, and strict acceptance
+report from one command, use the strict-final orchestrator. It also runs the
+hybrid APC exactness validation and passes that JSON report into acceptance:
+
+```bash
+python validation_scripts/qwen36_cold_prefill_strict_final.py \
+  --model-path /opt/dlami/nvme/models/Qwen3.6-27B \
+  --artifacts-2k /opt/dlami/nvme/qwen_artifacts/qwen36_27b_2k \
+  --artifacts-8k /opt/dlami/nvme/qwen_artifacts/qwen36_27b_8k \
+  --artifacts-32k /opt/dlami/nvme/qwen_artifacts/qwen36_27b_32k \
+  --artifacts-128k /opt/dlami/nvme/qwen_artifacts/qwen36_27b_128k \
+  --artifacts-262k /opt/dlami/nvme/qwen_artifacts/qwen36_27b_262k \
+  --output-dir /tmp/qwen36_cold_prefill_strict \
+  --repetitions 3
+```
+
+Add `--preflight` first on the Trainium host to verify the local model,
+non-empty compiled-artifact directories, output parent, Python executable, and
+helper scripts before launching vLLM. It also checks that the checkout is on
+`qwen36-cold-prefill-perf` by default; pass `--expected-branch` only if the
+branch was intentionally renamed. The preflight step writes
+`qwen36_cold_prefill_preflight.json` under `--output-dir` by default; keep that
+with the run manifest, benchmark, acceptance, and per-phase `.log` artifacts.
+The non-dry-run orchestrator writes `qwen36_cold_prefill_run_manifest.json`
+with phase commands, return codes, log paths, expected output paths, and
+non-empty evidence status for the preflight JSON and each output/log file. Add
+`--dry-run` to inspect the generated benchmark and acceptance commands without
+launching vLLM. After the strict-final run, use `--evidence-check` with the same
+`--output-dir` to verify the preflight JSON passed and describes the same
+bundle, the run manifest contains all phase commands and matching paths, all
+phase return codes are 0, strict-final acceptance passed with no failed audit
+items, and required benchmark/log files are present. It writes
+`qwen36_cold_prefill_evidence_check.json` under `--output-dir`. Add
+`--gdn-state-diff-json` here if GDN state-diff evidence is produced as a debug
+sidecar rather than runtime stdout.
+The same sequence is available as
+`bash validation_scripts/qwen36_trainium_strict_final.sh` after exporting
+`QWEN36_MODEL`, `QWEN36_ARTIFACT_2K`, `QWEN36_ARTIFACT_8K`,
+`QWEN36_ARTIFACT_32K`, `QWEN36_ARTIFACT_128K`, `QWEN36_ARTIFACT_262K`, and
+`QWEN36_OUT`. Set `QWEN36_OUTPUT_PREFIX` only if you need a non-default artifact
+prefix, and `QWEN36_FAIL_FAST=1` if you want benchmark phases to stop after the
+first runtime failure. The wrapper resolves the orchestrator from its own path,
+so an absolute script path works even when the current directory is not the repo
+root.
+The orchestrator includes the dense fallback rows automatically and explicitly
+runs both `--max-tokens-values 1 32`; for manual benchmark runs, add
+`--include-dense-fallback` to collect the same 256/512-token fallback evidence.
+For manual strict-final acceptance, first write the hybrid
+APC report with `validation_scripts/qwen36_hybrid_apc_validation.py exactness
+--output-json /tmp/qwen36_hybrid_apc_exactness.json`, then pass
+`--hybrid-apc-report /tmp/qwen36_hybrid_apc_exactness.json` to
+`qwen36_cold_prefill_acceptance.py --strict-final`.
+
+For a focused GDN kernel comparison, run the old chunked, fused, and PyTorch
+chunk toggles from the same prompt set:
+
+```bash
+python validation_scripts/qwen36_cold_prefill_benchmark.py \
+  --model-path /opt/dlami/nvme/models/Qwen3.6-27B \
+  --compiled-artifacts /opt/dlami/nvme/qwen_artifacts/qwen36_27b_2k \
+  --prompt-lengths 128 512 2048 \
+  --max-tokens-values 1 \
+  --variants A_single512_old_chunked E_short_text_compact_fused K_short_text_compact_pytorch_chunk \
+  --repetitions 5 \
+  --output-json /tmp/qwen36_gdn_kernel_compare.json
+```
+
+The offline runner and minimal OpenAI-compatible server log
+`GENERATION_METRICS` alongside `COLD_PREFILL_METRICS`; use that row for
+first-token latency, decode latency, decode tok/s, and end-to-end generated
+tok/s when validating benchmark and served requests. The benchmark harness
+captures both metric rows when present and folds generation fields into the
+acceptance report.
+Benchmark rows also record prompt SHA-256, model path, compiled artifact path,
+`max_model_len`, and `seq_len`; the acceptance script requires those controlled
+inputs to match between the baseline and candidate rows by default. In
+`--strict-final` mode, this controlled-input check also covers every
+`max_tokens=32` generation row. Long-artifact rows also carry the selected CTE
+bucket list, q/kv tile sizes, block size, text-only CTE flag, and compact-mask
+flag into the acceptance audit. A-G rows carry their expected CTE bucket list,
+text-only flag, compact-mask flag, and cold-zero-conv flag into the same audit.
+Its JSON output includes an `audit_checklist` mapping the goal gates to concrete
+evidence, including the optional baseline tok/s target, short-prompt speedup,
+prompt-token accuracy, 2K regression, exactness, HBM, GDN kernel identity, GDN
+state diff, and 128K/262K artifact checks.
+It also includes `feature_delta_checks` for the A->G matrix so you can see the
+per-step latency/token-throughput evidence for dynamic buckets, text-only CTE,
+compact masks, fused GDN CTE, cold-zero conv, and tile/block sweeps. Pass
+`--require-feature-deltas` to fail the report when any populated A->G step
+regresses. When HBM usage is present, an increased target HBM footprint also
+marks that feature step as regressed, and each feature-delta row includes the
+HBM byte delta for audit. The tile/block sweep keeps every tile profile in
+`tile_case_checks` and uses the best p50 profile per prompt for the gate.
 
 ## Next Milestone
 

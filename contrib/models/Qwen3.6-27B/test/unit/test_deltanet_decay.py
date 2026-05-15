@@ -7,7 +7,10 @@ import os
 import sys
 import unittest
 
+import pytest
 import torch
+
+pytest.importorskip("neuronx_distributed_inference")
 
 _CONTRIB_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if _CONTRIB_ROOT not in sys.path:

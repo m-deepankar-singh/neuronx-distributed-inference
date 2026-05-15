@@ -41,7 +41,7 @@ def _runner_args(args, *, enable_hybrid_apc: bool):
         cte_bucket_profile=args.cte_bucket_profile,
         seq_len=args.seq_len,
         tensor_parallel_size=args.tensor_parallel_size,
-        max_num_seqs=1,
+        max_num_seqs=args.max_num_seqs,
         ctx_batch_size=args.ctx_batch_size,
         logical_nc_config=args.logical_nc_config,
         block_size=args.block_size,
@@ -59,9 +59,12 @@ def _runner_args(args, *, enable_hybrid_apc: bool):
         hybrid_cache_mode="all",
         hybrid_cache_prefix_boundary_only=True,
         hybrid_cache_validate_exact=True,
-        text_only_cte=True,
-        compact_cte_attention_mask=True,
-        cold_zero_conv_fast_path=False,
+        hybrid_apc_require_vllm_metadata=getattr(
+            args, "hybrid_apc_require_vllm_metadata", False
+        ),
+        text_only_cte=getattr(args, "text_only_cte", True),
+        compact_cte_attention_mask=getattr(args, "compact_cte_attention_mask", True),
+        cold_zero_conv_fast_path=getattr(args, "cold_zero_conv_fast_path", False),
     )
 
 
@@ -93,7 +96,7 @@ def _build_llm(args, *, enable_hybrid_apc: bool):
         "trust_remote_code": True,
         "dtype": "bfloat16",
         "tensor_parallel_size": args.tensor_parallel_size,
-        "max_num_seqs": 1,
+        "max_num_seqs": args.max_num_seqs,
         "max_model_len": args.max_model_len,
         "enable_prefix_caching": enable_hybrid_apc,
         "enable_chunked_prefill": args.enable_vllm_chunked_prefill,
@@ -108,8 +111,10 @@ def _build_llm(args, *, enable_hybrid_apc: bool):
         llm_kwargs["max_num_batched_tokens"] = max(runner._cte_buckets(runner_args))
     if args.num_gpu_blocks_override is not None:
         llm_kwargs["num_gpu_blocks_override"] = args.num_gpu_blocks_override
+    print("VLLM_QWEN36_CONFIG", json.dumps(additional_config, sort_keys=True), flush=True)
+    print("GDN_CTE_KERNEL", runner._gdn_cte_kernel_from_env(), flush=True)
     sampling = SamplingParams(temperature=0.0, top_k=1, max_tokens=args.max_tokens)
-    return LLM(**llm_kwargs), sampling
+    return LLM(**llm_kwargs), sampling, runner, runner_args
 
 
 def _generate(llm, sampling, prompt: str):
@@ -120,20 +125,101 @@ def _generate(llm, sampling, prompt: str):
     return {"tokens": token_ids, "elapsed_seconds": elapsed}
 
 
+def _cold_prefill_metrics(
+    runner,
+    runner_args,
+    args,
+    prompt: str,
+    elapsed_seconds: float,
+    generated_token_count: int | None = None,
+    hbm_usage=None,
+):
+    actual_prompt_len = runner._prompt_token_count(args.model_path, prompt)
+    return runner._cold_prefill_metrics(
+        runner_args,
+        actual_prompt_len=actual_prompt_len,
+        elapsed_seconds=elapsed_seconds,
+        generated_token_count=generated_token_count,
+        hbm_usage=hbm_usage,
+    )
+
+
+def _emit_cold_prefill_metrics(label: str, metrics: dict) -> None:
+    payload = dict(metrics)
+    payload["request_label"] = label
+    print("COLD_PREFILL_METRICS", json.dumps(payload, sort_keys=True), flush=True)
+
+
+def _exactness_validation_config(args) -> dict:
+    return {
+        "max_model_len": args.max_model_len,
+        "seq_len": args.seq_len,
+        "cte_bucket": args.cte_bucket,
+        "cte_buckets": args.cte_buckets,
+        "cte_bucket_profile": args.cte_bucket_profile,
+        "tensor_parallel_size": args.tensor_parallel_size,
+        "logical_nc_config": args.logical_nc_config,
+        "max_num_seqs": args.max_num_seqs,
+        "ctx_batch_size": args.ctx_batch_size,
+        "block_size": args.block_size,
+        "gdn_checkpoint_interval": args.gdn_checkpoint_interval,
+        "max_gdn_checkpoint_slots": args.max_gdn_checkpoint_slots,
+        "enable_vllm_chunked_prefill": args.enable_vllm_chunked_prefill,
+        "kernel_q_tile_size": args.kernel_q_tile_size,
+        "kernel_kv_tile_size": args.kernel_kv_tile_size,
+        "text_only_cte": args.text_only_cte,
+        "compact_cte_attention_mask": args.compact_cte_attention_mask,
+        "cold_zero_conv_fast_path": args.cold_zero_conv_fast_path,
+        "hybrid_apc_require_vllm_metadata": args.hybrid_apc_require_vllm_metadata,
+        "max_tokens": args.max_tokens,
+    }
+
+
 def run_exactness(args) -> int:
     shared = args.shared_prefix
     prompt_a = shared + args.suffix_a
     prompt_b = shared + args.suffix_b
 
-    cold_llm, sampling = _build_llm(args, enable_hybrid_apc=False)
+    cold_llm, sampling, cold_runner, cold_runner_args = _build_llm(
+        args,
+        enable_hybrid_apc=False,
+    )
     cold_full = _generate(cold_llm, sampling, prompt_a)
+    cold_full_hbm = cold_runner._hbm_usage_if_available()
     cold_partial = _generate(cold_llm, sampling, prompt_b)
+    cold_partial_hbm = cold_runner._hbm_usage_if_available()
 
-    warm_llm, warm_sampling = _build_llm(args, enable_hybrid_apc=True)
+    warm_llm, warm_sampling, _warm_runner, _warm_runner_args = _build_llm(
+        args,
+        enable_hybrid_apc=True,
+    )
     warmup_full = _generate(warm_llm, warm_sampling, prompt_a)
     warm_full = _generate(warm_llm, warm_sampling, prompt_a)
     _warmup_partial = _generate(warm_llm, warm_sampling, prompt_a)
     warm_partial = _generate(warm_llm, warm_sampling, prompt_b)
+
+    cold_prefill_metrics = {
+        "cold_full": _cold_prefill_metrics(
+            cold_runner,
+            cold_runner_args,
+            args,
+            prompt_a,
+            cold_full["elapsed_seconds"],
+            generated_token_count=len(cold_full["tokens"]),
+            hbm_usage=cold_full_hbm,
+        ),
+        "cold_partial": _cold_prefill_metrics(
+            cold_runner,
+            cold_runner_args,
+            args,
+            prompt_b,
+            cold_partial["elapsed_seconds"],
+            generated_token_count=len(cold_partial["tokens"]),
+            hbm_usage=cold_partial_hbm,
+        ),
+    }
+    for label, metrics in cold_prefill_metrics.items():
+        _emit_cold_prefill_metrics(label, metrics)
 
     report = {
         "full_prefix_exact": cold_full["tokens"] == warm_full["tokens"],
@@ -143,11 +229,18 @@ def run_exactness(args) -> int:
         "warm_full": warm_full,
         "cold_partial": cold_partial,
         "warm_partial": warm_partial,
+        "cold_prefill_metrics": cold_prefill_metrics,
+        "validation_config": _exactness_validation_config(args),
         "negative_tests": {
             "missing_gdn_state_fallback": "requires scheduler fault injection",
             "zeroed_conv_state": "requires model debug hook",
         },
     }
+    if args.output_json:
+        args.output_json.expanduser().write_text(
+            json.dumps(report, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
     print(json.dumps(report, indent=2, sort_keys=True))
     return 0 if report["full_prefix_exact"] and report["partial_prefix_exact"] else 1
 
@@ -192,6 +285,7 @@ def parse_args():
     exact.add_argument("--cte-bucket-profile", default="single")
     exact.add_argument("--tensor-parallel-size", type=int, default=4)
     exact.add_argument("--logical-nc-config", type=int, default=2)
+    exact.add_argument("--max-num-seqs", type=int, default=1)
     exact.add_argument("--ctx-batch-size", type=int, default=1)
     exact.add_argument("--block-size", type=int, default=256)
     exact.add_argument("--gdn-checkpoint-interval", type=int, default=256)
@@ -201,11 +295,28 @@ def parse_args():
     exact.add_argument("--enable-vllm-chunked-prefill", action="store_true")
     exact.add_argument("--kernel-q-tile-size", type=int, default=128)
     exact.add_argument("--kernel-kv-tile-size", type=int, default=1024)
+    exact.add_argument(
+        "--text-only-cte",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    exact.add_argument(
+        "--compact-cte-attention-mask",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    exact.add_argument(
+        "--cold-zero-conv-fast-path",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    exact.add_argument("--hybrid-apc-require-vllm-metadata", action="store_true")
     exact.add_argument("--num-gpu-blocks-override", type=int)
     exact.add_argument("--max-tokens", type=int, default=32)
     exact.add_argument("--shared-prefix", default="System: answer deterministically.\n" * 64)
     exact.add_argument("--suffix-a", default="\nUser: What is 17 * 23?\nAssistant:")
     exact.add_argument("--suffix-b", default="\nUser: What is 19 * 29?\nAssistant:")
+    exact.add_argument("--output-json", type=Path)
     exact.set_defaults(func=run_exactness)
 
     hbm = subparsers.add_parser("hbm")

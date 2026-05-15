@@ -54,6 +54,260 @@ def _cte_buckets(args: argparse.Namespace) -> list[int]:
     return buckets
 
 
+def _selected_cte_bucket(actual_prompt_len: int, buckets: list[int]) -> int:
+    for bucket in buckets:
+        if actual_prompt_len <= bucket:
+            return bucket
+    return buckets[-1]
+
+
+def _bucketed_prefill_work(
+    actual_prompt_len: int,
+    buckets: list[int],
+    *,
+    chunked_prefill_enabled: bool,
+) -> dict:
+    max_bucket = buckets[-1]
+    if actual_prompt_len <= max_bucket or not chunked_prefill_enabled:
+        selected = _selected_cte_bucket(actual_prompt_len, buckets)
+        return {
+            "selected_cte_bucket": selected,
+            "selected_cte_buckets": [selected],
+            "num_cte_chunks": 1,
+            "bucket_work_tokens": selected,
+            "padding_tokens": max(selected - actual_prompt_len, 0),
+        }
+
+    remaining = actual_prompt_len
+    selected_buckets: list[int] = []
+    bucket_work_tokens = 0
+    while remaining > 0:
+        chunk_tokens = min(remaining, max_bucket)
+        selected = _selected_cte_bucket(chunk_tokens, buckets)
+        selected_buckets.append(selected)
+        bucket_work_tokens += selected
+        remaining -= chunk_tokens
+
+    return {
+        "selected_cte_bucket": selected_buckets[-1],
+        "selected_cte_buckets": selected_buckets,
+        "num_cte_chunks": len(selected_buckets),
+        "bucket_work_tokens": bucket_work_tokens,
+        "padding_tokens": max(bucket_work_tokens - actual_prompt_len, 0),
+    }
+
+
+def _gdn_cte_kernel_from_env(env: dict[str, str] | None = None) -> str:
+    env = env or os.environ
+    if env.get("USE_PYTORCH_CHUNK") == "1":
+        return "pytorch_chunk"
+    if env.get("USE_NKI_FUSED", "1") != "0":
+        return "fused_initial_state"
+    if env.get("USE_NKI_CHUNKED") == "1":
+        return "nki_chunked"
+    if env.get("USE_NKI") == "1":
+        return "nki_recurrent"
+    return "fused_initial_state"
+
+
+def _use_nki_fused_from_env(env: dict[str, str] | None = None) -> bool:
+    return _gdn_cte_kernel_from_env(env) == "fused_initial_state"
+
+
+def _hbm_usage_if_available():
+    try:
+        import torch_xla.core.xla_model as xm  # noqa: WPS433
+
+        device = xm.xla_device()
+        return xm.get_memory_info(device)
+    except Exception:
+        return None
+
+
+def _prompt_token_count(model_path: str, prompt: str, tokenizer=None) -> int:
+    try:
+        if tokenizer is None:
+            from transformers import AutoTokenizer  # noqa: WPS433
+
+            tokenizer = AutoTokenizer.from_pretrained(
+                model_path,
+                trust_remote_code=True,
+            )
+        try:
+            return len(tokenizer.encode(prompt, add_special_tokens=False))
+        except TypeError:
+            encoded = tokenizer(prompt, add_special_tokens=False)
+            return len(encoded["input_ids"])
+    except Exception:
+        return len(prompt.split())
+
+
+def _cte_attention_mask_path(args: argparse.Namespace, actual_prompt_len: int) -> str:
+    if args.enable_vllm_chunked_prefill:
+        return "neuron_chunked_prefill"
+    if args.compact_cte_attention_mask:
+        return "compact_2d"
+    if actual_prompt_len > 2048:
+        return "invalid_dense_long_guard"
+    return "dense_4d_fallback"
+
+
+def _cold_prefill_metrics(
+    args: argparse.Namespace,
+    actual_prompt_len: int,
+    elapsed_seconds: float,
+    generated_token_count: int | None = None,
+    hbm_usage=None,
+) -> dict:
+    cte_buckets = _cte_buckets(args)
+    bucket_work = _bucketed_prefill_work(
+        actual_prompt_len,
+        cte_buckets,
+        chunked_prefill_enabled=args.enable_vllm_chunked_prefill,
+    )
+    selected_bucket = bucket_work["selected_cte_bucket"]
+    bucket_work_tokens = bucket_work["bucket_work_tokens"]
+    padding_tokens = bucket_work["padding_tokens"]
+    latency_ms = elapsed_seconds * 1000.0
+    actual_tok_per_s = (
+        actual_prompt_len / elapsed_seconds if elapsed_seconds > 0 else None
+    )
+    bucket_tok_per_s = (
+        bucket_work_tokens / elapsed_seconds if elapsed_seconds > 0 else None
+    )
+    generated_tok_per_s = (
+        generated_token_count / elapsed_seconds
+        if generated_token_count is not None and elapsed_seconds > 0
+        else None
+    )
+    attention_mask_path = _cte_attention_mask_path(args, actual_prompt_len)
+
+    return {
+        "actual_prompt_len": actual_prompt_len,
+        "selected_cte_bucket": selected_bucket,
+        "selected_cte_buckets": bucket_work["selected_cte_buckets"],
+        "num_cte_chunks": bucket_work["num_cte_chunks"],
+        "bucket_work_tokens": bucket_work_tokens,
+        "cte_buckets": cte_buckets,
+        "cte_bucket_profile": args.cte_bucket_profile,
+        "padding_tokens": padding_tokens,
+        "padding_ratio": padding_tokens / bucket_work_tokens if bucket_work_tokens else 0.0,
+        "tensor_parallel_size": args.tensor_parallel_size,
+        "logical_nc_config": args.logical_nc_config,
+        "max_num_seqs": args.max_num_seqs,
+        "ctx_batch_size": args.ctx_batch_size,
+        "block_size": args.block_size,
+        "kernel_q_tile_size": args.kernel_q_tile_size,
+        "kernel_kv_tile_size": args.kernel_kv_tile_size,
+        "text_only_cte_enabled": bool(args.text_only_cte),
+        "compact_mask_enabled": bool(args.compact_cte_attention_mask),
+        "chunked_prefill_enabled": bool(args.enable_vllm_chunked_prefill),
+        "cte_attention_mask_path": attention_mask_path,
+        "dense_cte_mask_fallback": attention_mask_path == "dense_4d_fallback",
+        "cold_zero_conv_fast_path_enabled": bool(args.cold_zero_conv_fast_path),
+        "use_nki_fused": _use_nki_fused_from_env(),
+        "gdn_cte_kernel": _gdn_cte_kernel_from_env(),
+        "max_model_len": args.max_model_len,
+        "seq_len": args.seq_len,
+        "max_tokens": args.max_tokens,
+        "prefill_latency_ms": latency_ms,
+        "request_latency_ms": latency_ms,
+        "first_token_latency_ms": latency_ms if args.max_tokens == 1 else None,
+        "decode_tok_per_s": None,
+        "generated_tokens": generated_token_count,
+        "end_to_end_generated_tok_per_s": generated_tok_per_s,
+        "actual_tok_per_s": actual_tok_per_s,
+        "bucket_tok_per_s": bucket_tok_per_s,
+        "hbm_usage": hbm_usage,
+    }
+
+
+def _float_attr(obj, *names: str) -> float | None:
+    if obj is None:
+        return None
+    for name in names:
+        value = getattr(obj, name, None)
+        if value is not None:
+            return float(value)
+    return None
+
+
+def _generation_metrics_from_vllm_output(
+    output,
+    *,
+    request_start_time: float,
+    elapsed_seconds: float,
+    generated_token_count: int,
+    max_tokens: int,
+) -> dict:
+    request_metrics = getattr(output, "metrics", None)
+    arrival_time = _float_attr(
+        request_metrics,
+        "arrival_time",
+        "request_start_time",
+        "created_time",
+    )
+    first_token_time = _float_attr(request_metrics, "first_token_time")
+    finished_time = _float_attr(
+        request_metrics,
+        "finished_time",
+        "last_token_time",
+        "last_step_time",
+    )
+
+    first_token_latency_s = None
+    if first_token_time is not None:
+        first_token_latency_s = first_token_time - (
+            arrival_time if arrival_time is not None else request_start_time
+        )
+        first_token_latency_s = max(first_token_latency_s, 0.0)
+    elif max_tokens == 1:
+        first_token_latency_s = elapsed_seconds
+
+    decode_tokens = max(generated_token_count - 1, 0)
+    decode_latency_s = None
+    if decode_tokens > 0:
+        if first_token_time is not None and finished_time is not None:
+            decode_latency_s = max(finished_time - first_token_time, 0.0)
+        elif first_token_latency_s is not None:
+            decode_latency_s = max(elapsed_seconds - first_token_latency_s, 0.0)
+
+    return {
+        "generated_tokens": generated_token_count,
+        "max_tokens": max_tokens,
+        "request_latency_ms": elapsed_seconds * 1000.0,
+        "first_token_latency_ms": (
+            first_token_latency_s * 1000.0
+            if first_token_latency_s is not None
+            else None
+        ),
+        "prefill_latency_ms": (
+            first_token_latency_s * 1000.0
+            if first_token_latency_s is not None
+            else None
+        ),
+        "decode_tokens": decode_tokens,
+        "decode_latency_ms": (
+            decode_latency_s * 1000.0 if decode_latency_s is not None else None
+        ),
+        "decode_tok_per_s": (
+            decode_tokens / decode_latency_s
+            if decode_tokens > 0 and decode_latency_s and decode_latency_s > 0
+            else None
+        ),
+        "end_to_end_generated_tok_per_s": (
+            generated_token_count / elapsed_seconds if elapsed_seconds > 0 else None
+        ),
+        "metrics_source": (
+            "vllm_request_metrics"
+            if request_metrics is not None
+            else "elapsed_single_token_fallback"
+            if max_tokens == 1
+            else "missing_vllm_request_metrics"
+        ),
+    }
+
+
 def _validate_hybrid_apc_args(args: argparse.Namespace):
     if not args.enable_hybrid_apc:
         return
@@ -139,6 +393,7 @@ def main() -> int:
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--compiled-artifacts", default=None)
     parser.add_argument("--prompt", default="What is 17 * 23? Answer with the number only.")
+    parser.add_argument("--prompt-file", type=Path, default=None)
     parser.add_argument("--chat", action="store_true")
     parser.add_argument("--enable-vllm-chunked-prefill", action="store_true")
     parser.add_argument("--enable-prefix-caching", action="store_true")
@@ -215,6 +470,9 @@ def main() -> int:
     )
     os.environ.setdefault("VLLM_NEURON_FRAMEWORK", "neuronx-distributed-inference")
     os.environ.setdefault("VLLM_PLUGINS", "neuron")
+    os.environ.setdefault("USE_NKI_FUSED", "1")
+    os.environ.setdefault("USE_NKI_CHUNKED", "0")
+    os.environ.setdefault("USE_PYTORCH_CHUNK", "0")
     if args.enable_vllm_chunked_prefill:
         os.environ["DISABLE_NEURON_CUSTOM_SCHEDULER"] = "1"
     if args.compiled_artifacts:
@@ -228,7 +486,12 @@ def main() -> int:
 
     from vllm import LLM, SamplingParams  # noqa: WPS433
 
-    prompt = args.prompt
+    prompt = (
+        args.prompt_file.expanduser().read_text()
+        if args.prompt_file is not None
+        else args.prompt
+    )
+    tokenizer = None
     if args.chat:
         from transformers import AutoTokenizer  # noqa: WPS433
 
@@ -237,7 +500,7 @@ def main() -> int:
             trust_remote_code=True,
         )
         prompt = tokenizer.apply_chat_template(
-            [{"role": "user", "content": args.prompt}],
+            [{"role": "user", "content": prompt}],
             tokenize=False,
             add_generation_prompt=True,
             enable_thinking=False,
@@ -245,7 +508,13 @@ def main() -> int:
 
     additional_config = _override_config(args)
     print("VLLM_QWEN36_CONFIG", json.dumps(additional_config, sort_keys=True), flush=True)
+    print("GDN_CTE_KERNEL", _gdn_cte_kernel_from_env(), flush=True)
     max_cte_bucket = max(_cte_buckets(args))
+    actual_prompt_len = _prompt_token_count(
+        args.model_path,
+        prompt,
+        tokenizer=tokenizer,
+    )
 
     llm_kwargs = {
         "model": str(Path(args.model_path).expanduser().resolve()),
@@ -297,11 +566,30 @@ def main() -> int:
     elapsed = time.perf_counter() - start
     text = outputs[0].outputs[0].text
     token_ids = outputs[0].outputs[0].token_ids
+    generation_metrics = _generation_metrics_from_vllm_output(
+        outputs[0],
+        request_start_time=start,
+        elapsed_seconds=elapsed,
+        generated_token_count=len(token_ids),
+        max_tokens=args.max_tokens,
+    )
+    metrics = _cold_prefill_metrics(
+        args,
+        actual_prompt_len=actual_prompt_len,
+        elapsed_seconds=elapsed,
+        generated_token_count=len(token_ids),
+        hbm_usage=_hbm_usage_if_available(),
+    )
+    for key, value in generation_metrics.items():
+        if metrics.get(key) is None:
+            metrics[key] = value
 
     print("PROMPT", prompt)
     print("OUTPUT", text)
     print("TOKENS", list(token_ids))
     print("ELAPSED_SECONDS", f"{elapsed:.3f}")
+    print("GENERATION_METRICS", json.dumps(generation_metrics, sort_keys=True), flush=True)
+    print("COLD_PREFILL_METRICS", json.dumps(metrics, sort_keys=True), flush=True)
     return 0
 
 
