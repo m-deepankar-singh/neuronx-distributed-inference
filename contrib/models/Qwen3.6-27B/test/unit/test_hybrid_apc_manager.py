@@ -18,6 +18,12 @@ sys.modules[_SPEC.name] = _HYBRID_APC
 _SPEC.loader.exec_module(_HYBRID_APC)
 
 HybridAPCMetadataStore = _HYBRID_APC.HybridAPCMetadataStore
+estimate_qwen_gdn_checkpoint_bytes_per_rank = (
+    _HYBRID_APC.estimate_qwen_gdn_checkpoint_bytes_per_rank
+)
+estimate_qwen_hybrid_cache_bytes_per_rank = (
+    _HYBRID_APC.estimate_qwen_hybrid_cache_bytes_per_rank
+)
 
 
 def _store(**overrides):
@@ -227,6 +233,48 @@ class TestHybridAPCMetadataStore(unittest.TestCase):
         self.assertEqual(plan.restore_checkpoint_prefix_len, 256)
         self.assertEqual(plan.residual_replay_len, 44)
         self.assertEqual(plan.suffix_len, 84)
+
+    def test_request_lifecycle_releases_restored_ref_on_finish(self):
+        store = _store()
+        key, _checkpoint = _insert(store, 128)
+
+        record = store.on_request_restore(request_id="req-1", checkpoint_key=key)
+        self.assertEqual(record.state, "RESTORED_FROM_HYBRID_APC")
+        self.assertEqual(store.lookup(key).refcount, 1)
+
+        store.on_prefill_running("req-1")
+        store.on_decode_running("req-1")
+        finished = store.on_request_finish("req-1")
+
+        self.assertEqual(finished.state, "FINISHED")
+        self.assertEqual(store.lookup(key).refcount, 0)
+
+    def test_request_cancel_releases_ref_and_drops_pending_commit(self):
+        store = _store()
+        restored_key, _checkpoint = _insert(store, 128)
+        committed_key, _checkpoint = _insert(store, 256)
+
+        store.on_request_restore(request_id="req-1", checkpoint_key=restored_key)
+        store.on_checkpoint_committed(
+            request_id="req-1",
+            checkpoint_key=committed_key,
+        )
+        cancelled = store.on_request_cancel("req-1")
+
+        self.assertEqual(cancelled.state, "CANCELLED")
+        self.assertEqual(store.lookup(restored_key).refcount, 0)
+        self.assertIsNone(store.lookup(committed_key))
+
+    def test_qwen_hbm_estimator_uses_checkpoint_slots_not_token_slots(self):
+        per_checkpoint = estimate_qwen_gdn_checkpoint_bytes_per_rank()
+        totals = estimate_qwen_hybrid_cache_bytes_per_rank(
+            max_context_len=1024,
+            checkpoint_interval=256,
+        )
+
+        self.assertEqual(totals["num_gdn_checkpoints"], 4)
+        self.assertEqual(totals["gdn_checkpoint_bytes"], per_checkpoint * 4)
+        self.assertGreater(totals["gdn_checkpoint_bytes"], totals["attention_kv_bytes"])
 
 
 if __name__ == "__main__":

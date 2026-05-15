@@ -1,10 +1,14 @@
 import unittest
+from types import SimpleNamespace
 from typing import List
 from unittest.mock import patch
 
 import torch
 
-from neuronx_distributed_inference.modules.async_execution import AsyncTensorWrapper
+from neuronx_distributed_inference.modules.async_execution import (
+    AsyncTensorWrapper,
+    prepare_hybrid_apc_model_inputs,
+)
 
 
 class TestAsyncTensorWrapper(unittest.TestCase):
@@ -279,3 +283,31 @@ class TestAsyncTensorWrapper(unittest.TestCase):
         )
 
         assert res is None, f"Early Exit should return None, but found {res}"
+
+
+class TestHybridAPCAsyncBridge(unittest.TestCase):
+    def test_bridge_is_empty_when_hybrid_apc_disabled(self):
+        base = SimpleNamespace(config=SimpleNamespace(use_hybrid_apc_manager=False))
+
+        args = prepare_hybrid_apc_model_inputs(base, {"seq_ids": torch.tensor([0])})
+
+        self.assertEqual(args, [])
+
+    def test_bridge_builds_restore_and_commit_tensors(self):
+        base = SimpleNamespace(config=SimpleNamespace(use_hybrid_apc_manager=True))
+        input_dict = {
+            "seq_ids": torch.tensor([3, 4], dtype=torch.int32),
+            "computed_context_lens": torch.tensor([[256], [0]], dtype=torch.int32),
+            "hybrid_restore_slot_ids": torch.tensor([7, 0], dtype=torch.int32),
+            "hybrid_commit_slot_ids": torch.tensor([8, 9], dtype=torch.int32),
+            "hybrid_commit_mask": torch.tensor([1, 0], dtype=torch.int32),
+        }
+
+        args = prepare_hybrid_apc_model_inputs(base, input_dict)
+
+        self.assertEqual(len(args), 14)
+        self.assertTrue(torch.equal(args[9], torch.tensor([7, 0], dtype=torch.int32)))
+        self.assertTrue(torch.equal(args[10], torch.tensor([1, 0], dtype=torch.int32)))
+        self.assertTrue(torch.equal(args[11], torch.tensor([256, 0], dtype=torch.int32)))
+        self.assertTrue(torch.equal(args[12], torch.tensor([8, 9], dtype=torch.int32)))
+        self.assertTrue(torch.equal(args[13], torch.tensor([1, 0], dtype=torch.int32)))

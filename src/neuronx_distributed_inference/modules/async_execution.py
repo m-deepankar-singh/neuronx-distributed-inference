@@ -7,6 +7,144 @@ if TYPE_CHECKING:
     from neuronx_distributed_inference.models.model_wrapper import ModelWrapper
 
 
+def _is_hybrid_apc_enabled(neuron_base_instance: "NeuronBaseForCausalLM") -> bool:
+    return bool(getattr(neuron_base_instance.config, "use_hybrid_apc_manager", False))
+
+
+def _batch_vector(
+    input_dict: Dict[str, Any],
+    key: str,
+    *,
+    batch_size: int,
+    default: int = 0,
+) -> torch.Tensor:
+    value = input_dict.get(key)
+    if value is None:
+        return torch.full((batch_size,), default, dtype=torch.int32)
+    value = value.reshape(-1).to(torch.int32)
+    if value.shape[0] == batch_size:
+        return value
+    if value.shape[0] > batch_size:
+        return value[:batch_size]
+    pad = torch.full((batch_size - value.shape[0],), default, dtype=value.dtype)
+    return torch.cat([value, pad], dim=0)
+
+
+def _first_present(*values):
+    for value in values:
+        if value is not None:
+            return value
+    return None
+
+
+def prepare_hybrid_apc_model_inputs(
+    neuron_base_instance: "NeuronBaseForCausalLM",
+    input_dict: Dict[str, Any],
+) -> list[torch.Tensor]:
+    """Build optional Qwen hybrid APC args for prefix-caching execution.
+
+    The vLLM scheduler owns prefix hashes and checkpoint-slot allocation. This
+    bridge only translates scheduler-provided values into the fixed traced model
+    inputs. If no restore/commit slots are supplied, masks stay zero and the
+    model executes without GDN checkpoint reuse.
+    """
+
+    if not _is_hybrid_apc_enabled(neuron_base_instance):
+        return []
+
+    batch_size = int(input_dict["seq_ids"].reshape(-1).shape[0])
+    empty = torch.empty(0)
+
+    computed_context_lens = input_dict.get("computed_context_lens")
+    if computed_context_lens is None:
+        restore_prefix_lens = torch.zeros((batch_size,), dtype=torch.int32)
+    else:
+        restore_prefix_lens = computed_context_lens.reshape(-1).to(torch.int32)
+        if restore_prefix_lens.shape[0] != batch_size:
+            restore_prefix_lens = _batch_vector(
+                {"value": restore_prefix_lens},
+                "value",
+                batch_size=batch_size,
+            )
+
+    restore_slot_ids = _batch_vector(
+        input_dict,
+        "hybrid_restore_slot_ids",
+        batch_size=batch_size,
+        default=0,
+    )
+    if "hybrid_restore_mask" in input_dict:
+        restore_mask = _batch_vector(
+            input_dict,
+            "hybrid_restore_mask",
+            batch_size=batch_size,
+            default=0,
+        )
+    else:
+        restore_mask = torch.zeros((batch_size,), dtype=torch.int32)
+        if "hybrid_restore_slot_ids" in input_dict:
+            restore_mask = (restore_prefix_lens > 0).to(torch.int32)
+
+    if "hybrid_restore_prefix_lens" in input_dict:
+        restore_prefix_lens = _batch_vector(
+            input_dict,
+            "hybrid_restore_prefix_lens",
+            batch_size=batch_size,
+            default=0,
+        )
+
+    commit_slot_ids = _batch_vector(
+        input_dict,
+        "hybrid_commit_slot_ids",
+        batch_size=batch_size,
+        default=0,
+    )
+    if "hybrid_commit_mask" in input_dict:
+        commit_mask = _batch_vector(
+            input_dict,
+            "hybrid_commit_mask",
+            batch_size=batch_size,
+            default=0,
+        )
+    else:
+        commit_mask = torch.zeros((batch_size,), dtype=torch.int32)
+
+    llava_args = input_dict.get("llava_args") or []
+    rotary_position_id = _first_present(
+        input_dict.get("rotary_position_id"),
+        input_dict.get("rotary_position_ids"),
+        llava_args[2] if len(llava_args) >= 3 else None,
+        empty,
+    )
+    vision_embeddings = _first_present(
+        input_dict.get("vision_embeddings"),
+        llava_args[0] if len(llava_args) >= 1 else None,
+        empty,
+    )
+    vision_mask = _first_present(
+        input_dict.get("vision_mask"),
+        llava_args[1] if len(llava_args) >= 2 else None,
+        empty,
+    )
+
+    return [
+        input_dict.get("tile_q_indices", empty),
+        input_dict.get("tile_block_tables", empty),
+        input_dict.get("tile_masks", empty),
+        input_dict.get("inputs_embeds", empty),
+        input_dict.get("kv_cache", empty),
+        input_dict.get("active_mask", empty),
+        rotary_position_id,
+        vision_embeddings,
+        vision_mask,
+        restore_slot_ids,
+        restore_mask,
+        restore_prefix_lens,
+        commit_slot_ids,
+        commit_mask,
+    ]
+
+
 class AsyncTensorWrapper:
     """
     Wrapper class for tensors from models executed with async runtime.
@@ -86,6 +224,9 @@ def execute_model_prefix_caching(
         not neuron_base_instance.neuron_config.enable_fused_speculation
         and not neuron_base_instance.neuron_config.enable_eagle_speculation
     ):
+        hybrid_apc_args = prepare_hybrid_apc_model_inputs(
+            neuron_base_instance, input_dict
+        )
         return model_to_execute(
             input_dict["input_ids"],
             input_dict["attention_mask"],
@@ -102,6 +243,7 @@ def execute_model_prefix_caching(
             input_dict["block_table"],
             input_dict["num_queries"],
             input_dict["computed_context_lens"],
+            *hybrid_apc_args,
             pad_type=pad_type
         ), model_to_execute.is_neuron()
     elif neuron_base_instance.neuron_config.enable_eagle_speculation:

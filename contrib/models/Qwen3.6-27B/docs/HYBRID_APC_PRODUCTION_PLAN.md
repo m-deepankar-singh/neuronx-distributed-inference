@@ -135,12 +135,15 @@ implemented:
   model restore/commit slot inputs
   use_hybrid_apc_manager initialization without the old guard
   v0 launcher validation requiring checkpoint interval == block size
+  async prefix-caching bridge for scheduler-supplied restore/commit tensors
+  request finish/cancel lifecycle callbacks for checkpoint refcounts
+  Trainium exactness and HBM validation harness
 
 still required before production:
-  vLLM/NxDI request-prep integration that fills restore/commit tensors
-  exactness harness on Trainium artifacts
-  cancellation/refcount callbacks from the serving scheduler
-  long-context HBM tuning for checkpoint slot count and commit policy
+  vLLM scheduler integration that computes cumulative-prefix hashes and slots
+  Trainium execution of cold/warm exactness harness on compiled artifacts
+  production cancellation/eviction callback wiring from vLLM events
+  long-context HBM sweep to choose checkpoint slot count and commit policy
 ```
 
 ### Sprint 2: Dynamic CTE Buckets

@@ -589,10 +589,12 @@ class ModelWrapper(torch.nn.Module):
                 block_kv_empty_args = args[5:7]
                 block_kv_slot_mapping = args[7]
                 block_kv_args = args[8:11]
+                extra_prefix_args = args[11:]
             else:
                 block_kv_empty_args = args[5:11]
                 block_kv_slot_mapping = args[11]
                 block_kv_args = args[12:15]
+                extra_prefix_args = args[15:]
 
         # pad the inputs up to the compiled batch size in the end
         reorder_seq_ids = not self.is_prefix_caching
@@ -676,6 +678,23 @@ class ModelWrapper(torch.nn.Module):
                 eagle_empty_args = args[11:16]
                 for arg in eagle_empty_args:
                     padded_args.append(arg)
+            else:
+                for arg in extra_prefix_args:
+                    if arg.numel() == 0:
+                        padded_args.append(arg)
+                    elif arg.dim() == 3 and arg.shape[0] == 3 and arg.shape[1] == seq_ids.shape[0]:
+                        padded = torch.zeros(
+                            (arg.shape[0], target_batch_size, arg.shape[2]),
+                            dtype=arg.dtype,
+                        )
+                        padded[:, : arg.shape[1], :] = arg
+                        padded_args.append(padded)
+                    elif arg.shape[0] == seq_ids.shape[0]:
+                        padded_args.append(
+                            self._pad_helper(arg, pad_type="repeat_first_batchline")
+                        )
+                    else:
+                        padded_args.append(arg)
 
         outputs = self._forward(*padded_args)
 

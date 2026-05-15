@@ -52,6 +52,21 @@ class HybridAPCStats:
 
 
 @dataclass
+class HybridAPCRequestRecord:
+    request_id: Hashable
+    state: str
+    restored_key: HybridPrefixKey | None = None
+    committed_keys: list[HybridPrefixKey] | None = None
+    reserved_slots: list[int] | None = None
+
+    def __post_init__(self):
+        if self.committed_keys is None:
+            self.committed_keys = []
+        if self.reserved_slots is None:
+            self.reserved_slots = []
+
+
+@dataclass
 class HybridPrefixCheckpoint:
     key: HybridPrefixKey
     prefix_len: int
@@ -106,6 +121,59 @@ def _mask_has_layers(mask: torch.Tensor, required_layers: tuple[int, ...]) -> bo
         if layer >= mask.numel() or not bool(mask[layer].item()):
             return False
     return True
+
+
+def estimate_qwen_gdn_checkpoint_bytes_per_rank(
+    *,
+    num_gdn_layers: int = 48,
+    local_value_heads: int = 12,
+    local_key_heads: int = 4,
+    key_dim: int = 128,
+    value_dim: int = 128,
+    conv_kernel_size: int = 4,
+    recurrent_dtype: str | torch.dtype = "float32",
+    conv_dtype: str | torch.dtype = "bfloat16",
+) -> int:
+    recurrent_dtype = _normalize_dtype(recurrent_dtype)
+    conv_dtype = _normalize_dtype(conv_dtype)
+    recurrent_bytes = 4 if recurrent_dtype == "float32" else 2
+    conv_bytes = 4 if conv_dtype == "float32" else 2
+    recurrent_numel = num_gdn_layers * local_value_heads * key_dim * value_dim
+    conv_dim = 2 * local_key_heads * key_dim + local_value_heads * value_dim
+    conv_numel = num_gdn_layers * conv_dim * (conv_kernel_size - 1)
+    return recurrent_numel * recurrent_bytes + conv_numel * conv_bytes
+
+
+def estimate_qwen_hybrid_cache_bytes_per_rank(
+    *,
+    max_context_len: int,
+    checkpoint_interval: int,
+    num_attention_layers: int = 16,
+    local_kv_heads: int = 1,
+    attention_head_dim: int = 256,
+    attention_kv_dtype: str | torch.dtype = "bfloat16",
+    **gdn_kwargs,
+) -> dict[str, int]:
+    attention_dtype = _normalize_dtype(attention_kv_dtype)
+    attention_bytes = 4 if attention_dtype == "float32" else 2
+    attention_kv = (
+        int(max_context_len)
+        * num_attention_layers
+        * 2
+        * local_kv_heads
+        * attention_head_dim
+        * attention_bytes
+    )
+    checkpoints = max(0, int(max_context_len)) // int(checkpoint_interval)
+    gdn_per_checkpoint = estimate_qwen_gdn_checkpoint_bytes_per_rank(**gdn_kwargs)
+    gdn_total = checkpoints * gdn_per_checkpoint
+    return {
+        "attention_kv_bytes": attention_kv,
+        "gdn_checkpoint_bytes": gdn_total,
+        "gdn_bytes_per_checkpoint": gdn_per_checkpoint,
+        "num_gdn_checkpoints": checkpoints,
+        "total_bytes": attention_kv + gdn_total,
+    }
 
 
 class HybridAPCMetadataStore:
@@ -164,6 +232,7 @@ class HybridAPCMetadataStore:
             OrderedDict()
         )
         self._slot_to_key: dict[int, HybridPrefixKey] = {}
+        self._requests: dict[Hashable, HybridAPCRequestRecord] = {}
         self._step = 0
         self.stats = HybridAPCStats()
 
@@ -365,6 +434,68 @@ class HybridAPCMetadataStore:
             raise KeyError(key)
         checkpoint.refcount = max(0, checkpoint.refcount - 1)
         return checkpoint.refcount
+
+    def on_request_restore(
+        self,
+        *,
+        request_id: Hashable,
+        checkpoint_key: HybridPrefixKey | None,
+    ) -> HybridAPCRequestRecord:
+        record = HybridAPCRequestRecord(
+            request_id=request_id,
+            state="NEW",
+            restored_key=checkpoint_key,
+        )
+        if checkpoint_key is not None:
+            self.inc_ref(checkpoint_key)
+            record.state = "RESTORED_FROM_HYBRID_APC"
+        self._requests[request_id] = record
+        return record
+
+    def on_prefill_running(self, request_id: Hashable) -> HybridAPCRequestRecord:
+        record = self._requests[request_id]
+        record.state = "PREFILL_RUNNING"
+        return record
+
+    def on_checkpoint_committed(
+        self,
+        *,
+        request_id: Hashable,
+        checkpoint_key: HybridPrefixKey,
+    ) -> HybridAPCRequestRecord:
+        record = self._requests.setdefault(
+            request_id,
+            HybridAPCRequestRecord(request_id=request_id, state="PREFILL_RUNNING"),
+        )
+        record.state = "PREFILL_COMMIT_PENDING"
+        record.committed_keys.append(checkpoint_key)
+        return record
+
+    def on_decode_running(self, request_id: Hashable) -> HybridAPCRequestRecord:
+        record = self._requests[request_id]
+        record.state = "DECODE_RUNNING"
+        return record
+
+    def on_request_finish(self, request_id: Hashable) -> HybridAPCRequestRecord | None:
+        record = self._requests.pop(request_id, None)
+        if record is None:
+            return None
+        if record.restored_key is not None and record.restored_key in self._by_key:
+            self.dec_ref(record.restored_key)
+        record.state = "FINISHED"
+        return record
+
+    def on_request_cancel(self, request_id: Hashable) -> HybridAPCRequestRecord | None:
+        record = self._requests.pop(request_id, None)
+        if record is None:
+            return None
+        if record.restored_key is not None and record.restored_key in self._by_key:
+            self.dec_ref(record.restored_key)
+        for key in record.committed_keys:
+            if key in self._by_key:
+                self.mark_invalid(key)
+        record.state = "CANCELLED"
+        return record
 
     def evict_lru(self, *, target_checkpoints: int | None = None) -> list[HybridPrefixKey]:
         target = self.max_checkpoints if target_checkpoints is None else target_checkpoints
