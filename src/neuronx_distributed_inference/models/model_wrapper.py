@@ -978,6 +978,18 @@ class ModelWrapper(torch.nn.Module):
             horizontal_dim = args[14]
 
         if not self.tag == CONTEXT_ENCODING_MODEL_TAG:
+            if horizontal_dim.numel() == 0:
+                horizontal_dim = torch.full((args[0].shape[0], 1), args[1].shape[-1], dtype=torch.int32)
+            elif horizontal_dim.dim() == 0:
+                horizontal_dim = horizontal_dim.reshape(1, 1)
+            elif horizontal_dim.dim() == 1:
+                horizontal_dim = horizontal_dim.reshape(-1, 1)
+            if vertical_dim.numel() == 0:
+                vertical_dim = torch.full((args[0].shape[0], 1), args[0].shape[-1], dtype=torch.int32)
+            elif vertical_dim.dim() == 0:
+                vertical_dim = vertical_dim.reshape(1, 1)
+            elif vertical_dim.dim() == 1:
+                vertical_dim = vertical_dim.reshape(-1, 1)
             # Determine all buckets that meet horizontal condition
             horizontal_max = torch.max(horizontal_dim)
             horizontal_mask = buckets[:, 1] > horizontal_max + speculation_length
@@ -1007,8 +1019,14 @@ class ModelWrapper(torch.nn.Module):
             return buckets[bucket_idx]
         # recover the bucket for special handling
         else:
-            horizontal_dim = horizontal_dim[0][0]
-            vertical_dim = vertical_dim[0][0]
+            if horizontal_dim.numel() == 0:
+                horizontal_dim = torch.tensor(0, dtype=torch.int32)
+            else:
+                horizontal_dim = horizontal_dim.reshape(-1)[0]
+            if vertical_dim.numel() == 0:
+                vertical_dim = torch.tensor(args[0].shape[-1], dtype=torch.int32)
+            else:
+                vertical_dim = vertical_dim.reshape(-1)[0]
             prefix_buckets = []
             prefill_buckets = []
             for b in buckets:
@@ -1064,6 +1082,34 @@ class ModelWrapper(torch.nn.Module):
         if self.tag == CONTEXT_ENCODING_MODEL_TAG and args[0].shape[0] > 1:
             # We delay all paddings for CTE until we really need them
             return args
+
+        def _debug_int(value):
+            if hasattr(value, "item"):
+                return int(value.item())
+            return int(value)
+
+        def _debug_minmax(tensor):
+            if not hasattr(tensor, "numel") or tensor.numel() == 0:
+                return "empty"
+            flat = tensor.reshape(-1)
+            return f"{int(flat.min().item())}:{int(flat.max().item())}"
+
+        debug_hybrid_apc = os.environ.get("QWEN36_HYBRID_APC_DEBUG") == "1"
+
+        def _first_or_default(tensor, default_value):
+            if tensor.numel() == 0:
+                return torch.tensor(default_value, dtype=torch.int32)
+            return tensor.reshape(-1)[0]
+
+        def _length_matrix_or_default(tensor, default_value):
+            if tensor.numel() == 0:
+                return torch.full((args[0].shape[0], 1), default_value, dtype=torch.int32)
+            if tensor.dim() == 0:
+                return tensor.reshape(1, 1).to(torch.int32)
+            if tensor.dim() == 1:
+                return tensor.reshape(-1, 1).to(torch.int32)
+            return tensor.to(torch.int32)
+
         # Calculate the buckets
         prefill_bucket, prefix_bucket = self.get_target_2d_bucket_for_prefix_caching(*args, strategy=pad_type)
 
@@ -1071,13 +1117,35 @@ class ModelWrapper(torch.nn.Module):
             if self.neuron_config.enable_fused_speculation:
                 slot_mapping = args[7]
                 block_table = args[8]
-                prefill_len = args[9][0]
-                prefix_len = args[10][0]
+                prefill_len = _first_or_default(args[9], args[0].shape[-1])
+                prefix_len = _first_or_default(args[10], 0)
+                num_queries = _length_matrix_or_default(args[9], prefill_len)
+                computed_context_lens = _length_matrix_or_default(args[10], prefix_len)
             else:
                 slot_mapping = args[11]
                 block_table = args[12]
-                prefill_len = args[13][0]
-                prefix_len = args[14][0]
+                prefill_len = _first_or_default(args[13], args[0].shape[-1])
+                prefix_len = _first_or_default(args[14], 0)
+                num_queries = _length_matrix_or_default(args[13], prefill_len)
+                computed_context_lens = _length_matrix_or_default(args[14], prefix_len)
+            if slot_mapping.dim() == 1:
+                slot_mapping = slot_mapping.view(1, -1)
+            if block_table.dim() == 1:
+                block_table = block_table.view(1, -1)
+            slot_mapping = slot_mapping.to(torch.int32)
+            block_table = block_table.to(torch.int32)
+            if debug_hybrid_apc:
+                print(
+                    "[hybrid_apc_debug] pad-pre "
+                    f"tag={self.tag} input_shape={tuple(args[0].shape)} "
+                    f"attention_shape={tuple(args[1].shape)} "
+                    f"position_shape={tuple(args[2].shape)} "
+                    f"slot_shape={tuple(slot_mapping.shape)} slot_minmax={_debug_minmax(slot_mapping)} "
+                    f"block_shape={tuple(block_table.shape)} block_minmax={_debug_minmax(block_table)} "
+                    f"prefill_len={_debug_int(prefill_len)} prefix_len={_debug_int(prefix_len)} "
+                    f"prefill_bucket={prefill_bucket} prefix_bucket={prefix_bucket}",
+                    flush=True,
+                )
             if self.neuron_config.enable_eagle_speculation:
                 target_recomputation = 0 if prefix_bucket == 0 else self.neuron_config.pa_block_size
                 extra_prefill_slots = max(0, prefill_bucket - prefill_len - target_recomputation)
@@ -1118,7 +1186,7 @@ class ModelWrapper(torch.nn.Module):
                 else:
                     padded_block_table = F.pad(block_table, (0, num_blocks - block_table.shape[1]), "constant", 0)
                     target_padded_block_table = F.pad(block_table, (0, num_blocks - block_table.shape[1]), "constant", 0)
-                args = (padded_inputs, padded_attn_mask, padded_position_id, *args[3:7], padded_slot_mapping, padded_block_table, *args[9:11], target_padded_inputs, target_padded_attn_mask, target_padded_position_id, target_padded_slot_mapping, target_padded_block_table)
+                args = (padded_inputs, padded_attn_mask, padded_position_id, *args[3:7], padded_slot_mapping, padded_block_table, num_queries, computed_context_lens, target_padded_inputs, target_padded_attn_mask, target_padded_position_id, target_padded_slot_mapping, target_padded_block_table)
                 return tuple(args)
             else:
                 extra_prefill_slots = max(0, prefill_bucket - prefill_len)
@@ -1142,20 +1210,50 @@ class ModelWrapper(torch.nn.Module):
                 else:
                     padded_block_table = F.pad(block_table, (0, num_blocks - block_table.shape[1]), "constant", 0)
                 if self.neuron_config.enable_fused_speculation:
-                    args = (padded_inputs, padded_attn_mask, padded_position_id, *args[3:7], padded_slot_mapping, padded_block_table, *args[9:])
+                    args = (padded_inputs, padded_attn_mask, padded_position_id, *args[3:7], padded_slot_mapping, padded_block_table, num_queries, computed_context_lens, *args[11:])
                 else:
-                    args = (padded_inputs, padded_attn_mask, padded_position_id, *args[3:11], padded_slot_mapping, padded_block_table, *args[13:])
+                    args = (padded_inputs, padded_attn_mask, padded_position_id, *args[3:11], padded_slot_mapping, padded_block_table, num_queries, computed_context_lens, *args[15:])
+                if debug_hybrid_apc:
+                    print(
+                        "[hybrid_apc_debug] pad-post "
+                        f"tag={self.tag} adjusted_prefix_len={_debug_int(adjusted_prefix_len)} "
+                        f"extra_prefill_slots={_debug_int(extra_prefill_slots)} "
+                        f"padded_input_shape={tuple(padded_inputs.shape)} "
+                        f"padded_attention_shape={tuple(padded_attn_mask.shape)} "
+                        f"padded_position_shape={tuple(padded_position_id.shape)} "
+                        f"padded_slot_shape={tuple(padded_slot_mapping.shape)} "
+                        f"padded_slot_minmax={_debug_minmax(padded_slot_mapping)} "
+                        f"padded_block_shape={tuple(padded_block_table.shape)} "
+                        f"padded_block_minmax={_debug_minmax(padded_block_table)}",
+                        flush=True,
+                    )
                 return tuple(args)
         else:
             padded_attn_mask = F.pad(args[1], (0, prefix_bucket - args[1].shape[1]), "constant", 0)
+            slot_mapping_arg_idx = 7 if self.neuron_config.enable_fused_speculation else 11
             block_table_arg_idx = 8 if self.neuron_config.enable_fused_speculation else 12
+            num_queries_arg_idx = 9 if self.neuron_config.enable_fused_speculation else 13
+            computed_context_lens_arg_idx = 10 if self.neuron_config.enable_fused_speculation else 14
+            slot_mapping = args[slot_mapping_arg_idx]
             block_table = args[block_table_arg_idx]
+            if slot_mapping.dim() == 1:
+                slot_mapping = slot_mapping.view(1, -1)
+            if block_table.dim() == 1:
+                block_table = block_table.view(1, -1)
+            slot_mapping = slot_mapping.to(torch.int32)
+            block_table = block_table.to(torch.int32)
+            padded_slot_mapping = F.pad(slot_mapping, (0, prefill_bucket - slot_mapping.shape[1]), "constant", -1)
             pad_right = (prefix_bucket // self.neuron_config.pa_block_size) - block_table.shape[1]
             block_table_padding = -1 if self.neuron_config.attn_block_tkg_nki_kernel_enabled else 0
             padded_block_table = F.pad(block_table, (0, pad_right), "constant", block_table_padding)
+            num_queries = _length_matrix_or_default(args[num_queries_arg_idx], args[0].shape[-1])
+            computed_context_lens = _length_matrix_or_default(args[computed_context_lens_arg_idx], args[1].shape[-1])
             new_args = list(args)
             new_args[1] = padded_attn_mask
+            new_args[slot_mapping_arg_idx] = padded_slot_mapping
             new_args[block_table_arg_idx] = padded_block_table
+            new_args[num_queries_arg_idx] = num_queries
+            new_args[computed_context_lens_arg_idx] = computed_context_lens
             return tuple(new_args)
 
     def _process_async_inputs(self, *args):
@@ -1301,7 +1399,11 @@ class ModelWrapper(torch.nn.Module):
 
         # set hidden_states if None
         if args[5] is None:
-            dummy_hidden_states = torch.zeros((input_batch_size), dtype=torch.int32)
+            dummy_hidden_states = (
+                torch.empty(0)
+                if self.is_prefix_caching
+                else torch.zeros((input_batch_size), dtype=torch.int32)
+            )
             args = (*args[:5], dummy_hidden_states, *args[6:])
 
         # set adapter_ids if None

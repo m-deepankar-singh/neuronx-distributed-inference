@@ -39,6 +39,65 @@ def _load_text_config(model_path: Path) -> dict:
     return config_dict
 
 
+def _parse_int_list(values: list[str] | None) -> list[int] | None:
+    if values is None:
+        return None
+    tokens: list[str] = []
+    for value in values:
+        tokens.extend(value.replace(",", " ").split())
+    return [int(token) for token in tokens]
+
+
+def _cte_buckets(args: argparse.Namespace) -> list[int]:
+    buckets = _parse_int_list(args.cte_buckets) or [args.cte_bucket]
+    buckets = sorted(set(buckets))
+    if not buckets:
+        raise ValueError("At least one CTE bucket is required")
+    for bucket in buckets:
+        if bucket <= 0:
+            raise ValueError(f"CTE buckets must be positive, got {bucket}")
+        if bucket % 128 != 0:
+            raise ValueError(
+                f"CTE bucket {bucket} is not 128-aligned; DeltaNet CTE uses 128-token chunks"
+            )
+    if buckets[-1] > args.seq_len:
+        raise ValueError(
+            f"Largest CTE bucket {buckets[-1]} exceeds --seq-len {args.seq_len}"
+        )
+    return buckets
+
+
+def _prefix_buckets(args: argparse.Namespace, cte_buckets: list[int]) -> list[int]:
+    buckets = _parse_int_list(args.prefix_buckets) or cte_buckets
+    buckets = sorted(set(buckets))
+    if not buckets:
+        raise ValueError("At least one prefix bucket is required")
+    for bucket in buckets:
+        if bucket <= 0:
+            raise ValueError(f"Prefix buckets must be positive, got {bucket}")
+        if bucket % args.block_size != 0:
+            raise ValueError(
+                f"Prefix bucket {bucket} must be divisible by block size {args.block_size}"
+            )
+    if buckets[-1] > args.seq_len:
+        raise ValueError(
+            f"Largest prefix bucket {buckets[-1]} exceeds --seq-len {args.seq_len}"
+        )
+    return buckets
+
+
+def _pa_num_blocks(args: argparse.Namespace) -> int:
+    min_blocks = max(1, (args.seq_len + args.block_size - 1) // args.block_size)
+    if args.pa_num_blocks is None:
+        return min_blocks
+    if args.pa_num_blocks < min_blocks:
+        raise ValueError(
+            f"--pa-num-blocks {args.pa_num_blocks} is too small for seq_len="
+            f"{args.seq_len} and block_size={args.block_size}; need at least {min_blocks}"
+        )
+    return args.pa_num_blocks
+
+
 def _mlp_only_modules_to_not_convert(num_layers: int) -> list[str]:
     """Exclude numerically sensitive or unsupported modules from FP8 conversion."""
     modules = [
@@ -164,6 +223,7 @@ def _save_mlp_only_fp8_state_dict(model_path: Path, output_path: Path) -> None:
 
 def _build_config(args: argparse.Namespace):
     from neuronx_distributed_inference.models.config import (  # noqa: WPS433
+        ChunkedPrefillConfig,
         NeuronConfig,
         OnDeviceSamplingConfig,
     )
@@ -173,41 +233,82 @@ def _build_config(args: argparse.Namespace):
     config_dict = _load_text_config(model_path)
     num_layers = int(config_dict["num_hidden_layers"])
     modules_to_not_convert = _mlp_only_modules_to_not_convert(num_layers)
+    cte_buckets = _cte_buckets(args)
+    max_cte_bucket = cte_buckets[-1]
+    prefix_buckets = _prefix_buckets(args, cte_buckets)
 
-    neuron_config = NeuronConfig(
-        tp_degree=args.tp_degree,
-        batch_size=1,
-        ctx_batch_size=1,
-        tkg_batch_size=1,
-        seq_len=args.seq_len,
-        max_context_length=args.cte_bucket,
-        max_length=args.seq_len,
-        context_encoding_buckets=[args.cte_bucket],
-        torch_dtype=torch.bfloat16,
-        on_device_sampling_config=OnDeviceSamplingConfig(
+    neuron_config_kwargs = {
+        "tp_degree": args.tp_degree,
+        "batch_size": 1,
+        "ctx_batch_size": 1,
+        "tkg_batch_size": 1,
+        "seq_len": args.seq_len,
+        "max_context_length": max_cte_bucket,
+        "max_length": args.seq_len,
+        "context_encoding_buckets": cte_buckets,
+        "token_generation_buckets": [args.seq_len],
+        "torch_dtype": torch.bfloat16,
+        "enable_bucketing": len(cte_buckets) > 1,
+        "logical_nc_config": args.logical_nc_config,
+        "save_sharded_checkpoint": True,
+        "quantized": True,
+        "quantized_checkpoints_path": str(
+            Path(args.quantized_checkpoints_path).expanduser().resolve()
+        ),
+        "quantization_type": "per_channel_symmetric",
+        "quantization_dtype": "f8e4m3",
+        "modules_to_not_convert": modules_to_not_convert,
+        "kv_cache_quant": False,
+        "quantized_mlp_kernel_enabled": False,
+        "activation_quantization_type": None,
+    }
+    if args.disable_on_device_sampling:
+        neuron_config_kwargs["output_logits"] = False
+    else:
+        neuron_config_kwargs["on_device_sampling_config"] = OnDeviceSamplingConfig(
             do_sample=False,
             top_k=1,
             top_p=1.0,
             temperature=1.0,
-        ),
-        enable_bucketing=False,
-        logical_nc_config=args.logical_nc_config,
-        save_sharded_checkpoint=True,
-        quantized=True,
-        quantized_checkpoints_path=str(
-            Path(args.quantized_checkpoints_path).expanduser().resolve()
-        ),
-        quantization_type="per_channel_symmetric",
-        quantization_dtype="f8e4m3",
-        modules_to_not_convert=modules_to_not_convert,
-        kv_cache_quant=False,
-        quantized_mlp_kernel_enabled=False,
-        activation_quantization_type=None,
-    )
+        )
+    if args.enable_prefix_caching or args.enable_hybrid_apc or args.enable_vllm_chunked_prefill:
+        neuron_config_kwargs["is_block_kv_layout"] = True
+        neuron_config_kwargs["pa_block_size"] = args.block_size
+        neuron_config_kwargs["pa_num_blocks"] = _pa_num_blocks(args)
+    if args.enable_prefix_caching or args.enable_hybrid_apc:
+        neuron_config_kwargs["is_prefix_caching"] = True
+        neuron_config_kwargs["prefix_buckets"] = prefix_buckets
+    if args.enable_vllm_chunked_prefill:
+        neuron_config_kwargs["chunked_prefill_config"] = ChunkedPrefillConfig(
+            max_num_seqs=1,
+            tkg_model_enabled=True,
+            kernel_q_tile_size=args.kernel_q_tile_size,
+            kernel_kv_tile_size=args.kernel_kv_tile_size,
+        )
 
-    config_dict.setdefault("use_hybrid_cache_manager", True)
-    config_dict.setdefault("use_qwen_hybrid_chunked_prefill", True)
-    config_dict.setdefault("use_qwen_hybrid_chunked_prefill_nki", True)
+    neuron_config = NeuronConfig(**neuron_config_kwargs)
+
+    if args.disable_static_hybrid_cache or args.enable_prefix_caching or args.enable_hybrid_apc:
+        config_dict["use_hybrid_cache_manager"] = False
+    else:
+        config_dict.setdefault("use_hybrid_cache_manager", True)
+    config_dict["use_hybrid_apc_manager"] = args.enable_hybrid_apc
+    config_dict["gdn_checkpoint_interval"] = args.gdn_checkpoint_interval
+    config_dict["max_gdn_checkpoint_slots"] = args.max_gdn_checkpoint_slots
+    config_dict["gdn_recurrent_cache_dtype"] = args.gdn_recurrent_cache_dtype
+    config_dict["gdn_conv_cache_dtype"] = args.gdn_conv_cache_dtype
+    config_dict["hybrid_recurrent_cache_dtype"] = args.gdn_recurrent_cache_dtype
+    config_dict["hybrid_conv_cache_dtype"] = args.gdn_conv_cache_dtype
+    config_dict["hybrid_cache_mode"] = args.hybrid_cache_mode
+    config_dict["hybrid_apc_require_vllm_metadata"] = args.hybrid_apc_require_vllm_metadata
+    config_dict["hybrid_apc_allow_local_hash_fallback"] = (
+        not args.hybrid_apc_require_vllm_metadata
+    )
+    config_dict["hybrid_apc_require_attention_block_refs"] = (
+        args.hybrid_apc_require_vllm_metadata
+    )
+    config_dict["use_qwen_hybrid_chunked_prefill"] = args.enable_vllm_chunked_prefill
+    config_dict["use_qwen_hybrid_chunked_prefill_nki"] = args.enable_vllm_chunked_prefill
 
     inf_config = Qwen35InferenceConfig(neuron_config=neuron_config, **config_dict)
     return inf_config, modules_to_not_convert
@@ -221,8 +322,25 @@ def main() -> int:
     parser.add_argument("--quantized-checkpoints-path", required=True)
     parser.add_argument("--seq-len", type=int, default=65536)
     parser.add_argument("--cte-bucket", type=int, default=512)
+    parser.add_argument("--cte-buckets", nargs="+", default=None)
+    parser.add_argument("--prefix-buckets", nargs="+", default=None)
+    parser.add_argument("--block-size", type=int, default=256)
+    parser.add_argument("--pa-num-blocks", type=int, default=None)
     parser.add_argument("--tp-degree", type=int, default=4)
     parser.add_argument("--logical-nc-config", type=int, default=2)
+    parser.add_argument("--enable-prefix-caching", action="store_true")
+    parser.add_argument("--enable-hybrid-apc", action="store_true")
+    parser.add_argument("--enable-vllm-chunked-prefill", action="store_true")
+    parser.add_argument("--disable-on-device-sampling", action="store_true")
+    parser.add_argument("--kernel-q-tile-size", type=int, default=128)
+    parser.add_argument("--kernel-kv-tile-size", type=int, default=1024)
+    parser.add_argument("--disable-static-hybrid-cache", action="store_true")
+    parser.add_argument("--gdn-checkpoint-interval", type=int, default=256)
+    parser.add_argument("--max-gdn-checkpoint-slots", type=int, default=8)
+    parser.add_argument("--gdn-recurrent-cache-dtype", default="float32")
+    parser.add_argument("--gdn-conv-cache-dtype", default="bfloat16")
+    parser.add_argument("--hybrid-cache-mode", default="all")
+    parser.add_argument("--hybrid-apc-require-vllm-metadata", action="store_true")
     parser.add_argument("--force-quantize", action="store_true")
     parser.add_argument("--quantize-only", action="store_true")
     parser.add_argument("--load-after-compile", action="store_true")
@@ -251,8 +369,16 @@ def main() -> int:
         json.dumps(
             {
                 "seq_len": args.seq_len,
-                "max_context_length": args.cte_bucket,
-                "context_encoding_buckets": [args.cte_bucket],
+                "max_context_length": max(_cte_buckets(args)),
+                "context_encoding_buckets": _cte_buckets(args),
+                "prefix_buckets": _prefix_buckets(args, _cte_buckets(args)),
+                "enable_prefix_caching": args.enable_prefix_caching,
+                "enable_hybrid_apc": args.enable_hybrid_apc,
+                "enable_vllm_chunked_prefill": args.enable_vllm_chunked_prefill,
+                "block_size": args.block_size,
+                "pa_num_blocks": _pa_num_blocks(args),
+                "gdn_checkpoint_interval": args.gdn_checkpoint_interval,
+                "max_gdn_checkpoint_slots": args.max_gdn_checkpoint_slots,
             },
             sort_keys=True,
         ),

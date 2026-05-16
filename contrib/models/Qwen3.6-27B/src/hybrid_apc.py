@@ -12,6 +12,7 @@ accounting.
 from __future__ import annotations
 
 import hashlib
+import os
 import struct
 from collections import OrderedDict, deque
 from dataclasses import dataclass
@@ -387,6 +388,16 @@ def apply_hybrid_apc_prefill_plan(
     output["hybrid_restore_prefix_lens"] = _batch_i32(restore_len)
     output["hybrid_commit_slot_ids"] = _batch_i32(0 if commit_slot is None else commit_slot)
     output["hybrid_commit_mask"] = _batch_i32(0 if commit_slot is None else 1)
+
+    if os.environ.get("QWEN36_HYBRID_APC_DEBUG") == "1":
+        print(
+            "[hybrid_apc_debug] apply "
+            f"prompt_len={prompt_len} restore_len={restore_len} "
+            f"suffix_len={suffix_len} restore_slot={plan.checkpoint_slot} "
+            f"commit_slot={commit_slot} input_shape={tuple(input_ids.shape)} "
+            f"output_shape={tuple(output['input_ids'].shape)}",
+            flush=True,
+        )
 
     return output
 

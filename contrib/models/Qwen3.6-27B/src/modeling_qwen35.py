@@ -41,6 +41,10 @@ from neuronx_distributed_inference.models.model_base import (
     NeuronBaseForCausalLM,
     NeuronBaseModel,
 )
+from neuronx_distributed_inference.modules.async_execution import (
+    finish_hybrid_apc_request,
+    prepare_hybrid_apc_request_for_execution,
+)
 from neuronx_distributed_inference.modules.custom_calls import CustomRMSNorm
 
 try:
@@ -97,6 +101,9 @@ from neuronx_distributed_inference.modules.attention.attention_base import (
     NeuronAttentionBase,
 )
 from neuronx_distributed_inference.modules.attention.utils import RotaryEmbedding
+from neuronx_distributed_inference.modules.kvcache.block_kv_cache_manager import (
+    BlockKVCacheManager,
+)
 from neuronx_distributed_inference.modules.kvcache.kv_cache_manager import KVCacheManager
 from neuronx_distributed_inference.models.layer_boundary_marker import (
     ModuleMarkerEndWrapper,
@@ -417,6 +424,9 @@ class NeuronGatedDeltaNet(nn.Module):
         )
         self.use_qwen_hybrid_chunked_prefill_nki = getattr(
             tc, "use_qwen_hybrid_chunked_prefill_nki", False
+        )
+        self.use_cold_zero_conv_fast_path = getattr(
+            tc, "use_cold_zero_conv_fast_path", False
         )
 
         # KV cache dummy shape info
@@ -953,12 +963,17 @@ class NeuronGatedDeltaNet(nn.Module):
         batch_size, seq_len, _ = hidden_states.shape
 
         seq_ids = kwargs.get("seq_ids", None)
+        is_for_context_encoding = bool(kwargs.get("is_for_context_encoding", False))
         qwen_chunked_prefill_active = (
             self.use_qwen_hybrid_chunked_prefill
             and past_key_value is not None
             and seq_len > 1
         )
-        is_decode = past_key_value is not None and not qwen_chunked_prefill_active
+        is_decode = (
+            past_key_value is not None
+            and not qwen_chunked_prefill_active
+            and not is_for_context_encoding
+        )
 
         # Padding mask for DeltaNet: [B, S, 1] with 1.0 for real tokens, 0.0 for padding.
         # Passed from get_model_output where it's computed from input_ids != pad_token_id.
@@ -975,7 +990,10 @@ class NeuronGatedDeltaNet(nn.Module):
             self.use_hybrid_apc_manager
             and past_key_value is not None
             and len(past_key_value) == 2
+            and getattr(past_key_value[0], "dim", lambda: 0)() == 4
             and getattr(past_key_value[1], "dim", lambda: 0)() == 3
+            and past_key_value[0].shape[1:] == self.recurrent_state_buffer.shape[1:]
+            and past_key_value[1].shape[1:] == self.conv_state_buffer.shape[1:]
         ):
             recurrent_state_cache, conv_state_cache = past_key_value
 
@@ -1023,6 +1041,15 @@ class NeuronGatedDeltaNet(nn.Module):
             mixed_post_conv = F.silu(conv_out)
 
             new_conv_state = torch.cat([conv_state[:, :, 1:], mixed], dim=-1)
+            expected_state_len = self.conv_state_buffer.shape[-1]
+            if new_conv_state.shape[-1] != expected_state_len:
+                if new_conv_state.shape[-1] > expected_state_len:
+                    new_conv_state = new_conv_state[:, :, -expected_state_len:]
+                else:
+                    new_conv_state = F.pad(
+                        new_conv_state,
+                        (expected_state_len - new_conv_state.shape[-1], 0),
+                    )
             alloc_bs = self.conv_state_buffer.shape[0]
             if static_hybrid_cache_active:
                 new_conv_state = new_conv_state.to(self.conv_state_buffer.dtype)
@@ -1045,10 +1072,11 @@ class NeuronGatedDeltaNet(nn.Module):
             else:
                 new_conv_state = new_conv_state + self.conv_state_buffer * 0
         else:
-            if qwen_chunked_prefill_active and conv_state_cache is not None:
-                cold_prefill_from_zero = getattr(
-                    self.config, "use_cold_zero_conv_fast_path", False
-                )
+            if (
+                conv_state_cache is not None
+                and (qwen_chunked_prefill_active or is_for_context_encoding)
+            ):
+                cold_prefill_from_zero = self.use_cold_zero_conv_fast_path
                 if cold_prefill_from_zero:
                     mixed_post_conv = F.silu(
                         F.conv1d(
@@ -1239,7 +1267,9 @@ class NeuronGatedDeltaNet(nn.Module):
             use_sequential = os.environ.get("DELTANET_SEQUENTIAL") == "1"
             use_pytorch_chunk = os.environ.get("USE_PYTORCH_CHUNK") == "1"
 
-            if qwen_chunked_prefill_active and recurrent_state_cache is not None:
+            if recurrent_state_cache is not None and (
+                qwen_chunked_prefill_active or is_for_context_encoding
+            ):
                 initial_state = recurrent_state_cache[:batch_size].float()
                 if position_ids is not None:
                     reset_mask = (position_ids[:, :1].long() == 0).to(
@@ -2378,6 +2408,114 @@ class HybridDeltaNetCacheManager(KVCacheManager):
         return latest_recurrent + recurrent_cache * 0, latest_conv + conv_cache * 0
 
 
+class QwenHybridBlockKVCacheManager(BlockKVCacheManager):
+    """Block KV manager that allocates real KV only for full-attention layers."""
+
+    _LINEAR_PLACEHOLDER_SHAPE = (1, 1, 1, 1)
+
+    def __init__(self, config: Qwen35InferenceConfig, num_kv_head, **kwargs):
+        self.layer_types = list(config.layer_types)
+        super().__init__(config, num_kv_head=num_kv_head, **kwargs)
+
+        params = []
+        for layer_type in self.layer_types:
+            if layer_type == "full_attention":
+                params.append(
+                    nn.Parameter(
+                        torch.zeros(self.k_shape, dtype=self.cache_dtype),
+                        requires_grad=False,
+                    )
+                )
+                params.append(
+                    nn.Parameter(
+                        torch.zeros(self.v_shape, dtype=self.cache_dtype),
+                        requires_grad=False,
+                    )
+                )
+            else:
+                params.append(
+                    nn.Parameter(
+                        torch.zeros(
+                            self._LINEAR_PLACEHOLDER_SHAPE,
+                            dtype=self.cache_dtype,
+                        ),
+                        requires_grad=False,
+                    )
+                )
+                params.append(
+                    nn.Parameter(
+                        torch.zeros(
+                            self._LINEAR_PLACEHOLDER_SHAPE,
+                            dtype=self.cache_dtype,
+                        ),
+                        requires_grad=False,
+                    )
+                )
+        self.past_key_values = nn.ParameterList(params)
+
+    def _is_attention_layer(self, idx: int) -> bool:
+        return self.layer_types[idx] == "full_attention"
+
+    def get_seq_length(self, past_key_values=None):
+        for idx, layer_type in enumerate(self.layer_types):
+            if layer_type == "full_attention":
+                if past_key_values is None:
+                    _, v_cache = self._fetch_cache(idx)
+                elif len(past_key_values) == len(self.past_key_values):
+                    v_cache = past_key_values[2 * idx + 1]
+                else:
+                    v_cache = past_key_values[idx][1]
+                if v_cache.ndim >= 4 and v_cache.shape[1] == self.pa_block_size:
+                    return self.pa_num_blocks * self.pa_block_size
+                return v_cache.shape[2]
+        return 0
+
+    def get_cache(self, active_block_table=None, kvcache_buffer=None, **kwargs):
+        past_key_values = []
+        for idx in range(len(self.past_key_values) // 2):
+            if self._is_attention_layer(idx):
+                k_cache, v_cache = self.get_kv_by_layer_id(
+                    idx,
+                    active_block_table,
+                    kvcache_buffer=kvcache_buffer,
+                    **kwargs,
+                )
+            else:
+                k_cache, v_cache = self._fetch_cache(
+                    idx,
+                    kvcache_buffer=kvcache_buffer,
+                )
+            past_key_values.append([k_cache, v_cache])
+        return past_key_values
+
+    def update_cache(
+        self,
+        new_key_values: List[torch.Tensor],
+        scatter_index=None,
+        kvcache_buffer=None,
+        **kwargs,
+    ):
+        updated_kv_cache = []
+        for idx, kv_per_layer in enumerate(new_key_values):
+            if self._is_attention_layer(idx):
+                k_cache, v_cache = self.update_kv_by_layer_id(
+                    idx=idx,
+                    kv_per_layer=kv_per_layer,
+                    scatter_index=scatter_index,
+                    kvcache_buffer=kvcache_buffer,
+                )
+            else:
+                k_cache, v_cache = self._fetch_cache(
+                    idx,
+                    kvcache_buffer=kvcache_buffer,
+                )
+                k_cache = k_cache * 1
+                v_cache = v_cache * 1
+            updated_kv_cache.append(k_cache)
+            updated_kv_cache.append(v_cache)
+        return updated_kv_cache
+
+
 class HybridGDNCheckpointCache(nn.Module):
     """Bounded device-side GDN prefix checkpoint bank.
 
@@ -2633,6 +2771,11 @@ class NeuronQwen35Model(NeuronBaseModel):
     def init_inference_optimization(self, config: Qwen35InferenceConfig):
         super().init_inference_optimization(config)
         if getattr(config, "use_hybrid_apc_manager", False):
+            if getattr(config.neuron_config, "is_block_kv_layout", False):
+                self.kv_mgr = QwenHybridBlockKVCacheManager(
+                    config,
+                    num_kv_head=self.num_key_value_heads,
+                )
             self.hybrid_gdn_checkpoint_cache = HybridGDNCheckpointCache(config)
         elif getattr(config, "use_hybrid_cache_manager", False):
             self.kv_mgr = HybridDeltaNetCacheManager(
@@ -2723,9 +2866,17 @@ class NeuronQwen35Model(NeuronBaseModel):
             and attention_mask is not None
             and attention_mask.ndim == 2
         ):
-            deltanet_padding_mask = attention_mask.unsqueeze(-1).to(
+            attention_padding_mask = attention_mask.unsqueeze(-1).to(
                 inputs_embeds.dtype
             )
+            if attention_padding_mask.shape[1] == inputs_embeds.shape[1]:
+                deltanet_padding_mask = attention_padding_mask
+            else:
+                deltanet_padding_mask = (
+                    (input_ids != self.padding_idx)
+                    .unsqueeze(-1)
+                    .to(inputs_embeds.dtype)
+                )
         else:
             deltanet_padding_mask = (
                 (input_ids != self.padding_idx).unsqueeze(-1).to(inputs_embeds.dtype)
@@ -3803,6 +3954,48 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
             and input_ids.shape[-1] > 1
         )
 
+        hybrid_apc_request_dict = None
+        if (
+            is_prefill
+            and getattr(self.config, "use_hybrid_apc_manager", False)
+            and getattr(self.neuron_config, "is_prefix_caching", False)
+            and hybrid_restore_mask is None
+            and hybrid_commit_mask is None
+        ):
+            hybrid_apc_request_dict = {
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "position_ids": position_ids,
+                "seq_ids": seq_ids,
+                "sampling_params": sampling_params,
+                "adapter_ids": adapter_ids,
+                "slot_mapping": slot_mapping,
+                "block_table": block_table,
+                "full_context_lens": full_context_lens,
+                "computed_context_lens": computed_context_lens,
+            }
+            prepared_inputs = prepare_hybrid_apc_request_for_execution(
+                self,
+                hybrid_apc_request_dict,
+            )
+            input_ids = prepared_inputs.get("input_ids", input_ids)
+            attention_mask = prepared_inputs.get("attention_mask", attention_mask)
+            position_ids = prepared_inputs.get("position_ids", position_ids)
+            slot_mapping = prepared_inputs.get("slot_mapping", slot_mapping)
+            block_table = prepared_inputs.get("block_table", block_table)
+            full_context_lens = prepared_inputs.get("full_context_lens", full_context_lens)
+            computed_context_lens = prepared_inputs.get(
+                "computed_context_lens",
+                computed_context_lens,
+            )
+            hybrid_restore_slot_ids = prepared_inputs.get("hybrid_restore_slot_ids")
+            hybrid_restore_mask = prepared_inputs.get("hybrid_restore_mask")
+            hybrid_restore_prefix_lens = prepared_inputs.get(
+                "hybrid_restore_prefix_lens"
+            )
+            hybrid_commit_slot_ids = prepared_inputs.get("hybrid_commit_slot_ids")
+            hybrid_commit_mask = prepared_inputs.get("hybrid_commit_mask")
+
         seq_len = input_ids.shape[1]
         batch_size = input_ids.shape[0]
 
@@ -3847,7 +4040,50 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
         else:
             mrope_position_ids = torch.zeros((0,), dtype=torch.int32)
 
-        empties = [torch.empty(0) for _ in range(14)]
+        def _empty():
+            return torch.empty(0)
+
+        def _optional_tensor(value):
+            return value if value is not None else _empty()
+
+        def _length_matrix(value, default_value, batch=batch_size):
+            if value is None or not hasattr(value, "numel") or value.numel() == 0:
+                return torch.full((batch, 1), default_value, dtype=torch.int32)
+            value = value.to(torch.int32)
+            if value.ndim == 0:
+                return value.reshape(1, 1)
+            if value.ndim == 1:
+                return value.reshape(-1, 1)
+            return value
+
+        def _slice_batch(value, start, end):
+            if value is None or not hasattr(value, "numel") or value.numel() == 0:
+                return _empty()
+            if value.ndim > 0 and value.shape[0] >= end:
+                return value[start:end]
+            return value
+
+        def _pad_batch(value, target_batch, fill_value=0):
+            if value is None or not hasattr(value, "numel") or value.numel() == 0:
+                return value
+            if value.ndim == 0 or value.shape[0] >= target_batch:
+                return value
+            pad_shape = (target_batch - value.shape[0],) + tuple(value.shape[1:])
+            pad = torch.full(pad_shape, fill_value, dtype=value.dtype)
+            return torch.cat([value, pad], dim=0)
+
+        if self.neuron_config.is_prefix_caching:
+            computed_context_lens_arg = _length_matrix(computed_context_lens, 0)
+            full_context_lens_arg = _length_matrix(full_context_lens, seq_len)
+            num_queries_arg = (full_context_lens_arg - computed_context_lens_arg).to(torch.int32)
+            slot_mapping_arg = _optional_tensor(slot_mapping)
+            block_table_arg = _optional_tensor(block_table)
+        else:
+            computed_context_lens_arg = _empty()
+            num_queries_arg = _empty()
+            slot_mapping_arg = _empty()
+            block_table_arg = _empty()
+
         if hybrid_restore_slot_ids is None:
             hybrid_restore_slot_ids = torch.zeros((batch_size,), dtype=torch.int32)
         if hybrid_restore_mask is None:
@@ -3872,6 +4108,12 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
                 chunk_pos_ids = position_ids[cb:cb_end]
                 chunk_seq_ids = seq_ids[cb:cb_end]
                 chunk_sampling = sampling_params[cb:cb_end]
+                chunk_slot_mapping = _slice_batch(slot_mapping_arg, cb, cb_end)
+                chunk_block_table = _slice_batch(block_table_arg, cb, cb_end)
+                chunk_num_queries = _slice_batch(num_queries_arg, cb, cb_end)
+                chunk_computed_context_lens = _slice_batch(
+                    computed_context_lens_arg, cb, cb_end
+                )
                 chunk_restore_slots = hybrid_restore_slot_ids[cb:cb_end]
                 chunk_restore_mask = hybrid_restore_mask[cb:cb_end]
                 chunk_restore_prefix = hybrid_restore_prefix_lens[cb:cb_end]
@@ -3923,6 +4165,12 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
                     chunk_seq_ids = torch.cat([chunk_seq_ids, pad_seq], dim=0)
                     chunk_sampling = torch.cat(
                         [chunk_sampling, chunk_sampling[:1].expand(pad_n, -1)], dim=0
+                    )
+                    chunk_slot_mapping = _pad_batch(chunk_slot_mapping, ctx_bs, -1)
+                    chunk_block_table = _pad_batch(chunk_block_table, ctx_bs, 0)
+                    chunk_num_queries = _pad_batch(chunk_num_queries, ctx_bs, 0)
+                    chunk_computed_context_lens = _pad_batch(
+                        chunk_computed_context_lens, ctx_bs, 0
                     )
                     chunk_restore_slots = torch.cat(
                         [chunk_restore_slots, torch.zeros(pad_n, dtype=chunk_restore_slots.dtype)],
@@ -3998,6 +4246,33 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
                             dim=0,
                         )
 
+                if os.environ.get("QWEN36_HYBRID_APC_DEBUG") == "1":
+                    def _dbg_minmax(tensor):
+                        if not hasattr(tensor, "numel") or tensor.numel() == 0:
+                            return "empty"
+                        flat = tensor.reshape(-1)
+                        return f"{int(flat.min().item())}:{int(flat.max().item())}"
+
+                    print(
+                        "[hybrid_apc_debug] qwen-cte-call "
+                        f"input_shape={tuple(chunk_input_ids.shape)} "
+                        f"attention_shape={tuple(chunk_attn_mask.shape)} "
+                        f"position_shape={tuple(chunk_pos_ids.shape)} "
+                        f"position_minmax={_dbg_minmax(chunk_pos_ids)} "
+                        f"slot_shape={tuple(chunk_slot_mapping.shape)} "
+                        f"slot_minmax={_dbg_minmax(chunk_slot_mapping)} "
+                        f"block_shape={tuple(chunk_block_table.shape)} "
+                        f"block_minmax={_dbg_minmax(chunk_block_table)} "
+                        f"num_queries={chunk_num_queries.reshape(-1).tolist() if hasattr(chunk_num_queries, 'numel') and chunk_num_queries.numel() else []} "
+                        f"computed={chunk_computed_context_lens.reshape(-1).tolist() if hasattr(chunk_computed_context_lens, 'numel') and chunk_computed_context_lens.numel() else []} "
+                        f"restore_slots={chunk_restore_slots.reshape(-1).tolist()} "
+                        f"restore_mask={chunk_restore_mask.reshape(-1).tolist()} "
+                        f"restore_prefix={chunk_restore_prefix.reshape(-1).tolist()} "
+                        f"commit_slots={chunk_commit_slots.reshape(-1).tolist()} "
+                        f"commit_mask={chunk_commit_mask.reshape(-1).tolist()}",
+                        flush=True,
+                    )
+
                 chunk_out = self.context_encoding_model(
                     chunk_input_ids,
                     chunk_attn_mask,
@@ -4006,7 +4281,20 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
                     chunk_sampling,
                     chunk_prev_hidden,
                     chunk_adapter_ids,
-                    *empties,
+                    _empty(),
+                    _empty(),
+                    _empty(),
+                    _empty(),
+                    chunk_slot_mapping,
+                    chunk_block_table,
+                    chunk_num_queries,
+                    chunk_computed_context_lens,
+                    _empty(),
+                    _empty(),
+                    _empty(),
+                    _empty(),
+                    _empty(),
+                    _empty(),
                     chunk_mrope,
                     chunk_vis_emb,
                     chunk_vis_mask,
@@ -4027,6 +4315,8 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
             )
             self.kv_cache_populated = True
             is_run_on_neuron = self.context_encoding_model.is_neuron()
+            if hybrid_apc_request_dict is not None:
+                finish_hybrid_apc_request(hybrid_apc_request_dict)
         else:
             outputs = self.token_generation_model(
                 input_ids,
@@ -4036,7 +4326,20 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
                 sampling_params,
                 prev_hidden,
                 adapter_ids,
-                *empties,
+                _empty(),
+                _empty(),
+                _empty(),
+                _empty(),
+                slot_mapping_arg,
+                block_table_arg,
+                num_queries_arg,
+                computed_context_lens_arg,
+                _empty(),
+                _empty(),
+                _empty(),
+                _empty(),
+                _empty(),
+                _empty(),
                 mrope_position_ids,
                 vision_embeddings,
                 vision_mask,

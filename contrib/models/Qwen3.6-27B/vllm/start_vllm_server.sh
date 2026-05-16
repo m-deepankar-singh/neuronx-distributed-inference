@@ -115,6 +115,11 @@ fi
 if [[ "${ENABLE_PREFIX_CACHING}" == "1" || "${ENABLE_HYBRID_APC}" == "1" ]]; then
   ENABLE_PREFIX_CACHING="1"
 fi
+if [[ "${ENABLE_PREFIX_CACHING}" == "1" || "${ENABLE_CHUNKED_PREFILL}" == "1" ]]; then
+  if [[ -z "${NUM_GPU_BLOCKS_OVERRIDE}" ]]; then
+    NUM_GPU_BLOCKS_OVERRIDE=$(( ((SEQ_LEN + BLOCK_SIZE - 1) / BLOCK_SIZE) * MAX_NUM_SEQS ))
+  fi
+fi
 if [[ "${ENABLE_HYBRID_APC}" == "1" ]]; then
   if [[ "${HYBRID_CACHE_MODE}" != "all" ]]; then
     echo "ERROR: --enable-hybrid-apc requires --hybrid-cache-mode all" >&2
@@ -182,6 +187,16 @@ enable_prefix_caching = "${ENABLE_PREFIX_CACHING}" == "1"
 enable_hybrid_apc = "${ENABLE_HYBRID_APC}" == "1"
 cte_buckets = json.loads('${CTE_BUCKETS_JSON}')
 max_cte_bucket = cte_buckets[-1]
+num_gpu_blocks_override = "${NUM_GPU_BLOCKS_OVERRIDE}"
+pa_num_blocks = (
+    int(num_gpu_blocks_override)
+    if num_gpu_blocks_override
+    else max(
+        1,
+        ((int("${SEQ_LEN}") + int("${BLOCK_SIZE}") - 1) // int("${BLOCK_SIZE}"))
+        * int("${MAX_NUM_SEQS}"),
+    )
+)
 neuron_config = {
     "tp_degree": int("${TP_DEGREE}"),
     "batch_size": int("${MAX_NUM_SEQS}"),
@@ -197,6 +212,7 @@ neuron_config = {
     "torch_dtype": "bfloat16",
     "save_sharded_checkpoint": True,
     "pa_block_size": int("${BLOCK_SIZE}"),
+    "pa_num_blocks": pa_num_blocks,
 }
 if enable_prefix_caching or enable_hybrid_apc or enable_chunked:
     neuron_config["is_block_kv_layout"] = True

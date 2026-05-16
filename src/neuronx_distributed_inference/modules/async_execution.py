@@ -1,3 +1,4 @@
+import os
 from typing import TYPE_CHECKING, Any, Dict, List, Tuple, Union
 
 import torch
@@ -223,6 +224,21 @@ def prepare_hybrid_apc_request_for_execution(
     )
     input_dict["_hybrid_apc_bridge"] = bridge
     input_dict["_hybrid_apc_prepared"] = prepared
+    if os.environ.get("QWEN36_HYBRID_APC_DEBUG") == "1":
+        prepared_inputs = prepared.input_dict
+        print(
+            "[hybrid_apc_debug] prepare "
+            f"request_id={request_id!r} attention_hit_len={_to_python_int(attention_hit_len)} "
+            f"request_prefix_len={request_prefix_len} restore_len={prepared.plan.restore_checkpoint_prefix_len} "
+            f"commit_prefix_len={prepared.commit_prefix_len} restore_slot={prepared.plan.checkpoint_slot} "
+            f"commit_slot={prepared.commit_slot} input_shape={tuple(input_dict['input_ids'].shape)} "
+            f"prepared_shape={tuple(prepared_inputs['input_ids'].shape)} "
+            f"computed={prepared_inputs.get('computed_context_lens')} "
+            f"num_queries={prepared_inputs.get('num_queries')} "
+            f"restore_mask={prepared_inputs.get('hybrid_restore_mask')} "
+            f"commit_mask={prepared_inputs.get('hybrid_commit_mask')}",
+            flush=True,
+        )
     return prepared.input_dict
 
 

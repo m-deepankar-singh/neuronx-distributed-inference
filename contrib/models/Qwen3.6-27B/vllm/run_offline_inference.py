@@ -67,6 +67,17 @@ def _validate_hybrid_apc_args(args: argparse.Namespace):
     args.enable_prefix_caching = True
 
 
+def _pa_num_blocks(args: argparse.Namespace) -> int:
+    num_gpu_blocks_override = getattr(args, "num_gpu_blocks_override", None)
+    if num_gpu_blocks_override is not None:
+        return max(1, num_gpu_blocks_override)
+    return max(
+        1,
+        ((args.seq_len + args.block_size - 1) // args.block_size)
+        * args.max_num_seqs,
+    )
+
+
 def _override_config(args: argparse.Namespace) -> dict:
     _validate_hybrid_apc_args(args)
     cte_buckets = _cte_buckets(args)
@@ -89,7 +100,6 @@ def _override_config(args: argparse.Namespace) -> dict:
         "logical_nc_config": args.logical_nc_config,
         "torch_dtype": "bfloat16",
         "save_sharded_checkpoint": True,
-        "pa_block_size": args.block_size,
     }
     if (
         args.enable_prefix_caching
@@ -97,6 +107,8 @@ def _override_config(args: argparse.Namespace) -> dict:
         or args.enable_vllm_chunked_prefill
     ):
         neuron_config["is_block_kv_layout"] = True
+        neuron_config["pa_block_size"] = args.block_size
+        neuron_config["pa_num_blocks"] = _pa_num_blocks(args)
     if args.enable_prefix_caching or args.enable_hybrid_apc:
         neuron_config["is_prefix_caching"] = True
     if args.enable_vllm_chunked_prefill:
@@ -275,8 +287,13 @@ def main() -> int:
         and "mamba_ssm_cache_dtype" not in llm_kwargs
     ):
         llm_kwargs["mamba_ssm_cache_dtype"] = args.mamba_ssm_cache_dtype
-    if args.num_gpu_blocks_override is not None:
-        llm_kwargs["num_gpu_blocks_override"] = args.num_gpu_blocks_override
+    if (
+        args.num_gpu_blocks_override is not None
+        or args.enable_prefix_caching
+        or args.enable_hybrid_apc
+        or args.enable_vllm_chunked_prefill
+    ):
+        llm_kwargs["num_gpu_blocks_override"] = _pa_num_blocks(args)
     if (
         args.enable_prefix_caching
         or args.enable_hybrid_apc

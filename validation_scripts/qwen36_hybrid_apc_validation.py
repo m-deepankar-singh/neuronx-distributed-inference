@@ -11,11 +11,15 @@ Neuron/vLLM runtime and compiled artifacts. It covers two gates:
 from __future__ import annotations
 
 import argparse
+import gc
 import importlib.util
 import json
+import multiprocessing
 import os
+import queue
 import sys
 import time
+import traceback
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -45,6 +49,7 @@ def _runner_args(args, *, enable_hybrid_apc: bool):
         ctx_batch_size=args.ctx_batch_size,
         logical_nc_config=args.logical_nc_config,
         block_size=args.block_size,
+        num_gpu_blocks_override=args.num_gpu_blocks_override,
         enable_prefix_caching=enable_hybrid_apc,
         enable_hybrid_apc=enable_hybrid_apc,
         enable_vllm_chunked_prefill=args.enable_vllm_chunked_prefill,
@@ -59,6 +64,9 @@ def _runner_args(args, *, enable_hybrid_apc: bool):
         hybrid_cache_mode="all",
         hybrid_cache_prefix_boundary_only=True,
         hybrid_cache_validate_exact=True,
+        hybrid_apc_require_vllm_metadata=getattr(
+            args, "hybrid_apc_require_vllm_metadata", False
+        ),
         text_only_cte=True,
         compact_cte_attention_mask=True,
         cold_zero_conv_fast_path=False,
@@ -106,8 +114,12 @@ def _build_llm(args, *, enable_hybrid_apc: bool):
         llm_kwargs["mamba_ssm_cache_dtype"] = args.gdn_recurrent_cache_dtype
     if args.enable_vllm_chunked_prefill:
         llm_kwargs["max_num_batched_tokens"] = max(runner._cte_buckets(runner_args))
-    if args.num_gpu_blocks_override is not None:
-        llm_kwargs["num_gpu_blocks_override"] = args.num_gpu_blocks_override
+    if (
+        runner_args.enable_prefix_caching
+        or runner_args.enable_hybrid_apc
+        or runner_args.enable_vllm_chunked_prefill
+    ):
+        llm_kwargs["num_gpu_blocks_override"] = runner._pa_num_blocks(runner_args)
     sampling = SamplingParams(temperature=0.0, top_k=1, max_tokens=args.max_tokens)
     return LLM(**llm_kwargs), sampling
 
@@ -120,20 +132,108 @@ def _generate(llm, sampling, prompt: str):
     return {"tokens": token_ids, "elapsed_seconds": elapsed}
 
 
+def _shutdown_llm(llm) -> None:
+    if llm is None:
+        return
+    for target in (
+        llm,
+        getattr(llm, "llm_engine", None),
+        getattr(getattr(llm, "llm_engine", None), "engine_core", None),
+        getattr(getattr(llm, "llm_engine", None), "engine_core_client", None),
+    ):
+        shutdown = getattr(target, "shutdown", None)
+        if shutdown is None:
+            continue
+        try:
+            shutdown()
+        except Exception:
+            pass
+    del llm
+    gc.collect()
+
+
+def _generate_batch_worker(args_dict, enable_hybrid_apc: bool, labeled_prompts, result_queue):
+    llm = None
+    try:
+        args = argparse.Namespace(**args_dict)
+        llm, sampling = _build_llm(args, enable_hybrid_apc=enable_hybrid_apc)
+        results = {}
+        for label, prompt in labeled_prompts:
+            if os.environ.get("QWEN36_HYBRID_APC_DEBUG") == "1":
+                print(
+                    "[hybrid_apc_debug] generate "
+                    f"label={label} enable_hybrid_apc={enable_hybrid_apc} "
+                    f"prompt_chars={len(prompt)}",
+                    flush=True,
+                )
+            results[label] = _generate(llm, sampling, prompt)
+        result_queue.put({"ok": True, "results": results})
+    except BaseException:
+        result_queue.put({"ok": False, "traceback": traceback.format_exc()})
+    finally:
+        _shutdown_llm(llm)
+
+
+def _generate_batch(args, *, enable_hybrid_apc: bool, labeled_prompts):
+    ctx = multiprocessing.get_context("spawn")
+    result_queue = ctx.Queue()
+    proc = ctx.Process(
+        target=_generate_batch_worker,
+        args=(vars(args), enable_hybrid_apc, labeled_prompts, result_queue),
+    )
+    proc.start()
+    proc.join()
+
+    try:
+        message = result_queue.get(timeout=1.0)
+    except queue.Empty as exc:
+        raise RuntimeError(
+            f"generation worker exited with code {proc.exitcode} without a report"
+        ) from exc
+    if not message["ok"]:
+        raise RuntimeError(message["traceback"])
+    if proc.exitcode not in (0, None):
+        raise RuntimeError(f"generation worker exited with code {proc.exitcode}")
+    return message["results"]
+
+
 def run_exactness(args) -> int:
     shared = args.shared_prefix
     prompt_a = shared + args.suffix_a
     prompt_b = shared + args.suffix_b
 
-    cold_llm, sampling = _build_llm(args, enable_hybrid_apc=False)
-    cold_full = _generate(cold_llm, sampling, prompt_a)
-    cold_partial = _generate(cold_llm, sampling, prompt_b)
+    # This validation uses the v3 vLLM APC artifact, which is compiled for
+    # prefix/block KV layout. Keep prefix metadata enabled even for cold
+    # references, and isolate each cold prompt in a fresh process so it cannot
+    # observe cache state from the other reference prompt.
+    cold_full = _generate_batch(
+        args,
+        enable_hybrid_apc=True,
+        labeled_prompts=[
+            ("cold_full", prompt_a),
+        ],
+    )["cold_full"]
+    cold_partial = _generate_batch(
+        args,
+        enable_hybrid_apc=True,
+        labeled_prompts=[
+            ("cold_partial", prompt_b),
+        ],
+    )["cold_partial"]
+    warm_results = _generate_batch(
+        args,
+        enable_hybrid_apc=True,
+        labeled_prompts=[
+            ("warmup_full", prompt_a),
+            ("warm_full", prompt_a),
+            ("warmup_partial", prompt_a),
+            ("warm_partial", prompt_b),
+        ],
+    )
 
-    warm_llm, warm_sampling = _build_llm(args, enable_hybrid_apc=True)
-    warmup_full = _generate(warm_llm, warm_sampling, prompt_a)
-    warm_full = _generate(warm_llm, warm_sampling, prompt_a)
-    _warmup_partial = _generate(warm_llm, warm_sampling, prompt_a)
-    warm_partial = _generate(warm_llm, warm_sampling, prompt_b)
+    warmup_full = warm_results["warmup_full"]
+    warm_full = warm_results["warm_full"]
+    warm_partial = warm_results["warm_partial"]
 
     report = {
         "full_prefix_exact": cold_full["tokens"] == warm_full["tokens"],
@@ -198,6 +298,7 @@ def parse_args():
     exact.add_argument("--max-gdn-checkpoint-slots", type=int, default=8)
     exact.add_argument("--gdn-recurrent-cache-dtype", default="float32")
     exact.add_argument("--gdn-conv-cache-dtype", default="bfloat16")
+    exact.add_argument("--hybrid-apc-require-vllm-metadata", action="store_true")
     exact.add_argument("--enable-vllm-chunked-prefill", action="store_true")
     exact.add_argument("--kernel-q-tile-size", type=int, default=128)
     exact.add_argument("--kernel-kv-tile-size", type=int, default=1024)
