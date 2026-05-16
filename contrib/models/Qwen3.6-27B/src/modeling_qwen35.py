@@ -859,12 +859,18 @@ class NeuronGatedDeltaNet(nn.Module):
             conv_input = torch.cat([conv_state, mixed], dim=-1)
 
             w = self._conv1d_weight().squeeze(1)
-            conv_out = torch.zeros_like(mixed)
-            for k in range(4):
+            if seq_len == 1:
                 conv_out = (
-                    conv_out
-                    + w[:, k].unsqueeze(0).unsqueeze(-1) * conv_input[:, :, k : k + 1]
-                )
+                    conv_input[:, :, : self.conv_kernel_size] * w.unsqueeze(0)
+                ).sum(dim=-1, keepdim=True)
+            else:
+                conv_out = torch.zeros_like(mixed)
+                for k in range(self.conv_kernel_size):
+                    conv_out = (
+                        conv_out
+                        + w[:, k].unsqueeze(0).unsqueeze(-1)
+                        * conv_input[:, :, k : k + 1]
+                    )
             mixed_post_conv = F.silu(conv_out)
 
             new_conv_state = torch.cat([conv_state[:, :, 1:], mixed], dim=-1)
@@ -2072,6 +2078,17 @@ class HybridDeltaNetCacheManager(KVCacheManager):
 
 class NeuronQwen35Model(NeuronBaseModel):
     def setup_attr_for_model(self, config: Qwen35InferenceConfig):
+        mtp_step_state_enabled = getattr(
+            config.neuron_config, "enable_mtp_step_state_output", False
+        ) or getattr(config.neuron_config, "return_deltanet_step_states", False)
+        if (
+            not getattr(config.neuron_config, "enable_mtp", False)
+            and mtp_step_state_enabled
+        ):
+            raise ValueError(
+                "MTP step-state outputs must stay disabled in non-MTP mode"
+            )
+
         self.on_device_sampling = (
             config.neuron_config.on_device_sampling_config is not None
         )
@@ -2975,12 +2992,7 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
         if getattr(self.config, "use_hybrid_cache_manager", False):
             return
 
-        num_output_from_trace = 1
-        if (
-            self.neuron_config.output_logits
-            and self.neuron_config.on_device_sampling_config
-        ):
-            num_output_from_trace = 2
+        num_output_from_trace = 1 if not self.neuron_config.output_logits else 2
 
         if (
             hasattr(self, "token_generation_model")

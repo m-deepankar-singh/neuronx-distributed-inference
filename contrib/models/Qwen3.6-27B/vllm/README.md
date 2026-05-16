@@ -119,6 +119,51 @@ recurrent state and conv state at block boundaries. If native APC does not
 produce exact greedy matches and a clear warm-hit speedup, the next step is a
 hybrid APC path that caches those GDN states alongside attention KV.
 
+Decode fast-path experiment:
+
+```bash
+contrib/models/Qwen3.6-27B/vllm/start_vllm_server.sh \
+  --model-path /opt/dlami/nvme/models/Qwen3.6-27B \
+  --compiled-artifacts /opt/dlami/nvme/qwen_artifacts/qwen36_27b_128k_fp8_mlp_only_vllm_statereset_run1 \
+  --max-model-len 131072 \
+  --seq-len 131072 \
+  --cte-bucket 512 \
+  --block-size 256 \
+  --enable-vllm-chunked-prefill \
+  --enable-prefix-caching \
+  --enable-on-device-sampling \
+  --output-logits false \
+  --async-mode \
+  --token-generation-buckets 8192,32768,131072 \
+  --port 8000
+```
+
+This mode is intended for greedy decode only (`temperature=0`, `top_k=1`, no
+logprobs). Requests that need full logits should use a logits artifact or a
+separate server without `--enable-on-device-sampling`.
+
+Batch-throughput artifact experiment:
+
+```bash
+contrib/models/Qwen3.6-27B/vllm/start_vllm_server.sh \
+  --model-path /opt/dlami/nvme/models/Qwen3.6-27B \
+  --compiled-artifacts /opt/dlami/nvme/qwen_artifacts/qwen36_27b_128k_fp8_mlp_only_vllm_bs2 \
+  --max-model-len 131072 \
+  --seq-len 131072 \
+  --cte-bucket 512 \
+  --block-size 256 \
+  --enable-vllm-chunked-prefill \
+  --enable-prefix-caching \
+  --max-num-seqs 2 \
+  --max-batch-size 2 \
+  --token-generation-batches 1,2 \
+  --token-generation-buckets 8192,32768,131072 \
+  --port 8000
+```
+
+Use an artifact compiled with the same `max_num_seqs`/batch settings; a
+baseline `max_num_seqs=1` artifact will still queue concurrent requests.
+
 Production chat proxy:
 
 ```bash
@@ -149,6 +194,18 @@ message because the Qwen chat template rejects system messages that appear later
 in the conversation. Use `--allow-thinking` or `--allow-completions` only for
 explicit debugging.
 
+If you run both a token fast-path backend and a logits-path backend, the proxy
+can route greedy requests to the fast path and logprobs/sampling/guided requests
+to the logits backend:
+
+```bash
+python contrib/models/Qwen3.6-27B/vllm/qwen36_chat_proxy.py \
+  --backend-url http://127.0.0.1:8001 \
+  --logits-backend-url http://127.0.0.1:8002 \
+  --fastpath-routing \
+  --port 8000
+```
+
 Offline long-prompt smoke:
 
 ```bash
@@ -166,6 +223,34 @@ print('Summarize this document in one paragraph. ' + 'Neuron inference ' * 700)
 PY
 )"
 ```
+
+Offline decode benchmark with cold and warm APC measurements:
+
+```bash
+python contrib/models/Qwen3.6-27B/vllm/run_offline_inference.py \
+  --model-path /opt/dlami/nvme/models/Qwen3.6-27B \
+  --compiled-artifacts /opt/dlami/nvme/qwen_artifacts/qwen36_27b_128k_fp8_mlp_only_vllm_statereset_run1 \
+  --max-model-len 131072 \
+  --seq-len 131072 \
+  --cte-bucket 512 \
+  --block-size 256 \
+  --enable-vllm-chunked-prefill \
+  --enable-prefix-caching \
+  --enable-on-device-sampling \
+  --output-logits false \
+  --async-mode \
+  --token-generation-buckets 8192,32768,131072 \
+  --max-tokens 256 \
+  --ignore-eos \
+  --warm-apc \
+  --chat \
+  --prompt "Explain tensor parallel decode in one paragraph."
+```
+
+The runner prints one `GENERATION_METRICS` JSON record per measured request,
+including prompt/completion tokens, first-token latency when vLLM exposes it,
+steady decode seconds, decode tok/s, selected TKG bucket, fast-path flags, and
+prefix-cache hit information when available.
 
 Offline token-exact prefix-cache validation:
 
