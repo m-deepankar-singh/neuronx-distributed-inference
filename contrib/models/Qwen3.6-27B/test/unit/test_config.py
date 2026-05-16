@@ -169,6 +169,7 @@ class TestDeltaNetConfig(unittest.TestCase):
         config = _make_config(
             use_hybrid_apc_manager=True,
             hybrid_apc_require_vllm_metadata=True,
+            gdn_checkpoint_interval=128,
         )
 
         self.assertFalse(config.hybrid_apc_allow_local_hash_fallback)
@@ -199,6 +200,7 @@ class TestDeltaNetConfig(unittest.TestCase):
             _make_config(
                 use_hybrid_apc_manager=True,
                 hybrid_apc_allow_residual_replay=True,
+                gdn_checkpoint_interval=128,
             )
 
     def test_static_and_apc_managers_are_mutually_exclusive(self):

@@ -333,7 +333,7 @@ class TestDeltaNetPassthrough(unittest.TestCase):
     """Test that DeltaNet layer weights pass through conversion unchanged."""
 
     def test_deltanet_weights_unchanged(self):
-        config = _make_mini_config()
+        config = _make_mini_config(tp_degree=1)
         sd = _make_mini_state_dict(config)
 
         # Record original DeltaNet weights

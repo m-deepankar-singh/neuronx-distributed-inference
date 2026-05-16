@@ -66,18 +66,49 @@ def _managed_cache_numel(mgr):
 
 
 def _deltanet_state_numel(config, max_batch_size):
+    tp_degree = config.neuron_config.tp_degree
+    local_num_value_heads = config.linear_num_value_heads // tp_degree
+    local_num_key_heads = config.linear_num_key_heads // tp_degree
     recurrent = (
         max_batch_size
-        * config.linear_num_value_heads
+        * local_num_value_heads
         * config.linear_key_head_dim
         * config.linear_value_head_dim
     )
     conv_dim = (
-        2 * config.linear_num_key_heads * config.linear_key_head_dim
-        + config.linear_num_value_heads * config.linear_value_head_dim
+        2 * local_num_key_heads * config.linear_key_head_dim
+        + local_num_value_heads * config.linear_value_head_dim
     )
     conv = max_batch_size * conv_dim * (config.linear_conv_kernel_dim - 1)
     return recurrent + conv
+
+
+def _local_value_heads(config):
+    return config.linear_num_value_heads // config.neuron_config.tp_degree
+
+
+def _local_key_heads(config):
+    return config.linear_num_key_heads // config.neuron_config.tp_degree
+
+
+def _conv_dim(config):
+    return (
+        2 * _local_key_heads(config) * config.linear_key_head_dim
+        + _local_value_heads(config) * config.linear_value_head_dim
+    )
+
+
+def _recurrent_shape(config, batch_size):
+    return [
+        batch_size,
+        _local_value_heads(config),
+        config.linear_key_head_dim,
+        config.linear_value_head_dim,
+    ]
+
+
+def _conv_shape(config, batch_size):
+    return [batch_size, _conv_dim(config), config.linear_conv_kernel_dim - 1]
 
 
 class TestHybridDeltaNetCacheManager(unittest.TestCase):
@@ -86,8 +117,8 @@ class TestHybridDeltaNetCacheManager(unittest.TestCase):
         mgr = HybridDeltaNetCacheManager(config, num_kv_head=config.num_key_value_heads)
 
         self.assertEqual(len(mgr.past_key_values), config.num_hidden_layers * 2)
-        self.assertEqual(list(mgr.past_key_values[0].shape), [2, 48, 128, 128])
-        self.assertEqual(list(mgr.past_key_values[1].shape), [2, 10240, 3])
+        self.assertEqual(list(mgr.past_key_values[0].shape), _recurrent_shape(config, 2))
+        self.assertEqual(list(mgr.past_key_values[1].shape), _conv_shape(config, 2))
         self.assertEqual(mgr.past_key_values[0].dtype, torch.float32)
         self.assertEqual(mgr.past_key_values[1].dtype, torch.bfloat16)
         self.assertEqual(mgr.layer_types[3], "full_attention")
@@ -102,8 +133,8 @@ class TestHybridDeltaNetCacheManager(unittest.TestCase):
         recurrent_state, conv_state = cache[0]
         full_k, full_v = cache[3]
 
-        self.assertEqual(list(recurrent_state.shape), [1, 48, 128, 128])
-        self.assertEqual(list(conv_state.shape), [1, 10240, 3])
+        self.assertEqual(list(recurrent_state.shape), _recurrent_shape(config, 1))
+        self.assertEqual(list(conv_state.shape), _conv_shape(config, 1))
         self.assertEqual(full_k.shape[0], 2)
         self.assertEqual(full_v.shape[0], 2)
         self.assertEqual(full_k.shape[2], 4)
@@ -142,8 +173,8 @@ class TestHybridDeltaNetCacheManager(unittest.TestCase):
     def test_deltanet_update_scatters_by_seq_id(self):
         config = _make_config()
         mgr = HybridDeltaNetCacheManager(config, num_kv_head=config.num_key_value_heads)
-        recurrent = torch.ones((1, 48, 128, 128), dtype=torch.bfloat16)
-        conv = torch.ones((1, 10240, 3), dtype=torch.bfloat16)
+        recurrent = torch.ones(_recurrent_shape(config, 1), dtype=torch.bfloat16)
+        conv = torch.ones(_conv_shape(config, 1), dtype=torch.bfloat16)
 
         updated_recurrent, updated_conv = mgr.update_deltanet_state_by_layer_id(
             idx=0,
@@ -159,8 +190,8 @@ class TestHybridDeltaNetCacheManager(unittest.TestCase):
     def test_deltanet_full_batch_update_replaces_state_cache(self):
         config = _make_config()
         mgr = HybridDeltaNetCacheManager(config, num_kv_head=config.num_key_value_heads)
-        recurrent = torch.ones((2, 48, 128, 128), dtype=torch.bfloat16)
-        conv = torch.ones((2, 10240, 3), dtype=torch.bfloat16)
+        recurrent = torch.ones(_recurrent_shape(config, 2), dtype=torch.bfloat16)
+        conv = torch.ones(_conv_shape(config, 2), dtype=torch.bfloat16)
         recurrent[0].fill_(3)
         recurrent[1].fill_(5)
         conv[0].fill_(11)
@@ -180,8 +211,8 @@ class TestHybridDeltaNetCacheManager(unittest.TestCase):
     def test_deltanet_update_maps_out_of_range_seq_id_to_padding_row(self):
         config = _make_config(neuron_overrides={"kv_cache_padding_size": 1})
         mgr = HybridDeltaNetCacheManager(config, num_kv_head=config.num_key_value_heads)
-        recurrent = torch.ones((1, 48, 128, 128), dtype=torch.bfloat16)
-        conv = torch.ones((1, 10240, 3), dtype=torch.bfloat16)
+        recurrent = torch.ones(_recurrent_shape(config, 1), dtype=torch.bfloat16)
+        conv = torch.ones(_conv_shape(config, 1), dtype=torch.bfloat16)
 
         updated_recurrent, updated_conv = mgr.update_deltanet_state_by_layer_id(
             idx=0,
@@ -214,8 +245,8 @@ class TestHybridDeltaNetCacheManager(unittest.TestCase):
 
         recurrent_state, conv_state = mgr.get_cache(seq_len=4)[0]
 
-        self.assertEqual(list(recurrent_state.shape), [2, 48, 128, 128])
-        self.assertEqual(list(conv_state.shape), [2, 10240, 3])
+        self.assertEqual(list(recurrent_state.shape), _recurrent_shape(config, 2))
+        self.assertEqual(list(conv_state.shape), _conv_shape(config, 2))
 
     def test_update_cache_dispatches_deltanet_and_full_attention_layers(self):
         config = _make_config()

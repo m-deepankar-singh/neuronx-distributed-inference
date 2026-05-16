@@ -105,6 +105,28 @@ from neuronx_distributed_inference.models.layer_boundary_marker import (
 
 logger = logging.getLogger(__name__)
 
+FUSED_DELTANET_DECAY_MIN = -60.0
+FUSED_DELTANET_DECAY_MAX = 0.0
+
+
+def _bound_fused_deltanet_log_decay(
+    g: torch.Tensor,
+    batch_size: int,
+    num_heads: int,
+    total_seq_len: int,
+    chunk_size: int,
+) -> torch.Tensor:
+    """Bound per-chunk cumulative log-decay and recover per-token deltas."""
+
+    g_chunks = g.reshape(batch_size, num_heads, total_seq_len // chunk_size, chunk_size)
+    bounded_cumsum = g_chunks.cumsum(dim=-1).clamp(
+        min=FUSED_DELTANET_DECAY_MIN,
+        max=FUSED_DELTANET_DECAY_MAX,
+    )
+    previous = F.pad(bounded_cumsum[..., :-1], (1, 0), value=0.0)
+    return (bounded_cumsum - previous).reshape_as(g)
+
+
 try:
     _flash_fwd_call = nki_jit()(attention_isa_kernel)
 except TypeError:
