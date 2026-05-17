@@ -314,6 +314,44 @@ class TestQwen36HybridAPCSchedulerPatch(unittest.TestCase):
             )
         )
 
+    def test_additional_config_overrides_scheduler_registry_key_metadata(self):
+        scheduler = _scheduler(
+            block_size=2,
+            model_revision="stale-rev",
+            additional_config={
+                "hybrid_apc_model_revision": "runtime-rev",
+                "hybrid_apc_layout_version": 2,
+                "tp_rank": 3,
+                "hybrid_recurrent_cache_dtype": "bf16",
+                "hybrid_conv_cache_dtype": "float32",
+            },
+        )
+        token_ids = [10, 11, 12, 13, 14]
+        hashes = self.patch._local_cumulative_prefix_hashes(
+            token_ids,
+            block_size=2,
+            max_prefix_len=4,
+        )
+        key = self.patch.HybridGDNPrefixKey(
+            cumulative_prefix_hash=hashes[4],
+            prefix_len=4,
+            block_size=2,
+            cache_salt=None,
+            model_revision="runtime-rev",
+            layout_version=2,
+            tp_rank=3,
+            recurrent_dtype="bfloat16",
+            conv_dtype="float32",
+        )
+        self.patch.register_hybrid_apc_gdn_checkpoint(key)
+        request = types.SimpleNamespace(
+            prompt_token_ids=token_ids,
+            num_tokens=len(token_ids),
+            cache_salt=None,
+        )
+
+        self.assertEqual(self.patch.backed_gdn_prefix_hit(scheduler, request), key)
+
     def test_mismatched_gdn_checkpoint_keeps_prefix_read_disabled(self):
         scheduler = _scheduler(block_size=2)
         token_ids = [10, 11, 12, 13, 14]

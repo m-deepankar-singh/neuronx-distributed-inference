@@ -244,7 +244,7 @@ vLLM recomputes the active prompt as a no-prefix request
 cold and warm outputs match
 ```
 
-The diagnostic performance path is now proven:
+The single-request backed performance path is now proven:
 
 ```text
 attention KV prefix hit exists
@@ -252,8 +252,8 @@ matching GDN checkpoint exists
 model restores GDN state and runs only the suffix
 ```
 
-It is still guarded as diagnostic because suffix-only restore must not rely on
-prefix length alone in multi-prefix or multi-tenant serving.
+It is guarded to `max_num_seqs=1` because batched/concurrent serving still
+needs request-scoped restore metadata.
 
 ## Overnight Operating Rule
 
@@ -307,6 +307,18 @@ Remote scheduler subset after the single-request guard:
 
 ```text
 13 passed
+```
+
+Local focused tests after additional-config key metadata hardening:
+
+```text
+62 passed
+```
+
+Remote scheduler subset after additional-config key metadata hardening:
+
+```text
+14 passed
 ```
 
 Local focused tests after `7d1138e`:
@@ -598,6 +610,7 @@ Hybrid APC restore tensors stay suffix-only through padding
 Qwen CTE full-attention layers can consume selected prefix KV
 backed prefix reads remain opt-in
 the scheduler gate honors serving additional_config, not only hf_config
+the scheduler registry key also honors serving additional_config metadata
 ```
 
 The next required proof is request-id scoped metadata for batched/concurrent
@@ -651,7 +664,9 @@ prefix_bucket=256
 8. If the same failure repeats more than twice, search NVIDIA/vLLM implementation details and compare contracts before continuing.
 9. After BF16 backed restore exactness and perf are understood, revisit FP8 and TKG/on-device sampling separately.
 
-The next concrete engineering target is specific: compile the backed-prefix CTE contract into one BF16 2K artifact and prove that the 256-token backed GDN restore plus 16-token suffix produces the same logits/tokens as the cold 272-token prompt.
+The next concrete engineering target is request-scoped restore metadata for
+batched/concurrent serving. The old compile/prove target is done for the 2K
+single-request BF16 boundary case.
 
 ## NVIDIA/vLLM Comparison
 
@@ -668,7 +683,9 @@ The Neuron path is rebuilding that contract across vLLM-Neuron, NxDI trace signa
 usable_prefix_hit = attention_kv_hit intersect gdn_checkpoint_hit
 ```
 
-Now that the scheduler can find a backed hit, the remaining work is to make the compiled CTE input contract honor that backed hit during suffix-only execution.
+The compiled CTE input contract now honors the single-request backed hit during
+suffix-only execution. The remaining Neuron/vLLM gap is request-scoped restore
+identity for batched/concurrent serving.
 
 References:
 

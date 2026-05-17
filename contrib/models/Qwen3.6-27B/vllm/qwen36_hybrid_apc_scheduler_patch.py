@@ -78,6 +78,18 @@ def _scheduler_config_flag(
     return _config_flag(_get_hf_config(vllm_config), name, default)
 
 
+def _scheduler_config_value(
+    scheduler: Any,
+    name: str,
+    default: Any,
+) -> Any:
+    vllm_config = getattr(scheduler, "vllm_config", None)
+    additional_config = _get_additional_config(vllm_config)
+    if name in additional_config:
+        return additional_config[name]
+    return _config_value(_get_hf_config(vllm_config), name, default)
+
+
 def _max_num_seqs_for_scheduler(scheduler: Any) -> int:
     scheduler_config = getattr(scheduler, "scheduler_config", None)
     max_num_seqs = getattr(scheduler_config, "max_num_seqs", 1)
@@ -242,34 +254,43 @@ def _request_registry_key(
     prefix_len: int,
     block_size: int,
 ) -> HybridGDNPrefixKey:
-    hf_config = _get_hf_config(getattr(scheduler, "vllm_config", None))
     return HybridGDNPrefixKey(
         cumulative_prefix_hash=cumulative_prefix_hash,
         prefix_len=int(prefix_len),
         block_size=int(block_size),
         cache_salt=getattr(request, "cache_salt", None),
         model_revision=str(
-            _config_value(
-                hf_config,
+            _scheduler_config_value(
+                scheduler,
                 "hybrid_apc_model_revision",
                 "unknown",
             )
         ),
-        layout_version=int(_config_value(hf_config, "hybrid_apc_layout_version", 1)),
-        tp_rank=int(_config_value(hf_config, "tp_rank", 0)),
+        layout_version=int(
+            _scheduler_config_value(scheduler, "hybrid_apc_layout_version", 1)
+        ),
+        tp_rank=int(_scheduler_config_value(scheduler, "tp_rank", 0)),
         recurrent_dtype=_normalize_dtype(
-            _config_value(
-                hf_config,
+            _scheduler_config_value(
+                scheduler,
                 "hybrid_recurrent_cache_dtype",
-                _config_value(hf_config, "gdn_recurrent_cache_dtype", "float32"),
+                _scheduler_config_value(
+                    scheduler,
+                    "gdn_recurrent_cache_dtype",
+                    "float32",
+                ),
             ),
             "float32",
         ),
         conv_dtype=_normalize_dtype(
-            _config_value(
-                hf_config,
+            _scheduler_config_value(
+                scheduler,
                 "hybrid_conv_cache_dtype",
-                _config_value(hf_config, "gdn_conv_cache_dtype", "bfloat16"),
+                _scheduler_config_value(
+                    scheduler,
+                    "gdn_conv_cache_dtype",
+                    "bfloat16",
+                ),
             ),
             "bfloat16",
         ),
