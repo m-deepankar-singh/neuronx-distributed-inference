@@ -365,6 +365,43 @@ Important runs:
     compiled artifact is not a valid workaround:
     `/home/ubuntu/validation_logs/hybrid_apc_real_tokens/bf16_hybrid_apc_host_logits_nki_chunked_b59e3a2_chunked_runtime_decode4.json`
     - Real tokens were produced, but warm exactness failed immediately.
+- Commit `b35841d` added debug-only NxDI output top-k logging with
+  `NXDI_OUTPUT_DEBUG_TOPK`.
+  - Decode-24 top-k log:
+    `/home/ubuntu/validation_logs/hybrid_apc_real_tokens/bf16_hybrid_apc_host_logits_nki_chunked_b35841d_decode24_topk.log`
+  - The top-k trace showed warm logits were already numerically different at
+    the first warm CTE output, even though the argmax stayed the same until
+    token 23. This moved the remaining issue from "TKG drift accumulates" to
+    "warm CTE handoff is not equivalent to cold CTE."
+- Commit `b36bba3` added a correctness guard for checkpoint metadata:
+  - The Neuron checkpoint bank can only commit active GDN state at the end of
+    the traced CTE call. A 463-token prompt must not mark that final state as a
+    valid 256-token checkpoint.
+  - The bridge now reserves/commits a GDN checkpoint only when the current
+    prefill ends exactly at the checkpoint boundary.
+  - Unit test:
+    `test_bridge_does_not_commit_mid_prompt_checkpoint_boundary`
+  - Local and remote focused tests passed:
+    `python3 -m pytest contrib/models/Qwen3.6-27B/test/unit/test_hybrid_apc_manager.py`
+    - `30 passed`
+- Commit `fd3b906` broadened active slot repair:
+  - Any negative active `slot_mapping` entries are repaired from `block_table`
+    and `block_size`; this covers both warm suffix replay and no-restore warm
+    full-prompt fallback where vLLM still supplies cached-prefix `-1` slots.
+  - Unit test:
+    `test_prefill_plan_repairs_negative_active_slots_from_block_table`
+  - Local and remote focused tests passed:
+    `python3 -m pytest contrib/models/Qwen3.6-27B/test/unit/test_hybrid_apc_manager.py`
+    - `31 passed`
+  - Guarded decode-24 validation:
+    `/home/ubuntu/validation_logs/hybrid_apc_real_tokens/bf16_hybrid_apc_host_logits_nki_chunked_fd3b906_decode24_guard.json`
+    - Still produces finite real tokens.
+    - Still fails warm exactness because vLLM/NxDI schedules an attention APC
+      hit even when the Qwen bridge has no matching GDN checkpoint to restore.
+    - This confirms the next production fix must be scheduler-level: either
+      prevent attention APC reuse unless the Qwen GDN checkpoint lookup succeeds,
+      or enable real 256-token chunked prefill so the checkpoint bank writes a
+      true boundary state before metadata is committed.
 
 Latest PA9 artifact run:
 
