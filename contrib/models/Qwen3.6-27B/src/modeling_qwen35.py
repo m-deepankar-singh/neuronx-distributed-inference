@@ -1458,6 +1458,7 @@ class Qwen35InferenceConfig(InferenceConfig):
         kwargs.setdefault("hybrid_apc_require_vllm_metadata", False)
         kwargs.setdefault("hybrid_apc_allow_local_hash_fallback", True)
         kwargs.setdefault("hybrid_apc_require_attention_block_refs", False)
+        kwargs.setdefault("hybrid_apc_reject_unbacked_attention_hits", True)
         kwargs.setdefault(
             "hybrid_apc_model_revision",
             kwargs.get("_name_or_path", kwargs.get("model_revision", "unknown")),
@@ -1527,9 +1528,13 @@ class Qwen35InferenceConfig(InferenceConfig):
         self.hybrid_apc_require_attention_block_refs = bool(
             self.hybrid_apc_require_attention_block_refs
         )
+        self.hybrid_apc_reject_unbacked_attention_hits = bool(
+            self.hybrid_apc_reject_unbacked_attention_hits
+        )
         if self.hybrid_apc_require_vllm_metadata:
             self.hybrid_apc_allow_local_hash_fallback = False
             self.hybrid_apc_require_attention_block_refs = True
+            self.hybrid_apc_reject_unbacked_attention_hits = True
         if self.use_hybrid_cache_manager and self.use_hybrid_apc_manager:
             raise ValueError(
                 "use_hybrid_cache_manager and use_hybrid_apc_manager are mutually exclusive"
@@ -4205,6 +4210,9 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
             conv_dtype=self.config.hybrid_conv_cache_dtype,
             allow_local_hash_fallback=self.config.hybrid_apc_allow_local_hash_fallback,
             require_attention_block_refs=self.config.hybrid_apc_require_attention_block_refs,
+            reject_unbacked_attention_hits=(
+                self.config.hybrid_apc_reject_unbacked_attention_hits
+            ),
         )
 
     def ensure_hybrid_apc_scheduler_bridge(self):

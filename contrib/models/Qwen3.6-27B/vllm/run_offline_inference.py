@@ -152,6 +152,11 @@ def _override_config(args: argparse.Namespace) -> dict:
         "hybrid_apc_require_vllm_metadata": args.hybrid_apc_require_vllm_metadata,
         "hybrid_apc_allow_local_hash_fallback": not args.hybrid_apc_require_vllm_metadata,
         "hybrid_apc_require_attention_block_refs": args.hybrid_apc_require_vllm_metadata,
+        "hybrid_apc_reject_unbacked_attention_hits": getattr(
+            args,
+            "hybrid_apc_reject_unbacked_attention_hits",
+            True,
+        ),
         "override_neuron_config": neuron_config,
     }
 
@@ -190,6 +195,15 @@ def main() -> int:
         help=(
             "Require serving-provided vLLM cumulative prefix hashes and attention "
             "block refs instead of the local token-hash validation fallback."
+        ),
+    )
+    parser.add_argument(
+        "--hybrid-apc-reject-unbacked-attention-hits",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Reject attention prefix-cache hits that do not have a matching GDN "
+            "checkpoint. Disable only for controlled plumbing/debug isolation."
         ),
     )
     parser.add_argument("--num-gpu-blocks-override", type=int, default=None)

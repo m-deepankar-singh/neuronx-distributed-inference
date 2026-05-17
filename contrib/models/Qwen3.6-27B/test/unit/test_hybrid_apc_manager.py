@@ -5,6 +5,7 @@ import os
 import sys
 import unittest
 import importlib.util
+from unittest.mock import patch
 
 import torch
 
@@ -564,6 +565,7 @@ class TestHybridAPCSchedulerBridge(unittest.TestCase):
             slot_allocator=allocator,
             cache_salt="tenant-a",
             model_revision="rev-a",
+            reject_unbacked_attention_hits=False,
         )
 
         prepared = bridge.prepare_request(
@@ -620,6 +622,7 @@ class TestHybridAPCSchedulerBridge(unittest.TestCase):
             slot_allocator=allocator,
             cache_salt="tenant-a",
             model_revision="rev-a",
+            reject_unbacked_attention_hits=False,
         )
 
         prepared = bridge.prepare_request(
@@ -645,6 +648,23 @@ class TestHybridAPCSchedulerBridge(unittest.TestCase):
         self.assertEqual(allocator.reserved_slots, ())
         self.assertEqual(allocator.free_slots, (1, 0))
         self.assertEqual(len(store), 0)
+
+    def test_bridge_rejects_attention_hit_without_gdn_checkpoint_by_default(self):
+        bridge = HybridAPCSchedulerBridge(
+            store=_store(),
+            slot_allocator=HybridAPCSlotAllocator(num_slots=2),
+            cache_salt="tenant-a",
+            model_revision="rev-a",
+        )
+
+        with self.assertRaisesRegex(ValueError, "without a matching GDN checkpoint"):
+            bridge.prepare_request(
+                request_id="req-unbacked-hit",
+                input_dict={
+                    "input_ids": torch.arange(256, dtype=torch.int32).unsqueeze(0)
+                },
+                attention_hit_len=128,
+            )
 
     def test_bridge_does_not_commit_mid_prompt_checkpoint_boundary(self):
         store = _store()
@@ -726,6 +746,7 @@ class TestHybridAPCSchedulerBridge(unittest.TestCase):
             slot_allocator=allocator,
             cache_salt="tenant-b",
             model_revision="rev-a",
+            reject_unbacked_attention_hits=False,
         )
 
         prepared = bridge.prepare_request(
@@ -743,6 +764,52 @@ class TestHybridAPCSchedulerBridge(unittest.TestCase):
                 torch.tensor([0], dtype=torch.int32),
             )
         )
+        self.assertTrue(
+            torch.equal(
+                prepared.input_dict["hybrid_restore_mask"],
+                torch.tensor([0], dtype=torch.int32),
+            )
+        )
+
+    def test_bridge_env_can_disable_restore_and_commit(self):
+        store = _store()
+        allocator = HybridAPCSlotAllocator(num_slots=2)
+        input_ids = torch.arange(128, dtype=torch.int32).unsqueeze(0)
+        hashes = build_cumulative_prefix_hashes(input_ids, block_size=128)
+        restored_key, _checkpoint = _insert(
+            store,
+            128,
+            prefix_hash=hashes[128],
+            gdn_checkpoint_slot=1,
+        )
+        bridge = HybridAPCSchedulerBridge(
+            store=store,
+            slot_allocator=allocator,
+            cache_salt="tenant-a",
+            model_revision="rev-a",
+        )
+
+        with patch.dict(
+            os.environ,
+            {
+                "QWEN36_DISABLE_HYBRID_GDN_RESTORE": "1",
+                "QWEN36_DISABLE_HYBRID_GDN_COMMIT": "1",
+            },
+        ):
+            prepared = bridge.prepare_request(
+                request_id="req-disabled",
+                input_dict={"input_ids": input_ids},
+                attention_hit_len=128,
+                cumulative_hashes_by_prefix_len=hashes,
+            )
+
+        self.assertIsNone(prepared.plan.checkpoint_key)
+        self.assertIsNone(prepared.commit_slot)
+        self.assertEqual(store.lookup(restored_key).refcount, 0)
+        self.assertEqual(allocator.reserved_slots, ())
+        self.assertTrue(torch.equal(prepared.input_dict["input_ids"], input_ids))
+        self.assertEqual(prepared.input_dict["hybrid_restore_mask"].item(), 0)
+        self.assertEqual(prepared.input_dict["hybrid_commit_mask"].item(), 0)
         self.assertTrue(
             torch.equal(
                 prepared.input_dict["hybrid_restore_mask"],

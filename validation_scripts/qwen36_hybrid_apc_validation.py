@@ -76,6 +76,11 @@ def _runner_args(args, *, enable_hybrid_apc: bool):
         hybrid_apc_require_vllm_metadata=getattr(
             args, "hybrid_apc_require_vllm_metadata", False
         ),
+        hybrid_apc_reject_unbacked_attention_hits=getattr(
+            args,
+            "hybrid_apc_reject_unbacked_attention_hits",
+            True,
+        ),
         text_only_cte=True,
         compact_cte_attention_mask=True,
         cold_zero_conv_fast_path=False,
@@ -366,6 +371,11 @@ def parse_args():
     exact.add_argument("--gdn-recurrent-cache-dtype", default="float32")
     exact.add_argument("--gdn-conv-cache-dtype", default="bfloat16")
     exact.add_argument("--hybrid-apc-require-vllm-metadata", action="store_true")
+    exact.add_argument(
+        "--hybrid-apc-reject-unbacked-attention-hits",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     exact.add_argument("--enable-vllm-chunked-prefill", action="store_true")
     exact.add_argument("--kernel-q-tile-size", type=int, default=128)
     exact.add_argument("--kernel-kv-tile-size", type=int, default=1024)

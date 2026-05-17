@@ -44,6 +44,7 @@ def _args(**overrides):
         hybrid_cache_prefix_boundary_only=True,
         hybrid_cache_validate_exact=False,
         hybrid_apc_require_vllm_metadata=False,
+        hybrid_apc_reject_unbacked_attention_hits=True,
         text_only_cte=True,
         compact_cte_attention_mask=True,
         cold_zero_conv_fast_path=False,
@@ -127,6 +128,7 @@ class TestVllmServingConfig(unittest.TestCase):
         self.assertTrue(config["hybrid_apc_require_vllm_metadata"])
         self.assertFalse(config["hybrid_apc_allow_local_hash_fallback"])
         self.assertTrue(config["hybrid_apc_require_attention_block_refs"])
+        self.assertTrue(config["hybrid_apc_reject_unbacked_attention_hits"])
 
 
 if __name__ == "__main__":

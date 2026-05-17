@@ -136,6 +136,17 @@ def _mask_has_layers(mask: torch.Tensor, required_layers: tuple[int, ...]) -> bo
     return True
 
 
+def _env_flag(name: str) -> bool:
+    value = os.environ.get(name)
+    return value is not None and value.strip().lower() not in {
+        "",
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+
 def estimate_qwen_gdn_checkpoint_bytes_per_rank(
     *,
     num_gdn_layers: int = 48,
@@ -444,17 +455,24 @@ def apply_hybrid_apc_prefill_plan(
     def _batch_i32_col(value: int) -> torch.Tensor:
         return torch.full((batch_size, 1), int(value), dtype=torch.int32, device=device)
 
-    restore_enabled = plan.checkpoint_slot is not None
+    disable_restore = _env_flag("QWEN36_DISABLE_HYBRID_GDN_RESTORE")
+    disable_commit = _env_flag("QWEN36_DISABLE_HYBRID_GDN_COMMIT")
+    restore_enabled = plan.checkpoint_slot is not None and not disable_restore
+    commit_enabled = commit_slot is not None and not disable_commit
     output["computed_context_lens"] = _batch_i32_col(restore_len)
     output["full_context_lens"] = _batch_i32_col(prompt_len)
     output["num_queries"] = _batch_i32_col(suffix_len)
     output["hybrid_restore_slot_ids"] = _batch_i32(
-        0 if plan.checkpoint_slot is None else int(plan.checkpoint_slot)
+        0 if not restore_enabled else int(plan.checkpoint_slot)
     )
     output["hybrid_restore_mask"] = _batch_i32(1 if restore_enabled else 0)
-    output["hybrid_restore_prefix_lens"] = _batch_i32(restore_len)
-    output["hybrid_commit_slot_ids"] = _batch_i32(0 if commit_slot is None else commit_slot)
-    output["hybrid_commit_mask"] = _batch_i32(0 if commit_slot is None else 1)
+    output["hybrid_restore_prefix_lens"] = _batch_i32(
+        restore_len if restore_enabled else 0
+    )
+    output["hybrid_commit_slot_ids"] = _batch_i32(
+        0 if not commit_enabled else commit_slot
+    )
+    output["hybrid_commit_mask"] = _batch_i32(1 if commit_enabled else 0)
 
     if os.environ.get("QWEN36_HYBRID_APC_DEBUG") == "1":
         print(
@@ -549,6 +567,7 @@ class HybridAPCSchedulerBridge:
         conv_dtype: str | torch.dtype | None = None,
         allow_local_hash_fallback: bool = True,
         require_attention_block_refs: bool = False,
+        reject_unbacked_attention_hits: bool = True,
     ):
         self.store = store
         self.slot_allocator = slot_allocator
@@ -560,6 +579,7 @@ class HybridAPCSchedulerBridge:
         self.conv_dtype = conv_dtype
         self.allow_local_hash_fallback = bool(allow_local_hash_fallback)
         self.require_attention_block_refs = bool(require_attention_block_refs)
+        self.reject_unbacked_attention_hits = bool(reject_unbacked_attention_hits)
 
     @property
     def requires_external_metadata(self) -> bool:
@@ -614,6 +634,31 @@ class HybridAPCSchedulerBridge:
             recurrent_dtype=self.recurrent_dtype,
             conv_dtype=self.conv_dtype,
         )
+        disable_restore = _env_flag("QWEN36_DISABLE_HYBRID_GDN_RESTORE")
+        disable_commit = _env_flag("QWEN36_DISABLE_HYBRID_GDN_COMMIT")
+        if disable_restore and plan.checkpoint_slot is not None:
+            plan = HybridAPCHitPlan(
+                attention_hit_len=0,
+                recurrent_hit_len=0,
+                conv_hit_len=0,
+                usable_hit_len=0,
+                restore_checkpoint_prefix_len=0,
+                residual_replay_len=0,
+                suffix_len=prompt_len,
+                checkpoint_slot=None,
+                checkpoint_key=None,
+            )
+        if (
+            self.reject_unbacked_attention_hits
+            and not disable_restore
+            and int(attention_hit_len) > 0
+            and plan.checkpoint_slot is None
+        ):
+            raise ValueError(
+                "hybrid APC received an attention prefix hit without a matching "
+                "GDN checkpoint; scheduler must intersect attention KV hits with "
+                "GDN checkpoint hits or disable prefix reuse for this request"
+            )
         if plan.checkpoint_slot is not None:
             self.slot_allocator.validate_slot_range(plan.checkpoint_slot)
 
@@ -626,7 +671,7 @@ class HybridAPCSchedulerBridge:
         # at that boundary; scheduler-level chunking must create those boundary
         # calls.
         can_commit_boundary = commit_prefix_len > 0 and commit_prefix_len == prompt_len
-        if can_commit_boundary:
+        if can_commit_boundary and not disable_commit:
             if commit_prefix_len not in cumulative_hashes_by_prefix_len:
                 raise ValueError(
                     f"missing cumulative prefix hash for commit boundary {commit_prefix_len}"
