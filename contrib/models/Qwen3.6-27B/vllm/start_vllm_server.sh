@@ -31,6 +31,7 @@ HYBRID_CACHE_MODE="all"
 HYBRID_CACHE_PREFIX_BOUNDARY_ONLY="1"
 HYBRID_CACHE_VALIDATE_EXACT="0"
 HYBRID_APC_REQUIRE_VLLM_METADATA="1"
+HYBRID_APC_DISABLE_UNBACKED_PREFIX_READS="0"
 NUM_GPU_BLOCKS_OVERRIDE=""
 KERNEL_Q_TILE_SIZE="128"
 KERNEL_KV_TILE_SIZE="1024"
@@ -71,6 +72,8 @@ while [[ $# -gt 0 ]]; do
     --hybrid-cache-validate-exact) HYBRID_CACHE_VALIDATE_EXACT="1"; shift ;;
     --hybrid-apc-require-vllm-metadata) HYBRID_APC_REQUIRE_VLLM_METADATA="1"; shift ;;
     --no-hybrid-apc-require-vllm-metadata|--allow-hybrid-apc-local-hash-fallback) HYBRID_APC_REQUIRE_VLLM_METADATA="0"; shift ;;
+    --hybrid-apc-disable-unbacked-prefix-reads) HYBRID_APC_DISABLE_UNBACKED_PREFIX_READS="1"; shift ;;
+    --no-hybrid-apc-disable-unbacked-prefix-reads) HYBRID_APC_DISABLE_UNBACKED_PREFIX_READS="0"; shift ;;
     --num-gpu-blocks-override) NUM_GPU_BLOCKS_OVERRIDE="$2"; shift 2 ;;
     --kernel-q-tile-size) KERNEL_Q_TILE_SIZE="$2"; shift 2 ;;
     --kernel-kv-tile-size) KERNEL_KV_TILE_SIZE="$2"; shift 2 ;;
@@ -107,6 +110,9 @@ if [[ -z "${BLOCK_SIZE}" ]]; then
 fi
 if [[ "${ENABLE_CHUNKED_PREFILL}" == "1" ]]; then
   export DISABLE_NEURON_CUSTOM_SCHEDULER="1"
+fi
+if [[ "${HYBRID_APC_DISABLE_UNBACKED_PREFIX_READS}" == "1" ]]; then
+  export QWEN36_HYBRID_APC_DISABLE_UNBACKED_PREFIX_READS="1"
 fi
 if [[ -z "${HYBRID_GDN_RECURRENT_CACHE_DTYPE}" ]]; then
   HYBRID_GDN_RECURRENT_CACHE_DTYPE="${GDN_RECURRENT_CACHE_DTYPE}"
@@ -248,6 +254,7 @@ print(json.dumps({
     "hybrid_apc_require_vllm_metadata": enable_hybrid_apc and "${HYBRID_APC_REQUIRE_VLLM_METADATA}" == "1",
     "hybrid_apc_allow_local_hash_fallback": not (enable_hybrid_apc and "${HYBRID_APC_REQUIRE_VLLM_METADATA}" == "1"),
     "hybrid_apc_require_attention_block_refs": enable_hybrid_apc and "${HYBRID_APC_REQUIRE_VLLM_METADATA}" == "1",
+    "hybrid_apc_disable_unbacked_prefix_reads": enable_hybrid_apc and "${HYBRID_APC_DISABLE_UNBACKED_PREFIX_READS}" == "1",
     "override_neuron_config": neuron_config,
 }))
 PY
@@ -277,6 +284,7 @@ echo "MAX_GDN_CHECKPOINT_SLOTS=${MAX_GDN_CHECKPOINT_SLOTS}"
 echo "HYBRID_GDN_RECURRENT_CACHE_DTYPE=${HYBRID_GDN_RECURRENT_CACHE_DTYPE}"
 echo "HYBRID_GDN_CONV_CACHE_DTYPE=${HYBRID_GDN_CONV_CACHE_DTYPE}"
 echo "HYBRID_APC_REQUIRE_VLLM_METADATA=${HYBRID_APC_REQUIRE_VLLM_METADATA}"
+echo "HYBRID_APC_DISABLE_UNBACKED_PREFIX_READS=${HYBRID_APC_DISABLE_UNBACKED_PREFIX_READS}"
 echo "ADDITIONAL_CONFIG=${ADDITIONAL_CONFIG}"
 
 VLLM_ARGS=(

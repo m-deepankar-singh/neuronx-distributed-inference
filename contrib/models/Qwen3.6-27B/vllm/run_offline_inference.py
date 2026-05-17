@@ -157,6 +157,11 @@ def _override_config(args: argparse.Namespace) -> dict:
             "hybrid_apc_reject_unbacked_attention_hits",
             True,
         ),
+        "hybrid_apc_disable_unbacked_prefix_reads": getattr(
+            args,
+            "hybrid_apc_disable_unbacked_prefix_reads",
+            False,
+        ),
         "override_neuron_config": neuron_config,
     }
 
@@ -204,6 +209,15 @@ def main() -> int:
         help=(
             "Reject attention prefix-cache hits that do not have a matching GDN "
             "checkpoint. Disable only for controlled plumbing/debug isolation."
+        ),
+    )
+    parser.add_argument(
+        "--hybrid-apc-disable-unbacked-prefix-reads",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Make vLLM skip prefix-cache reads for Qwen Hybrid APC until scheduler "
+            "GDN checkpoint metadata is available."
         ),
     )
     parser.add_argument("--num-gpu-blocks-override", type=int, default=None)
@@ -254,6 +268,8 @@ def main() -> int:
     os.environ.setdefault("VLLM_PLUGINS", "neuron")
     if args.enable_vllm_chunked_prefill:
         os.environ["DISABLE_NEURON_CUSTOM_SCHEDULER"] = "1"
+    if args.hybrid_apc_disable_unbacked_prefix_reads:
+        os.environ["QWEN36_HYBRID_APC_DISABLE_UNBACKED_PREFIX_READS"] = "1"
     if args.compiled_artifacts:
         os.environ["NEURON_COMPILED_ARTIFACTS"] = str(
             Path(args.compiled_artifacts).expanduser().resolve()
@@ -261,8 +277,12 @@ def main() -> int:
         _ensure_fp8_environment()
 
     from hf_qwen35_config import register_qwen35_config  # noqa: WPS433
+    from qwen36_hybrid_apc_scheduler_patch import (  # noqa: WPS433
+        install as install_hybrid_apc_scheduler_patch,
+    )
 
     register_qwen35_config()
+    install_hybrid_apc_scheduler_patch()
 
     from vllm import LLM, SamplingParams  # noqa: WPS433
 

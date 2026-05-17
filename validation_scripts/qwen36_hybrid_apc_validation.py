@@ -81,6 +81,11 @@ def _runner_args(args, *, enable_hybrid_apc: bool):
             "hybrid_apc_reject_unbacked_attention_hits",
             True,
         ),
+        hybrid_apc_disable_unbacked_prefix_reads=getattr(
+            args,
+            "hybrid_apc_disable_unbacked_prefix_reads",
+            False,
+        ),
         text_only_cte=True,
         compact_cte_attention_mask=True,
         cold_zero_conv_fast_path=False,
@@ -97,6 +102,8 @@ def _build_llm(args, *, enable_hybrid_apc: bool):
     os.environ.setdefault("VLLM_PLUGINS", "neuron")
     if args.enable_vllm_chunked_prefill:
         os.environ["DISABLE_NEURON_CUSTOM_SCHEDULER"] = "1"
+    if args.hybrid_apc_disable_unbacked_prefix_reads:
+        os.environ["QWEN36_HYBRID_APC_DISABLE_UNBACKED_PREFIX_READS"] = "1"
     if args.compiled_artifacts:
         os.environ["NEURON_COMPILED_ARTIFACTS"] = str(
             Path(args.compiled_artifacts).expanduser().resolve()
@@ -106,8 +113,12 @@ def _build_llm(args, *, enable_hybrid_apc: bool):
 
     runner = _load_module("qwen36_run_offline_inference_validation", RUNNER_PATH)
     from hf_qwen35_config import register_qwen35_config  # noqa: WPS433
+    from qwen36_hybrid_apc_scheduler_patch import (  # noqa: WPS433
+        install as install_hybrid_apc_scheduler_patch,
+    )
 
     register_qwen35_config()
+    install_hybrid_apc_scheduler_patch()
     from vllm import LLM, SamplingParams  # noqa: WPS433
 
     runner_args = _runner_args(args, enable_hybrid_apc=enable_hybrid_apc)
@@ -375,6 +386,11 @@ def parse_args():
         "--hybrid-apc-reject-unbacked-attention-hits",
         action=argparse.BooleanOptionalAction,
         default=True,
+    )
+    exact.add_argument(
+        "--hybrid-apc-disable-unbacked-prefix-reads",
+        action=argparse.BooleanOptionalAction,
+        default=False,
     )
     exact.add_argument("--enable-vllm-chunked-prefill", action="store_true")
     exact.add_argument("--kernel-q-tile-size", type=int, default=128)

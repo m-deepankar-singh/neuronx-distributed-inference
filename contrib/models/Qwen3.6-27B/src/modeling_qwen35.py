@@ -1459,6 +1459,7 @@ class Qwen35InferenceConfig(InferenceConfig):
         kwargs.setdefault("hybrid_apc_allow_local_hash_fallback", True)
         kwargs.setdefault("hybrid_apc_require_attention_block_refs", False)
         kwargs.setdefault("hybrid_apc_reject_unbacked_attention_hits", True)
+        kwargs.setdefault("hybrid_apc_disable_unbacked_prefix_reads", False)
         kwargs.setdefault(
             "hybrid_apc_model_revision",
             kwargs.get("_name_or_path", kwargs.get("model_revision", "unknown")),
@@ -1530,6 +1531,9 @@ class Qwen35InferenceConfig(InferenceConfig):
         )
         self.hybrid_apc_reject_unbacked_attention_hits = bool(
             self.hybrid_apc_reject_unbacked_attention_hits
+        )
+        self.hybrid_apc_disable_unbacked_prefix_reads = bool(
+            self.hybrid_apc_disable_unbacked_prefix_reads
         )
         if self.hybrid_apc_require_vllm_metadata:
             self.hybrid_apc_allow_local_hash_fallback = False

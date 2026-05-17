@@ -162,6 +162,7 @@ class TestDeltaNetConfig(unittest.TestCase):
         self.assertTrue(config.hybrid_apc_allow_local_hash_fallback)
         self.assertFalse(config.hybrid_apc_require_attention_block_refs)
         self.assertTrue(config.hybrid_apc_reject_unbacked_attention_hits)
+        self.assertFalse(config.hybrid_apc_disable_unbacked_prefix_reads)
         self.assertTrue(config.use_text_only_cte_inputs)
         self.assertTrue(config.use_compact_cte_attention_mask)
         self.assertFalse(config.use_cold_zero_conv_fast_path)
