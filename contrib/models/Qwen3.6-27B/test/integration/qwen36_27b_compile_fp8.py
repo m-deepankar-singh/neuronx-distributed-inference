@@ -245,7 +245,6 @@ def _save_mlp_only_fp8_state_dict(model_path: Path, output_path: Path) -> None:
 
 def _build_config(args: argparse.Namespace):
     from neuronx_distributed_inference.models.config import (  # noqa: WPS433
-        ChunkedPrefillConfig,
         NeuronConfig,
         OnDeviceSamplingConfig,
     )
@@ -310,12 +309,10 @@ def _build_config(args: argparse.Namespace):
         neuron_config_kwargs["is_prefix_caching"] = True
         neuron_config_kwargs["prefix_buckets"] = prefix_buckets
     if args.enable_vllm_chunked_prefill:
-        neuron_config_kwargs["chunked_prefill_config"] = ChunkedPrefillConfig(
-            max_num_seqs=1,
-            tkg_model_enabled=True,
-            kernel_q_tile_size=args.kernel_q_tile_size,
-            kernel_kv_tile_size=args.kernel_kv_tile_size,
-        )
+        # This flag selects Qwen's custom vLLM/Hybrid APC CTE prefix path.
+        # Do not set NeuronConfig.chunked_prefill_config here: NxDI's generic
+        # chunked-prefill feature is still rejected by NeuronBaseForCausalLM.
+        neuron_config_kwargs["is_block_kv_layout"] = True
 
     neuron_config = NeuronConfig(**neuron_config_kwargs)
 

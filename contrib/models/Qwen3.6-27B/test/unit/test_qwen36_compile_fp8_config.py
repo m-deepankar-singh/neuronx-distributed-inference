@@ -209,6 +209,27 @@ class TestQwen36CompileFp8Config(unittest.TestCase):
 
         self.assertTrue(config.config_dict["hybrid_apc_enable_backed_prefix_reads"])
 
+    def test_vllm_chunked_prefill_uses_qwen_flags_not_nxdi_chunked_prefill(self):
+        with patch.object(
+            _COMPILE,
+            "_load_text_config",
+            return_value={"num_hidden_layers": 2},
+        ), patch.dict(
+            sys.modules,
+            {
+                "neuronx_distributed_inference.models.config": _fake_config_module(),
+                "src.modeling_qwen35": _fake_qwen_module(),
+            },
+        ):
+            config, _modules = _COMPILE._build_config(
+                _args(enable_vllm_chunked_prefill=True),
+            )
+
+        self.assertTrue(config.neuron_config.is_block_kv_layout)
+        self.assertIsNone(getattr(config.neuron_config, "chunked_prefill_config", None))
+        self.assertTrue(config.config_dict["use_qwen_hybrid_chunked_prefill"])
+        self.assertTrue(config.config_dict["use_qwen_hybrid_chunked_prefill_nki"])
+
 
 if __name__ == "__main__":
     unittest.main()
