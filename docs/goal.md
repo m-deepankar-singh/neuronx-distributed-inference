@@ -11,8 +11,7 @@ Make Qwen3.6-27B Hybrid APC on Trainium correct first, then measure cold-prefill
 
 ## Current Status
 
-The active branch is `experimental`. The latest pushed safety-gate patch before
-the CTE-prefix implementation work was `02e636c`.
+The active branch is `experimental`. The latest pushed code patch is `d6df06a`.
 
 Useful Trainium paths:
 
@@ -165,6 +164,29 @@ computed=tensor([[0]], dtype=torch.int32)
 ```
 
 So correctness is protected for both the normal validation prompt and the checkpoint-boundary prompt, but this is still a no-prefix fallback and not the final perf path.
+
+The same no-compile checkpoint-boundary validation also passes from clean commit `d6df06a`:
+
+```text
+full_prefix_exact=True
+partial_prefix_exact=True
+real_generated_tokens_passed=True
+```
+
+Artifacts:
+
+- JSON:
+  `/home/ubuntu/validation_logs/hybrid_apc_real_tokens/bf16_hybrid_apc_host_logits_nki_chunked_d6df06a_cte_prefix_contract_boundary_decode24.json`
+- Log:
+  `/home/ubuntu/validation_logs/hybrid_apc_real_tokens/bf16_hybrid_apc_host_logits_nki_chunked_d6df06a_cte_prefix_contract_boundary_decode24.log`
+
+The `d6df06a` debug log still shows the intended safety behavior on the old artifact:
+
+```text
+attention_hit_len=0
+restore_len=0
+computed=tensor([[0]], dtype=torch.int32)
+```
 
 ## Backed Restore Evidence
 
