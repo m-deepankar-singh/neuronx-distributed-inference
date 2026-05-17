@@ -30,16 +30,19 @@ def _scheduler(
     use_hybrid_apc=True,
     disable_unbacked_prefix_reads=False,
     block_size=2,
+    model_revision="rev-a",
 ):
-    hf_config = types.SimpleNamespace(
+    hf_config_kwargs = dict(
         use_hybrid_apc_manager=use_hybrid_apc,
         hybrid_apc_disable_unbacked_prefix_reads=disable_unbacked_prefix_reads,
-        hybrid_apc_model_revision="rev-a",
         hybrid_apc_layout_version=1,
         hybrid_recurrent_cache_dtype="float32",
         hybrid_conv_cache_dtype="bfloat16",
         tp_rank=0,
     )
+    if model_revision is not None:
+        hf_config_kwargs["hybrid_apc_model_revision"] = model_revision
+    hf_config = types.SimpleNamespace(**hf_config_kwargs)
     model_config = types.SimpleNamespace(hf_config=hf_config)
     vllm_config = types.SimpleNamespace(model_config=model_config)
     cache_config = types.SimpleNamespace(block_size=block_size)
@@ -189,6 +192,38 @@ class TestQwen36HybridAPCSchedulerPatch(unittest.TestCase):
             self.assertTrue(
                 self.patch.should_disable_unbacked_prefix_reads(scheduler, request)
             )
+
+    def test_missing_model_revision_defaults_to_unknown(self):
+        scheduler = _scheduler(block_size=2, model_revision=None)
+        token_ids = [10, 11, 12, 13, 14]
+        hashes = self.patch._local_cumulative_prefix_hashes(
+            token_ids,
+            block_size=2,
+            max_prefix_len=4,
+        )
+        self.patch.register_hybrid_apc_gdn_checkpoint(
+            self.patch.HybridGDNPrefixKey(
+                cumulative_prefix_hash=hashes[4],
+                prefix_len=4,
+                block_size=2,
+                cache_salt=None,
+                model_revision="unknown",
+                layout_version=1,
+                tp_rank=0,
+                recurrent_dtype="float32",
+                conv_dtype="bfloat16",
+            )
+        )
+        request = types.SimpleNamespace(
+            prompt_token_ids=token_ids,
+            num_tokens=len(token_ids),
+            cache_salt=None,
+        )
+
+        self.assertEqual(
+            self.patch.backed_gdn_prefix_hit_len(scheduler, request),
+            4,
+        )
 
     def test_import_hook_does_not_import_scheduler_immediately(self):
         installed = self.patch.install_import_hook()

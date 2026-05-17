@@ -165,7 +165,7 @@ def _request_registry_key(
             _config_value(
                 hf_config,
                 "hybrid_apc_model_revision",
-                _config_value(hf_config, "_name_or_path", "unknown"),
+                "unknown",
             )
         ),
         layout_version=int(_config_value(hf_config, "hybrid_apc_layout_version", 1)),
