@@ -350,6 +350,12 @@ def apply_hybrid_apc_prefill_plan(
             or bool((value.to(torch.int64) < 0).any().item())
         )
 
+    unbacked_attention_hit = (
+        plan.checkpoint_slot is None
+        and int(plan.attention_hit_len) > 0
+        and restore_len == 0
+    )
+
     def _synthesize_suffix_slot_mapping() -> torch.Tensor | None:
         if block_size is None or int(block_size) <= 0 or suffix_len <= 0:
             return None
@@ -397,7 +403,16 @@ def apply_hybrid_apc_prefill_plan(
         elif slot_mapping.numel() >= batch_size * prompt_len:
             flattened = slot_mapping.reshape(batch_size, -1)
             output["slot_mapping"] = flattened[:, restore_len:prompt_len]
-    if _slot_mapping_needs_repair(output.get("slot_mapping")):
+    if unbacked_attention_hit:
+        synthesized_slot_mapping = _synthesize_suffix_slot_mapping()
+        if synthesized_slot_mapping is not None:
+            dtype = (
+                slot_mapping.dtype
+                if isinstance(slot_mapping, torch.Tensor)
+                else torch.int32
+            )
+            output["slot_mapping"] = synthesized_slot_mapping.to(dtype=dtype)
+    elif _slot_mapping_needs_repair(output.get("slot_mapping")):
         synthesized_slot_mapping = _synthesize_suffix_slot_mapping()
         if synthesized_slot_mapping is not None:
             dtype = (
