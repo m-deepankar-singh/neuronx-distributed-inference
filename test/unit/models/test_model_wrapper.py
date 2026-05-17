@@ -347,6 +347,39 @@ def test_batch_bucketing_input_generation():
     assert inputs[1][1].shape == (2, 128)  # attention_mask shape
 
 
+def test_prefix_caching_cte_input_generation_uses_valid_block_slots():
+    """Warmup inputs for prefix CTE should follow vLLM-style block mapping."""
+    neuron_config = NeuronConfig(
+        batch_size=1,
+        torch_dtype=torch.float32,
+        buckets=[[256, 512]],
+        bucket_n_active_tokens=True,
+        is_prefix_caching=True,
+        is_block_kv_layout=True,
+        pa_block_size=256,
+        pa_num_blocks=9,
+    )
+    config = InferenceConfig(neuron_config=neuron_config)
+    config.pad_token_id = 0
+    config.hidden_size = 128
+
+    wrapper = ModelWrapper(config, MockModel, tag=CONTEXT_ENCODING_MODEL_TAG)
+    generated = wrapper.input_generator()[0]
+
+    position_ids = generated[2]
+    slot_mapping = generated[11]
+    active_block_table = generated[12]
+    num_queries = generated[13]
+    computed_context_lens = generated[14]
+
+    assert torch.equal(position_ids[0, :3], torch.tensor([512, 513, 514], dtype=torch.int32))
+    assert torch.equal(position_ids[0, -3:], torch.tensor([765, 766, 767], dtype=torch.int32))
+    assert torch.equal(slot_mapping, position_ids)
+    assert torch.equal(active_block_table, torch.tensor([[0, 1]], dtype=torch.int32))
+    assert torch.equal(num_queries, torch.tensor([[256]], dtype=torch.int32))
+    assert torch.equal(computed_context_lens, torch.tensor([[512]], dtype=torch.int32))
+
+
 def test_batch_bucketing_target_bucket_selection():
     """Test get_target_bucket selects smallest bucket that fits."""
     config = create_base_config()

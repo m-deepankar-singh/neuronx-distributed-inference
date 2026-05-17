@@ -370,14 +370,26 @@ class ModelWrapper(torch.nn.Module):
         prefix_size,
         adapter_ids,
     ):
-        if self.neuron_config.enable_fused_speculation and self.tag == FUSED_SPECULATION_MODEL_TAG:
+        if self.tag == CONTEXT_ENCODING_MODEL_TAG:
+            active_positions = torch.arange(
+                prefix_size,
+                prefix_size + n_active_tokens,
+                dtype=torch.int32,
+            ).unsqueeze(0)
+            position_ids = active_positions.repeat(batch_size, 1)
+            slot_mapping = position_ids.clone()
+        elif self.neuron_config.enable_fused_speculation and self.tag == FUSED_SPECULATION_MODEL_TAG:
             slot_mapping = torch.zeros((batch_size, self.neuron_config.speculation_length), dtype=torch.int32)
         else:
             slot_mapping = torch.zeros((batch_size, n_active_tokens), dtype=torch.int32)
 
         num_blocks = prefix_size // self.neuron_config.pa_block_size
-        active_block_table = torch.zeros(1, dtype=torch.int32) if num_blocks == 0 else torch.zeros(
-            (batch_size, num_blocks), dtype=torch.int32
+        active_block_table = (
+            torch.zeros(1, dtype=torch.int32)
+            if num_blocks == 0
+            else torch.arange(num_blocks, dtype=torch.int32)
+            .unsqueeze(0)
+            .repeat(batch_size, 1)
         )
 
         num_queries = torch.full((batch_size, 1), n_active_tokens, dtype=torch.int32)
@@ -410,12 +422,16 @@ class ModelWrapper(torch.nn.Module):
                     target_attention_mask = torch.zeros(1, dtype=torch.int32)
                 else:
                     target_attention_mask = torch.ones((batch_size, prefix_size), dtype=torch.int32)
-                target_position_ids = torch.arange(0, prefill, dtype=torch.int32).unsqueeze(0)
+                target_position_ids = torch.arange(prefix_size, prefix_size + prefill, dtype=torch.int32).unsqueeze(0)
                 target_position_ids = target_position_ids.repeat(batch_size, 1)
-                target_slot_mapping = torch.zeros((batch_size, prefill), dtype=torch.int32)
+                target_slot_mapping = target_position_ids.clone()
                 target_num_blocks = prefix_size // self.neuron_config.pa_block_size
-                target_active_block_table = torch.zeros(1, dtype=torch.int32) if target_num_blocks == 0 else torch.zeros(
-                    (batch_size, target_num_blocks), dtype=torch.int32
+                target_active_block_table = (
+                    torch.zeros(1, dtype=torch.int32)
+                    if target_num_blocks == 0
+                    else torch.arange(target_num_blocks, dtype=torch.int32)
+                    .unsqueeze(0)
+                    .repeat(batch_size, 1)
                 )
                 return (
                     input_ids,
