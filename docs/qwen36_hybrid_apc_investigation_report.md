@@ -254,6 +254,29 @@ Important runs:
   - Conclusion: restore/commit state is not the first NaN source for this
     artifact. The current leading suspect is malformed prefix-cache CTE
     `slot_mapping` before cache update.
+- Slot-mapping fix on commit `5911e3d` corrected the runtime CTE slot contract
+  for short prompts:
+  - Hybrid APC single-prompt smoke log:
+    `/home/ubuntu/validation_logs/hybrid_apc_real_tokens/slotfix_5911e3d_single_smoke.log`
+  - CTE now enters with `slot_shape=(1, 16)`, pads to
+    `padded_slot_shape=(1, 256)`, and the first raw logits are finite:
+    `finite=248320/248320 nan=0`.
+  - The first generated token was real: `TOKENS [271, 0, 0, 0]`.
+  - TKG still returned all-NaN logits on the next decode step, so the
+    slot-mapping patch fixed one CTE contract bug but not the full generation
+    path.
+- Longer BF16 controls show the remaining NaN is not specific to Hybrid APC:
+  - Hybrid APC validation-style prompt after slot fix:
+    `/home/ubuntu/validation_logs/hybrid_apc_real_tokens/slotfix_5911e3d_validation_prompt_single.log`
+    - CTE slot mapping was correct: `slot_shape=(1, 463)` and padded to
+      `padded_slot_shape=(1, 512)`.
+    - Raw logits were still all NaN.
+  - No-prefix BF16 artifact with the same validation-style prompt:
+    `/home/ubuntu/validation_logs/host_logits_controls/bf16_no_prefix_validation_prompt_5911e3d_smoke.log`
+    - Raw logits were also all NaN.
+  - Conclusion: the current highest-priority blocker is long-prompt BF16 CTE
+    numerical behavior. Hybrid APC should not be judged until a no-prefix
+    BF16 long-prompt control produces finite logits.
 
 Latest PA9 artifact run:
 
