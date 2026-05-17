@@ -402,6 +402,22 @@ Follow-up ABI patch:
     - The fused DeltaNet log-decay clamp alone is insufficient. The remaining
       fault is at or before the traced model's `logits` output slot for the
       BF16 host-logits path, not only in vLLM CPU sampling.
+- Raw-output slot validation on `96e15f7`:
+  - Added env-gated wrapper debug:
+    `NXDI_RAW_OUTPUT_DEBUG=1 NXDI_RAW_OUTPUT_DEBUG_LIMIT=6`.
+  - Validation log:
+    `/home/ubuntu/validation_logs/hybrid_apc_real_tokens/legacy_tkg_bf16_host_logits_decay_clamp_980b918_rawslots_96e15f7_validation.log`
+  - Validation JSON:
+    `/home/ubuntu/validation_logs/hybrid_apc_real_tokens/legacy_tkg_bf16_host_logits_decay_clamp_980b918_rawslots_96e15f7_validation.json`
+  - Result:
+    - No recompile was needed; this reused the `980b918` BF16 artifact.
+    - NxDI returned exactly one raw output slot:
+      `[nxdi_raw_output_debug] count=1 limit=1`.
+    - That sole raw output was the logits-shaped tensor and was already all
+      NaN:
+      `name=raw_output[0] shape=(1, 1, 248320) dtype=torch.float32 finite=0/248320 nan=248320`.
+    - Therefore the failure is not a simple "finite logits are in another
+      output slot" wrapper-order issue.
 - Local verification:
   - `python3 -m py_compile contrib/models/Qwen3.6-27B/src/modeling_qwen35.py contrib/models/Qwen3.6-27B/test/integration/qwen36_27b_compile_fp8.py validation_scripts/qwen36_hybrid_apc_validation.py`
   - `python3 -m pytest contrib/models/Qwen3.6-27B/test/unit/test_qwen36_model_aliases.py contrib/models/Qwen3.6-27B/test/unit/test_qwen36_compile_fp8_config.py contrib/models/Qwen3.6-27B/test/unit/test_hybrid_apc_validation.py`
@@ -427,7 +443,9 @@ entrypoints.
   in range?
 - Why does BF16 host-logits mode return all-NaN logits at the NxDI output
   boundary even after the trace compiles, loads, and TKG metadata stays in
-  range? This is now proven on a fresh BF16/no-FP8 artifact from `980b918`.
+  range? This is now proven on a fresh BF16/no-FP8 artifact from `980b918`,
+  and `96e15f7` raw-output debug shows the single raw output slot itself is
+  all NaN.
 - Why do host-side BF16 logits/CPU sampling collapse to dummy token `0` after
   CTE/TKG active-length handling is fixed? The dummy token is downstream of
   all-NaN logits, not yet an independent sampler bug.
