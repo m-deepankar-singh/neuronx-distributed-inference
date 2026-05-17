@@ -46,6 +46,7 @@ def _args(**overrides):
         hybrid_apc_require_vllm_metadata=False,
         hybrid_apc_reject_unbacked_attention_hits=True,
         hybrid_apc_disable_unbacked_prefix_reads=False,
+        hybrid_apc_enable_backed_prefix_reads=False,
         text_only_cte=True,
         compact_cte_attention_mask=True,
         cold_zero_conv_fast_path=False,
@@ -142,6 +143,18 @@ class TestVllmServingConfig(unittest.TestCase):
         )
 
         self.assertTrue(config["hybrid_apc_disable_unbacked_prefix_reads"])
+
+    def test_hybrid_apc_can_enable_backed_prefix_reads(self):
+        config = self.runner._override_config(
+            _args(
+                enable_hybrid_apc=True,
+                block_size=256,
+                gdn_checkpoint_interval=256,
+                hybrid_apc_enable_backed_prefix_reads=True,
+            )
+        )
+
+        self.assertTrue(config["hybrid_apc_enable_backed_prefix_reads"])
 
 
 if __name__ == "__main__":

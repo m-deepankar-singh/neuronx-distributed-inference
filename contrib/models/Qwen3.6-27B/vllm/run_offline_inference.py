@@ -162,6 +162,11 @@ def _override_config(args: argparse.Namespace) -> dict:
             "hybrid_apc_disable_unbacked_prefix_reads",
             False,
         ),
+        "hybrid_apc_enable_backed_prefix_reads": getattr(
+            args,
+            "hybrid_apc_enable_backed_prefix_reads",
+            False,
+        ),
         "override_neuron_config": neuron_config,
     }
 
@@ -218,6 +223,16 @@ def main() -> int:
         help=(
             "Make vLLM skip prefix-cache reads for Qwen Hybrid APC until scheduler "
             "GDN checkpoint metadata is available."
+        ),
+    )
+    parser.add_argument(
+        "--hybrid-apc-enable-backed-prefix-reads",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Allow vLLM prefix-cache reads when both attention KV and GDN "
+            "checkpoint state are backed by a CTE artifact compiled for that "
+            "contract."
         ),
     )
     parser.add_argument("--num-gpu-blocks-override", type=int, default=None)

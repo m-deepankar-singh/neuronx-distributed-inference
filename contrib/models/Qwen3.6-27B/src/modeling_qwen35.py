@@ -1460,6 +1460,7 @@ class Qwen35InferenceConfig(InferenceConfig):
         kwargs.setdefault("hybrid_apc_require_attention_block_refs", False)
         kwargs.setdefault("hybrid_apc_reject_unbacked_attention_hits", True)
         kwargs.setdefault("hybrid_apc_disable_unbacked_prefix_reads", False)
+        kwargs.setdefault("hybrid_apc_enable_backed_prefix_reads", False)
         kwargs.setdefault(
             "hybrid_apc_model_revision",
             kwargs.get("_name_or_path", kwargs.get("model_revision", "unknown")),
@@ -1834,14 +1835,22 @@ class NeuronQwen35Attention(NeuronAttentionBase):
 
         return _flash_fwd_call(Q, K, V, use_causal_mask=True), None
 
-    def perform_qwen_chunked_prefill(self, Q, K, V, past_key_value, position_ids):
-        """Exact chunked CTE over the full decode cache.
+    def perform_qwen_chunked_prefill(
+        self,
+        Q,
+        K,
+        V,
+        past_key_value,
+        position_ids,
+        attention_mask=None,
+    ):
+        """Exact chunked CTE over full-cache or selected-prefix KV.
 
-        The current chunk K/V tensors are scattered into the full cache at
-        absolute position_ids, then attention for this chunk is computed over
-        all cache positions up to the chunk end. This keeps full-attention
-        layers correct when model-local chunked prefill feeds context in
-        multiple CTE-bucket calls.
+        For model-local chunked prefill, the current chunk K/V tensors are
+        scattered into the full cache at absolute position_ids. For vLLM prefix
+        reuse, BlockKVCacheManager returns selected prefix blocks already
+        arranged as logical positions, so concatenate the current suffix K/V
+        after that logical prefix.
         """
         k_cache, v_cache = past_key_value
         B, q_heads, q_len, head_dim = Q.shape
@@ -1854,9 +1863,67 @@ class NeuronQwen35Attention(NeuronAttentionBase):
         cache_len = k_cache.shape[2]
 
         pos = position_ids.long()
-        k_index = pos[:, None, :, None].expand(B, kv_heads, q_len, head_dim)
-        k_cache = torch.scatter(k_cache, dim=2, index=k_index, src=K.to(k_cache.dtype))
-        v_cache = torch.scatter(v_cache, dim=2, index=k_index, src=V.to(v_cache.dtype))
+        selected_prefix_cache = cache_len < int(
+            getattr(self.config.neuron_config, "seq_len", cache_len)
+        )
+        if selected_prefix_cache:
+            k_cache = torch.cat([k_cache, K.to(k_cache.dtype)], dim=2)
+            v_cache = torch.cat([v_cache, V.to(v_cache.dtype)], dim=2)
+            prefix_positions = torch.arange(
+                cache_len,
+                device=position_ids.device,
+                dtype=pos.dtype,
+            ).view(1, -1).expand(B, -1)
+            cache_positions = torch.cat([prefix_positions, pos], dim=1).view(
+                B,
+                1,
+                1,
+                -1,
+            )
+            prefix_valid = torch.ones(
+                (B, cache_len),
+                device=position_ids.device,
+                dtype=torch.bool,
+            )
+            if (
+                attention_mask is not None
+                and attention_mask.ndim == 2
+                and attention_mask.shape[1] == q_len
+            ):
+                active_valid = attention_mask.to(torch.bool)
+            else:
+                active_valid = torch.ones(
+                    (B, q_len),
+                    device=position_ids.device,
+                    dtype=torch.bool,
+                )
+            key_valid_mask = torch.cat([prefix_valid, active_valid], dim=1).view(
+                B,
+                1,
+                1,
+                -1,
+            )
+            cache_len = k_cache.shape[2]
+        else:
+            k_index = pos[:, None, :, None].expand(B, kv_heads, q_len, head_dim)
+            k_cache = torch.scatter(
+                k_cache,
+                dim=2,
+                index=k_index,
+                src=K.to(k_cache.dtype),
+            )
+            v_cache = torch.scatter(
+                v_cache,
+                dim=2,
+                index=k_index,
+                src=V.to(v_cache.dtype),
+            )
+            cache_positions = torch.arange(
+                cache_len,
+                device=position_ids.device,
+                dtype=pos.dtype,
+            ).view(1, 1, 1, -1)
+            key_valid_mask = None
 
         if q_heads != kv_heads:
             kv_rep = q_heads // kv_heads
@@ -1875,8 +1942,9 @@ class NeuronQwen35Attention(NeuronAttentionBase):
             V_full = v_cache
 
         attn_weights = torch.matmul(Q, K_full.transpose(-1, -2)) / math.sqrt(head_dim)
-        cache_positions = torch.arange(cache_len, device=position_ids.device).view(1, 1, 1, -1)
         causal_mask = cache_positions <= pos[:, None, :, None]
+        if key_valid_mask is not None:
+            causal_mask = causal_mask & key_valid_mask
         attn_weights = attn_weights.masked_fill(~causal_mask, -65504.0)
         attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(Q.dtype)
         return torch.matmul(attn_weights, V_full)
@@ -1934,7 +2002,12 @@ class NeuronQwen35Attention(NeuronAttentionBase):
             )
         elif qwen_chunked_prefill_active:
             attn_output = self.perform_qwen_chunked_prefill(
-                Q, K, V, past_key_value, position_ids
+                Q,
+                K,
+                V,
+                past_key_value,
+                position_ids,
+                attention_mask,
             )
         else:
             # Token generation (decode)
@@ -3285,12 +3358,19 @@ class NeuronQwen35Model(NeuronBaseModel):
             is_for_context_encoding
             and getattr(self.config, "use_qwen_hybrid_chunked_prefill", False)
         )
+        active_block_table = kwargs.get("active_block_table", None)
+        cte_has_prefix_blocks = (
+            is_for_context_encoding
+            and use_qwen_chunked_prefill
+            and active_block_table is not None
+            and getattr(active_block_table, "ndim", 0) > 1
+        )
         cache_size = (
             self.config.neuron_config.seq_len
             if use_qwen_chunked_prefill
             else self.n_positions
         )
-        if (not is_for_context_encoding) or use_qwen_chunked_prefill:
+        if (not is_for_context_encoding) or cte_has_prefix_blocks:
             if self.kv_mgr is not None:
                 past_key_values = self.kv_mgr.get_cache(
                     seq_ids=seq_ids,

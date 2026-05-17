@@ -32,6 +32,7 @@ HYBRID_CACHE_PREFIX_BOUNDARY_ONLY="1"
 HYBRID_CACHE_VALIDATE_EXACT="0"
 HYBRID_APC_REQUIRE_VLLM_METADATA="1"
 HYBRID_APC_DISABLE_UNBACKED_PREFIX_READS="0"
+HYBRID_APC_ENABLE_BACKED_PREFIX_READS="0"
 NUM_GPU_BLOCKS_OVERRIDE=""
 KERNEL_Q_TILE_SIZE="128"
 KERNEL_KV_TILE_SIZE="1024"
@@ -74,6 +75,8 @@ while [[ $# -gt 0 ]]; do
     --no-hybrid-apc-require-vllm-metadata|--allow-hybrid-apc-local-hash-fallback) HYBRID_APC_REQUIRE_VLLM_METADATA="0"; shift ;;
     --hybrid-apc-disable-unbacked-prefix-reads) HYBRID_APC_DISABLE_UNBACKED_PREFIX_READS="1"; shift ;;
     --no-hybrid-apc-disable-unbacked-prefix-reads) HYBRID_APC_DISABLE_UNBACKED_PREFIX_READS="0"; shift ;;
+    --hybrid-apc-enable-backed-prefix-reads) HYBRID_APC_ENABLE_BACKED_PREFIX_READS="1"; shift ;;
+    --no-hybrid-apc-enable-backed-prefix-reads) HYBRID_APC_ENABLE_BACKED_PREFIX_READS="0"; shift ;;
     --num-gpu-blocks-override) NUM_GPU_BLOCKS_OVERRIDE="$2"; shift 2 ;;
     --kernel-q-tile-size) KERNEL_Q_TILE_SIZE="$2"; shift 2 ;;
     --kernel-kv-tile-size) KERNEL_KV_TILE_SIZE="$2"; shift 2 ;;
@@ -255,6 +258,7 @@ print(json.dumps({
     "hybrid_apc_allow_local_hash_fallback": not (enable_hybrid_apc and "${HYBRID_APC_REQUIRE_VLLM_METADATA}" == "1"),
     "hybrid_apc_require_attention_block_refs": enable_hybrid_apc and "${HYBRID_APC_REQUIRE_VLLM_METADATA}" == "1",
     "hybrid_apc_disable_unbacked_prefix_reads": enable_hybrid_apc and "${HYBRID_APC_DISABLE_UNBACKED_PREFIX_READS}" == "1",
+    "hybrid_apc_enable_backed_prefix_reads": enable_hybrid_apc and "${HYBRID_APC_ENABLE_BACKED_PREFIX_READS}" == "1",
     "override_neuron_config": neuron_config,
 }))
 PY

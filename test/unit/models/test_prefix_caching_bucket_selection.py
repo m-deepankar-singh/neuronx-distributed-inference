@@ -153,3 +153,77 @@ class TestPrefixCachingBucketSelection:
         assert torch.equal(padded_args[14], torch.tensor([[15]], dtype=torch.int32))
         assert padded_args[0].shape[-1] == 1
         assert padded_args[1].shape[-1] == 16
+
+    def test_cte_hybrid_apc_restore_padding_keeps_suffix_and_prefix_bucket(self):
+        model_wrapper = self.setup_context_encoding()
+        model_wrapper.neuron_config.buckets = [
+            [256, 0],
+            [256, 256],
+            [512, 0],
+            [512, 256],
+        ]
+        model_wrapper.neuron_config.pa_block_size = 256
+
+        suffix_len = 16
+        restore_len = 256
+        inp_args = [
+            torch.arange(suffix_len, dtype=torch.int32).reshape(1, suffix_len),
+            torch.ones((1, suffix_len), dtype=torch.int32),
+            torch.arange(
+                restore_len,
+                restore_len + suffix_len,
+                dtype=torch.int32,
+            ).reshape(1, suffix_len),
+            torch.zeros((1,), dtype=torch.int32),
+            torch.ones((1, 3), dtype=torch.float32),
+            torch.empty(0),
+            torch.zeros((1,), dtype=torch.int32),
+            torch.empty(0),
+            torch.empty(0),
+            torch.empty(0),
+            torch.empty(0),
+            torch.arange(1792, 1792 + suffix_len, dtype=torch.int32).reshape(
+                1,
+                suffix_len,
+            ),
+            torch.arange(8, dtype=torch.int32).reshape(1, 8),
+            torch.tensor([[suffix_len]], dtype=torch.int32),
+            torch.tensor([[restore_len]], dtype=torch.int32),
+            torch.empty(0),
+            torch.empty(0),
+            torch.empty(0),
+            torch.empty(0),
+            torch.empty(0),
+            torch.empty(0),
+            torch.empty(0),
+            torch.empty(0),
+            torch.empty(0),
+            torch.tensor([0], dtype=torch.int32),  # restore slot
+            torch.tensor([1], dtype=torch.int32),  # restore mask
+            torch.tensor([restore_len], dtype=torch.int32),
+            torch.tensor([0], dtype=torch.int32),  # commit slot
+            torch.tensor([0], dtype=torch.int32),  # commit mask
+        ]
+
+        prefill_bucket, prefix_bucket = (
+            model_wrapper.get_target_2d_bucket_for_prefix_caching(*inp_args)
+        )
+        padded_args = model_wrapper._pad_prefix_caching_inputs(*inp_args)
+
+        assert int(prefill_bucket) == 256
+        assert int(prefix_bucket) == 256
+        assert padded_args[0].shape == (1, 256)
+        assert padded_args[1].shape == (1, 256)
+        assert padded_args[2].shape == (1, 256)
+        assert torch.equal(padded_args[0][:, :suffix_len], inp_args[0])
+        assert torch.equal(padded_args[1][:, :suffix_len], inp_args[1])
+        assert torch.equal(padded_args[2][:, :suffix_len], inp_args[2])
+        assert torch.equal(padded_args[11][:, :suffix_len], inp_args[11])
+        assert torch.equal(
+            padded_args[11][:, suffix_len:],
+            torch.full((1, 256 - suffix_len), -1, dtype=torch.int32),
+        )
+        assert padded_args[12].shape == (1, 1)
+        assert torch.equal(padded_args[12], torch.tensor([[0]], dtype=torch.int32))
+        assert torch.equal(padded_args[13], torch.tensor([[suffix_len]], dtype=torch.int32))
+        assert torch.equal(padded_args[14], torch.tensor([[restore_len]], dtype=torch.int32))

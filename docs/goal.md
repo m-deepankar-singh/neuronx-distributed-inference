@@ -11,7 +11,8 @@ Make Qwen3.6-27B Hybrid APC on Trainium correct first, then measure cold-prefill
 
 ## Current Status
 
-The active branch is `experimental`. The latest pushed code patch is `02e636c`.
+The active branch is `experimental`. The latest pushed safety-gate patch before
+the CTE-prefix implementation work was `02e636c`.
 
 Useful Trainium paths:
 
@@ -89,6 +90,20 @@ Remote focused tests after `02e636c`:
 ```text
 46 passed
 ```
+
+The CTE-prefix implementation work after `02e636c` has remote focused unit coverage:
+
+```text
+90 passed
+```
+
+That covers:
+
+- Prefix-cache bucket/padding behavior, including the 16-token suffix plus 256-token Hybrid APC restore case.
+- Qwen compile config flag forwarding.
+- vLLM serving config flag forwarding.
+- Scheduler backed-prefix gating.
+- Hybrid APC manager registry publish/unpublish behavior.
 
 The no-compile safe fallback used the existing artifact and passed decode24 exactness:
 
@@ -262,6 +277,15 @@ This strongly suggests that the scheduler and model now select the right restore
 - `QWEN36_HYBRID_APC_ENABLE_BACKED_PREFIX_READS=1` remains a debug override.
 - This prevents the current artifact from taking the known-wrong "GDN restored, attention prefix missing" path.
 
+The CTE-prefix implementation patch adds the pieces needed for the next artifact:
+
+- Hybrid APC restore padding now treats `input_ids`, `attention_mask`, `position_ids`, and `slot_mapping` as suffix-only tensors.
+- The bucket selector no longer applies the 257-512 token no-prefix corner case or empty-prefill prefix stealing when `hybrid_restore_mask=1`.
+- The failing 16-token suffix plus 256-token prefix case now pads to `[prefill_bucket=256, prefix_bucket=256]`.
+- Qwen CTE full-attention layers can treat selected prefix KV blocks as a logical prefix and concatenate current suffix K/V for attention.
+- Padded suffix K/V positions are masked out in that selected-prefix attention path.
+- Backed prefix reads remain opt-in through `hybrid_apc_enable_backed_prefix_reads`; the default remains safe.
+
 ## Exact Current Problem
 
 The exact current problem is:
@@ -318,7 +342,7 @@ The current issue does not prove that another compile is required. The run used 
 4. Enable backed prefix reads only for an artifact compiled with the CTE full-attention prefix path.
 5. Compare against the older working `contrib/qwen36-27b-vllm-apc-pr` branch for CTE/TKG argument and padding contracts. That branch compiled Qwen chunked prefill on by default.
 6. Rerun the same 2K boundary validation after the safety gate. It should fall back to no-prefix on the current artifact and pass exactness without claiming perf.
-7. Only if/when the corrected CTE prefix contract is implemented, compile once with the corrected signature and `hybrid_apc_enable_backed_prefix_reads=True`.
+7. Compile one BF16 2K artifact with `--enable-vllm-chunked-prefill` and `--hybrid-apc-enable-backed-prefix-reads`, then rerun the same boundary validation with `--hybrid-apc-enable-backed-prefix-reads`.
 8. After BF16 backed restore exactness passes, revisit FP8 and TKG/on-device sampling separately.
 
 The next concrete engineering target is specific: fix the CTE restore padding/input/full-attention-prefix contract so the 256-token backed GDN restore plus 16-token suffix produces the same logits/tokens as the cold 272-token prompt.

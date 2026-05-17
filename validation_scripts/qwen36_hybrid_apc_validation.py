@@ -86,6 +86,11 @@ def _runner_args(args, *, enable_hybrid_apc: bool):
             "hybrid_apc_disable_unbacked_prefix_reads",
             False,
         ),
+        hybrid_apc_enable_backed_prefix_reads=getattr(
+            args,
+            "hybrid_apc_enable_backed_prefix_reads",
+            False,
+        ),
         text_only_cte=True,
         compact_cte_attention_mask=True,
         cold_zero_conv_fast_path=False,
@@ -389,6 +394,11 @@ def parse_args():
     )
     exact.add_argument(
         "--hybrid-apc-disable-unbacked-prefix-reads",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    exact.add_argument(
+        "--hybrid-apc-enable-backed-prefix-reads",
         action=argparse.BooleanOptionalAction,
         default=False,
     )

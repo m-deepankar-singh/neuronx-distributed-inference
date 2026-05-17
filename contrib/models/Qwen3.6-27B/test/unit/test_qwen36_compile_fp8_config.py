@@ -97,6 +97,7 @@ def _args(**overrides):
         gdn_conv_cache_dtype="bfloat16",
         hybrid_cache_mode="all",
         hybrid_apc_require_vllm_metadata=False,
+        hybrid_apc_enable_backed_prefix_reads=False,
     )
     defaults.update(overrides)
     return argparse.Namespace(**defaults)
@@ -189,6 +190,24 @@ class TestQwen36CompileFp8Config(unittest.TestCase):
     def test_pa_num_blocks_rejects_user_blocks_below_sequence_requirement(self):
         with self.assertRaisesRegex(ValueError, "need at least 8"):
             _COMPILE._pa_num_blocks(_args(pa_num_blocks=7))
+
+    def test_backed_prefix_read_compile_flag_is_forwarded(self):
+        with patch.object(
+            _COMPILE,
+            "_load_text_config",
+            return_value={"num_hidden_layers": 2},
+        ), patch.dict(
+            sys.modules,
+            {
+                "neuronx_distributed_inference.models.config": _fake_config_module(),
+                "src.modeling_qwen35": _fake_qwen_module(),
+            },
+        ):
+            config, _modules = _COMPILE._build_config(
+                _args(hybrid_apc_enable_backed_prefix_reads=True),
+            )
+
+        self.assertTrue(config.config_dict["hybrid_apc_enable_backed_prefix_reads"])
 
 
 if __name__ == "__main__":

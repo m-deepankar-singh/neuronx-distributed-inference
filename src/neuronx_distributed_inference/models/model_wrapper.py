@@ -976,6 +976,13 @@ class ModelWrapper(torch.nn.Module):
         else:
             vertical_dim = args[13]
             horizontal_dim = args[14]
+        hybrid_apc_restore_active = (
+            self.tag == CONTEXT_ENCODING_MODEL_TAG
+            and len(args) >= 26
+            and torch.is_tensor(args[25])
+            and args[25].numel() > 0
+            and bool(args[25].to(torch.bool).any().item())
+        )
 
         if not self.tag == CONTEXT_ENCODING_MODEL_TAG:
             if self.tag == TOKEN_GENERATION_MODEL_TAG:
@@ -1044,7 +1051,11 @@ class ModelWrapper(torch.nn.Module):
                     prefix_buckets.append(b[1])
             # Corner case
             total_context = vertical_dim + horizontal_dim
-            if total_context <= 512 and total_context > 256:
+            if (
+                not hybrid_apc_restore_active
+                and total_context <= 512
+                and total_context > 256
+            ):
                 for b in buckets:
                     if b[0] == 512 and b[1] == 0:
                         return b
@@ -1072,8 +1083,9 @@ class ModelWrapper(torch.nn.Module):
             if self.neuron_config.enable_eagle_speculation:
                 # Calculate how many blocks can be moved from prefix to prefill.
                 empty_prefill_block_slots = empty_prefill_slots // self.neuron_config.pa_block_size
-                horizontal_dim = max(0, horizontal_dim - empty_prefill_block_slots * self.neuron_config.pa_block_size)
-            else:
+                if not hybrid_apc_restore_active:
+                    horizontal_dim = max(0, horizontal_dim - empty_prefill_block_slots * self.neuron_config.pa_block_size)
+            elif not hybrid_apc_restore_active:
                 horizontal_dim = max(0, horizontal_dim - empty_prefill_slots)
             prefix_index = 0
             for b in prefix_buckets:
@@ -1103,6 +1115,13 @@ class ModelWrapper(torch.nn.Module):
             return f"{int(flat.min().item())}:{int(flat.max().item())}"
 
         debug_hybrid_apc = os.environ.get("QWEN36_HYBRID_APC_DEBUG") == "1"
+        hybrid_apc_restore_active = (
+            self.tag == CONTEXT_ENCODING_MODEL_TAG
+            and len(args) >= 26
+            and torch.is_tensor(args[25])
+            and args[25].numel() > 0
+            and bool(args[25].to(torch.bool).any().item())
+        )
 
         def _first_or_default(tensor, default_value):
             if tensor.numel() == 0:
@@ -1198,10 +1217,20 @@ class ModelWrapper(torch.nn.Module):
                 return tuple(args)
             else:
                 extra_prefill_slots = max(0, prefill_bucket - prefill_len)
-                adjusted_prefix_len = max(0, prefix_len - extra_prefill_slots)
-                sliced_inputs = args[0][:, adjusted_prefix_len:]
-                sliced_attn_mask = args[1][:, :adjusted_prefix_len]
-                sliced_position_id = args[2][:, adjusted_prefix_len:]
+                if hybrid_apc_restore_active:
+                    # Hybrid APC request prep has already sliced input_ids,
+                    # attention_mask, position_ids, and slot_mapping to the
+                    # suffix. Preserve those tensors and keep computed_context
+                    # as the restored prefix length.
+                    adjusted_prefix_len = prefix_len
+                    sliced_inputs = args[0]
+                    sliced_attn_mask = args[1]
+                    sliced_position_id = args[2]
+                else:
+                    adjusted_prefix_len = max(0, prefix_len - extra_prefill_slots)
+                    sliced_inputs = args[0][:, adjusted_prefix_len:]
+                    sliced_attn_mask = args[1][:, :adjusted_prefix_len]
+                    sliced_position_id = args[2][:, adjusted_prefix_len:]
 
                 padded_inputs = F.pad(sliced_inputs, (0, prefill_bucket - sliced_inputs.shape[1]), "constant", self.config.pad_token_id)
                 if prefix_bucket == 0:
@@ -1209,7 +1238,8 @@ class ModelWrapper(torch.nn.Module):
                 else:
                     padded_attn_mask = F.pad(sliced_attn_mask, (0, prefix_bucket - sliced_attn_mask.shape[1]), "constant", 0)
                 padded_position_id = F.pad(sliced_position_id, (0, prefill_bucket - sliced_position_id.shape[1]), "constant", 1)
-                padded_slot_mapping = F.pad(slot_mapping, (prefix_len - adjusted_prefix_len, 0), "constant", -1)
+                left_slot_pad = 0 if hybrid_apc_restore_active else prefix_len - adjusted_prefix_len
+                padded_slot_mapping = F.pad(slot_mapping, (left_slot_pad, 0), "constant", -1)
                 padded_slot_mapping = F.pad(padded_slot_mapping, (0, prefill_bucket - padded_slot_mapping.shape[1]), "constant", -1)
 
                 num_blocks = prefix_bucket // self.neuron_config.pa_block_size

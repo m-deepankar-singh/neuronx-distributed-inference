@@ -338,6 +338,11 @@ def _build_config(args: argparse.Namespace):
     config_dict["hybrid_apc_require_attention_block_refs"] = (
         args.hybrid_apc_require_vllm_metadata
     )
+    config_dict["hybrid_apc_enable_backed_prefix_reads"] = getattr(
+        args,
+        "hybrid_apc_enable_backed_prefix_reads",
+        False,
+    )
     config_dict["use_qwen_hybrid_chunked_prefill"] = args.enable_vllm_chunked_prefill
     config_dict["use_qwen_hybrid_chunked_prefill_nki"] = args.enable_vllm_chunked_prefill
 
@@ -381,6 +386,11 @@ def main() -> int:
     parser.add_argument("--gdn-conv-cache-dtype", default="bfloat16")
     parser.add_argument("--hybrid-cache-mode", default="all")
     parser.add_argument("--hybrid-apc-require-vllm-metadata", action="store_true")
+    parser.add_argument(
+        "--hybrid-apc-enable-backed-prefix-reads",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
     parser.add_argument("--force-quantize", action="store_true")
     parser.add_argument("--quantize-only", action="store_true")
     parser.add_argument("--load-after-compile", action="store_true")
