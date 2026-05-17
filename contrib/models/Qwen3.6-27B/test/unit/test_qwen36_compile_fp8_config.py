@@ -84,6 +84,8 @@ def _args(**overrides):
         pa_num_blocks=8,
         tp_degree=4,
         logical_nc_config=2,
+        max_num_seqs=1,
+        ctx_batch_size=1,
         enable_prefix_caching=True,
         enable_hybrid_apc=True,
         enable_vllm_chunked_prefill=False,
@@ -142,6 +144,34 @@ class TestQwen36CompileFp8Config(unittest.TestCase):
         self.assertIsNone(config.neuron_config.on_device_sampling_config)
         self.assertEqual(config.neuron_config.pa_num_blocks, 9)
         self.assertTrue(config.neuron_config.quantized)
+
+    def test_compile_can_trace_batched_token_generation(self):
+        with patch.object(
+            _COMPILE,
+            "_load_text_config",
+            return_value={"num_hidden_layers": 2},
+        ), patch.dict(
+            sys.modules,
+            {
+                "neuronx_distributed_inference.models.config": _fake_config_module(),
+                "src.modeling_qwen35": _fake_qwen_module(),
+            },
+        ):
+            config, _modules = _COMPILE._build_config(
+                _args(
+                    disable_on_device_sampling=True,
+                    weight_dtype="bf16_control",
+                    quantized_checkpoints_path=None,
+                    max_num_seqs=2,
+                    ctx_batch_size=1,
+                    pa_num_blocks=16,
+                ),
+            )
+
+        self.assertEqual(config.neuron_config.batch_size, 2)
+        self.assertEqual(config.neuron_config.ctx_batch_size, 1)
+        self.assertEqual(config.neuron_config.tkg_batch_size, 2)
+        self.assertEqual(config.neuron_config.pa_num_blocks, 17)
 
     def test_on_device_sampling_compile_uses_sampler_config(self):
         with patch.object(

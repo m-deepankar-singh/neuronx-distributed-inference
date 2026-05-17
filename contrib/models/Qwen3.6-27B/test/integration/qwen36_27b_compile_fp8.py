@@ -105,7 +105,11 @@ def _prefix_buckets(args: argparse.Namespace, cte_buckets: list[int]) -> list[in
 
 
 def _pa_num_blocks(args: argparse.Namespace) -> int:
-    min_blocks = max(1, (args.seq_len + args.block_size - 1) // args.block_size)
+    min_blocks = max(
+        1,
+        ((args.seq_len + args.block_size - 1) // args.block_size)
+        * args.max_num_seqs,
+    )
     if args.pa_num_blocks is None:
         requested_blocks = min_blocks
     else:
@@ -260,9 +264,9 @@ def _build_config(args: argparse.Namespace):
 
     neuron_config_kwargs = {
         "tp_degree": args.tp_degree,
-        "batch_size": 1,
-        "ctx_batch_size": 1,
-        "tkg_batch_size": 1,
+        "batch_size": args.max_num_seqs,
+        "ctx_batch_size": args.ctx_batch_size,
+        "tkg_batch_size": args.max_num_seqs,
         "seq_len": args.seq_len,
         "max_context_length": max_cte_bucket,
         "max_length": args.seq_len,
@@ -370,6 +374,8 @@ def main() -> int:
     parser.add_argument("--pa-num-blocks", type=int, default=None)
     parser.add_argument("--tp-degree", type=int, default=4)
     parser.add_argument("--logical-nc-config", type=int, default=2)
+    parser.add_argument("--max-num-seqs", type=int, default=1)
+    parser.add_argument("--ctx-batch-size", type=int, default=1)
     parser.add_argument("--enable-prefix-caching", action="store_true")
     parser.add_argument("--enable-hybrid-apc", action="store_true")
     parser.add_argument("--enable-vllm-chunked-prefill", action="store_true")
@@ -397,6 +403,10 @@ def main() -> int:
         and not args.quantized_checkpoints_path
     ):
         parser.error("--quantized-checkpoints-path is required for fp8_mlp_only")
+    if args.max_num_seqs <= 0:
+        parser.error("--max-num-seqs must be positive")
+    if args.ctx_batch_size <= 0:
+        parser.error("--ctx-batch-size must be positive")
 
     repo = _repo_root(args.repo_root)
     contrib_model_dir = repo / "contrib" / "models" / "Qwen3.6-27B"
@@ -437,6 +447,9 @@ def main() -> int:
                 "max_context_length": max(_cte_buckets(args)),
                 "context_encoding_buckets": _cte_buckets(args),
                 "prefix_buckets": _prefix_buckets(args, _cte_buckets(args)),
+                "max_num_seqs": args.max_num_seqs,
+                "ctx_batch_size": args.ctx_batch_size,
+                "tkg_batch_size": args.max_num_seqs,
                 "enable_prefix_caching": args.enable_prefix_caching,
                 "enable_hybrid_apc": args.enable_hybrid_apc,
                 "enable_vllm_chunked_prefill": args.enable_vllm_chunked_prefill,

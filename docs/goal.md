@@ -355,6 +355,37 @@ This means a real generated-token batched E2E proof needs either:
   `max_num_seqs=2`, or
 - a separate prefill-only batched validator that does not enter TKG.
 
+### 2026-05-18 Batched Compile Prep
+
+The compile helper now accepts the missing batch shape knobs:
+
+```text
+--max-num-seqs
+--ctx-batch-size
+```
+
+It maps them into the compiled Neuron config as:
+
+```text
+batch_size=max_num_seqs
+ctx_batch_size=ctx_batch_size
+tkg_batch_size=max_num_seqs
+pa_num_blocks=(seq_len / block_size * max_num_seqs) + 1 null block
+```
+
+The intended next artifact is a 2K BF16 host-logits Hybrid APC compile with
+`--max-num-seqs 2`, `--ctx-batch-size 1`, and 17 physical PA blocks for two
+2048-token sequences at block size 256. This should remove the known
+`sampling_params [2,3]` vs compiled `[1,3]` TKG mismatch and let
+`batched-exactness` reach the actual Hybrid APC restore/fallback logic.
+
+Focused local test for this compile-helper change:
+
+```text
+contrib/models/Qwen3.6-27B/test/unit/test_qwen36_compile_fp8_config.py
+8 passed
+```
+
 The base BF16 host-logits path is not the current blocker when using the per-chunk DeltaNet CTE path:
 
 - Fused CTE artifact goes NaN around 105-106 tokens.
@@ -769,6 +800,7 @@ Primary files changed or relevant:
 - `contrib/models/Qwen3.6-27B/vllm/qwen36_hybrid_apc_scheduler_patch.py`
 - `contrib/models/Qwen3.6-27B/vllm/run_offline_inference.py`
 - `validation_scripts/qwen36_hybrid_apc_validation.py`
+- `contrib/models/Qwen3.6-27B/test/integration/qwen36_27b_compile_fp8.py`
 
 ## Why The Earlier Artifacts Did Not Work
 
