@@ -206,6 +206,47 @@ Latest PA9 artifact run:
   - Hardware sampling was enabled.
   - Runtime failed with `NRT_EXEC_OOB` in token generation.
 
+Legacy TKG arg experiment:
+
+- Branch/artifact code under test:
+  - Local/remote commit: `d0cdfc2 Add legacy Qwen TKG args experiment`
+  - Remote clean worktree: `/home/ubuntu/inferentia-gdn-experimental-test`
+- Remote focused unit tests passed in the vLLM/Neuron environment:
+  - `test_qwen36_model_aliases.py`
+  - `test_qwen36_compile_fp8_config.py`
+  - `test_hybrid_apc_validation.py`
+  - Result: `13 passed`
+- FP8 legacy TKG compile attempt:
+  - Log:
+    `/home/ubuntu/validation_logs/hybrid_apc_real_tokens/legacy_tkg_2k_compile.log`
+  - Result:
+    - Legacy TKG trace/HLO/NEFF compilation reached the checkpoint-sharding
+      stage.
+    - Sharding failed because the supplied checkpoint path contained
+      already-presharded Neuron runtime files
+      (`tp*_sharded_checkpoint.safetensors`) instead of HF-style source
+      checkpoint files (`model.safetensors`, `model.safetensors.index.json`, or
+      `pytorch_model.bin`).
+    - Conclusion: those existing `weights/` directories can be loaded as part
+      of their original compiled artifact, but they are not valid
+      `--quantized-checkpoints-path` inputs for a fresh FP8 compile.
+- BF16 legacy TKG control compile:
+  - Log:
+    `/home/ubuntu/validation_logs/hybrid_apc_real_tokens/legacy_tkg_bf16_2k_compile.log`
+  - Result:
+    - TKG priority compile passed.
+    - CTE HLO compilation passed.
+    - Weight sharding completed.
+    - `LOAD_AFTER_COMPILE_OK` was reached in-process.
+  - Caveat:
+    - The `/dev/shm/...` compiled artifact path was gone after the SSH process
+      exited, so a later separate validation process could not load it.
+    - A one-shot compile-then-validate wrapper was launched to keep validation
+      in the same process lifetime:
+      `/home/ubuntu/validation_logs/hybrid_apc_real_tokens/legacy_tkg_bf16_inline_2k_compile_validate.log`
+    - At the time this report was pushed, that inline run was still compiling
+      on the Trainium host and had not yet reached validation.
+
 ## External Reference
 
 AWS Neuron documentation and the existing NxDI `inference_demo.py` both use
