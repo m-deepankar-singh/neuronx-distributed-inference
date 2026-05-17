@@ -332,18 +332,51 @@ Follow-up ABI patch:
   `_pad_prefix_caching_inputs` -> `get_target_2d_bucket_for_prefix_caching`.
   This is a separate bucket/shape contract issue from the earlier physical PA
   block-capacity hypothesis.
+- Patch `1e41faf` added explicit CTE/TKG arg builders, contract debug, a TKG
+  token-id guard, and generic TKG prefix-cache padding protection so decode
+  `num_queries` is derived from `input_ids.shape[-1]`, not from a bad
+  context-length value.
+- Patch `f283e93` fixed warm-prefix suffix classification: any multi-token Qwen
+  request is routed to CTE even when `position_ids` starts at a nonzero restored
+  prefix boundary. TKG remains a strict one-token decode path.
+- Remote unit verification on `f283e93`:
+  - Qwen focused unit suites:
+    `test_qwen36_model_aliases.py`,
+    `test_qwen36_compile_fp8_config.py`,
+    `test_hybrid_apc_validation.py`
+    - Result: `21 passed`.
+  - Prefix-cache bucket suite:
+    `test/unit/models/test_prefix_caching_bucket_selection.py`
+    with `--import-mode=importlib`
+    - Result: `28 passed`.
+- BF16 host-logits validation on `f283e93` reused the existing
+  `/home/ubuntu/qwen_artifacts/qwen36_27b_2048_bf16_hybrid_apc_host_logits_legacy_tkg_5a08328`
+  artifact and completed far enough to write JSON:
+  `/home/ubuntu/validation_logs/hybrid_apc_real_tokens/legacy_tkg_bf16_host_logits_2k_f283e93_validation.json`.
+  The previous warm TKG padding crash is gone. TKG debug now shows
+  `input_shape=(1, 1)`, `num_queries=[1]`, and valid context metadata through
+  cold and warm decode. The validation still fails because every generated
+  token is dummy token `0`:
+  `real_generated_tokens_passed=false`.
+- BF16 on-device validation on `f283e93` reused the existing
+  `/home/ubuntu/qwen_artifacts/qwen36_27b_2048_bf16_hybrid_apc_ondevice_legacy_tkg_5a08328`
+  artifact. The new guard fails before Neuron embedding/gather execution with:
+  `Qwen3.6 TKG input_ids contains out-of-vocab token id 2143289344; vocab_size=248320`.
+  This confirms the prior `NRT_EXEC_OOB` was downstream of a corrupt sampled
+  token handoff, not a PA block-count issue.
 - Current exact problem:
   - The stage-consistent 24-tensor legacy ABI fix compiles and loads.
+  - Warm prefix-cache CTE/TKG length classification is fixed for the host-logits
+    path.
   - On-device BF16 decode still fails because the sampler/token handoff feeds a
     corrupt out-of-vocab token id into TKG.
-  - BF16 host-side sampling avoids that corrupt token, but logits/sampling still
-    collapse to dummy token `0`, so real generation is not proven.
-  - Warm host-logits validation also exposes a TKG prefix-cache bucket-selection
-    bug before the JSON report can be written.
+  - BF16 host-side sampling avoids that corrupt token and no longer crashes on
+    the second/warm request, but logits/sampling still collapse to dummy token
+    `0`, so real generation is not proven.
 - Local verification:
   - `python3 -m py_compile contrib/models/Qwen3.6-27B/src/modeling_qwen35.py contrib/models/Qwen3.6-27B/test/integration/qwen36_27b_compile_fp8.py validation_scripts/qwen36_hybrid_apc_validation.py`
   - `python3 -m pytest contrib/models/Qwen3.6-27B/test/unit/test_qwen36_model_aliases.py contrib/models/Qwen3.6-27B/test/unit/test_qwen36_compile_fp8_config.py contrib/models/Qwen3.6-27B/test/unit/test_hybrid_apc_validation.py`
-  - Result: `16 passed`.
+  - Result: `21 passed` after `f283e93`.
 
 ## External Reference
 
@@ -366,10 +399,8 @@ entrypoints.
   inspect the vLLM-Neuron loader/runner logits boundary, because the
   `modeling_qwen35.py` logit-stage debug did not surface useful summaries from
   the precompiled-artifact runtime path.
-- Why does the TKG prefix-cache bucket selector reject the warm/multi-request
-  host-logits run with
-  `Input len tensor([[207]]) exceeds largest bucket (2048)`? Add debug for both
-  vertical and horizontal dimensions before changing the bucket comparison.
+- Why do host-side BF16 logits/CPU sampling collapse to dummy token `0` even
+  after CTE/TKG active-length handling is fixed?
 - Why does FP8 host-side `output_logits=True` return all-NaN logits even when
   special scalar handling is set?
 - Whether the older `contrib/qwen36-27b-vllm-apc-pr` branch has a serving/runtime
