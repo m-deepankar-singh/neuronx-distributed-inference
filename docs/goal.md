@@ -11,8 +11,7 @@ Make Qwen3.6-27B Hybrid APC on Trainium correct first, then measure cold-prefill
 
 ## Current Status
 
-The active branch is `experimental`. The latest pushed code patch before this
-round was `7d1138e`.
+The active branch is `experimental`. The latest pushed code patch is `02e636c`.
 
 Useful Trainium paths:
 
@@ -79,6 +78,18 @@ Remote focused subset after `7d1138e`:
 45 passed
 ```
 
+Local focused tests after `02e636c`:
+
+```text
+46 passed
+```
+
+Remote focused tests after `02e636c`:
+
+```text
+46 passed
+```
+
 The no-compile safe fallback used the existing artifact and passed decode24 exactness:
 
 ```bash
@@ -114,6 +125,31 @@ restore_len=0
 ```
 
 That is correct for safety, but it does not prove the performance path.
+
+After `02e636c`, the same 2K checkpoint-boundary prompt also passes on the existing artifact without compiling:
+
+```text
+full_prefix_exact=True
+partial_prefix_exact=True
+real_generated_tokens_passed=True
+```
+
+Artifacts:
+
+- JSON:
+  `/home/ubuntu/validation_logs/hybrid_apc_real_tokens/bf16_hybrid_apc_host_logits_nki_chunked_02e636c_scheduler_backed_gate_boundary_decode24.json`
+- Log:
+  `/home/ubuntu/validation_logs/hybrid_apc_real_tokens/bf16_hybrid_apc_host_logits_nki_chunked_02e636c_scheduler_backed_gate_boundary_decode24.log`
+
+The log confirms the scheduler safety gate avoided the backed path on this artifact:
+
+```text
+attention_hit_len=0
+restore_len=0
+computed=tensor([[0]], dtype=torch.int32)
+```
+
+So correctness is protected for both the normal validation prompt and the checkpoint-boundary prompt, but this is still a no-prefix fallback and not the final perf path.
 
 ## Backed Restore Evidence
 
@@ -218,7 +254,7 @@ This strongly suggests that the scheduler and model now select the right restore
 - Scheduler registry now defaults missing `hybrid_apc_model_revision` to `"unknown"`, matching the Qwen model config embedded in the current artifact.
 - Added test coverage for the missing model revision default.
 
-The next local patch tightens the scheduler safety gate:
+`02e636c` tightened the scheduler safety gate:
 
 - A registered GDN checkpoint still proves that the GDN side is backed.
 - vLLM attention prefix reads are only allowed when the compiled artifact also advertises backed CTE attention-prefix support.
