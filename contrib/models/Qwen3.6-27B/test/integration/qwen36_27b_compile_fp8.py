@@ -276,6 +276,7 @@ def _build_config(args: argparse.Namespace):
         "enable_bucketing": len(cte_buckets) > 1,
         "logical_nc_config": args.logical_nc_config,
         "save_sharded_checkpoint": True,
+        "skip_warmup": args.skip_warmup,
     }
     if args.weight_dtype == _WEIGHT_DTYPE_FP8_MLP_ONLY:
         neuron_config_kwargs.update(
@@ -376,6 +377,7 @@ def main() -> int:
     parser.add_argument("--logical-nc-config", type=int, default=2)
     parser.add_argument("--max-num-seqs", type=int, default=1)
     parser.add_argument("--ctx-batch-size", type=int, default=1)
+    parser.add_argument("--skip-warmup", action="store_true")
     parser.add_argument("--enable-prefix-caching", action="store_true")
     parser.add_argument("--enable-hybrid-apc", action="store_true")
     parser.add_argument("--enable-vllm-chunked-prefill", action="store_true")
@@ -450,6 +452,7 @@ def main() -> int:
                 "max_num_seqs": args.max_num_seqs,
                 "ctx_batch_size": args.ctx_batch_size,
                 "tkg_batch_size": args.max_num_seqs,
+                "skip_warmup": args.skip_warmup,
                 "enable_prefix_caching": args.enable_prefix_caching,
                 "enable_hybrid_apc": args.enable_hybrid_apc,
                 "enable_vllm_chunked_prefill": args.enable_vllm_chunked_prefill,

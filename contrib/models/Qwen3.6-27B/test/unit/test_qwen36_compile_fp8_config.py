@@ -86,6 +86,7 @@ def _args(**overrides):
         logical_nc_config=2,
         max_num_seqs=1,
         ctx_batch_size=1,
+        skip_warmup=False,
         enable_prefix_caching=True,
         enable_hybrid_apc=True,
         enable_vllm_chunked_prefill=False,
@@ -164,6 +165,7 @@ class TestQwen36CompileFp8Config(unittest.TestCase):
                     quantized_checkpoints_path=None,
                     max_num_seqs=2,
                     ctx_batch_size=1,
+                    skip_warmup=True,
                     pa_num_blocks=16,
                 ),
             )
@@ -172,6 +174,7 @@ class TestQwen36CompileFp8Config(unittest.TestCase):
         self.assertEqual(config.neuron_config.ctx_batch_size, 1)
         self.assertEqual(config.neuron_config.tkg_batch_size, 2)
         self.assertEqual(config.neuron_config.pa_num_blocks, 17)
+        self.assertTrue(config.neuron_config.skip_warmup)
 
     def test_on_device_sampling_compile_uses_sampler_config(self):
         with patch.object(

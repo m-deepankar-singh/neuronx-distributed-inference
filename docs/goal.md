@@ -362,6 +362,7 @@ The compile helper now accepts the missing batch shape knobs:
 ```text
 --max-num-seqs
 --ctx-batch-size
+--skip-warmup
 ```
 
 It maps them into the compiled Neuron config as:
@@ -374,8 +375,8 @@ pa_num_blocks=(seq_len / block_size * max_num_seqs) + 1 null block
 ```
 
 The intended next artifact is a 2K BF16 host-logits Hybrid APC compile with
-`--max-num-seqs 2`, `--ctx-batch-size 1`, and 17 physical PA blocks for two
-2048-token sequences at block size 256. This should remove the known
+`--max-num-seqs 2`, `--ctx-batch-size 1`, `--skip-warmup`, and 17 physical PA
+blocks for two 2048-token sequences at block size 256. This should remove the known
 `sampling_params [2,3]` vs compiled `[1,3]` TKG mismatch and let
 `batched-exactness` reach the actual Hybrid APC restore/fallback logic.
 
