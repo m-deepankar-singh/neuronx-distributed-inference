@@ -3790,6 +3790,8 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
                 )
 
     def _construct_output_with_tokens_and_logits(self, next_tokens, logits, hidden_states=[]):
+        self._debug_constructed_output("tokens", next_tokens)
+        self._debug_constructed_output("logits", logits)
         OutputParams = CausalLMOutputWithPast(
             logits=logits,
             hidden_states=hidden_states,
@@ -3810,6 +3812,8 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
                 logits_or_next_tokens = logits_or_next_tokens[0]
             next_tokens = logits_or_next_tokens
 
+        output_kind = "tokens" if self.on_device_sampling else "logits"
+        self._debug_constructed_output(output_kind, logits_or_next_tokens)
         OutputParams = CausalLMOutputWithPast(
             logits=None if self.on_device_sampling else logits_or_next_tokens,
             hidden_states=logits_or_next_tokens,
@@ -3826,6 +3830,65 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
             OutputParams.tokens = next_tokens
 
         return OutputParams
+
+    def _debug_constructed_output(self, name, tensor):
+        if os.environ.get("NXDI_OUTPUT_DEBUG") != "1":
+            return
+        if tensor is None or not hasattr(tensor, "numel"):
+            print(f"[nxdi_output_debug] name={name} tensor=none", flush=True)
+            return
+        if tensor.numel() == 0:
+            print(
+                f"[nxdi_output_debug] name={name} shape={tuple(tensor.shape)} "
+                f"dtype={tensor.dtype} empty",
+                flush=True,
+            )
+            return
+        try:
+            flat = tensor.detach().reshape(-1)
+            if torch.is_floating_point(flat):
+                finite_mask = torch.isfinite(flat)
+                finite_count = int(finite_mask.sum().item())
+                nan_count = int(torch.isnan(flat).sum().item())
+                posinf_count = int(
+                    torch.logical_and(torch.isinf(flat), flat > 0).sum().item()
+                )
+                neginf_count = int(
+                    torch.logical_and(torch.isinf(flat), flat < 0).sum().item()
+                )
+                if finite_count:
+                    finite_flat = flat[finite_mask].float()
+                    finite_min = float(finite_flat.min().item())
+                    finite_max = float(finite_flat.max().item())
+                    argmax = int(torch.argmax(tensor.reshape(-1, tensor.shape[-1])[0]).item())
+                else:
+                    finite_min = "none"
+                    finite_max = "none"
+                    argmax = "none"
+                print(
+                    "[nxdi_output_debug] "
+                    f"name={name} shape={tuple(tensor.shape)} dtype={tensor.dtype} "
+                    f"finite={finite_count}/{tensor.numel()} nan={nan_count} "
+                    f"posinf={posinf_count} neginf={neginf_count} "
+                    f"finite_min={finite_min} finite_max={finite_max} "
+                    f"first_row_argmax={argmax}",
+                    flush=True,
+                )
+            else:
+                flat_i64 = flat.to(torch.int64)
+                print(
+                    "[nxdi_output_debug] "
+                    f"name={name} shape={tuple(tensor.shape)} dtype={tensor.dtype} "
+                    f"min={int(flat_i64.min().item())} "
+                    f"max={int(flat_i64.max().item())}",
+                    flush=True,
+                )
+        except Exception as exc:
+            print(
+                "[nxdi_output_debug] "
+                f"name={name} summary_error={type(exc).__name__}: {exc}",
+                flush=True,
+            )
 
     def _prepare_inputs(self):
         accepted_indices = torch.zeros(
