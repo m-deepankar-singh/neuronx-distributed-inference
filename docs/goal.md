@@ -7,111 +7,140 @@ Make Qwen3.6-27B Hybrid APC on Trainium correct first, then measure cold-prefill
 - BF16 host-logits path emits finite real-token outputs.
 - Cold and warm Hybrid APC outputs match for the tested prompts.
 - Attention KV prefix reuse is only used when matching GDN recurrent/conv checkpoint state is available.
-- Any unsupported scheduler/cache state fails fast instead of silently producing wrong tokens.
+- Unsupported scheduler/cache states fail fast instead of silently producing wrong tokens.
 
 ## Current Status
 
-The active branch is `experimental`. The latest pushed code patch is `ab9c60f`.
+The active branch is `experimental`. The latest pushed code patch is `479755a`.
 
-The base BF16 host-logits path is no longer the blocker when using the per-chunk DeltaNet CTE path:
+The base BF16 host-logits path is not the current blocker when using the per-chunk DeltaNet CTE path:
 
 - Fused CTE artifact goes NaN around 105-106 tokens.
 - Per-chunk CTE artifact stays finite through the long BF16 control.
-- Hybrid APC decode passes short exactness after suffix slot mapping repair, but drifts on longer decode once vLLM schedules an attention prefix hit that does not have a matching GDN checkpoint.
+- The old warm drift was caused by vLLM reusing attention KV without a matching GDN checkpoint.
+- The new opt-in scheduler fallback disables those unbacked vLLM prefix reads before allocation, and the existing BF16 Hybrid APC per-chunk artifact now passes decode24 exactness without the model-side debug fallback.
 
-Useful artifacts on the Trainium instance:
+Useful Trainium paths:
 
-- Base BF16 no-prefix fused CTE artifact:
-  `/home/ubuntu/qwen_artifacts/qwen36_27b_2048_bf16_host_logits_no_prefix_353306f`
-- Base BF16 no-prefix per-chunk CTE artifact:
-  `/home/ubuntu/qwen_artifacts/qwen36_27b_2048_bf16_host_logits_no_prefix_nki_chunked_6f575ef`
-- Hybrid APC BF16 host-logits per-chunk CTE artifact:
+- Instance: `ubuntu@16.50.102.110`
+- Key: `/Users/deepankarsingh1312/Downloads/trainium.pem`
+- Remote repo: `/home/ubuntu/inferentia-gdn-experimental-test`
+- Weights: `/home/ubuntu/models/Qwen3.6-27B`
+- Main BF16 Hybrid APC artifact:
   `/home/ubuntu/qwen_artifacts/qwen36_27b_2048_bf16_hybrid_apc_host_logits_nki_chunked_4434edf`
 
-Important validation logs:
+## Confirmed Validation
 
-- BF16 fused boundary NaN:
-  `/home/ubuntu/validation_logs/host_logits_controls/bf16_no_prefix_length_sweep_boundary_6f575ef.log`
-- BF16 per-chunk long finite control:
-  `/home/ubuntu/validation_logs/host_logits_controls/bf16_no_prefix_nki_chunked_long_6f575ef.log`
-- Hybrid APC CTE-only pass:
-  `/home/ubuntu/validation_logs/hybrid_apc_real_tokens/bf16_hybrid_apc_host_logits_nki_chunked_4434edf_cte_only.json`
-- Hybrid APC decode4 exact pass after suffix slot mapping repair:
-  `/home/ubuntu/validation_logs/hybrid_apc_real_tokens/bf16_hybrid_apc_host_logits_nki_chunked_b59e3a2_decode4.json`
-- Hybrid APC decode22 exact pass:
-  `/home/ubuntu/validation_logs/hybrid_apc_real_tokens/bf16_hybrid_apc_host_logits_nki_chunked_b59e3a2_decode22.json`
-- Hybrid APC decode24/32 warm drift evidence:
-  `/home/ubuntu/validation_logs/hybrid_apc_real_tokens/bf16_hybrid_apc_host_logits_nki_chunked_b35841d_decode24_topk.log`
-  `/home/ubuntu/validation_logs/hybrid_apc_real_tokens/bf16_hybrid_apc_host_logits_nki_chunked_fd3b906_decode24_guard.json`
-
-## Exact Current Problem
-
-The remaining correctness bug is a scheduler/state contract mismatch:
+Local focused tests after the latest patches:
 
 ```text
-vLLM attention APC says: prefix attention KV can be reused
-Hybrid APC metadata says: no matching GDN checkpoint is available
-Neuron execution still receives a prefix-cache-shaped request
+15 passed
 ```
 
-For Qwen GDN, attention KV reuse without the matching recurrent/conv checkpoint is invalid. It can produce warm logits that are finite but semantically wrong. This is why the current failure is exactness drift, not primarily NaN/OOB.
+Remote focused tests after pulling `479755a`:
 
-NVIDIA/vLLM avoids this class of bug by keeping prefix cache ownership inside its scheduler/KV cache manager. For hybrid models, the usable cache hit must be the intersection of all required cache groups. The Neuron path has to recreate that contract across vLLM-Neuron, NxDI trace inputs/outputs, block tables, slot mapping, and GDN checkpoint metadata.
+```text
+84 passed
+```
 
-Reference:
+Remote exactness command reused the existing artifact and did not compile:
 
-- vLLM PagedAttention: https://docs.vllm.ai/en/stable/design/paged_attention/
-- vLLM prefix caching: https://docs.vllm.ai/en/stable/design/prefix_caching/
+```bash
+QWEN36_HYBRID_APC_DEBUG=1 USE_NKI_FUSED=0 USE_NKI_CHUNKED=1 \
+python3 validation_scripts/qwen36_hybrid_apc_validation.py exactness \
+  --model-path /home/ubuntu/models/Qwen3.6-27B \
+  --compiled-artifacts /home/ubuntu/qwen_artifacts/qwen36_27b_2048_bf16_hybrid_apc_host_logits_nki_chunked_4434edf \
+  --max-model-len 2048 --seq-len 2048 --cte-buckets 256,512 \
+  --max-tokens 24 --require-real-tokens --skip-fp8-env \
+  --hybrid-apc-disable-unbacked-prefix-reads
+```
 
-## Current Guard And Fallback Patches
+Result:
 
-The safety patch in `939dba5` adds:
+```text
+full_prefix_exact=True
+partial_prefix_exact=True
+real_generated_tokens_passed=True
+```
+
+Artifacts:
+
+- JSON:
+  `/home/ubuntu/validation_logs/hybrid_apc_real_tokens/bf16_hybrid_apc_host_logits_nki_chunked_479755a_scheduler_fallback_decode24.json`
+- Log:
+  `/home/ubuntu/validation_logs/hybrid_apc_real_tokens/bf16_hybrid_apc_host_logits_nki_chunked_479755a_scheduler_fallback_decode24.log`
+
+The log shows the scheduler fallback path is active. Warm requests run with:
+
+```text
+restore_len=0
+suffix_len=463
+input_shape=(1, 463)
+```
+
+That means the invalid attention prefix hit is no longer being used; vLLM executes the full active prompt instead of reusing attention KV without GDN state.
+
+## What Changed
+
+`939dba5` added the production safety guard:
 
 - `hybrid_apc_reject_unbacked_attention_hits=True` by default.
-- A bridge guard that raises when `attention_hit_len > 0` but no matching GDN checkpoint exists.
+- Raise if `attention_hit_len > 0` and no matching GDN checkpoint exists.
 - Debug kill switches:
   - `QWEN36_DISABLE_HYBRID_GDN_RESTORE=1`
   - `QWEN36_DISABLE_HYBRID_GDN_COMMIT=1`
 
-The guard does not deliver the final performance fix by itself. It prevents silent wrong output and proves the scheduler needs to intersect attention and GDN cache eligibility before block/slot allocation.
+`fb881a7` repaired the model-side no-restore fallback:
 
-The fallback patch in `fb881a7` repairs the controlled no-restore fallback path:
+- If an unbacked attention hit is explicitly allowed for debugging, rebuild full active `slot_mapping` from `block_table`.
+- This fixed token 0 being written to a suffix slot.
 
-- When an attention hit is present but no GDN checkpoint is available, and the guard is explicitly disabled, rebuild active slots from `block_table` for the full prompt instead of trusting vLLM's suffix-start `slot_mapping`.
-- This fixes the earlier fallback bug where token 0 was written to the suffix slot.
+`553e4e1`, `f2ac367`, and `479755a` added the scheduler-side opt-in fallback:
 
-The debug override in `ab9c60f` allows this fallback to be tested against old compiled artifacts whose loaded model config still defaults the guard to true:
+- CLI/config/env flag: `--hybrid-apc-disable-unbacked-prefix-reads`
+- Env flag: `QWEN36_HYBRID_APC_DISABLE_UNBACKED_PREFIX_READS=1`
+- Lazy `sitecustomize.py` hook patches vLLM EngineCore without importing vLLM at Python startup.
+- The env flag now wins even when the artifact's embedded config is stale, which is required for old compiled artifacts.
 
-- `QWEN36_ALLOW_UNBACKED_HYBRID_APC_FALLBACK=1`
+The failed intermediate attempt at `f2ac367` proved the lazy hook fixed stdout pollution but did not yet disable prefix reads, because `hf_config.use_hybrid_apc_manager` was stale/false inside EngineCore. `479755a` fixed that by letting the explicit env flag override stale artifact config.
 
-Verification:
+## Exact Current Problem
 
-- Remote focused unit suite passed after pulling `939dba5`:
-  `74 passed` across `test_hybrid_apc_manager.py`, `test_config.py`, and `test_vllm_serving_config.py`.
-- Existing BF16 Hybrid APC per-chunk artifact now fails fast, as expected, instead of silently drifting:
-  `/home/ubuntu/validation_logs/hybrid_apc_real_tokens/bf16_hybrid_apc_host_logits_nki_chunked_939dba5_reject_unbacked.log`
-- The explicit validation error is:
-  `hybrid APC received an attention prefix hit without a matching GDN checkpoint; scheduler must intersect attention KV hits with GDN checkpoint hits or disable prefix reuse for this request`
-- Remote unit test after fallback patches:
-  `75 passed` across `test_hybrid_apc_manager.py`, `test_config.py`, and `test_vllm_serving_config.py`.
-- Controlled fallback validation with the existing BF16 per-chunk artifact passed decode24 exactness and real-token gates:
-  `/home/ubuntu/validation_logs/hybrid_apc_real_tokens/bf16_hybrid_apc_host_logits_nki_chunked_ab9c60f_fallback_decode24.json`
-  Result: `full_prefix_exact=True`, `partial_prefix_exact=True`, `real_generated_tokens_passed=True`.
+Correctness is now protected, but the real performance path is not done.
 
-## Recommended Next Work
+The current passing mode intentionally disables unbacked vLLM attention prefix reads:
 
-1. Keep the fail-fast guard enabled by default for production.
-2. Use `QWEN36_ALLOW_UNBACKED_HYBRID_APC_FALLBACK=1` only for controlled validation of the no-restore fallback path.
-3. Implement the real scheduler fallback:
+```text
+attention KV prefix hit exists
+GDN checkpoint hit is missing
+scheduler marks request skip_reading_prefix_cache=True
+vLLM recomputes the prompt as a no-prefix request
+outputs are exact
+```
+
+This is correct but does not deliver the final cold-prefill speedup, because it avoids reuse when the GDN checkpoint side is not available.
+
+The final implementation still needs a real cache eligibility contract:
 
 ```text
 usable_prefix_hit = attention_kv_hit intersect gdn_checkpoint_hit
-if gdn_checkpoint_hit is missing:
-    force prefix hit to 0 before block/slot allocation
 ```
 
-4. Promote the fallback from debug/model-side repair to scheduler-side behavior, so vLLM allocates/writes a true no-prefix request instead of relying on rewriting cached prefix slots.
-5. After scheduler fallback passes exactness without silent drift, compile one real chunked-prefill artifact that creates checkpoint-boundary prefill calls at 256-token boundaries.
-6. Only then run the cold-prefill performance gate.
+Only that usable prefix should be exposed to vLLM allocation. If the GDN checkpoint hit is missing, the request must be scheduled as no-prefix before block/slot allocation. If both attention KV and GDN checkpoint exist at the same boundary, the request may restore GDN state and reuse attention KV.
 
-Avoid additional compiles until the scheduler fallback is implemented or a compile is needed specifically for true chunked-prefill boundary behavior.
+NVIDIA/vLLM avoids this class of bug because prefix-cache ownership is centralized in the scheduler/KV cache manager. For hybrid state models, the usable hit must be the intersection of all required cache groups. The Neuron path has to recreate that contract across vLLM-Neuron, NxDI trace inputs/outputs, block tables, slot mapping, and GDN checkpoint metadata.
+
+References:
+
+- vLLM PagedAttention: https://docs.vllm.ai/en/stable/design/paged_attention/
+- vLLM prefix caching: https://docs.vllm.ai/en/stable/design/prefix_caching/
+
+## Recommended Next Work
+
+1. Keep the fail-fast guard enabled by default.
+2. Keep `--hybrid-apc-disable-unbacked-prefix-reads` enabled for correctness validation on old artifacts.
+3. Promote the fallback into a real scheduler/cache-manager contract that computes `usable_prefix_hit = attention_kv_hit intersect gdn_checkpoint_hit`.
+4. Add a positive warm-prefix test where the prompt is chunked on checkpoint boundaries and a matching GDN checkpoint exists.
+5. Compile only once for that true checkpoint-boundary path, then run decode exactness and the cold-prefill performance gate.
+
+Avoid additional compiles until the scheduler can produce a request with both matching attention KV blocks and matching GDN checkpoint metadata.
