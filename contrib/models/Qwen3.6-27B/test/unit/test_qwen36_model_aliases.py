@@ -379,6 +379,22 @@ class TestQwen36ModelAliases(unittest.TestCase):
             248320,
         )
 
+    def test_prefill_detection_keeps_nonzero_multi_token_suffix_on_cte(self):
+        self.assertTrue(
+            self.qwen_module._qwen36_is_prefill_request(
+                torch.ones((1, 207), dtype=torch.int32),
+                torch.arange(207, 414, dtype=torch.int32).reshape(1, -1),
+            )
+        )
+
+    def test_prefill_detection_keeps_one_token_nonzero_decode_on_tkg(self):
+        self.assertFalse(
+            self.qwen_module._qwen36_is_prefill_request(
+                torch.ones((1, 1), dtype=torch.int32),
+                torch.tensor([[207]], dtype=torch.int32),
+            )
+        )
+
     def test_stage_builders_keep_cte_and_tkg_contracts_explicit(self):
         wrapper = _make_wrapper(
             self.qwen_module,

@@ -2973,6 +2973,14 @@ def _validate_qwen36_tkg_input_ids(input_ids, vocab_size) -> None:
         )
 
 
+def _qwen36_is_prefill_request(input_ids, position_ids) -> bool:
+    # Warm prefix-cache suffixes may start at a nonzero position, but they are
+    # still multi-token CTE requests. TKG must remain a one-token decode path.
+    if input_ids.shape[-1] > 1:
+        return True
+    return position_ids.min().item() == 0
+
+
 def _debug_logits_stage(stage: str, tensor) -> None:
     if os.environ.get("QWEN36_LOGIT_STAGE_DEBUG") != "1":
         return
@@ -4313,10 +4321,7 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
         hybrid_commit_mask=None,
     ):
         """Override to pass Qwen/vLLM positional args explicitly."""
-        is_prefill = self._is_prefill(position_ids) or (
-            getattr(self.config, "use_qwen_hybrid_chunked_prefill", False)
-            and input_ids.shape[-1] > 1
-        )
+        is_prefill = _qwen36_is_prefill_request(input_ids, position_ids)
 
         hybrid_apc_request_dict = None
         if (
