@@ -11,7 +11,7 @@ Make Qwen3.6-27B Hybrid APC on Trainium correct first, then measure cold-prefill
 
 ## Current Status
 
-The active branch is `experimental`. The latest pushed code patch is `d6df06a`.
+The active branch is `experimental`. The latest pushed code patch is `d6df06a`; the latest pushed report/docs commit is `f666d48`.
 
 Useful Trainium paths:
 
@@ -57,6 +57,19 @@ use_qwen_hybrid_chunked_prefill_nki=False
 ```
 
 With that artifact, Qwen CTE restores GDN state but does not consume attention KV prefix state for full-attention layers. A registered GDN checkpoint is therefore not sufficient to make an attention prefix read safe.
+
+## Overnight Operating Rule
+
+If the same failure mode or error repeats more than twice, stop local trial-and-error and search the current NVIDIA/vLLM implementation or documentation before continuing. Compare the Neuron contract against NVIDIA/vLLM for:
+
+- paged attention block tables
+- slot mapping
+- prefix caching
+- Mamba/SSM or other hybrid state cache handling
+- prefill/decode runner argument order
+- sampler/logits contract
+
+Then record the finding in this file before applying the next patch or starting another compile.
 
 ## Confirmed Validation
 
@@ -313,11 +326,11 @@ The CTE-prefix implementation patch adds the pieces needed for the next artifact
 The exact current problem is:
 
 ```text
-Backed restore path activates at restore_len=256, but warm partial-prefix exactness fails.
-The failure appears after scheduling/registry selection, inside the CTE restore padding/model input/full-attention prefix contract.
+Correctness is protected on the old artifact by falling back to no-prefix execution.
+The unresolved work is proving the real performance path on a newly compiled backed-prefix artifact.
 ```
 
-The likely bad contract is:
+The old failing backed run exposed this contract:
 
 ```text
 suffix input length: 16
@@ -327,19 +340,22 @@ num_queries: [16]
 slot_mapping: suffix slots only
 block_table: 8 prefix blocks
 current artifact: use_qwen_hybrid_chunked_prefill=False
-padding wrapper: resets/collapses prefix side during CTE bucket padding
-full-attention layers: do not consume attention KV prefix in CTE on this artifact
+old padding wrapper: reset/collapsed prefix side during CTE bucket padding
+old artifact: full-attention layers did not consume attention KV prefix in CTE
 ```
 
-The current artifact does not support the full backed-prefix CTE path because Qwen chunked prefill was compiled off. Before compiling again, also inspect and fix the wrapper path that produced:
+`d6df06a` fixes the known wrapper/model contract in code and focused unit tests:
 
 ```text
-adjusted_prefix_len=0
-padded_attention_shape=(1,)
-padded_block_shape=(1,)
+16-token suffix plus 256-token restored prefix pads as prefill_bucket=256, prefix_bucket=256
+Hybrid APC restore tensors stay suffix-only through padding
+Qwen CTE full-attention layers can consume selected prefix KV
+backed prefix reads remain opt-in
 ```
 
-Primary files to inspect:
+The next required proof is a new BF16 2K artifact compiled with backed CTE prefix support. The old artifact is expected to keep falling back.
+
+Primary files changed or relevant:
 
 - `src/neuronx_distributed_inference/models/model_wrapper.py`
 - `contrib/models/Qwen3.6-27B/src/modeling_qwen35.py`
@@ -354,20 +370,32 @@ The earlier artifacts failed for different reasons:
 - Old warm Hybrid APC runs: reused attention KV without matching GDN recurrent/conv state, so warm logits drifted.
 - Existing BF16 per-chunk artifact: works for correctness when unbacked prefix reads are disabled, but the true backed restore path now exposes a CTE restore/padding contract issue.
 
-The current issue does not prove that another compile is required. The run used an existing artifact and reached the right restore call. The next step is to fix or prove the Python-side CTE input/padding contract before spending another compile.
+The existing BF16 per-chunk artifact was generated before the backed-prefix CTE path existed. It can prove the safety fallback, but it cannot prove the intended warm-prefix performance path.
 
 ## Recommended Next Work
 
-1. Do not compile again until the padding contract is understood.
-2. Inspect `model_wrapper.py` around the `pad-pre` / `pad-post` debug path and find why `prefix_len=256` becomes `adjusted_prefix_len=0`.
-3. Preserve `computed_context_lens=[256]`, `num_queries=[16]`, the suffix `slot_mapping`, and the required attention-prefix block table through CTE padding if the compiled NEFF expects prefix-cache CTE inputs.
-4. Enable backed prefix reads only for an artifact compiled with the CTE full-attention prefix path.
-5. Compare against the older working `contrib/qwen36-27b-vllm-apc-pr` branch for CTE/TKG argument and padding contracts. That branch compiled Qwen chunked prefill on by default.
-6. Rerun the same 2K boundary validation after the safety gate. It should fall back to no-prefix on the current artifact and pass exactness without claiming perf.
-7. Compile one BF16 2K artifact with `--enable-vllm-chunked-prefill` and `--hybrid-apc-enable-backed-prefix-reads`, then rerun the same boundary validation with `--hybrid-apc-enable-backed-prefix-reads`.
-8. After BF16 backed restore exactness passes, revisit FP8 and TKG/on-device sampling separately.
+1. Compile exactly one BF16 2K artifact with `--enable-vllm-chunked-prefill` and `--hybrid-apc-enable-backed-prefix-reads`.
+2. Use `--load-after-compile` so a broken artifact is caught immediately.
+3. Do not start parallel compile variants unless the first compile result proves the artifact shape is wrong.
+4. Rerun the same 2K checkpoint-boundary validation with `--hybrid-apc-enable-backed-prefix-reads`.
+5. Expected backed-prefix debug:
 
-The next concrete engineering target is specific: fix the CTE restore padding/input/full-attention-prefix contract so the 256-token backed GDN restore plus 16-token suffix produces the same logits/tokens as the cold 272-token prompt.
+```text
+attention_hit_len=256
+restore_len=256
+computed=[256]
+num_queries=[16]
+restore_mask=[1]
+prefill_bucket=256
+prefix_bucket=256
+```
+
+6. If backed BF16 exactness passes, measure cold vs warm prefill performance.
+7. If backed BF16 exactness fails, capture the first failing token/logit stage and inspect CTE prefix K/V selection before compiling again.
+8. If the same failure repeats more than twice, search NVIDIA/vLLM implementation details and compare contracts before continuing.
+9. After BF16 backed restore exactness and perf are understood, revisit FP8 and TKG/on-device sampling separately.
+
+The next concrete engineering target is specific: compile the backed-prefix CTE contract into one BF16 2K artifact and prove that the 256-token backed GDN restore plus 16-token suffix produces the same logits/tokens as the cold 272-token prompt.
 
 ## NVIDIA/vLLM Comparison
 
