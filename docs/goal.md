@@ -11,7 +11,7 @@ Make Qwen3.6-27B Hybrid APC on Trainium correct first, then measure cold-prefill
 
 ## Current Status
 
-The active branch is `experimental`. The latest pushed guard patch is `939dba5`.
+The active branch is `experimental`. The latest pushed code patch is `ab9c60f`.
 
 The base BF16 host-logits path is no longer the blocker when using the per-chunk DeltaNet CTE path:
 
@@ -63,7 +63,7 @@ Reference:
 - vLLM PagedAttention: https://docs.vllm.ai/en/stable/design/paged_attention/
 - vLLM prefix caching: https://docs.vllm.ai/en/stable/design/prefix_caching/
 
-## Current Guard Patch
+## Current Guard And Fallback Patches
 
 The safety patch in `939dba5` adds:
 
@@ -75,6 +75,15 @@ The safety patch in `939dba5` adds:
 
 The guard does not deliver the final performance fix by itself. It prevents silent wrong output and proves the scheduler needs to intersect attention and GDN cache eligibility before block/slot allocation.
 
+The fallback patch in `fb881a7` repairs the controlled no-restore fallback path:
+
+- When an attention hit is present but no GDN checkpoint is available, and the guard is explicitly disabled, rebuild active slots from `block_table` for the full prompt instead of trusting vLLM's suffix-start `slot_mapping`.
+- This fixes the earlier fallback bug where token 0 was written to the suffix slot.
+
+The debug override in `ab9c60f` allows this fallback to be tested against old compiled artifacts whose loaded model config still defaults the guard to true:
+
+- `QWEN36_ALLOW_UNBACKED_HYBRID_APC_FALLBACK=1`
+
 Verification:
 
 - Remote focused unit suite passed after pulling `939dba5`:
@@ -83,11 +92,16 @@ Verification:
   `/home/ubuntu/validation_logs/hybrid_apc_real_tokens/bf16_hybrid_apc_host_logits_nki_chunked_939dba5_reject_unbacked.log`
 - The explicit validation error is:
   `hybrid APC received an attention prefix hit without a matching GDN checkpoint; scheduler must intersect attention KV hits with GDN checkpoint hits or disable prefix reuse for this request`
+- Remote unit test after fallback patches:
+  `75 passed` across `test_hybrid_apc_manager.py`, `test_config.py`, and `test_vllm_serving_config.py`.
+- Controlled fallback validation with the existing BF16 per-chunk artifact passed decode24 exactness and real-token gates:
+  `/home/ubuntu/validation_logs/hybrid_apc_real_tokens/bf16_hybrid_apc_host_logits_nki_chunked_ab9c60f_fallback_decode24.json`
+  Result: `full_prefix_exact=True`, `partial_prefix_exact=True`, `real_generated_tokens_passed=True`.
 
 ## Recommended Next Work
 
-1. Push and verify the guard patch.
-2. Run the existing BF16 Hybrid APC validation with the per-chunk artifact. Expected behavior is now a fast, explicit error on the unbacked attention hit instead of warm drift.
+1. Keep the fail-fast guard enabled by default for production.
+2. Use `QWEN36_ALLOW_UNBACKED_HYBRID_APC_FALLBACK=1` only for controlled validation of the no-restore fallback path.
 3. Implement the real scheduler fallback:
 
 ```text
@@ -96,7 +110,8 @@ if gdn_checkpoint_hit is missing:
     force prefix hit to 0 before block/slot allocation
 ```
 
-4. After fallback passes exactness without silent drift, compile one real chunked-prefill artifact that creates checkpoint-boundary prefill calls at 256-token boundaries.
-5. Only then run the cold-prefill performance gate.
+4. Promote the fallback from debug/model-side repair to scheduler-side behavior, so vLLM allocates/writes a true no-prefix request instead of relying on rewriting cached prefix slots.
+5. After scheduler fallback passes exactness without silent drift, compile one real chunked-prefill artifact that creates checkpoint-boundary prefill calls at 256-token boundaries.
+6. Only then run the cold-prefill performance gate.
 
 Avoid additional compiles until the scheduler fallback is implemented or a compile is needed specifically for true chunked-prefill boundary behavior.
