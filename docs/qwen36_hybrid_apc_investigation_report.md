@@ -169,12 +169,19 @@ generated token ids were `0`, which is why the real-token gate was added.
 
 ## Trainium Findings
 
-Remote instance:
+Remote instances:
 
-- Host: `ubuntu@16.26.90.15`
-- Repo: `/home/ubuntu/inferentia-gdn`
-- Validation logs: `/home/ubuntu/validation_logs/hybrid_apc_real_tokens/`
-- Scripts: `/home/ubuntu/qwen_artifacts/`
+- Prior host: `ubuntu@16.26.90.15`
+- Current host: `ubuntu@16.50.102.110`
+- Current repo: `/home/ubuntu/inferentia-gdn-experimental-test`
+- Current branch: `experimental`
+- Current weights:
+  `/home/ubuntu/models/Qwen3.6-27B`
+  and `/opt/dlami/nvme/models/Qwen3.6-27B`
+- Current validation logs:
+  `/home/ubuntu/validation_logs/hybrid_apc_real_tokens/`
+- Current artifacts:
+  `/home/ubuntu/qwen_artifacts/`
 
 Important runs:
 
@@ -297,6 +304,42 @@ Follow-up ABI patch:
   `/home/ubuntu/qwen_artifacts/qwen36_27b_2048_bf16_hybrid_apc_host_logits_legacy_tkg_5a08328`.
   Its compile log is
   `/home/ubuntu/validation_logs/hybrid_apc_real_tokens/legacy_tkg_bf16_host_logits_2k_5a08328_compile.log`.
+- That BF16 host-logits artifact reached `COMPILE_DONE` and
+  `LOAD_AFTER_COMPILE_OK`. It produced four BF16 sharded checkpoint files and
+  loaded/warmed successfully from the precompiled artifact.
+- BF16 host-logits validation log:
+  `/home/ubuntu/validation_logs/hybrid_apc_real_tokens/legacy_tkg_bf16_host_logits_2k_5a08328_validation.log`.
+  The run did not write the requested JSON report because the engine crashed
+  before validation completed.
+- Host-side sampling avoided the on-device garbage token/OOB failure. TKG input
+  debug showed repeated valid token id `0` instead of `2143289344`, with
+  in-range position, slot, and block metadata. Example first decode:
+  `input_values=[0]`,
+  `position_minmax=463:463`,
+  `slot_minmax=719:719`,
+  `block_minmax=1:2`,
+  `computed_context_lens=[463]`,
+  `pa_num_blocks=9`,
+  `block_size=256`.
+- However, the CPU sampler selected dummy token `0` repeatedly. Because the
+  validation gate requires real generated tokens, this means the host-logits
+  output path is still not producing a usable real-token distribution.
+- The same host-logits validation then crashed on the warm/multi-request path in
+  TKG prefix-cache input padding:
+  `ValueError: Input len tensor([[207]], dtype=torch.int32) exceeds largest bucket (2048) for token_generation_model`.
+  The stack is in
+  `src/neuronx_distributed_inference/models/model_wrapper.py`
+  `_pad_prefix_caching_inputs` -> `get_target_2d_bucket_for_prefix_caching`.
+  This is a separate bucket/shape contract issue from the earlier physical PA
+  block-capacity hypothesis.
+- Current exact problem:
+  - The stage-consistent 24-tensor legacy ABI fix compiles and loads.
+  - On-device BF16 decode still fails because the sampler/token handoff feeds a
+    corrupt out-of-vocab token id into TKG.
+  - BF16 host-side sampling avoids that corrupt token, but logits/sampling still
+    collapse to dummy token `0`, so real generation is not proven.
+  - Warm host-logits validation also exposes a TKG prefix-cache bucket-selection
+    bug before the JSON report can be written.
 - Local verification:
   - `python3 -m py_compile contrib/models/Qwen3.6-27B/src/modeling_qwen35.py contrib/models/Qwen3.6-27B/test/integration/qwen36_27b_compile_fp8.py validation_scripts/qwen36_hybrid_apc_validation.py`
   - `python3 -m pytest contrib/models/Qwen3.6-27B/test/unit/test_qwen36_model_aliases.py contrib/models/Qwen3.6-27B/test/unit/test_qwen36_compile_fp8_config.py contrib/models/Qwen3.6-27B/test/unit/test_hybrid_apc_validation.py`
@@ -315,14 +358,22 @@ entrypoints.
 
 ## Open Questions
 
-- Why does host-side `output_logits=True` return all-NaN logits even when FP8
-  special scalar handling is set?
 - Why does on-device sampling feed an invalid token id into TKG
   (`2143289344` in the BF16 PA9 run) even though the TKG block metadata is
   in range?
-- Whether BF16 host logits are finite once on-device sampling is disabled.
+- Why does BF16 host-side sampling repeatedly select dummy token `0` after the
+  artifact loads and decodes without the on-device OOB? The next check should
+  inspect the vLLM-Neuron loader/runner logits boundary, because the
+  `modeling_qwen35.py` logit-stage debug did not surface useful summaries from
+  the precompiled-artifact runtime path.
+- Why does the TKG prefix-cache bucket selector reject the warm/multi-request
+  host-logits run with
+  `Input len tensor([[207]]) exceeds largest bucket (2048)`? Add debug for both
+  vertical and horizontal dimensions before changing the bucket comparison.
+- Why does FP8 host-side `output_logits=True` return all-NaN logits even when
+  special scalar handling is set?
 - Whether the older `contrib/qwen36-27b-vllm-apc-pr` branch has a serving/runtime
-  detail outside the Qwen compile path that avoids this OOB.
+  detail outside the Qwen compile path that avoids these sampler/logits issues.
 
 ## Files To Review First
 
