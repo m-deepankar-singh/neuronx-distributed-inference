@@ -3431,6 +3431,8 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
         if not generation_model.is_neuron():
             self._copy_past_key_values(outputs)
 
+        self._debug_raw_outputs(outputs)
+
         # process outputs
         if self.on_device_sampling and self.neuron_config.output_logits and not \
                 (self.neuron_config.enable_fused_speculation or self.neuron_config.is_medusa):
@@ -3830,6 +3832,22 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
             OutputParams.tokens = next_tokens
 
         return OutputParams
+
+    def _debug_raw_outputs(self, outputs):
+        if os.environ.get("NXDI_RAW_OUTPUT_DEBUG") != "1":
+            return
+        limit = int(os.environ.get("NXDI_RAW_OUTPUT_DEBUG_LIMIT", "8"))
+        if isinstance(outputs, (list, tuple)):
+            print(
+                f"[nxdi_raw_output_debug] count={len(outputs)} limit={limit}",
+                flush=True,
+            )
+            iterable = enumerate(outputs[:limit])
+        else:
+            print("[nxdi_raw_output_debug] count=1 limit=1", flush=True)
+            iterable = [(0, outputs)]
+        for idx, tensor in iterable:
+            self._debug_constructed_output(f"raw_output[{idx}]", tensor)
 
     def _debug_constructed_output(self, name, tensor):
         if os.environ.get("NXDI_OUTPUT_DEBUG") != "1":
