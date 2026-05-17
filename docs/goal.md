@@ -11,7 +11,7 @@ Make Qwen3.6-27B Hybrid APC on Trainium correct first, then measure cold-prefill
 
 ## Current Status
 
-The active branch is `experimental`. The latest pushed investigation state before the current guard patch was `4f6d5b2`.
+The active branch is `experimental`. The latest pushed guard patch is `939dba5`.
 
 The base BF16 host-logits path is no longer the blocker when using the per-chunk DeltaNet CTE path:
 
@@ -65,7 +65,7 @@ Reference:
 
 ## Current Guard Patch
 
-The next safety patch adds:
+The safety patch in `939dba5` adds:
 
 - `hybrid_apc_reject_unbacked_attention_hits=True` by default.
 - A bridge guard that raises when `attention_hit_len > 0` but no matching GDN checkpoint exists.
@@ -74,6 +74,15 @@ The next safety patch adds:
   - `QWEN36_DISABLE_HYBRID_GDN_COMMIT=1`
 
 The guard does not deliver the final performance fix by itself. It prevents silent wrong output and proves the scheduler needs to intersect attention and GDN cache eligibility before block/slot allocation.
+
+Verification:
+
+- Remote focused unit suite passed after pulling `939dba5`:
+  `74 passed` across `test_hybrid_apc_manager.py`, `test_config.py`, and `test_vllm_serving_config.py`.
+- Existing BF16 Hybrid APC per-chunk artifact now fails fast, as expected, instead of silently drifting:
+  `/home/ubuntu/validation_logs/hybrid_apc_real_tokens/bf16_hybrid_apc_host_logits_nki_chunked_939dba5_reject_unbacked.log`
+- The explicit validation error is:
+  `hybrid APC received an attention prefix hit without a matching GDN checkpoint; scheduler must intersect attention KV hits with GDN checkpoint hits or disable prefix reuse for this request`
 
 ## Recommended Next Work
 
