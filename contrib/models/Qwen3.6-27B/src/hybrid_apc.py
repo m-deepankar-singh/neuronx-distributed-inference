@@ -147,6 +147,32 @@ def _env_flag(name: str) -> bool:
     }
 
 
+def _publish_scheduler_gdn_checkpoint(key):
+    try:
+        from qwen36_hybrid_apc_scheduler_patch import (  # noqa: WPS433
+            register_hybrid_apc_gdn_checkpoint,
+        )
+    except Exception:
+        return
+    try:
+        register_hybrid_apc_gdn_checkpoint(key)
+    except Exception:
+        return
+
+
+def _unpublish_scheduler_gdn_checkpoint(key):
+    try:
+        from qwen36_hybrid_apc_scheduler_patch import (  # noqa: WPS433
+            unregister_hybrid_apc_gdn_checkpoint,
+        )
+    except Exception:
+        return
+    try:
+        unregister_hybrid_apc_gdn_checkpoint(key)
+    except Exception:
+        return
+
+
 def estimate_qwen_gdn_checkpoint_bytes_per_rank(
     *,
     num_gdn_layers: int = 48,
@@ -767,6 +793,7 @@ class HybridAPCSchedulerBridge:
             gdn_checkpoint_slot=prepared.commit_slot,
             bytes_used=bytes_used,
         )
+        _publish_scheduler_gdn_checkpoint(prepared.commit_key)
         self.slot_allocator.mark_committed(prepared.commit_slot)
         record = self.store.on_checkpoint_committed(
             request_id=prepared.request_id,
@@ -1040,6 +1067,7 @@ class HybridAPCMetadataStore:
                 checkpoint.valid_conv_layers[int(layer_id)] = False
         else:
             raise ValueError(f"unknown state_kind: {state_kind}")
+        _unpublish_scheduler_gdn_checkpoint(key)
         return True
 
     def inc_ref(self, key: HybridPrefixKey) -> int:
@@ -1237,6 +1265,7 @@ class HybridAPCMetadataStore:
         checkpoint = self._by_key.pop(key, None)
         if checkpoint is not None:
             self._slot_to_key.pop(checkpoint.gdn_checkpoint_slot, None)
+            _unpublish_scheduler_gdn_checkpoint(key)
 
     def _refresh_stats(self):
         self.stats.checkpoints = len(self._by_key)

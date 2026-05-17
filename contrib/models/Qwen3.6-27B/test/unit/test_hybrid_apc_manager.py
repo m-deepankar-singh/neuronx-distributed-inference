@@ -5,6 +5,7 @@ import os
 import sys
 import unittest
 import importlib.util
+import types
 from unittest.mock import patch
 
 import torch
@@ -13,6 +14,9 @@ import torch
 _CONTRIB_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if _CONTRIB_ROOT not in sys.path:
     sys.path.insert(0, _CONTRIB_ROOT)
+_VLLM_ROOT = os.path.join(_CONTRIB_ROOT, "vllm")
+if _VLLM_ROOT not in sys.path:
+    sys.path.insert(0, _VLLM_ROOT)
 
 _HYBRID_APC_PATH = os.path.join(_CONTRIB_ROOT, "src", "hybrid_apc.py")
 _SPEC = importlib.util.spec_from_file_location("qwen36_hybrid_apc", _HYBRID_APC_PATH)
@@ -32,6 +36,7 @@ estimate_qwen_gdn_checkpoint_bytes_per_rank = (
 estimate_qwen_hybrid_cache_bytes_per_rank = (
     _HYBRID_APC.estimate_qwen_hybrid_cache_bytes_per_rank
 )
+import qwen36_hybrid_apc_scheduler_patch as _SCHEDULER_PATCH  # noqa: E402
 
 
 def _store(**overrides):
@@ -559,6 +564,9 @@ class TestHybridAPCPrefillPlanInputs(unittest.TestCase):
 
 
 class TestHybridAPCSchedulerBridge(unittest.TestCase):
+    def tearDown(self):
+        _SCHEDULER_PATCH.clear_hybrid_apc_gdn_checkpoint_registry()
+
     def test_slot_allocator_validates_lifecycle(self):
         allocator = HybridAPCSlotAllocator(num_slots=2)
 
@@ -641,6 +649,36 @@ class TestHybridAPCSchedulerBridge(unittest.TestCase):
         self.assertEqual(committed.attention_block_refs, (11, 12))
         self.assertEqual(allocator.committed_slots, (0,))
         self.assertIsNotNone(store.lookup(prepared.commit_key))
+
+        fake_scheduler = types.SimpleNamespace(
+            cache_config=types.SimpleNamespace(block_size=128),
+            vllm_config=types.SimpleNamespace(
+                model_config=types.SimpleNamespace(
+                    hf_config=types.SimpleNamespace(
+                        hybrid_apc_model_revision="rev-a",
+                        hybrid_apc_layout_version=1,
+                        hybrid_recurrent_cache_dtype="float32",
+                        hybrid_conv_cache_dtype="bfloat16",
+                        tp_rank=0,
+                    )
+                )
+            ),
+        )
+        fake_request = types.SimpleNamespace(
+            prompt_token_ids=list(range(300)),
+            num_tokens=300,
+            cache_salt="tenant-a",
+        )
+        self.assertEqual(
+            _SCHEDULER_PATCH.backed_gdn_prefix_hit_len(fake_scheduler, fake_request),
+            256,
+        )
+
+        store.mark_invalid(prepared.commit_key, state_kind="conv")
+        self.assertEqual(
+            _SCHEDULER_PATCH.backed_gdn_prefix_hit_len(fake_scheduler, fake_request),
+            0,
+        )
 
         bridge.finish_request("req-warm")
         self.assertEqual(store.lookup(restored_key).refcount, 0)

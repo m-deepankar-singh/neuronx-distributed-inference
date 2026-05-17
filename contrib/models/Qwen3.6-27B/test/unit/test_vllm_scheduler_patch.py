@@ -25,14 +25,25 @@ def _load_patch_module():
     return module
 
 
-def _scheduler(*, use_hybrid_apc=True, disable_unbacked_prefix_reads=False):
+def _scheduler(
+    *,
+    use_hybrid_apc=True,
+    disable_unbacked_prefix_reads=False,
+    block_size=2,
+):
     hf_config = types.SimpleNamespace(
         use_hybrid_apc_manager=use_hybrid_apc,
         hybrid_apc_disable_unbacked_prefix_reads=disable_unbacked_prefix_reads,
+        hybrid_apc_model_revision="rev-a",
+        hybrid_apc_layout_version=1,
+        hybrid_recurrent_cache_dtype="float32",
+        hybrid_conv_cache_dtype="bfloat16",
+        tp_rank=0,
     )
     model_config = types.SimpleNamespace(hf_config=hf_config)
     vllm_config = types.SimpleNamespace(model_config=model_config)
-    return types.SimpleNamespace(vllm_config=vllm_config)
+    cache_config = types.SimpleNamespace(block_size=block_size)
+    return types.SimpleNamespace(vllm_config=vllm_config, cache_config=cache_config)
 
 
 class TestQwen36HybridAPCSchedulerPatch(unittest.TestCase):
@@ -41,6 +52,7 @@ class TestQwen36HybridAPCSchedulerPatch(unittest.TestCase):
         cls.patch = _load_patch_module()
 
     def tearDown(self):
+        self.patch.clear_hybrid_apc_gdn_checkpoint_registry()
         sys.modules.pop(_SCHEDULER_MODULE, None)
         sys.meta_path = [
             finder
@@ -99,6 +111,84 @@ class TestQwen36HybridAPCSchedulerPatch(unittest.TestCase):
         self.assertTrue(installed)
         self.assertEqual(calls, [True])
         self.assertTrue(request.skip_reading_prefix_cache)
+
+    def test_registered_gdn_checkpoint_allows_prefix_read(self):
+        scheduler = _scheduler(block_size=2)
+        token_ids = [10, 11, 12, 13, 14]
+        hashes = self.patch._local_cumulative_prefix_hashes(
+            token_ids,
+            block_size=2,
+            max_prefix_len=4,
+        )
+        self.patch.register_hybrid_apc_gdn_checkpoint(
+            self.patch.HybridGDNPrefixKey(
+                cumulative_prefix_hash=hashes[4],
+                prefix_len=4,
+                block_size=2,
+                cache_salt=None,
+                model_revision="rev-a",
+                layout_version=1,
+                tp_rank=0,
+                recurrent_dtype="float32",
+                conv_dtype="bfloat16",
+            )
+        )
+        request = types.SimpleNamespace(
+            prompt_token_ids=token_ids,
+            num_tokens=len(token_ids),
+            cache_salt=None,
+        )
+
+        with patch.dict(
+            os.environ,
+            {"QWEN36_HYBRID_APC_DISABLE_UNBACKED_PREFIX_READS": "1"},
+        ):
+            self.assertEqual(
+                self.patch.backed_gdn_prefix_hit_len(scheduler, request),
+                4,
+            )
+            self.assertFalse(
+                self.patch.should_disable_unbacked_prefix_reads(scheduler, request)
+            )
+
+    def test_mismatched_gdn_checkpoint_keeps_prefix_read_disabled(self):
+        scheduler = _scheduler(block_size=2)
+        token_ids = [10, 11, 12, 13, 14]
+        hashes = self.patch._local_cumulative_prefix_hashes(
+            token_ids,
+            block_size=2,
+            max_prefix_len=4,
+        )
+        self.patch.register_hybrid_apc_gdn_checkpoint(
+            self.patch.HybridGDNPrefixKey(
+                cumulative_prefix_hash=hashes[4],
+                prefix_len=4,
+                block_size=2,
+                cache_salt="tenant-a",
+                model_revision="rev-a",
+                layout_version=1,
+                tp_rank=0,
+                recurrent_dtype="float32",
+                conv_dtype="bfloat16",
+            )
+        )
+        request = types.SimpleNamespace(
+            prompt_token_ids=token_ids,
+            num_tokens=len(token_ids),
+            cache_salt="tenant-b",
+        )
+
+        with patch.dict(
+            os.environ,
+            {"QWEN36_HYBRID_APC_DISABLE_UNBACKED_PREFIX_READS": "1"},
+        ):
+            self.assertEqual(
+                self.patch.backed_gdn_prefix_hit_len(scheduler, request),
+                0,
+            )
+            self.assertTrue(
+                self.patch.should_disable_unbacked_prefix_reads(scheduler, request)
+            )
 
     def test_import_hook_does_not_import_scheduler_immediately(self):
         installed = self.patch.install_import_hook()
