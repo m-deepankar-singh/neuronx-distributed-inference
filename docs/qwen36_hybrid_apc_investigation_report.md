@@ -277,6 +277,37 @@ Important runs:
   - Conclusion: the current highest-priority blocker is long-prompt BF16 CTE
     numerical behavior. Hybrid APC should not be judged until a no-prefix
     BF16 long-prompt control produces finite logits.
+- Boundary sweeps on commit `6f575ef` isolated the no-prefix BF16 failure:
+  - Existing fused-CTE BF16 artifact:
+    `/home/ubuntu/qwen_artifacts/qwen36_27b_2048_bf16_host_logits_no_prefix_353306f`
+  - Validation-style repeated prompt:
+    `/home/ubuntu/validation_logs/host_logits_controls/bf16_no_prefix_length_sweep_boundary_6f575ef.log`
+    - Finite through 99 tokens.
+    - All-NaN beginning at 106 tokens.
+  - Plain repeated `hello` prompt:
+    `/home/ubuntu/validation_logs/host_logits_controls/bf16_no_prefix_plain_hello_sweep_6f575ef.log`
+    - Finite at 97 tokens.
+    - All-NaN beginning at 105 tokens.
+  - Conclusion: the failure is not prompt-content specific. It appears around
+    the first 128-token fused DeltaNet CTE chunk boundary.
+- A no-prefix BF16 artifact compiled with legacy per-chunk NKI CTE fixed the
+  CTE NaNs without changing APC:
+  - Compile env: `USE_NKI_FUSED=0 USE_NKI_CHUNKED=1`
+  - Artifact:
+    `/home/ubuntu/qwen_artifacts/qwen36_27b_2048_bf16_host_logits_no_prefix_nki_chunked_6f575ef`
+  - Compile log:
+    `/home/ubuntu/validation_logs/host_logits_controls/bf16_no_prefix_nki_chunked_6f575ef_compile.log`
+    - `COMPILE_DONE`
+    - `LOAD_AFTER_COMPILE_OK`
+  - Boundary sweep:
+    `/home/ubuntu/validation_logs/host_logits_controls/bf16_no_prefix_nki_chunked_boundary_6f575ef.log`
+    - Finite through 127 tokens.
+  - Long validation-style sweep:
+    `/home/ubuntu/validation_logs/host_logits_controls/bf16_no_prefix_nki_chunked_long_6f575ef.log`
+    - Finite through 463 tokens.
+  - Conclusion: the immediate workaround is to compile Qwen3.6 CTE with
+    `USE_NKI_FUSED=0 USE_NKI_CHUNKED=1`. The current fused DeltaNet CTE NKI
+    kernel is the leading root cause for host-logits all-NaN CTE outputs.
 
 Latest PA9 artifact run:
 
@@ -520,11 +551,9 @@ entrypoints.
 - Why does on-device sampling feed an invalid token id into TKG
   (`2143289344` in the BF16 PA9 run) even though the TKG block metadata is
   in range?
-- Why does BF16 host-logits mode return all-NaN logits at the NxDI output
-  boundary even after the trace compiles, loads, and TKG metadata stays in
-  range? This is now proven on a fresh BF16/no-FP8 artifact from `980b918`,
-  and `96e15f7` raw-output debug shows the single raw output slot itself is
-  all NaN.
+- Why does the fused DeltaNet CTE NKI kernel return all-NaN logits around
+  105-106 active tokens, while the legacy per-chunk NKI CTE backend stays
+  finite through the 463-token validation prompt?
 - Why do host-side BF16 logits/CPU sampling collapse to dummy token `0` after
   CTE/TKG active-length handling is fixed? The dummy token is downstream of
   all-NaN logits, not yet an independent sampler bug.
