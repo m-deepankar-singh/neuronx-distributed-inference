@@ -978,6 +978,13 @@ class ModelWrapper(torch.nn.Module):
             horizontal_dim = args[14]
 
         if not self.tag == CONTEXT_ENCODING_MODEL_TAG:
+            if self.tag == TOKEN_GENERATION_MODEL_TAG:
+                input_shape = getattr(args[0], "shape", ())
+                batch_size = input_shape[0] if len(input_shape) > 0 else 1
+                active_len = input_shape[-1] if len(input_shape) > 1 else 1
+                vertical_dim = torch.full(
+                    (batch_size, 1), active_len, dtype=torch.int32
+                )
             if horizontal_dim.numel() == 0:
                 horizontal_dim = torch.full((args[0].shape[0], 1), args[1].shape[-1], dtype=torch.int32)
             elif horizontal_dim.dim() == 0:
@@ -1012,7 +1019,8 @@ class ModelWrapper(torch.nn.Module):
             else:
                 if not self.neuron_config.allow_input_truncation:
                     raise ValueError(
-                        f"Input len {vertical_dim} exceeds largest bucket ({buckets[-1][1]}) for {self.tag}"
+                        f"Active len {vertical_dim} with context len {horizontal_dim} "
+                        f"exceeds largest bucket ({buckets[-1].tolist()}) for {self.tag}"
                     )
                 else:
                     bucket_idx = -1
@@ -1246,7 +1254,14 @@ class ModelWrapper(torch.nn.Module):
             pad_right = (prefix_bucket // self.neuron_config.pa_block_size) - block_table.shape[1]
             block_table_padding = -1 if self.neuron_config.attn_block_tkg_nki_kernel_enabled else 0
             padded_block_table = F.pad(block_table, (0, pad_right), "constant", block_table_padding)
-            num_queries = _length_matrix_or_default(args[num_queries_arg_idx], args[0].shape[-1])
+            if self.tag == TOKEN_GENERATION_MODEL_TAG:
+                num_queries = torch.full(
+                    (args[0].shape[0], 1),
+                    args[0].shape[-1],
+                    dtype=torch.int32,
+                )
+            else:
+                num_queries = _length_matrix_or_default(args[num_queries_arg_idx], args[0].shape[-1])
             computed_context_lens = _length_matrix_or_default(args[computed_context_lens_arg_idx], args[1].shape[-1])
             new_args = list(args)
             new_args[1] = padded_attn_mask

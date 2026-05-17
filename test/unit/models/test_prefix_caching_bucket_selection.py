@@ -99,3 +99,57 @@ class TestPrefixCachingBucketSelection:
         computed_prefill_bucket, computed_prefix_bucket = model_wrapper.get_target_2d_bucket_for_prefix_caching(*inp_args)
         assert computed_prefill_bucket == 1
         assert computed_prefix_bucket == prefix_bucket
+
+    def test_tkg_bucket_selection_uses_decode_active_len_not_bad_num_queries(self):
+        model_wrapper = self.setup_token_generation()
+        inp_args = [
+            torch.ones((1, 1), dtype=torch.int32),  # input_ids
+            torch.ones((1, 15), dtype=torch.int32),  # attention_mask
+            torch.tensor([[15]], dtype=torch.int32),  # position_ids
+            torch.zeros((1,), dtype=torch.int32),  # seq_ids
+            torch.ones((1, 3), dtype=torch.float32),  # sampling_params
+            torch.empty(0),
+            torch.zeros((1,), dtype=torch.int32),  # adapter_ids
+            torch.empty(0),
+            torch.empty(0),
+            torch.empty(0),
+            torch.empty(0),
+            torch.zeros((1, 1), dtype=torch.int32),  # slot_mapping
+            torch.zeros((1, 4), dtype=torch.int32),  # block_table
+            torch.tensor([[15]], dtype=torch.int32),  # bad num_queries
+            torch.tensor([[15]], dtype=torch.int32),  # computed_context_lens
+        ]
+
+        computed_prefill_bucket, computed_prefix_bucket = (
+            model_wrapper.get_target_2d_bucket_for_prefix_caching(*inp_args)
+        )
+
+        assert computed_prefill_bucket == 1
+        assert computed_prefix_bucket == 16
+
+    def test_tkg_padding_rewrites_bad_num_queries_to_decode_active_len(self):
+        model_wrapper = self.setup_token_generation()
+        inp_args = [
+            torch.ones((1, 1), dtype=torch.int32),  # input_ids
+            torch.ones((1, 15), dtype=torch.int32),  # attention_mask
+            torch.tensor([[15]], dtype=torch.int32),  # position_ids
+            torch.zeros((1,), dtype=torch.int32),  # seq_ids
+            torch.ones((1, 3), dtype=torch.float32),  # sampling_params
+            torch.empty(0),
+            torch.zeros((1,), dtype=torch.int32),  # adapter_ids
+            torch.empty(0),
+            torch.empty(0),
+            torch.empty(0),
+            torch.empty(0),
+            torch.zeros((1, 1), dtype=torch.int32),  # slot_mapping
+            torch.zeros((1, 4), dtype=torch.int32),  # block_table
+            torch.tensor([[15]], dtype=torch.int32),  # bad num_queries
+            torch.tensor([[15]], dtype=torch.int32),  # computed_context_lens
+        ]
+
+        padded_args = model_wrapper._pad_prefix_caching_inputs(*inp_args)
+
+        assert torch.equal(padded_args[13], torch.tensor([[1]], dtype=torch.int32))
+        assert torch.equal(padded_args[14], torch.tensor([[15]], dtype=torch.int32))
+        assert padded_args[0].shape[-1] == 1
+        assert padded_args[1].shape[-1] == 16

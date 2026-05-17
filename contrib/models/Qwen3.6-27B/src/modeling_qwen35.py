@@ -2792,6 +2792,187 @@ def _assert_qwen36_arg_count(stage: str, args, expected: int) -> None:
         )
 
 
+_QWEN36_PREFIX_ARG_NAMES = (
+    "input_ids",
+    "attention_mask",
+    "position_ids",
+    "seq_ids",
+    "sampling_params",
+    "prev_hidden",
+    "adapter_ids",
+    "accepted_indices",
+    "current_length",
+    "medusa_mask",
+    "scatter_index",
+    "slot_mapping",
+    "block_table",
+    "num_queries",
+    "computed_context_lens",
+    "tile_q_indices",
+    "tile_block_tables",
+    "tile_masks",
+    "inputs_embeds",
+    "kv_cache",
+    "active_mask",
+)
+_QWEN36_MROPE_VISION_ARG_NAMES = (
+    "rotary_position_ids",
+    "vision_embeddings",
+    "vision_mask",
+)
+_QWEN36_HYBRID_APC_ARG_NAMES = (
+    "hybrid_restore_slot_ids",
+    "hybrid_restore_mask",
+    "hybrid_restore_prefix_lens",
+    "hybrid_commit_slot_ids",
+    "hybrid_commit_mask",
+)
+
+
+def _empty_qwen36_arg():
+    return torch.empty(0)
+
+
+def _qwen36_arg_names(config, tag: str):
+    names = list(_QWEN36_PREFIX_ARG_NAMES + _QWEN36_MROPE_VISION_ARG_NAMES)
+    if _use_expanded_hybrid_args_for_tag(config, tag):
+        names.extend(_QWEN36_HYBRID_APC_ARG_NAMES)
+    return names
+
+
+def _normalize_qwen36_prefix_args(prefix_args):
+    args = list(prefix_args)
+    if len(args) > len(_QWEN36_PREFIX_ARG_NAMES):
+        raise RuntimeError(
+            "Qwen3.6 prefix argument contract mismatch: "
+            f"expected at most {len(_QWEN36_PREFIX_ARG_NAMES)} base tensors, "
+            f"got {len(args)}"
+        )
+    while len(args) < len(_QWEN36_PREFIX_ARG_NAMES):
+        args.append(_empty_qwen36_arg())
+    return args
+
+
+def _normalize_qwen36_hybrid_args(hybrid_args, batch_size):
+    args = list(hybrid_args or ())
+    while len(args) < len(_QWEN36_HYBRID_APC_ARG_NAMES):
+        args.append(torch.zeros((batch_size,), dtype=torch.int32))
+    if len(args) > len(_QWEN36_HYBRID_APC_ARG_NAMES):
+        raise RuntimeError(
+            "Qwen3.6 Hybrid APC argument contract mismatch: "
+            f"expected {len(_QWEN36_HYBRID_APC_ARG_NAMES)} tensors, got {len(args)}"
+        )
+    return args
+
+
+def _build_qwen36_stage_args(
+    config,
+    tag: str,
+    prefix_args,
+    mrope_position_ids,
+    vision_embeddings,
+    vision_mask,
+    hybrid_args=None,
+):
+    args = _normalize_qwen36_prefix_args(prefix_args)
+    args.extend([mrope_position_ids, vision_embeddings, vision_mask])
+    if _use_expanded_hybrid_args_for_tag(config, tag):
+        batch_size = args[0].shape[0]
+        args.extend(_normalize_qwen36_hybrid_args(hybrid_args, batch_size))
+    _assert_qwen36_arg_count(tag, args, _qwen36_expected_arg_count(config, tag))
+    return args
+
+
+def build_cte_args(
+    config,
+    prefix_args,
+    mrope_position_ids,
+    vision_embeddings,
+    vision_mask,
+    hybrid_args=None,
+):
+    return _build_qwen36_stage_args(
+        config,
+        CONTEXT_ENCODING_MODEL_TAG,
+        prefix_args,
+        mrope_position_ids,
+        vision_embeddings,
+        vision_mask,
+        hybrid_args=hybrid_args,
+    )
+
+
+def build_tkg_args(
+    config,
+    prefix_args,
+    mrope_position_ids,
+    vision_embeddings,
+    vision_mask,
+    hybrid_args=None,
+):
+    return _build_qwen36_stage_args(
+        config,
+        TOKEN_GENERATION_MODEL_TAG,
+        prefix_args,
+        mrope_position_ids,
+        vision_embeddings,
+        vision_mask,
+        hybrid_args=hybrid_args,
+    )
+
+
+def _debug_qwen36_arg_contract(stage: str, tag: str, config, args) -> None:
+    if (
+        os.environ.get("QWEN36_ARG_CONTRACT_DEBUG") != "1"
+        and os.environ.get("QWEN36_HYBRID_APC_DEBUG") != "1"
+    ):
+        return
+
+    names = _qwen36_arg_names(config, tag)
+    print(
+        f"[qwen36_arg_contract] stage={stage} tag={tag} argc={len(args)}",
+        flush=True,
+    )
+    for idx, (name, value) in enumerate(zip(names, args)):
+        shape = _debug_tensor_shape(value)
+        dtype = getattr(value, "dtype", None)
+        min_value = "empty"
+        max_value = "empty"
+        if value is not None and hasattr(value, "numel") and value.numel() > 0:
+            try:
+                flat = value.detach().reshape(-1) if hasattr(value, "detach") else value.reshape(-1)
+                min_value = flat.min().item()
+                max_value = flat.max().item()
+            except Exception as exc:
+                min_value = f"error:{type(exc).__name__}"
+                max_value = f"error:{type(exc).__name__}"
+        print(
+            "[qwen36_arg_contract] "
+            f"stage={stage} tag={tag} index={idx} name={name} "
+            f"shape={shape} dtype={dtype} min={min_value} max={max_value}",
+            flush=True,
+        )
+
+
+def _validate_qwen36_tkg_input_ids(input_ids, vocab_size) -> None:
+    if input_ids is None or not hasattr(input_ids, "numel") or input_ids.numel() == 0:
+        raise ValueError("Qwen3.6 TKG input_ids must be a non-empty tensor")
+    if input_ids.dtype not in (torch.int32, torch.int64):
+        raise ValueError(
+            "Qwen3.6 TKG input_ids must be int32 or int64, "
+            f"got {input_ids.dtype}"
+        )
+    min_id = int(input_ids.min().item())
+    max_id = int(input_ids.max().item())
+    if min_id < 0:
+        raise ValueError(f"Qwen3.6 TKG input_ids contains negative token id {min_id}")
+    if vocab_size is not None and max_id >= int(vocab_size):
+        raise ValueError(
+            "Qwen3.6 TKG input_ids contains out-of-vocab token id "
+            f"{max_id}; vocab_size={int(vocab_size)}"
+        )
+
+
 def _debug_logits_stage(stage: str, tensor) -> None:
     if os.environ.get("QWEN36_LOGIT_STAGE_DEBUG") != "1":
         return
@@ -3725,33 +3906,39 @@ class Qwen35ModelWrapper(ModelWrapper):
                 )
                 vision_mask = torch.zeros((0,), dtype=torch.int32)
 
-            padded = list(bucket_inputs)
-            while len(padded) < 21:
-                padded.append(torch.zeros((0,), dtype=torch.int32))
-            padded.append(mrope_position_ids)  # position 21
-            padded.append(vision_embeddings)  # position 22
-            padded.append(vision_mask)  # position 23
+            hybrid_args = None
             if _use_expanded_hybrid_args_for_tag(self.config, self.tag):
-                padded.append(
-                    torch.zeros((batch_size,), dtype=torch.int32)
-                )  # restore slots
-                padded.append(
-                    torch.zeros((batch_size,), dtype=torch.int32)
-                )  # restore mask
-                padded.append(
-                    torch.zeros((batch_size,), dtype=torch.int32)
-                )  # restore prefix
-                padded.append(
-                    torch.zeros((batch_size,), dtype=torch.int32)
-                )  # commit slots
-                padded.append(
-                    torch.zeros((batch_size,), dtype=torch.int32)
-                )  # commit mask
+                hybrid_args = (
+                    torch.zeros((batch_size,), dtype=torch.int32),
+                    torch.zeros((batch_size,), dtype=torch.int32),
+                    torch.zeros((batch_size,), dtype=torch.int32),
+                    torch.zeros((batch_size,), dtype=torch.int32),
+                    torch.zeros((batch_size,), dtype=torch.int32),
+                )
 
-            _assert_qwen36_arg_count(
+            if is_cte:
+                padded = build_cte_args(
+                    self.config,
+                    bucket_inputs,
+                    mrope_position_ids,
+                    vision_embeddings,
+                    vision_mask,
+                    hybrid_args=hybrid_args,
+                )
+            else:
+                padded = build_tkg_args(
+                    self.config,
+                    bucket_inputs,
+                    mrope_position_ids,
+                    vision_embeddings,
+                    vision_mask,
+                    hybrid_args=hybrid_args,
+                )
+            _debug_qwen36_arg_contract(
+                "compile",
                 self.tag,
+                self.config,
                 padded,
-                _qwen36_expected_arg_count(self.config, self.tag),
             )
             extended_inputs.append(tuple(padded))
 
@@ -3903,6 +4090,7 @@ class Qwen35ModelWrapper(ModelWrapper):
             padded_args,
             _qwen36_expected_arg_count(self.config, self.tag),
         )
+        _debug_qwen36_arg_contract("pad", self.tag, self.config, padded_args)
         return padded_args
 
 
@@ -4249,9 +4437,36 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
             return torch.cat([value, pad], dim=0)
 
         if self.neuron_config.is_prefix_caching:
-            computed_context_lens_arg = _length_matrix(computed_context_lens, 0)
-            full_context_lens_arg = _length_matrix(full_context_lens, seq_len)
-            num_queries_arg = (full_context_lens_arg - computed_context_lens_arg).to(torch.int32)
+            if is_prefill:
+                computed_context_lens_arg = _length_matrix(computed_context_lens, 0)
+                full_context_lens_arg = _length_matrix(full_context_lens, seq_len)
+                num_queries_arg = (
+                    full_context_lens_arg - computed_context_lens_arg
+                ).to(torch.int32)
+            else:
+                if seq_len != 1:
+                    raise ValueError(
+                        "Qwen3.6 TKG expects active decode length 1, "
+                        f"got input_ids.shape[-1]={seq_len}"
+                    )
+                num_queries_arg = torch.full(
+                    (batch_size, 1), seq_len, dtype=torch.int32
+                )
+                if (
+                    position_ids is not None
+                    and hasattr(position_ids, "numel")
+                    and position_ids.numel() > 0
+                ):
+                    computed_context_lens_arg = _length_matrix(position_ids, 0)
+                elif full_context_lens is not None:
+                    computed_context_lens_arg = _length_matrix(
+                        full_context_lens, seq_len
+                    )
+                else:
+                    computed_context_lens_arg = _length_matrix(
+                        computed_context_lens,
+                        attention_mask.shape[-1] if attention_mask is not None else 0,
+                    )
             slot_mapping_arg = _optional_tensor(slot_mapping)
             block_table_arg = _optional_tensor(block_table)
         else:
@@ -4449,7 +4664,7 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
                         flush=True,
                     )
 
-                cte_args = [
+                cte_prefix_args = [
                     chunk_input_ids,
                     chunk_attn_mask,
                     chunk_pos_ids,
@@ -4471,28 +4686,26 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
                     _empty(),
                     _empty(),
                     _empty(),
+                ]
+                cte_args = build_cte_args(
+                    self.config,
+                    cte_prefix_args,
                     chunk_mrope,
                     chunk_vis_emb,
                     chunk_vis_mask,
-                ]
-                if _use_expanded_hybrid_args_for_tag(
-                    self.config, CONTEXT_ENCODING_MODEL_TAG
-                ):
-                    cte_args.extend(
-                        [
-                            chunk_restore_slots,
-                            chunk_restore_mask,
-                            chunk_restore_prefix,
-                            chunk_commit_slots,
-                            chunk_commit_mask,
-                        ]
-                    )
-                _assert_qwen36_arg_count(
-                    CONTEXT_ENCODING_MODEL_TAG,
-                    cte_args,
-                    _qwen36_expected_arg_count(
-                        self.config, CONTEXT_ENCODING_MODEL_TAG
+                    hybrid_args=(
+                        chunk_restore_slots,
+                        chunk_restore_mask,
+                        chunk_restore_prefix,
+                        chunk_commit_slots,
+                        chunk_commit_mask,
                     ),
+                )
+                _debug_qwen36_arg_contract(
+                    "runtime",
+                    CONTEXT_ENCODING_MODEL_TAG,
+                    self.config,
+                    cte_args,
                 )
                 chunk_out = self.context_encoding_model(*cte_args)
                 if actual_chunk < ctx_bs:
@@ -4509,6 +4722,10 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
             if hybrid_apc_request_dict is not None:
                 finish_hybrid_apc_request(hybrid_apc_request_dict)
         else:
+            _validate_qwen36_tkg_input_ids(
+                input_ids,
+                getattr(self.config, "vocab_size", None),
+            )
             legacy_tkg_args = _use_legacy_tkg_args()
             if (
                 os.environ.get("QWEN36_TKG_INPUT_DEBUG") == "1"
@@ -4539,7 +4756,7 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
                     f"seq_len={seq_len} max_model_len={max_model_len}",
                     flush=True,
                 )
-            tkg_args = [
+            tkg_prefix_args = [
                 input_ids,
                 attention_mask,
                 position_ids,
@@ -4561,26 +4778,26 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
                 _empty(),
                 _empty(),
                 _empty(),
+            ]
+            tkg_args = build_tkg_args(
+                self.config,
+                tkg_prefix_args,
                 mrope_position_ids,
                 vision_embeddings,
                 vision_mask,
-            ]
-            if _use_expanded_hybrid_args_for_tag(
-                self.config, TOKEN_GENERATION_MODEL_TAG
-            ):
-                tkg_args.extend(
-                    [
-                        hybrid_restore_slot_ids,
-                        hybrid_restore_mask,
-                        hybrid_restore_prefix_lens,
-                        hybrid_commit_slot_ids,
-                        hybrid_commit_mask,
-                    ]
-                )
-            _assert_qwen36_arg_count(
+                hybrid_args=(
+                    hybrid_restore_slot_ids,
+                    hybrid_restore_mask,
+                    hybrid_restore_prefix_lens,
+                    hybrid_commit_slot_ids,
+                    hybrid_commit_mask,
+                ),
+            )
+            _debug_qwen36_arg_contract(
+                "runtime",
                 TOKEN_GENERATION_MODEL_TAG,
+                self.config,
                 tkg_args,
-                _qwen36_expected_arg_count(self.config, TOKEN_GENERATION_MODEL_TAG),
             )
             outputs = self.token_generation_model(*tkg_args)
             is_run_on_neuron = self.token_generation_model.is_neuron()

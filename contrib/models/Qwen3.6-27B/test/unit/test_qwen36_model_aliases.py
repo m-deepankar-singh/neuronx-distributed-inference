@@ -366,6 +366,50 @@ class TestQwen36ModelAliases(unittest.TestCase):
         self.assertEqual(generated[14].shape, (1, 1))
         self.assertEqual(generated[24].shape, (1,))
 
+    def test_tkg_token_guard_rejects_out_of_vocab_id(self):
+        with self.assertRaisesRegex(ValueError, "out-of-vocab token id"):
+            self.qwen_module._validate_qwen36_tkg_input_ids(
+                torch.tensor([[2143289344]], dtype=torch.int32),
+                248320,
+            )
+
+    def test_tkg_token_guard_accepts_valid_vocab_id(self):
+        self.qwen_module._validate_qwen36_tkg_input_ids(
+            torch.tensor([[42]], dtype=torch.int32),
+            248320,
+        )
+
+    def test_stage_builders_keep_cte_and_tkg_contracts_explicit(self):
+        wrapper = _make_wrapper(
+            self.qwen_module,
+            tag=self.qwen_module.TOKEN_GENERATION_MODEL_TAG,
+        )
+        prefix_args = wrapper._base_inputs[0]
+        mrope = torch.zeros((0,), dtype=torch.int32)
+        vision_embeddings = torch.zeros((0,), dtype=torch.bfloat16)
+        vision_mask = torch.zeros((0,), dtype=torch.int32)
+
+        with patch.dict(os.environ, {"QWEN36_TKG_LEGACY_ARGS": "1"}, clear=True):
+            cte_args = self.qwen_module.build_cte_args(
+                wrapper.config,
+                prefix_args,
+                mrope,
+                vision_embeddings,
+                vision_mask,
+            )
+            tkg_args = self.qwen_module.build_tkg_args(
+                wrapper.config,
+                prefix_args,
+                mrope,
+                vision_embeddings,
+                vision_mask,
+            )
+
+        self.assertEqual(len(cte_args), 24)
+        self.assertEqual(len(tkg_args), 24)
+        self.assertEqual(cte_args[13].shape, (1, 1))
+        self.assertEqual(tkg_args[13].shape, (1, 1))
+
 
 if __name__ == "__main__":
     unittest.main()
