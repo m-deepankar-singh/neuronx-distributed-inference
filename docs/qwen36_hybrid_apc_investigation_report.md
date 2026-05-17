@@ -255,6 +255,19 @@ Legacy TKG arg experiment:
       independent explicit arg contracts; legacy TKG mode must not make the
       CTE trace/runtime disagree.
 
+Follow-up ABI patch:
+
+- Local patch after `5396ef3` makes the Qwen wrapper choose argument contracts
+  by model tag instead of active-token length.
+- With `QWEN36_TKG_LEGACY_ARGS=1`:
+  - CTE trace/runtime keeps the expanded 29-tensor Hybrid APC contract.
+  - TKG trace/runtime uses the older 24-tensor prefixless contract.
+  - Hard arg-count checks fail early if compile/runtime drift again.
+- Local verification:
+  - `python3 -m py_compile contrib/models/Qwen3.6-27B/src/modeling_qwen35.py contrib/models/Qwen3.6-27B/test/integration/qwen36_27b_compile_fp8.py validation_scripts/qwen36_hybrid_apc_validation.py`
+  - `python3 -m pytest contrib/models/Qwen3.6-27B/test/unit/test_qwen36_model_aliases.py contrib/models/Qwen3.6-27B/test/unit/test_qwen36_compile_fp8_config.py contrib/models/Qwen3.6-27B/test/unit/test_hybrid_apc_validation.py`
+  - Result: `16 passed`.
+
 ## External Reference
 
 AWS Neuron documentation and the existing NxDI `inference_demo.py` both use

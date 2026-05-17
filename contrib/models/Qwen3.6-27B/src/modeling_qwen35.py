@@ -2764,6 +2764,33 @@ def _use_legacy_tkg_args() -> bool:
     return os.environ.get("QWEN36_TKG_LEGACY_ARGS") == "1"
 
 
+def _use_expanded_hybrid_args_for_tag(config, tag: str) -> bool:
+    if not getattr(config, "use_hybrid_apc_manager", False):
+        return False
+    if tag == CONTEXT_ENCODING_MODEL_TAG:
+        return True
+    if tag == TOKEN_GENERATION_MODEL_TAG:
+        return not _use_legacy_tkg_args()
+    return False
+
+
+def _use_legacy_tkg_prefixless_args_for_tag(tag: str) -> bool:
+    return tag == TOKEN_GENERATION_MODEL_TAG and _use_legacy_tkg_args()
+
+
+def _qwen36_expected_arg_count(config, tag: str) -> int:
+    return 29 if _use_expanded_hybrid_args_for_tag(config, tag) else 24
+
+
+def _assert_qwen36_arg_count(stage: str, args, expected: int) -> None:
+    actual = len(args)
+    if actual != expected:
+        raise RuntimeError(
+            f"Qwen3.6 {stage} argument contract mismatch: "
+            f"expected {expected} tensors, got {actual}"
+        )
+
+
 def _debug_logits_stage(stage: str, tensor) -> None:
     if os.environ.get("QWEN36_LOGIT_STAGE_DEBUG") != "1":
         return
@@ -3664,7 +3691,7 @@ class Qwen35ModelWrapper(ModelWrapper):
             batch_size = input_ids.shape[0]
             n_active_tokens = input_ids.shape[1]
 
-            is_cte = n_active_tokens > 1
+            is_cte = self.tag == CONTEXT_ENCODING_MODEL_TAG
 
             if is_cte:
                 mrope_position_ids = (
@@ -3698,12 +3725,17 @@ class Qwen35ModelWrapper(ModelWrapper):
                 vision_mask = torch.zeros((0,), dtype=torch.int32)
 
             padded = list(bucket_inputs)
+            if _use_legacy_tkg_prefixless_args_for_tag(self.tag):
+                while len(padded) < 15:
+                    padded.append(torch.zeros((0,), dtype=torch.int32))
+                for idx in range(11, 15):
+                    padded[idx] = torch.zeros((0,), dtype=torch.int32)
             while len(padded) < 21:
                 padded.append(torch.zeros((0,), dtype=torch.int32))
             padded.append(mrope_position_ids)  # position 21
             padded.append(vision_embeddings)  # position 22
             padded.append(vision_mask)  # position 23
-            if is_cte or not _use_legacy_tkg_args():
+            if _use_expanded_hybrid_args_for_tag(self.config, self.tag):
                 padded.append(
                     torch.zeros((batch_size,), dtype=torch.int32)
                 )  # restore slots
@@ -3720,6 +3752,11 @@ class Qwen35ModelWrapper(ModelWrapper):
                     torch.zeros((batch_size,), dtype=torch.int32)
                 )  # commit mask
 
+            _assert_qwen36_arg_count(
+                self.tag,
+                padded,
+                _qwen36_expected_arg_count(self.config, self.tag),
+            )
             extended_inputs.append(tuple(padded))
 
         return extended_inputs
@@ -3740,7 +3777,7 @@ class Qwen35ModelWrapper(ModelWrapper):
         if len(padded_args) >= 24 and orig_mrope is not None:
             padded_seq_len = padded_args[0].shape[1]
             batch_size = padded_args[0].shape[0]
-            is_cte = padded_seq_len > 1
+            is_cte = self.tag == CONTEXT_ENCODING_MODEL_TAG
 
             if is_cte:
                 current_mrope = orig_mrope
@@ -3835,7 +3872,7 @@ class Qwen35ModelWrapper(ModelWrapper):
 
         if (
             len(padded_args) >= 24
-            and not (_use_legacy_tkg_args() and padded_args[0].shape[1] == 1)
+            and _use_expanded_hybrid_args_for_tag(self.config, self.tag)
         ):
             padded_batch_size = padded_args[0].shape[0]
 
@@ -3865,6 +3902,11 @@ class Qwen35ModelWrapper(ModelWrapper):
             else:
                 padded_args = (*padded_args, *hybrid_args)
 
+        _assert_qwen36_arg_count(
+            self.tag,
+            padded_args,
+            _qwen36_expected_arg_count(self.config, self.tag),
+        )
         return padded_args
 
 
@@ -4411,7 +4453,7 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
                         flush=True,
                     )
 
-                chunk_out = self.context_encoding_model(
+                cte_args = [
                     chunk_input_ids,
                     chunk_attn_mask,
                     chunk_pos_ids,
@@ -4436,12 +4478,27 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
                     chunk_mrope,
                     chunk_vis_emb,
                     chunk_vis_mask,
-                    chunk_restore_slots,
-                    chunk_restore_mask,
-                    chunk_restore_prefix,
-                    chunk_commit_slots,
-                    chunk_commit_mask,
+                ]
+                if _use_expanded_hybrid_args_for_tag(
+                    self.config, CONTEXT_ENCODING_MODEL_TAG
+                ):
+                    cte_args.extend(
+                        [
+                            chunk_restore_slots,
+                            chunk_restore_mask,
+                            chunk_restore_prefix,
+                            chunk_commit_slots,
+                            chunk_commit_mask,
+                        ]
+                    )
+                _assert_qwen36_arg_count(
+                    CONTEXT_ENCODING_MODEL_TAG,
+                    cte_args,
+                    _qwen36_expected_arg_count(
+                        self.config, CONTEXT_ENCODING_MODEL_TAG
+                    ),
                 )
+                chunk_out = self.context_encoding_model(*cte_args)
                 if actual_chunk < ctx_bs:
                     chunk_out = chunk_out[:actual_chunk]
                 output_logits.append(chunk_out)
@@ -4487,7 +4544,7 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
                     flush=True,
                 )
             if legacy_tkg_args:
-                outputs = self.token_generation_model(
+                tkg_args = [
                     input_ids,
                     attention_mask,
                     position_ids,
@@ -4499,9 +4556,9 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
                     mrope_position_ids,
                     vision_embeddings,
                     vision_mask,
-                )
+                ]
             else:
-                outputs = self.token_generation_model(
+                tkg_args = [
                     input_ids,
                     attention_mask,
                     position_ids,
@@ -4526,12 +4583,25 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
                     mrope_position_ids,
                     vision_embeddings,
                     vision_mask,
-                    hybrid_restore_slot_ids,
-                    hybrid_restore_mask,
-                    hybrid_restore_prefix_lens,
-                    hybrid_commit_slot_ids,
-                    hybrid_commit_mask,
-                )
+                ]
+                if _use_expanded_hybrid_args_for_tag(
+                    self.config, TOKEN_GENERATION_MODEL_TAG
+                ):
+                    tkg_args.extend(
+                        [
+                            hybrid_restore_slot_ids,
+                            hybrid_restore_mask,
+                            hybrid_restore_prefix_lens,
+                            hybrid_commit_slot_ids,
+                            hybrid_commit_mask,
+                        ]
+                    )
+            _assert_qwen36_arg_count(
+                TOKEN_GENERATION_MODEL_TAG,
+                tkg_args,
+                _qwen36_expected_arg_count(self.config, TOKEN_GENERATION_MODEL_TAG),
+            )
+            outputs = self.token_generation_model(*tkg_args)
             is_run_on_neuron = self.token_generation_model.is_neuron()
 
         return outputs, is_run_on_neuron

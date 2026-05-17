@@ -51,7 +51,12 @@ class _FakeDecoderModelInstance:
 
 
 class _FakeModelWrapper:
-    pass
+    def input_generator(self):
+        return self._base_inputs
+
+    def pad_inputs(self, *args, pad_type="first_fit"):
+        del pad_type
+        return args
 
 
 def _fake_modules():
@@ -219,6 +224,37 @@ def _make_instance(qwen_module, *, output_logits, on_device_sampling_config=None
     return instance, (kv0, kv1, state, checkpoint)
 
 
+def _make_wrapper(qwen_module, *, tag, use_hybrid_apc_manager=True):
+    wrapper = qwen_module.Qwen35ModelWrapper.__new__(qwen_module.Qwen35ModelWrapper)
+    wrapper.tag = tag
+    wrapper.config = SimpleNamespace(
+        hidden_size=8,
+        neuron_config=SimpleNamespace(torch_dtype=torch.bfloat16),
+        use_text_only_cte_inputs=True,
+        use_hybrid_apc_manager=use_hybrid_apc_manager,
+    )
+    wrapper._base_inputs = [
+        (
+            torch.ones((1, 1), dtype=torch.int32),  # input_ids
+            torch.ones((1, 1), dtype=torch.int32),  # attention_mask
+            torch.ones((1, 1), dtype=torch.int32),  # position_ids
+            torch.zeros((1,), dtype=torch.int32),  # seq_ids
+            torch.ones((1, 3), dtype=torch.float32),  # sampling_params
+            torch.empty(0),
+            torch.zeros((1,), dtype=torch.int32),  # adapter_ids
+            torch.empty(0),
+            torch.empty(0),
+            torch.empty(0),
+            torch.empty(0),
+            torch.zeros((1, 1), dtype=torch.int32),  # slot_mapping
+            torch.zeros((1, 1), dtype=torch.int32),  # block_table
+            torch.ones((1, 1), dtype=torch.int32),  # num_queries
+            torch.zeros((1, 1), dtype=torch.int32),  # computed_context_lens
+        )
+    ]
+    return wrapper
+
+
 class TestQwen36ModelAliases(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -285,6 +321,47 @@ class TestQwen36ModelAliases(unittest.TestCase):
             self.assertFalse(self.qwen_module._use_legacy_tkg_args())
         with patch.dict(os.environ, {"QWEN36_TKG_LEGACY_ARGS": "1"}, clear=True):
             self.assertTrue(self.qwen_module._use_legacy_tkg_args())
+
+    def test_legacy_tkg_does_not_disable_expanded_cte_trace_args(self):
+        wrapper = _make_wrapper(
+            self.qwen_module,
+            tag=self.qwen_module.CONTEXT_ENCODING_MODEL_TAG,
+        )
+
+        with patch.dict(os.environ, {"QWEN36_TKG_LEGACY_ARGS": "1"}, clear=True):
+            generated = wrapper.input_generator()[0]
+
+        self.assertEqual(len(generated), 29)
+        self.assertEqual(generated[11].shape, (1, 1))
+        self.assertEqual(generated[24].shape, (1,))
+        self.assertEqual(generated[28].shape, (1,))
+
+    def test_legacy_tkg_trace_args_blank_prefix_metadata(self):
+        wrapper = _make_wrapper(
+            self.qwen_module,
+            tag=self.qwen_module.TOKEN_GENERATION_MODEL_TAG,
+        )
+
+        with patch.dict(os.environ, {"QWEN36_TKG_LEGACY_ARGS": "1"}, clear=True):
+            generated = wrapper.input_generator()[0]
+
+        self.assertEqual(len(generated), 24)
+        for idx in range(11, 15):
+            self.assertEqual(generated[idx].numel(), 0)
+
+    def test_nonlegacy_tkg_trace_args_keep_prefix_and_hybrid_metadata(self):
+        wrapper = _make_wrapper(
+            self.qwen_module,
+            tag=self.qwen_module.TOKEN_GENERATION_MODEL_TAG,
+        )
+
+        with patch.dict(os.environ, {}, clear=True):
+            generated = wrapper.input_generator()[0]
+
+        self.assertEqual(len(generated), 29)
+        self.assertEqual(generated[11].shape, (1, 1))
+        self.assertEqual(generated[14].shape, (1, 1))
+        self.assertEqual(generated[24].shape, (1,))
 
 
 if __name__ == "__main__":
