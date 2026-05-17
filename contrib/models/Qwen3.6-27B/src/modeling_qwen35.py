@@ -2760,6 +2760,10 @@ def _debug_tensor_shape(tensor):
     return tuple(tensor.shape)
 
 
+def _use_legacy_tkg_args() -> bool:
+    return os.environ.get("QWEN36_TKG_LEGACY_ARGS") == "1"
+
+
 def _debug_logits_stage(stage: str, tensor) -> None:
     if os.environ.get("QWEN36_LOGIT_STAGE_DEBUG") != "1":
         return
@@ -3179,7 +3183,9 @@ class NeuronQwen35Model(NeuronBaseModel):
                 )
             )
 
+        _debug_logits_stage("before_final_norm", hidden_states)
         hidden_states = self.norm(hidden_states)
+        _debug_logits_stage("after_final_norm_full", hidden_states)
 
         self._deltanet_updated_states = deltanet_state_tensors
 
@@ -3300,7 +3306,10 @@ class NeuronQwen35Model(NeuronBaseModel):
                 hidden_states = torch.gather(hidden_states, dim=1, index=index)
 
         _debug_logits_stage("after_final_norm", hidden_states)
+        _debug_logits_stage("selected_hidden_before_lm_head", hidden_states)
+        _debug_logits_stage("lm_head_weight", getattr(self.lm_head, "weight", None))
         logits = self.lm_head(hidden_states)
+        _debug_logits_stage("after_lm_head_pre_float", logits)
         logits = logits.float()
         _debug_logits_stage("after_lm_head", logits)
 
@@ -3694,11 +3703,22 @@ class Qwen35ModelWrapper(ModelWrapper):
             padded.append(mrope_position_ids)  # position 21
             padded.append(vision_embeddings)  # position 22
             padded.append(vision_mask)  # position 23
-            padded.append(torch.zeros((batch_size,), dtype=torch.int32))  # restore slots
-            padded.append(torch.zeros((batch_size,), dtype=torch.int32))  # restore mask
-            padded.append(torch.zeros((batch_size,), dtype=torch.int32))  # restore prefix
-            padded.append(torch.zeros((batch_size,), dtype=torch.int32))  # commit slots
-            padded.append(torch.zeros((batch_size,), dtype=torch.int32))  # commit mask
+            if is_cte or not _use_legacy_tkg_args():
+                padded.append(
+                    torch.zeros((batch_size,), dtype=torch.int32)
+                )  # restore slots
+                padded.append(
+                    torch.zeros((batch_size,), dtype=torch.int32)
+                )  # restore mask
+                padded.append(
+                    torch.zeros((batch_size,), dtype=torch.int32)
+                )  # restore prefix
+                padded.append(
+                    torch.zeros((batch_size,), dtype=torch.int32)
+                )  # commit slots
+                padded.append(
+                    torch.zeros((batch_size,), dtype=torch.int32)
+                )  # commit mask
 
             extended_inputs.append(tuple(padded))
 
@@ -3813,7 +3833,10 @@ class Qwen35ModelWrapper(ModelWrapper):
                     padded_args[23] = padded_args[23].clamp(max=padded_seq_len - 1)
                     padded_args = tuple(padded_args)
 
-        if len(padded_args) >= 24:
+        if (
+            len(padded_args) >= 24
+            and not (_use_legacy_tkg_args() and padded_args[0].shape[1] == 1)
+        ):
             padded_batch_size = padded_args[0].shape[0]
 
             def _pad_vector(value, dtype=torch.int32):
@@ -4433,6 +4456,7 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
             if hybrid_apc_request_dict is not None:
                 finish_hybrid_apc_request(hybrid_apc_request_dict)
         else:
+            legacy_tkg_args = _use_legacy_tkg_args()
             if (
                 os.environ.get("QWEN36_TKG_INPUT_DEBUG") == "1"
                 or os.environ.get("QWEN36_HYBRID_APC_DEBUG") == "1"
@@ -4444,6 +4468,7 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
                 )
                 print(
                     "[hybrid_apc_debug] qwen-tkg-call "
+                    f"arg_mode={'legacy' if legacy_tkg_args else 'hybrid'} "
                     f"input_shape={_debug_tensor_shape(input_ids)} "
                     f"input_values={_debug_tensor_values(input_ids)} "
                     f"attention_shape={_debug_tensor_shape(attention_mask)} "
@@ -4461,37 +4486,52 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
                     f"seq_len={seq_len} max_model_len={max_model_len}",
                     flush=True,
                 )
-            outputs = self.token_generation_model(
-                input_ids,
-                attention_mask,
-                position_ids,
-                seq_ids,
-                sampling_params,
-                prev_hidden,
-                adapter_ids,
-                _empty(),
-                _empty(),
-                _empty(),
-                _empty(),
-                slot_mapping_arg,
-                block_table_arg,
-                num_queries_arg,
-                computed_context_lens_arg,
-                _empty(),
-                _empty(),
-                _empty(),
-                _empty(),
-                _empty(),
-                _empty(),
-                mrope_position_ids,
-                vision_embeddings,
-                vision_mask,
-                hybrid_restore_slot_ids,
-                hybrid_restore_mask,
-                hybrid_restore_prefix_lens,
-                hybrid_commit_slot_ids,
-                hybrid_commit_mask,
-            )
+            if legacy_tkg_args:
+                outputs = self.token_generation_model(
+                    input_ids,
+                    attention_mask,
+                    position_ids,
+                    seq_ids,
+                    sampling_params,
+                    prev_hidden,
+                    adapter_ids,
+                    *[_empty() for _ in range(14)],
+                    mrope_position_ids,
+                    vision_embeddings,
+                    vision_mask,
+                )
+            else:
+                outputs = self.token_generation_model(
+                    input_ids,
+                    attention_mask,
+                    position_ids,
+                    seq_ids,
+                    sampling_params,
+                    prev_hidden,
+                    adapter_ids,
+                    _empty(),
+                    _empty(),
+                    _empty(),
+                    _empty(),
+                    slot_mapping_arg,
+                    block_table_arg,
+                    num_queries_arg,
+                    computed_context_lens_arg,
+                    _empty(),
+                    _empty(),
+                    _empty(),
+                    _empty(),
+                    _empty(),
+                    _empty(),
+                    mrope_position_ids,
+                    vision_embeddings,
+                    vision_mask,
+                    hybrid_restore_slot_ids,
+                    hybrid_restore_mask,
+                    hybrid_restore_prefix_lens,
+                    hybrid_commit_slot_ids,
+                    hybrid_commit_mask,
+                )
             is_run_on_neuron = self.token_generation_model.is_neuron()
 
         return outputs, is_run_on_neuron

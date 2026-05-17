@@ -33,7 +33,11 @@ Added repo-side checks for the next debugging pass:
 
 - `QWEN36_LOGIT_STAGE_DEBUG=1` now prints finite/NaN/Inf summaries in
   `modeling_qwen35.py` at:
+  - before final norm;
   - after final norm / final hidden selection;
+  - selected hidden state before `lm_head`;
+  - `lm_head.weight`;
+  - raw `lm_head` output before float cast;
   - after `lm_head`;
   - after `mask_padded_logits`;
   - before logits are returned.
@@ -47,6 +51,11 @@ Added repo-side checks for the next debugging pass:
   but compiling with `quantized=False`.
 - The validation harness supports `--skip-fp8-env` so BF16 artifacts can run
   without `XLA_HANDLE_SPECIAL_SCALAR` / `UNSAFE_FP8FNCAST`.
+- `QWEN36_TKG_LEGACY_ARGS=1` is an experimental compile-time and runtime mode
+  for testing the older token-generation argument contract: CTE keeps the
+  current Hybrid APC expanded args, while TKG uses the older 24-argument
+  mRoPE/vision layout and does not pass prefix-cache or Hybrid APC
+  restore/commit tensors into decode.
 
 Minimal BF16 host-logits control to run on Trainium:
 
@@ -86,6 +95,33 @@ PA null-block sweep to run only at 2K:
 
 # user-intended 10 -> compile physical 11
 --pa-num-blocks 10
+```
+
+Legacy TKG contract experiment:
+
+```bash
+QWEN36_TKG_LEGACY_ARGS=1 \
+python3 contrib/models/Qwen3.6-27B/test/integration/qwen36_27b_compile_fp8.py \
+  --model-path "$MODEL_PATH" \
+  --compiled-path /dev/shm/qwen36_27b_2048_fp8_hybrid_apc_ondevice_legacy_tkg \
+  --quantized-checkpoints-path /dev/shm/qwen36_27b_2048_fp8_mlp_only_ckpt \
+  --seq-len 2048 \
+  --cte-buckets 256,512 \
+  --enable-prefix-caching \
+  --enable-hybrid-apc \
+  --pa-num-blocks 8 \
+  --load-after-compile
+
+QWEN36_TKG_LEGACY_ARGS=1 \
+QWEN36_TKG_INPUT_DEBUG=1 \
+python3 validation_scripts/qwen36_hybrid_apc_validation.py exactness \
+  --model-path "$MODEL_PATH" \
+  --compiled-artifacts /dev/shm/qwen36_27b_2048_fp8_hybrid_apc_ondevice_legacy_tkg \
+  --max-model-len 2048 \
+  --seq-len 2048 \
+  --cte-buckets 256,512 \
+  --enable-vllm-chunked-prefill \
+  --require-real-tokens
 ```
 
 ## Older APC PR Branch Comparison

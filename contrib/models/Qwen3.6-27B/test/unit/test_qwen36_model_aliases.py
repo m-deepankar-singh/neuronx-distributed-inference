@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import importlib.util
+import os
 import sys
 import types
 import unittest
@@ -278,6 +279,12 @@ class TestQwen36ModelAliases(unittest.TestCase):
             ),
             128,
         )
+
+    def test_legacy_tkg_args_are_env_gated(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertFalse(self.qwen_module._use_legacy_tkg_args())
+        with patch.dict(os.environ, {"QWEN36_TKG_LEGACY_ARGS": "1"}, clear=True):
+            self.assertTrue(self.qwen_module._use_legacy_tkg_args())
 
 
 if __name__ == "__main__":
