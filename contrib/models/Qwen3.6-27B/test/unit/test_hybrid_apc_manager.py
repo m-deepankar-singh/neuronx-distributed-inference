@@ -614,6 +614,32 @@ class TestHybridAPCSchedulerBridge(unittest.TestCase):
         self.assertEqual(allocator.free_slots, (1, 0))
         self.assertEqual(len(store), 0)
 
+    def test_bridge_does_not_commit_mid_prompt_checkpoint_boundary(self):
+        store = _store()
+        allocator = HybridAPCSlotAllocator(num_slots=2)
+        input_ids = torch.arange(192, dtype=torch.int32).unsqueeze(0)
+        hashes = build_cumulative_prefix_hashes(input_ids[:, :128], block_size=128)
+        bridge = HybridAPCSchedulerBridge(
+            store=store,
+            slot_allocator=allocator,
+            cache_salt="tenant-a",
+            model_revision="rev-a",
+        )
+
+        prepared = bridge.prepare_request(
+            request_id="req-mid-boundary",
+            input_dict={"input_ids": input_ids},
+            attention_hit_len=0,
+            cumulative_hashes_by_prefix_len=hashes,
+        )
+
+        self.assertEqual(prepared.commit_prefix_len, 128)
+        self.assertIsNone(prepared.commit_slot)
+        self.assertEqual(prepared.input_dict["hybrid_commit_mask"].item(), 0)
+        self.assertEqual(allocator.reserved_slots, ())
+        self.assertEqual(allocator.free_slots, (0, 1))
+        self.assertIsNone(bridge.commit_prefill(prepared))
+
     def test_bridge_can_require_scheduler_prefix_hashes(self):
         bridge = HybridAPCSchedulerBridge(
             store=_store(),

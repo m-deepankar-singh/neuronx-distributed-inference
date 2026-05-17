@@ -609,7 +609,13 @@ class HybridAPCSchedulerBridge:
         commit_key = None
         commit_slot = None
         attention_block_refs: tuple[int, ...] = ()
-        if commit_prefix_len > 0:
+        # The Neuron checkpoint bank can only commit the active GDN state at
+        # the end of this traced prefill call. Do not label that state as an
+        # earlier checkpoint boundary unless the current prefill ends exactly
+        # at that boundary; scheduler-level chunking must create those boundary
+        # calls.
+        can_commit_boundary = commit_prefix_len > 0 and commit_prefix_len == prompt_len
+        if can_commit_boundary:
             if commit_prefix_len not in cumulative_hashes_by_prefix_len:
                 raise ValueError(
                     f"missing cumulative prefix hash for commit boundary {commit_prefix_len}"
