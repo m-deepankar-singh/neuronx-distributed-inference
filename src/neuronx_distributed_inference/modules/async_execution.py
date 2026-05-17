@@ -194,6 +194,7 @@ def prepare_hybrid_apc_request_for_execution(
         input_dict.get("prompt_input_ids"),
     )
     bridge_input_dict = input_dict
+    prepared = None
     if full_input_ids is not None:
         if not _single_batch_tensor(full_input_ids):
             if requires_external_metadata:
@@ -225,13 +226,26 @@ def prepare_hybrid_apc_request_for_execution(
             # The live prefix-caching request has already been sliced to the
             # attention suffix. Without full prompt tokens the bridge cannot
             # compute or apply an exact GDN checkpoint boundary.
-            if requires_external_metadata:
-                raise ValueError(
-                    "hybrid APC production mode received suffix-only input "
-                    "without hybrid_full_input_ids/full_input_ids; request prep "
-                    "must attach full prompt tokens before suffix slicing"
+            prepare_suffix_only = getattr(
+                bridge,
+                "prepare_suffix_only_request",
+                None,
+            )
+            if prepare_suffix_only is not None:
+                prepared = prepare_suffix_only(
+                    request_id=request_id,
+                    input_dict=input_dict,
+                    attention_hit_len=_to_python_int(attention_hit_len),
+                    request_prefix_len=request_prefix_len,
                 )
-            return input_dict
+            if prepared is None:
+                if requires_external_metadata:
+                    raise ValueError(
+                        "hybrid APC production mode received suffix-only input "
+                        "without hybrid_full_input_ids/full_input_ids; request prep "
+                        "must attach full prompt tokens before suffix slicing"
+                    )
+                return input_dict
     if not _single_batch_tensor(bridge_input_dict.get("input_ids")):
         if requires_external_metadata:
             raise ValueError(
@@ -240,18 +254,19 @@ def prepare_hybrid_apc_request_for_execution(
             )
         return input_dict
 
-    prepared = bridge.prepare_request(
-        request_id=request_id,
-        input_dict=bridge_input_dict,
-        attention_hit_len=_to_python_int(attention_hit_len),
-        request_prefix_len=request_prefix_len,
-        cumulative_hashes_by_prefix_len=cumulative_hashes_by_prefix_len,
-        attention_block_refs_by_prefix_len=_first_present(
-            input_dict.get("attention_block_refs"),
-            input_dict.get("attention_block_refs_by_prefix_len"),
-            input_dict.get("hybrid_attention_block_refs_by_prefix_len"),
-        ),
-    )
+    if prepared is None:
+        prepared = bridge.prepare_request(
+            request_id=request_id,
+            input_dict=bridge_input_dict,
+            attention_hit_len=_to_python_int(attention_hit_len),
+            request_prefix_len=request_prefix_len,
+            cumulative_hashes_by_prefix_len=cumulative_hashes_by_prefix_len,
+            attention_block_refs_by_prefix_len=_first_present(
+                input_dict.get("attention_block_refs"),
+                input_dict.get("attention_block_refs_by_prefix_len"),
+                input_dict.get("hybrid_attention_block_refs_by_prefix_len"),
+            ),
+        )
     input_dict["_hybrid_apc_bridge"] = bridge
     input_dict["_hybrid_apc_prepared"] = prepared
     _apply_hybrid_gdn_debug_switches(prepared.input_dict)

@@ -528,6 +528,83 @@ def apply_hybrid_apc_prefill_plan(
     return output
 
 
+def apply_hybrid_apc_suffix_prefill_plan(
+    input_dict: dict[str, torch.Tensor],
+    *,
+    plan: HybridAPCHitPlan,
+    request_prefix_len: int,
+) -> dict[str, torch.Tensor]:
+    """Materialize Hybrid APC controls when vLLM already sliced to suffix.
+
+    This diagnostic path is used only when the caller explicitly allows an
+    unhashed single-checkpoint restore. The input tokens are already the active
+    suffix, so this helper must not slice token tensors by ``restore_len``.
+    """
+
+    if "input_ids" not in input_dict:
+        raise KeyError("input_ids is required to apply a hybrid APC suffix plan")
+
+    input_ids = input_dict["input_ids"]
+    if input_ids.ndim != 2:
+        raise ValueError(f"input_ids must be [batch, seq], got {tuple(input_ids.shape)}")
+
+    batch_size, suffix_len = input_ids.shape
+    prompt_len = int(request_prefix_len)
+    restore_len = int(plan.restore_checkpoint_prefix_len)
+    expected_suffix_len = prompt_len - restore_len
+    if plan.checkpoint_slot is None or restore_len <= 0:
+        raise ValueError("suffix-only Hybrid APC restore requires a checkpoint slot")
+    if expected_suffix_len != suffix_len:
+        raise ValueError(
+            "suffix-only Hybrid APC input length mismatch: "
+            f"expected {expected_suffix_len}, got {suffix_len}"
+        )
+
+    output = dict(input_dict)
+    device = input_ids.device
+    output["input_ids"] = input_ids
+
+    position_template = input_dict.get("position_ids")
+    position_dtype = (
+        position_template.dtype
+        if isinstance(position_template, torch.Tensor)
+        else torch.int64
+    )
+    position_ids = torch.arange(
+        restore_len,
+        prompt_len,
+        dtype=position_dtype,
+        device=device,
+    ).unsqueeze(0)
+    output["position_ids"] = position_ids.expand(batch_size, suffix_len).contiguous()
+
+    def _batch_i32(value: int) -> torch.Tensor:
+        return torch.full((batch_size,), int(value), dtype=torch.int32, device=device)
+
+    def _batch_i32_col(value: int) -> torch.Tensor:
+        return torch.full((batch_size, 1), int(value), dtype=torch.int32, device=device)
+
+    output["computed_context_lens"] = _batch_i32_col(restore_len)
+    output["full_context_lens"] = _batch_i32_col(prompt_len)
+    output["num_queries"] = _batch_i32_col(suffix_len)
+    output["hybrid_restore_slot_ids"] = _batch_i32(int(plan.checkpoint_slot))
+    output["hybrid_restore_mask"] = _batch_i32(1)
+    output["hybrid_restore_prefix_lens"] = _batch_i32(restore_len)
+    output["hybrid_commit_slot_ids"] = _batch_i32(0)
+    output["hybrid_commit_mask"] = _batch_i32(0)
+
+    if os.environ.get("QWEN36_HYBRID_APC_DEBUG") == "1":
+        print(
+            "[hybrid_apc_debug] apply-suffix "
+            f"prompt_len={prompt_len} restore_len={restore_len} "
+            f"suffix_len={suffix_len} restore_slot={plan.checkpoint_slot} "
+            f"input_shape={tuple(input_ids.shape)}",
+            flush=True,
+        )
+
+    return output
+
+
 class HybridAPCSlotAllocator:
     """Small checkpoint-slot allocator for local scheduler integration tests."""
 
@@ -766,6 +843,88 @@ class HybridAPCSchedulerBridge:
             commit_key=commit_key,
             commit_slot=commit_slot,
             attention_block_refs=attention_block_refs,
+        )
+
+    def prepare_suffix_only_request(
+        self,
+        *,
+        request_id: Hashable,
+        input_dict: dict[str, torch.Tensor],
+        attention_hit_len: int,
+        request_prefix_len: int,
+    ) -> HybridAPCPreparedRequest | None:
+        """Prepare a suffix-only request when explicitly allowed for diagnosis."""
+
+        if not _env_flag("QWEN36_HYBRID_APC_ALLOW_UNHASHED_SINGLE_PREFIX_RESTORE"):
+            return None
+        if "input_ids" not in input_dict:
+            raise KeyError("input_ids is required for hybrid APC request prep")
+        input_ids = input_dict["input_ids"]
+        if input_ids.ndim != 2:
+            raise ValueError(
+                f"input_ids must be [batch, seq], got {tuple(input_ids.shape)}"
+            )
+        request_prefix_len = int(request_prefix_len)
+        attention_hit_len = max(0, int(attention_hit_len))
+        suffix_len = int(input_ids.shape[1])
+        restore_len = min(attention_hit_len, request_prefix_len)
+        restore_len = floor_to_checkpoint_boundary(
+            restore_len,
+            self.store.checkpoint_interval,
+        )
+        if restore_len <= 0 or request_prefix_len - restore_len != suffix_len:
+            return None
+
+        checkpoint = self.store.lookup_unique_prefix_len(
+            prefix_len=restore_len,
+            cache_salt=self.cache_salt,
+            model_revision=self.model_revision,
+            layout_version=self.layout_version,
+            tp_rank=self.tp_rank,
+            recurrent_dtype=self.recurrent_dtype,
+            conv_dtype=self.conv_dtype,
+        )
+        if checkpoint is None:
+            if self.reject_unbacked_attention_hits:
+                raise ValueError(
+                    "suffix-only hybrid APC received an attention prefix hit "
+                    "without a unique matching GDN checkpoint"
+                )
+            return None
+
+        plan = HybridAPCHitPlan(
+            attention_hit_len=attention_hit_len,
+            recurrent_hit_len=checkpoint.prefix_len,
+            conv_hit_len=checkpoint.prefix_len,
+            usable_hit_len=checkpoint.prefix_len,
+            restore_checkpoint_prefix_len=checkpoint.prefix_len,
+            residual_replay_len=0,
+            suffix_len=suffix_len,
+            checkpoint_slot=checkpoint.gdn_checkpoint_slot,
+            checkpoint_key=checkpoint.key,
+        )
+        model_inputs = apply_hybrid_apc_suffix_prefill_plan(
+            input_dict,
+            plan=plan,
+            request_prefix_len=request_prefix_len,
+        )
+        self.store.on_request_restore(
+            request_id=request_id,
+            checkpoint_key=plan.checkpoint_key,
+        )
+        self.store.on_prefill_running(request_id)
+
+        return HybridAPCPreparedRequest(
+            request_id=request_id,
+            input_dict=model_inputs,
+            plan=plan,
+            commit_prefix_len=floor_to_checkpoint_boundary(
+                request_prefix_len,
+                self.store.checkpoint_interval,
+            ),
+            commit_key=None,
+            commit_slot=None,
+            attention_block_refs=checkpoint.attention_block_refs,
         )
 
     def commit_prefill(
@@ -1030,6 +1189,60 @@ class HybridAPCMetadataStore:
         self._by_key.move_to_end(key)
         self.stats.hits += 1
         return checkpoint
+
+    def lookup_unique_prefix_len(
+        self,
+        *,
+        prefix_len: int,
+        cache_salt: Hashable | None = None,
+        model_revision: str | None = None,
+        layout_version: int | None = None,
+        tp_rank: int | None = None,
+        recurrent_dtype: str | torch.dtype | None = None,
+        conv_dtype: str | torch.dtype | None = None,
+    ) -> HybridPrefixCheckpoint | None:
+        """Return the only valid checkpoint at a prefix length, if unambiguous."""
+
+        prefix_len = int(prefix_len)
+        model_revision = self.model_revision if model_revision is None else str(model_revision)
+        layout_version = self.layout_version if layout_version is None else int(layout_version)
+        tp_rank = self.tp_rank if tp_rank is None else int(tp_rank)
+        recurrent_dtype = (
+            self.recurrent_dtype
+            if recurrent_dtype is None
+            else _normalize_dtype(recurrent_dtype)
+        )
+        conv_dtype = self.conv_dtype if conv_dtype is None else _normalize_dtype(conv_dtype)
+
+        candidates: list[HybridPrefixKey] = []
+        for key, checkpoint in self._by_key.items():
+            if key.prefix_len != prefix_len:
+                continue
+            if key.cache_salt != cache_salt:
+                continue
+            if key.model_revision != model_revision:
+                continue
+            if key.layout_version != layout_version:
+                continue
+            if key.tp_rank != tp_rank:
+                continue
+            if key.recurrent_dtype != recurrent_dtype or key.conv_dtype != conv_dtype:
+                continue
+            if not checkpoint.attention_valid:
+                continue
+            if not checkpoint.has_valid_gdn(self.required_gdn_layers):
+                continue
+            candidates.append(key)
+
+        if not candidates:
+            self.stats.misses += 1
+            return None
+        if len(candidates) > 1:
+            raise ValueError(
+                "ambiguous unhashed Hybrid APC restore: "
+                f"{len(candidates)} checkpoints match prefix_len={prefix_len}"
+            )
+        return self.lookup(candidates[0])
 
     def mark_invalid(
         self,

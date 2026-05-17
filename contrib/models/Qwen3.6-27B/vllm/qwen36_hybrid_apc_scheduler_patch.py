@@ -97,6 +97,14 @@ def register_hybrid_apc_gdn_checkpoint(key: Any) -> HybridGDNPrefixKey:
 
     registry_key = _to_registry_key(key)
     _GDN_PREFIX_KEYS.add(registry_key)
+    if _env_flag("QWEN36_HYBRID_APC_DEBUG"):
+        print(
+            "[hybrid_apc_debug] scheduler-register "
+            f"prefix_len={registry_key.prefix_len} "
+            f"model_revision={registry_key.model_revision} "
+            f"registry_size={len(_GDN_PREFIX_KEYS)}",
+            flush=True,
+        )
     return registry_key
 
 
@@ -105,6 +113,14 @@ def unregister_hybrid_apc_gdn_checkpoint(key: Any) -> bool:
     if registry_key not in _GDN_PREFIX_KEYS:
         return False
     _GDN_PREFIX_KEYS.remove(registry_key)
+    if _env_flag("QWEN36_HYBRID_APC_DEBUG"):
+        print(
+            "[hybrid_apc_debug] scheduler-unregister "
+            f"prefix_len={registry_key.prefix_len} "
+            f"model_revision={registry_key.model_revision} "
+            f"registry_size={len(_GDN_PREFIX_KEYS)}",
+            flush=True,
+        )
     return True
 
 
@@ -260,10 +276,20 @@ def should_disable_unbacked_prefix_reads(scheduler: Any, request: Any = None) ->
         )
     if not disable_requested:
         return False
-    if (
-        backed_gdn_prefix_hit_len(scheduler, request) > 0
-        and _supports_backed_prefix_reads(scheduler)
-    ):
+    backed_hit_len = backed_gdn_prefix_hit_len(scheduler, request)
+    supports_backed = _supports_backed_prefix_reads(scheduler)
+    if _env_flag("QWEN36_HYBRID_APC_DEBUG"):
+        prompt_len = len(getattr(request, "prompt_token_ids", ()) or ())
+        print(
+            "[hybrid_apc_debug] scheduler-decision "
+            f"disable_requested={disable_requested} "
+            f"backed_hit_len={backed_hit_len} "
+            f"supports_backed={supports_backed} "
+            f"prompt_len={prompt_len} "
+            f"registry_size={len(_GDN_PREFIX_KEYS)}",
+            flush=True,
+        )
+    if backed_hit_len > 0 and supports_backed:
         return False
     return True
 

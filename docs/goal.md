@@ -11,7 +11,7 @@ Make Qwen3.6-27B Hybrid APC on Trainium correct first, then measure cold-prefill
 
 ## Current Status
 
-The active branch is `experimental`. The latest pushed code patch is `d6df06a`; the latest pushed report/docs commit is `f666d48`.
+The active branch is `experimental`.
 
 Useful Trainium paths:
 
@@ -20,7 +20,102 @@ Useful Trainium paths:
 - Remote repo: `/home/ubuntu/inferentia-gdn-experimental-test`
 - Weights: `/home/ubuntu/models/Qwen3.6-27B`
 - Main BF16 Hybrid APC artifact:
-  `/home/ubuntu/qwen_artifacts/qwen36_27b_2048_bf16_hybrid_apc_host_logits_nki_chunked_4434edf`
+  `/mnt/trainium_artifacts/qwen_artifacts/qwen36_27b_2048_bf16_hybrid_apc_backed_prefix_d061df5`
+
+### 2026-05-18 Overnight Update
+
+The new 2K BF16 Hybrid APC artifact compiled on the mounted NVMe, but normal
+load warmup OOBs in the non-target CTE bucket:
+
+```text
+context_encoding_model/_tp0_bk2
+neuron_config.buckets = [[256, 512]]
+NRT_EXEC_OOB during warmup
+```
+
+Setting `skip_warmup=true` in the artifact config lets the artifact load and
+serve. The backup before that local artifact edit is:
+
+```text
+/mnt/trainium_artifacts/qwen_artifacts/qwen36_27b_2048_bf16_hybrid_apc_backed_prefix_d061df5/neuron_config.json.bak_before_skip_warmup_6fa9ea1
+```
+
+With `--enable-vllm-chunked-prefill`, the safety fallback still passes
+decode24 exactness and real-token generation:
+
+```text
+full_prefix_exact=true
+partial_prefix_exact=true
+real_generated_tokens_passed=true
+```
+
+Artifacts:
+
+- JSON:
+  `/home/ubuntu/validation_logs/hybrid_apc_real_tokens/bf16_hybrid_apc_backed_prefix_d061df5_boundary_decode24_chunked_6fa9ea1.json`
+- Log:
+  `/home/ubuntu/validation_logs/hybrid_apc_real_tokens/bf16_hybrid_apc_backed_prefix_d061df5_boundary_decode24_chunked_6fa9ea1.log`
+
+That pass is not the performance path. The debug lines still show:
+
+```text
+attention_hit_len=0
+restore_len=0
+computed=tensor([[0]], dtype=torch.int32)
+```
+
+Forcing vLLM prefix reads proves the exact remaining contract bug. vLLM does
+reuse the attention KV prefix and sends:
+
+```text
+input_shape=(1, 16)
+computed=[256]
+position_minmax=256:271
+```
+
+but Qwen Hybrid APC does not restore GDN state because vLLM-Neuron only passes
+the suffix into CTE and does not pass the full prompt tokens, cumulative prefix
+hash, or restore slot metadata. The forced-prefix run therefore mismatches:
+
+```text
+full_prefix_exact=true
+partial_prefix_exact=false
+real_generated_tokens_passed=true
+restore_mask=[0]
+```
+
+Artifacts:
+
+- JSON:
+  `/home/ubuntu/validation_logs/hybrid_apc_real_tokens/bf16_hybrid_apc_backed_prefix_d061df5_force_prefix_reads_py_path_6fa9ea1.json`
+- Log:
+  `/home/ubuntu/validation_logs/hybrid_apc_real_tokens/bf16_hybrid_apc_backed_prefix_d061df5_force_prefix_reads_py_path_6fa9ea1.log`
+
+Current interpretation:
+
+```text
+vLLM/NVIDIA contract:
+  scheduler finds prefix KV hit
+  runner passes num_computed_tokens + block table + suffix slots
+  model-specific state cache is handled by a separate stable contract
+
+Current Neuron/Qwen contract:
+  vLLM-Neuron passes the attention suffix and computed_context_lens
+  Qwen Hybrid APC needs full prompt/hash or scheduler-selected restore metadata
+  without that, attention KV can be reused while GDN state is not restored
+```
+
+The next diagnostic patch is intentionally guarded by:
+
+```text
+QWEN36_HYBRID_APC_ALLOW_UNHASHED_SINGLE_PREFIX_RESTORE=1
+```
+
+It allows suffix-only restore only when exactly one valid GDN checkpoint exists
+for the vLLM-reported prefix length. This is not the production contract; it is
+to prove whether the CTE restore path itself becomes exact once GDN state is
+restored. The production fix should pass full prompt hashes or explicit restore
+metadata from vLLM/vLLM-Neuron into the Qwen model request.
 
 The base BF16 host-logits path is not the current blocker when using the per-chunk DeltaNet CTE path:
 

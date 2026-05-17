@@ -759,6 +759,76 @@ class TestHybridAPCSchedulerBridge(unittest.TestCase):
         self.assertIsNone(prepared.plan.checkpoint_key)
         self.assertEqual(prepared.input_dict["hybrid_restore_mask"].item(), 0)
 
+    def test_bridge_suffix_only_restore_is_explicit_and_unambiguous(self):
+        store = _store()
+        _insert(store, 128, gdn_checkpoint_slot=1)
+        bridge = HybridAPCSchedulerBridge(
+            store=store,
+            slot_allocator=HybridAPCSlotAllocator(num_slots=2),
+            cache_salt="tenant-a",
+            model_revision="rev-a",
+        )
+        suffix_ids = torch.arange(128, 256, dtype=torch.int32).unsqueeze(0)
+
+        self.assertIsNone(
+            bridge.prepare_suffix_only_request(
+                request_id="req-suffix-disabled",
+                input_dict={"input_ids": suffix_ids},
+                attention_hit_len=128,
+                request_prefix_len=256,
+            )
+        )
+
+        with patch.dict(
+            os.environ,
+            {"QWEN36_HYBRID_APC_ALLOW_UNHASHED_SINGLE_PREFIX_RESTORE": "1"},
+        ):
+            prepared = bridge.prepare_suffix_only_request(
+                request_id="req-suffix",
+                input_dict={"input_ids": suffix_ids},
+                attention_hit_len=128,
+                request_prefix_len=256,
+            )
+
+        self.assertIsNotNone(prepared)
+        self.assertTrue(torch.equal(prepared.input_dict["input_ids"], suffix_ids))
+        self.assertTrue(
+            torch.equal(
+                prepared.input_dict["position_ids"],
+                torch.arange(128, 256, dtype=torch.int64).unsqueeze(0),
+            )
+        )
+        self.assertEqual(prepared.input_dict["computed_context_lens"].item(), 128)
+        self.assertEqual(prepared.input_dict["num_queries"].item(), 128)
+        self.assertEqual(prepared.input_dict["hybrid_restore_mask"].item(), 1)
+        self.assertEqual(prepared.input_dict["hybrid_restore_slot_ids"].item(), 1)
+
+    def test_bridge_suffix_only_restore_rejects_ambiguous_prefix_len(self):
+        store = _store()
+        _insert(store, 128, prefix_hash="h128-a", gdn_checkpoint_slot=0)
+        _insert(store, 128, prefix_hash="h128-b", gdn_checkpoint_slot=1)
+        bridge = HybridAPCSchedulerBridge(
+            store=store,
+            slot_allocator=HybridAPCSlotAllocator(num_slots=2),
+            cache_salt="tenant-a",
+            model_revision="rev-a",
+        )
+
+        with patch.dict(
+            os.environ,
+            {"QWEN36_HYBRID_APC_ALLOW_UNHASHED_SINGLE_PREFIX_RESTORE": "1"},
+        ):
+            with self.assertRaisesRegex(ValueError, "ambiguous unhashed"):
+                bridge.prepare_suffix_only_request(
+                    request_id="req-ambiguous",
+                    input_dict={
+                        "input_ids": torch.arange(128, 256, dtype=torch.int32)
+                        .unsqueeze(0)
+                    },
+                    attention_hit_len=128,
+                    request_prefix_len=256,
+                )
+
     def test_bridge_does_not_commit_mid_prompt_checkpoint_boundary(self):
         store = _store()
         allocator = HybridAPCSlotAllocator(num_slots=2)
