@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
-"""Compile Qwen3.6-27B 64K with a scoped FP8 weight-quantization ablation.
+"""Compile Qwen3.6-27B 64K with scoped weight-mode ablations.
 
 This script intentionally starts from the validated 64K hybrid/chunked-prefill
-baseline and changes only weight quantization. The first supported mode is
-``mlp_only``: MLP linear weights are converted to FP8 while attention, DeltaNet,
-normalization, embeddings, lm_head, KV cache, and recurrent state remain BF16.
+baseline and changes only weight quantization. Supported modes:
+
+* ``fp8_mlp_only``: MLP linear weights are converted to FP8 while attention,
+  DeltaNet, normalization, embeddings, lm_head, KV cache, and recurrent state
+  remain BF16.
+* ``bf16_control``: no FP8 conversion; this is the real-token host-logits
+  control for separating FP8 conversion failures from serving/logits failures.
 """
 
 from __future__ import annotations
@@ -23,6 +27,9 @@ _FP8_ENV_DEFAULTS = {
     "XLA_HANDLE_SPECIAL_SCALAR": "1",
     "UNSAFE_FP8FNCAST": "1",
 }
+
+_WEIGHT_DTYPE_FP8_MLP_ONLY = "fp8_mlp_only"
+_WEIGHT_DTYPE_BF16_CONTROL = "bf16_control"
 
 
 def _ensure_fp8_environment() -> None:
@@ -266,17 +273,24 @@ def _build_config(args: argparse.Namespace):
         "enable_bucketing": len(cte_buckets) > 1,
         "logical_nc_config": args.logical_nc_config,
         "save_sharded_checkpoint": True,
-        "quantized": True,
-        "quantized_checkpoints_path": str(
-            Path(args.quantized_checkpoints_path).expanduser().resolve()
-        ),
-        "quantization_type": "per_channel_symmetric",
-        "quantization_dtype": "f8e4m3",
-        "modules_to_not_convert": modules_to_not_convert,
-        "kv_cache_quant": False,
-        "quantized_mlp_kernel_enabled": False,
-        "activation_quantization_type": None,
     }
+    if args.weight_dtype == _WEIGHT_DTYPE_FP8_MLP_ONLY:
+        neuron_config_kwargs.update(
+            {
+                "quantized": True,
+                "quantized_checkpoints_path": str(
+                    Path(args.quantized_checkpoints_path).expanduser().resolve()
+                ),
+                "quantization_type": "per_channel_symmetric",
+                "quantization_dtype": "f8e4m3",
+                "modules_to_not_convert": modules_to_not_convert,
+                "kv_cache_quant": False,
+                "quantized_mlp_kernel_enabled": False,
+                "activation_quantization_type": None,
+            }
+        )
+    else:
+        neuron_config_kwargs["quantized"] = False
     if args.disable_on_device_sampling:
         # vLLM/host-side sampling consumes logits from the Neuron trace. Without
         # logits, the serving path can only surface placeholder token ids.
@@ -336,7 +350,16 @@ def main() -> int:
     parser.add_argument("--repo-root", default=None)
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--compiled-path", required=True)
-    parser.add_argument("--quantized-checkpoints-path", required=True)
+    parser.add_argument("--quantized-checkpoints-path")
+    parser.add_argument(
+        "--weight-dtype",
+        choices=[_WEIGHT_DTYPE_FP8_MLP_ONLY, _WEIGHT_DTYPE_BF16_CONTROL],
+        default=_WEIGHT_DTYPE_FP8_MLP_ONLY,
+        help=(
+            "Weight mode to compile. Use bf16_control for the non-FP8 "
+            "host-logits real-token control."
+        ),
+    )
     parser.add_argument("--seq-len", type=int, default=65536)
     parser.add_argument("--cte-bucket", type=int, default=512)
     parser.add_argument("--cte-buckets", nargs="+", default=None)
@@ -362,25 +385,40 @@ def main() -> int:
     parser.add_argument("--quantize-only", action="store_true")
     parser.add_argument("--load-after-compile", action="store_true")
     args = parser.parse_args()
+    if (
+        args.weight_dtype == _WEIGHT_DTYPE_FP8_MLP_ONLY
+        and not args.quantized_checkpoints_path
+    ):
+        parser.error("--quantized-checkpoints-path is required for fp8_mlp_only")
 
     repo = _repo_root(args.repo_root)
     contrib_model_dir = repo / "contrib" / "models" / "Qwen3.6-27B"
     sys.path.insert(0, str(repo))
     sys.path.insert(0, str(contrib_model_dir))
-    _ensure_fp8_environment()
+    if args.weight_dtype == _WEIGHT_DTYPE_FP8_MLP_ONLY:
+        _ensure_fp8_environment()
 
     from src.modeling_qwen35 import NeuronQwen35ForCausalLM  # noqa: WPS433
 
     model_path = Path(args.model_path).expanduser().resolve()
     compiled_path = Path(args.compiled_path).expanduser().resolve()
-    quantized_path = Path(args.quantized_checkpoints_path).expanduser().resolve()
+    quantized_path = (
+        Path(args.quantized_checkpoints_path).expanduser().resolve()
+        if args.quantized_checkpoints_path
+        else None
+    )
 
     inf_config, modules_to_not_convert = _build_config(args)
 
-    print("FP8_MODE mlp_only", flush=True)
+    print("WEIGHT_DTYPE_MODE", args.weight_dtype, flush=True)
+    if args.weight_dtype == _WEIGHT_DTYPE_FP8_MLP_ONLY:
+        print("FP8_MODE mlp_only", flush=True)
+    else:
+        print("FP8_MODE disabled_bf16_control", flush=True)
     print("MODEL_PATH", str(model_path), flush=True)
     print("COMPILED_PATH", str(compiled_path), flush=True)
-    print("QUANTIZED_CHECKPOINTS_PATH", str(quantized_path), flush=True)
+    if quantized_path is not None:
+        print("QUANTIZED_CHECKPOINTS_PATH", str(quantized_path), flush=True)
     for env_name in _FP8_ENV_DEFAULTS:
         print(env_name, os.environ.get(env_name), flush=True)
     print("MODULES_TO_NOT_CONVERT_COUNT", len(modules_to_not_convert), flush=True)
@@ -405,7 +443,9 @@ def main() -> int:
         flush=True,
     )
 
-    if args.force_quantize or not _quantized_checkpoint_ready(quantized_path):
+    if args.weight_dtype == _WEIGHT_DTYPE_BF16_CONTROL:
+        print("QUANTIZE_SKIP bf16_control", flush=True)
+    elif args.force_quantize or not _quantized_checkpoint_ready(quantized_path):
         print("QUANTIZE_START manual_mlp_only", flush=True)
         _save_mlp_only_fp8_state_dict(model_path, quantized_path)
         print("QUANTIZE_DONE", flush=True)

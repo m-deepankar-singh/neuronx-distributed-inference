@@ -27,6 +27,93 @@ runtime behavior.
 - Added unit coverage for the FP8 compile config, Qwen alias accounting, and
   real-token validation gate.
 
+## 2026-05-17 Follow-Up Instrumentation
+
+Added repo-side checks for the next debugging pass:
+
+- `QWEN36_LOGIT_STAGE_DEBUG=1` now prints finite/NaN/Inf summaries in
+  `modeling_qwen35.py` at:
+  - after final norm / final hidden selection;
+  - after `lm_head`;
+  - after `mask_padded_logits`;
+  - before logits are returned.
+- `QWEN36_TKG_INPUT_DEBUG=1` now prints the decode-side
+  `token_generation_model` inputs immediately before the call:
+  `input_ids`, `position_ids`, `attention_mask`, `slot_mapping`, `block_table`,
+  `num_queries`, `computed_context_lens`, `pa_num_blocks`, `block_size`,
+  `seq_len`, and `max_model_len`.
+- The compile harness supports a BF16 real-token control with
+  `--weight-dtype bf16_control`, preserving the same Hybrid APC/2K shape knobs
+  but compiling with `quantized=False`.
+- The validation harness supports `--skip-fp8-env` so BF16 artifacts can run
+  without `XLA_HANDLE_SPECIAL_SCALAR` / `UNSAFE_FP8FNCAST`.
+
+Minimal BF16 host-logits control to run on Trainium:
+
+```bash
+python3 contrib/models/Qwen3.6-27B/test/integration/qwen36_27b_compile_fp8.py \
+  --weight-dtype bf16_control \
+  --model-path "$MODEL_PATH" \
+  --compiled-path /dev/shm/qwen36_27b_2048_bf16_hybrid_apc_host_logits \
+  --seq-len 2048 \
+  --cte-buckets 256,512 \
+  --enable-prefix-caching \
+  --enable-hybrid-apc \
+  --disable-on-device-sampling \
+  --pa-num-blocks 8 \
+  --load-after-compile
+
+QWEN36_LOGIT_STAGE_DEBUG=1 \
+python3 validation_scripts/qwen36_hybrid_apc_validation.py exactness \
+  --model-path "$MODEL_PATH" \
+  --compiled-artifacts /dev/shm/qwen36_27b_2048_bf16_hybrid_apc_host_logits \
+  --max-model-len 2048 \
+  --seq-len 2048 \
+  --cte-buckets 256,512 \
+  --enable-vllm-chunked-prefill \
+  --require-real-tokens \
+  --skip-fp8-env
+```
+
+PA null-block sweep to run only at 2K:
+
+```bash
+# user-intended 8 -> compile physical 9
+--pa-num-blocks 8
+
+# user-intended 9 -> compile physical 10
+--pa-num-blocks 9
+
+# user-intended 10 -> compile physical 11
+--pa-num-blocks 10
+```
+
+## Older APC PR Branch Comparison
+
+Compared current `experimental` against
+`contrib/qwen36-27b-vllm-apc-pr` for the token-generation contract:
+
+- Older branch pads wrapper inputs to 24 positional args:
+  base inputs, 14 empties, then mRoPE/vision tensors.
+- Current branch pads wrapper inputs to 29 positional args by appending five
+  Hybrid APC restore/commit tensors after mRoPE/vision.
+- Older branch does not pass `slot_mapping`, `block_table`, `num_queries`, or
+  `computed_context_lens` into `token_generation_model`; current branch passes
+  those four tensors before six empty tensor placeholders.
+- Current branch computes `computed_context_lens` and `num_queries` as
+  `(batch, 1)` int32 matrices and pads CTE chunks, while older branch has no
+  equivalent TKG prefix-cache tensors.
+- Current vLLM runners force Hybrid APC prefix settings:
+  `enable_prefix_caching=True`, `mamba_cache_mode="all"`,
+  `mamba_ssm_cache_dtype=<GDN recurrent dtype>`, and
+  `num_gpu_blocks_override` when prefix/APC is enabled. The older runner only
+  forwards mamba cache settings when explicitly supplied.
+
+Most suspicious contract risk: a positional-input mismatch in the expanded TKG
+call. One shifted tensor would put block-table or prefix-length metadata in the
+wrong Neuron input slot and can plausibly produce the observed token-generation
+OOB.
+
 ## Working Evidence
 
 Local checks passed:

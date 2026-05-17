@@ -75,6 +75,7 @@ def _args(**overrides):
     defaults = dict(
         model_path="/tmp/qwen36",
         quantized_checkpoints_path="/tmp/qwen36-fp8",
+        weight_dtype="fp8_mlp_only",
         seq_len=2048,
         cte_bucket=512,
         cte_buckets=["256,512"],
@@ -139,6 +140,7 @@ class TestQwen36CompileFp8Config(unittest.TestCase):
         self.assertTrue(config.neuron_config.output_logits)
         self.assertIsNone(config.neuron_config.on_device_sampling_config)
         self.assertEqual(config.neuron_config.pa_num_blocks, 9)
+        self.assertTrue(config.neuron_config.quantized)
 
     def test_on_device_sampling_compile_uses_sampler_config(self):
         with patch.object(
@@ -158,6 +160,31 @@ class TestQwen36CompileFp8Config(unittest.TestCase):
 
         self.assertIsNotNone(config.neuron_config.on_device_sampling_config)
         self.assertEqual(config.neuron_config.pa_num_blocks, 9)
+
+    def test_bf16_control_compile_disables_quantization_and_keeps_host_logits(self):
+        with patch.object(
+            _COMPILE,
+            "_load_text_config",
+            return_value={"num_hidden_layers": 2},
+        ), patch.dict(
+            sys.modules,
+            {
+                "neuronx_distributed_inference.models.config": _fake_config_module(),
+                "src.modeling_qwen35": _fake_qwen_module(),
+            },
+        ):
+            config, modules = _COMPILE._build_config(
+                _args(
+                    disable_on_device_sampling=True,
+                    weight_dtype="bf16_control",
+                    quantized_checkpoints_path=None,
+                ),
+            )
+
+        self.assertTrue(config.neuron_config.output_logits)
+        self.assertFalse(config.neuron_config.quantized)
+        self.assertIsNone(config.neuron_config.on_device_sampling_config)
+        self.assertGreater(len(modules), 0)
 
     def test_pa_num_blocks_rejects_user_blocks_below_sequence_requirement(self):
         with self.assertRaisesRegex(ValueError, "need at least 8"):

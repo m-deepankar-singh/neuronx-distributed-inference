@@ -2741,6 +2741,86 @@ def _effective_lm_head_pad_size(lm_head, logits, config):
     return pad_size
 
 
+def _debug_tensor_minmax(tensor):
+    if tensor is None or not hasattr(tensor, "numel") or tensor.numel() == 0:
+        return "empty"
+    flat = tensor.reshape(-1)
+    return f"{int(flat.min().item())}:{int(flat.max().item())}"
+
+
+def _debug_tensor_values(tensor, limit=8):
+    if tensor is None or not hasattr(tensor, "numel") or tensor.numel() == 0:
+        return []
+    return tensor.reshape(-1)[:limit].tolist()
+
+
+def _debug_tensor_shape(tensor):
+    if tensor is None or not hasattr(tensor, "shape"):
+        return None
+    return tuple(tensor.shape)
+
+
+def _debug_logits_stage(stage: str, tensor) -> None:
+    if os.environ.get("QWEN36_LOGIT_STAGE_DEBUG") != "1":
+        return
+    if tensor is None or not hasattr(tensor, "numel"):
+        print(
+            f"[qwen36_logits_debug] stage={stage} tensor=none",
+            flush=True,
+        )
+        return
+    if tensor.numel() == 0:
+        print(
+            f"[qwen36_logits_debug] stage={stage} "
+            f"shape={tuple(tensor.shape)} dtype={tensor.dtype} device={tensor.device} empty",
+            flush=True,
+        )
+        return
+
+    try:
+        with torch.no_grad():
+            flat = tensor.detach().reshape(-1)
+            if torch.is_floating_point(flat):
+                finite_mask = torch.isfinite(flat)
+                finite_count = int(finite_mask.sum().item())
+                nan_count = int(torch.isnan(flat).sum().item())
+                posinf_count = int(
+                    torch.logical_and(torch.isinf(flat), flat > 0).sum().item()
+                )
+                neginf_count = int(
+                    torch.logical_and(torch.isinf(flat), flat < 0).sum().item()
+                )
+                if finite_count:
+                    finite_flat = flat[finite_mask].float()
+                    finite_min = float(finite_flat.min().item())
+                    finite_max = float(finite_flat.max().item())
+                else:
+                    finite_min = "none"
+                    finite_max = "none"
+                print(
+                    "[qwen36_logits_debug] "
+                    f"stage={stage} shape={tuple(tensor.shape)} dtype={tensor.dtype} "
+                    f"device={tensor.device} numel={tensor.numel()} finite={finite_count} "
+                    f"nan={nan_count} posinf={posinf_count} neginf={neginf_count} "
+                    f"finite_min={finite_min} finite_max={finite_max}",
+                    flush=True,
+                )
+            else:
+                print(
+                    "[qwen36_logits_debug] "
+                    f"stage={stage} shape={tuple(tensor.shape)} dtype={tensor.dtype} "
+                    f"device={tensor.device} numel={tensor.numel()} "
+                    f"minmax={_debug_tensor_minmax(tensor)}",
+                    flush=True,
+                )
+    except Exception as exc:
+        print(
+            "[qwen36_logits_debug] "
+            f"stage={stage} summary_error={type(exc).__name__}: {exc}",
+            flush=True,
+        )
+
+
 class NeuronQwen35Model(NeuronBaseModel):
     def setup_attr_for_model(self, config: Qwen35InferenceConfig):
         self.on_device_sampling = (
@@ -3219,8 +3299,10 @@ class NeuronQwen35Model(NeuronBaseModel):
                 index = index.unsqueeze(1).expand(batch_size, 1, self.hidden_size)
                 hidden_states = torch.gather(hidden_states, dim=1, index=index)
 
+        _debug_logits_stage("after_final_norm", hidden_states)
         logits = self.lm_head(hidden_states)
         logits = logits.float()
+        _debug_logits_stage("after_lm_head", logits)
 
         if hasattr(self.lm_head, "pad_size"):
             if self.lm_head.gather_output:
@@ -3245,6 +3327,7 @@ class NeuronQwen35Model(NeuronBaseModel):
                     self.lm_head, logits, self.config
                 ),
             )
+            _debug_logits_stage("after_mask_padded_logits", logits)
 
         if self.on_device_sampling:
             res = self._sample_on_device(
@@ -3253,6 +3336,7 @@ class NeuronQwen35Model(NeuronBaseModel):
         else:
             res = logits
 
+        _debug_logits_stage("before_return_logits", logits)
         outputs = [res]
         if self.neuron_config.output_logits and self.on_device_sampling:
             outputs += [logits]
@@ -3979,7 +4063,7 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
         hybrid_commit_slot_ids=None,
         hybrid_commit_mask=None,
     ):
-        """Override to pass all 24 positional args explicitly."""
+        """Override to pass Qwen/vLLM positional args explicitly."""
         is_prefill = self._is_prefill(position_ids) or (
             getattr(self.config, "use_qwen_hybrid_chunked_prefill", False)
             and input_ids.shape[-1] > 1
@@ -4349,6 +4433,34 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
             if hybrid_apc_request_dict is not None:
                 finish_hybrid_apc_request(hybrid_apc_request_dict)
         else:
+            if (
+                os.environ.get("QWEN36_TKG_INPUT_DEBUG") == "1"
+                or os.environ.get("QWEN36_HYBRID_APC_DEBUG") == "1"
+            ):
+                max_model_len = getattr(
+                    self.neuron_config,
+                    "max_length",
+                    getattr(self.neuron_config, "seq_len", None),
+                )
+                print(
+                    "[hybrid_apc_debug] qwen-tkg-call "
+                    f"input_shape={_debug_tensor_shape(input_ids)} "
+                    f"input_values={_debug_tensor_values(input_ids)} "
+                    f"attention_shape={_debug_tensor_shape(attention_mask)} "
+                    f"position_shape={_debug_tensor_shape(position_ids)} "
+                    f"position_minmax={_debug_tensor_minmax(position_ids)} "
+                    f"slot_shape={_debug_tensor_shape(slot_mapping_arg)} "
+                    f"slot_minmax={_debug_tensor_minmax(slot_mapping_arg)} "
+                    f"block_shape={_debug_tensor_shape(block_table_arg)} "
+                    f"block_minmax={_debug_tensor_minmax(block_table_arg)} "
+                    f"num_queries={_debug_tensor_values(num_queries_arg)} "
+                    "computed_context_lens="
+                    f"{_debug_tensor_values(computed_context_lens_arg)} "
+                    f"pa_num_blocks={getattr(self.neuron_config, 'pa_num_blocks', None)} "
+                    f"block_size={getattr(self.neuron_config, 'pa_block_size', None)} "
+                    f"seq_len={seq_len} max_model_len={max_model_len}",
+                    flush=True,
+                )
             outputs = self.token_generation_model(
                 input_ids,
                 attention_mask,

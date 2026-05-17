@@ -96,7 +96,8 @@ def _build_llm(args, *, enable_hybrid_apc: bool):
         os.environ["NEURON_COMPILED_ARTIFACTS"] = str(
             Path(args.compiled_artifacts).expanduser().resolve()
         )
-        _ensure_fp8_environment()
+        if not args.skip_fp8_env:
+            _ensure_fp8_environment()
 
     runner = _load_module("qwen36_run_offline_inference_validation", RUNNER_PATH)
     from hf_qwen35_config import register_qwen35_config  # noqa: WPS433
@@ -346,6 +347,11 @@ def parse_args():
     exact = subparsers.add_parser("exactness")
     exact.add_argument("--model-path", required=True)
     exact.add_argument("--compiled-artifacts")
+    exact.add_argument(
+        "--skip-fp8-env",
+        action="store_true",
+        help="Do not set FP8 runtime environment defaults for BF16 control artifacts.",
+    )
     exact.add_argument("--max-model-len", type=int, default=2048)
     exact.add_argument("--seq-len", type=int, default=2048)
     exact.add_argument("--cte-bucket", type=int, default=512)
