@@ -308,6 +308,56 @@ Important runs:
   - Conclusion: the immediate workaround is to compile Qwen3.6 CTE with
     `USE_NKI_FUSED=0 USE_NKI_CHUNKED=1`. The current fused DeltaNet CTE NKI
     kernel is the leading root cause for host-logits all-NaN CTE outputs.
+- Hybrid APC BF16 host-logits artifact compiled with per-chunk NKI CTE:
+  - Compile env: `USE_NKI_FUSED=0 USE_NKI_CHUNKED=1`
+  - Artifact:
+    `/home/ubuntu/qwen_artifacts/qwen36_27b_2048_bf16_hybrid_apc_host_logits_nki_chunked_4434edf`
+  - Compile log:
+    `/home/ubuntu/validation_logs/hybrid_apc_real_tokens/bf16_hybrid_apc_host_logits_nki_chunked_4434edf_compile.log`
+    - `COMPILE_DONE`
+    - `LOAD_AFTER_COMPILE_OK`
+  - CTE-only exactness gate on `4434edf`:
+    `/home/ubuntu/validation_logs/hybrid_apc_real_tokens/bf16_hybrid_apc_host_logits_nki_chunked_4434edf_cte_only.json`
+    - `full_prefix_exact=true`
+    - `partial_prefix_exact=true`
+    - `real_generated_tokens_passed=true`
+  - First short decode gate on `4434edf` showed finite real tokens but failed
+    exactness because warm suffix CTE received all-padding slot mappings:
+    `/home/ubuntu/validation_logs/hybrid_apc_real_tokens/bf16_hybrid_apc_host_logits_nki_chunked_4434edf_decode4.log`
+    - Warm suffix CTE had `slot_minmax=-1:-1`.
+    - TKG started from missing suffix attention KV and diverged from cold
+      decode after the second generated token.
+- Commit `b59e3a2` fixed warm-suffix attention KV writes by synthesizing suffix
+  `slot_mapping` from `block_table`, `restore_len`, and `block_size` when vLLM
+  provides only `-1` padding slots for the replayed suffix:
+  - Changed:
+    `contrib/models/Qwen3.6-27B/src/hybrid_apc.py`
+  - Unit test:
+    `test_prefill_plan_synthesizes_padding_suffix_slots_from_block_table`
+  - Local and remote focused tests:
+    `python3 -m pytest contrib/models/Qwen3.6-27B/test/unit/test_hybrid_apc_manager.py`
+    - `29 passed`
+  - Reused the already compiled per-chunk Hybrid APC artifact; no recompile
+    was needed because this changes runtime input preparation only.
+  - Decode-4 exactness after the fix:
+    `/home/ubuntu/validation_logs/hybrid_apc_real_tokens/bf16_hybrid_apc_host_logits_nki_chunked_b59e3a2_decode4.json`
+    - `full_prefix_exact=true`
+    - `partial_prefix_exact=true`
+    - `real_generated_tokens_passed=true`
+    - Warm suffix CTE slot mappings became positive physical slots, for
+      example `slot_minmax=768:974` instead of `-1:-1`.
+  - Decode-32 exactness after the fix:
+    `/home/ubuntu/validation_logs/hybrid_apc_real_tokens/bf16_hybrid_apc_host_logits_nki_chunked_b59e3a2_decode32.json`
+    - `real_generated_tokens_passed=true`
+    - `full_prefix_exact=false`
+    - `partial_prefix_exact=false`
+    - Cold and warm outputs match for the early tokens but drift later in
+      decode. This is now the leading remaining BF16 host-logits correctness
+      issue; it is no longer a NaN/OOB or dummy-token failure.
+  - Runtime-enabling `--enable-vllm-chunked-prefill` against the non-chunked
+    compiled artifact is not a valid workaround:
+    `/home/ubuntu/validation_logs/hybrid_apc_real_tokens/bf16_hybrid_apc_host_logits_nki_chunked_b59e3a2_chunked_runtime_decode4.json`
+    - Real tokens were produced, but warm exactness failed immediately.
 
 Latest PA9 artifact run:
 
