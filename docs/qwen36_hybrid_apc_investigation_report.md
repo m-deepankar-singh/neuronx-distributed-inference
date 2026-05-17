@@ -275,6 +275,28 @@ Follow-up ABI patch:
   serialized CTE trace exposed 24 tensor inputs while runtime still sent 29.
   The latest local patch makes legacy mode stage-consistent with that artifact,
   so the same artifact can be retested without recompiling.
+- Remote BF16 on-device compile on `5a08328` reached `COMPILE_DONE` and
+  `LOAD_AFTER_COMPILE_OK` with the stage-consistent 24-tensor ABI:
+  `/home/ubuntu/qwen_artifacts/qwen36_27b_2048_bf16_hybrid_apc_ondevice_legacy_tkg_5a08328`.
+  Validation progressed past CTE and failed on the first TKG decode with
+  `NRT_EXEC_OOB`.
+  `QWEN36_TKG_INPUT_DEBUG=1` showed:
+  `input_ids=[2143289344]`,
+  `position_minmax=463:463`,
+  `slot_minmax=719:719`,
+  `block_minmax=1:2`,
+  `computed_context_lens=[463]`,
+  `pa_num_blocks=9`,
+  `block_size=256`.
+  Interpretation: the block table and slot mapping were in range for PA9, but
+  the TKG token id was garbage/out-of-vocab before the embedding gather. The
+  remaining on-device failure is now most likely the sampler/token handoff
+  contract, not physical PA capacity.
+- A BF16 host-logits control was launched on the same commit with
+  `--disable-on-device-sampling`:
+  `/home/ubuntu/qwen_artifacts/qwen36_27b_2048_bf16_hybrid_apc_host_logits_legacy_tkg_5a08328`.
+  Its compile log is
+  `/home/ubuntu/validation_logs/hybrid_apc_real_tokens/legacy_tkg_bf16_host_logits_2k_5a08328_compile.log`.
 - Local verification:
   - `python3 -m py_compile contrib/models/Qwen3.6-27B/src/modeling_qwen35.py contrib/models/Qwen3.6-27B/test/integration/qwen36_27b_compile_fp8.py validation_scripts/qwen36_hybrid_apc_validation.py`
   - `python3 -m pytest contrib/models/Qwen3.6-27B/test/unit/test_qwen36_model_aliases.py contrib/models/Qwen3.6-27B/test/unit/test_qwen36_compile_fp8_config.py contrib/models/Qwen3.6-27B/test/unit/test_hybrid_apc_validation.py`
@@ -295,10 +317,10 @@ entrypoints.
 
 - Why does host-side `output_logits=True` return all-NaN logits even when FP8
   special scalar handling is set?
-- Why does on-device sampling OOB in token generation even after the compile
-  artifact and vLLM runtime both use 9 physical PA blocks?
-- Whether the OOB is caused by token-generation block-table shape/indexing,
-  sampler input layout, or another vLLM Neuron/NxDI contract mismatch.
+- Why does on-device sampling feed an invalid token id into TKG
+  (`2143289344` in the BF16 PA9 run) even though the TKG block metadata is
+  in range?
+- Whether BF16 host logits are finite once on-device sampling is disabled.
 - Whether the older `contrib/qwen36-27b-vllm-apc-pr` branch has a serving/runtime
   detail outside the Qwen compile path that avoids this OOB.
 
