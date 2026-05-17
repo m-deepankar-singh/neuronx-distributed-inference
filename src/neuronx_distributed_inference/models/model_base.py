@@ -3878,18 +3878,30 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
                     finite_flat = flat[finite_mask].float()
                     finite_min = float(finite_flat.min().item())
                     finite_max = float(finite_flat.max().item())
-                    argmax = int(torch.argmax(tensor.reshape(-1, tensor.shape[-1])[0]).item())
+                    first_row = tensor.reshape(-1, tensor.shape[-1])[0].float()
+                    argmax = int(torch.argmax(first_row).item())
                 else:
                     finite_min = "none"
                     finite_max = "none"
                     argmax = "none"
+                topk_suffix = ""
+                topk = int(os.environ.get("NXDI_OUTPUT_DEBUG_TOPK", "0"))
+                if finite_count and topk > 0 and tensor.shape[-1] > 0:
+                    topk = min(topk, int(tensor.shape[-1]))
+                    top_values, top_indices = torch.topk(first_row, k=topk)
+                    topk_suffix = (
+                        f" first_row_top{topk}_ids="
+                        f"{[int(idx.item()) for idx in top_indices]}"
+                        f" first_row_top{topk}_values="
+                        f"{[float(value.item()) for value in top_values]}"
+                    )
                 print(
                     "[nxdi_output_debug] "
                     f"name={name} shape={tuple(tensor.shape)} dtype={tensor.dtype} "
                     f"finite={finite_count}/{tensor.numel()} nan={nan_count} "
                     f"posinf={posinf_count} neginf={neginf_count} "
                     f"finite_min={finite_min} finite_max={finite_max} "
-                    f"first_row_argmax={argmax}",
+                    f"first_row_argmax={argmax}{topk_suffix}",
                     flush=True,
                 )
             else:
