@@ -244,8 +244,16 @@ Legacy TKG arg experiment:
     - A one-shot compile-then-validate wrapper was launched to keep validation
       in the same process lifetime:
       `/home/ubuntu/validation_logs/hybrid_apc_real_tokens/legacy_tkg_bf16_inline_2k_compile_validate.log`
-    - At the time this report was pushed, that inline run was still compiling
-      on the Trainium host and had not yet reached validation.
+    - The inline run compiled and started validation, but failed before decode
+      in context encoding:
+      `RuntimeError: forward() expected at most 25 argument(s) but received 30 argument(s)`.
+      The compiled CTE graph accepted 24 tensor arguments, while the runtime
+      still passed the expanded 29-tensor/30-argument CTE input list.
+    - Conclusion: the attempted legacy mode proved the failure class is a
+      compiled-trace/runtime positional signature mismatch, but the patch was
+      too broad or applied at the wrong wrapper boundary. CTE and TKG need
+      independent explicit arg contracts; legacy TKG mode must not make the
+      CTE trace/runtime disagree.
 
 ## External Reference
 
