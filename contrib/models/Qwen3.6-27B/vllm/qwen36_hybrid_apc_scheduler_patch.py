@@ -48,15 +48,15 @@ def should_disable_unbacked_prefix_reads(scheduler: Any) -> bool:
     fallback makes vLLM allocate the request as a normal no-prefix prefill.
     """
 
+    if _env_flag("QWEN36_HYBRID_APC_ENABLE_PREFIX_READS"):
+        return False
+    if _env_flag("QWEN36_HYBRID_APC_DISABLE_UNBACKED_PREFIX_READS"):
+        return True
+
     hf_config = _get_hf_config(getattr(scheduler, "vllm_config", None))
     if not _config_flag(hf_config, "use_hybrid_apc_manager"):
         return False
-    if _env_flag("QWEN36_HYBRID_APC_ENABLE_PREFIX_READS"):
-        return False
-    return (
-        _env_flag("QWEN36_HYBRID_APC_DISABLE_UNBACKED_PREFIX_READS")
-        or _config_flag(hf_config, "hybrid_apc_disable_unbacked_prefix_reads")
-    )
+    return _config_flag(hf_config, "hybrid_apc_disable_unbacked_prefix_reads")
 
 
 def patch_scheduler_class(scheduler_cls: type) -> bool:

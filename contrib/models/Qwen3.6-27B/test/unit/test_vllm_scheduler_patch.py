@@ -62,6 +62,15 @@ class TestQwen36HybridAPCSchedulerPatch(unittest.TestCase):
         ):
             self.assertTrue(self.patch.should_disable_unbacked_prefix_reads(scheduler))
 
+    def test_env_flag_wins_when_artifact_config_is_stale(self):
+        scheduler = _scheduler(use_hybrid_apc=False)
+
+        with patch.dict(
+            os.environ,
+            {"QWEN36_HYBRID_APC_DISABLE_UNBACKED_PREFIX_READS": "1"},
+        ):
+            self.assertTrue(self.patch.should_disable_unbacked_prefix_reads(scheduler))
+
     def test_non_hybrid_apc_model_is_not_changed(self):
         scheduler = _scheduler(
             use_hybrid_apc=False,
