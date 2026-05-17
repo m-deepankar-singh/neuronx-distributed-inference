@@ -316,6 +316,32 @@ class TestQwen36ModelAliases(unittest.TestCase):
             128,
         )
 
+    def test_fused_deltanet_decay_bound_recovers_finite_deltas(self):
+        g = torch.tensor(
+            [[[[0.0, float("-inf"), float("-inf"), -1.0]]]],
+            dtype=torch.float32,
+        )
+
+        bounded = self.qwen_module._bound_fused_deltanet_log_decay(
+            g,
+            batch_size=1,
+            num_heads=1,
+            total_seq_len=4,
+            chunk_size=4,
+        )
+        bounded_cumsum = bounded.reshape(1, 1, 1, 4).cumsum(dim=-1)
+
+        self.assertTrue(torch.isfinite(bounded).all())
+        self.assertTrue(torch.isfinite(bounded_cumsum).all())
+        self.assertGreaterEqual(
+            float(bounded_cumsum.min().item()),
+            self.qwen_module.FUSED_DELTANET_DECAY_MIN,
+        )
+        self.assertLessEqual(
+            float(bounded_cumsum.max().item()),
+            self.qwen_module.FUSED_DELTANET_DECAY_MAX,
+        )
+
     def test_legacy_tkg_args_are_env_gated(self):
         with patch.dict(os.environ, {}, clear=True):
             self.assertFalse(self.qwen_module._use_legacy_tkg_args())

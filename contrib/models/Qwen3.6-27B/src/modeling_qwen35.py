@@ -628,6 +628,13 @@ class NeuronGatedDeltaNet(nn.Module):
             beta = F.pad(beta, (0, pad_size))
             g = F.pad(g, (0, pad_size))
         total_seq_len = S + pad_size
+        g = _bound_fused_deltanet_log_decay(
+            g,
+            batch_size=B,
+            num_heads=H,
+            total_seq_len=total_seq_len,
+            chunk_size=chunk_size,
+        )
 
         num_chunks = total_seq_len // chunk_size
         g_reshaped = g.reshape(B, H, num_chunks, chunk_size)
@@ -759,8 +766,16 @@ class NeuronGatedDeltaNet(nn.Module):
             beta = F.pad(beta, (0, pad_size))
             g = F.pad(g, (0, pad_size))
         total_seq_len = S + pad_size
-        # Pass raw per-token log-decay. The fused NKI kernel forms decay as
-        # exp(cumsum(g)_i - cumsum(g)_j), so no pre-kernel clamp is needed.
+        # Keep cumulative log-decay finite before the fused kernel forms
+        # exp(cumsum(g)_i - cumsum(g)_j). Without this, -inf cumulative values
+        # can produce -inf - -inf and poison the CTE hidden state with NaNs.
+        g = _bound_fused_deltanet_log_decay(
+            g,
+            batch_size=B,
+            num_heads=H,
+            total_seq_len=total_seq_len,
+            chunk_size=chunk_size,
+        )
 
         BH = B * H
         # Flatten to (BH, S, dim) for per-(b,h) kernel calls
