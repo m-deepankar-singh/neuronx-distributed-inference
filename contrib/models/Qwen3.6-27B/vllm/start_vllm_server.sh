@@ -259,6 +259,8 @@ print(json.dumps({
     "hybrid_apc_require_attention_block_refs": enable_hybrid_apc and "${HYBRID_APC_REQUIRE_VLLM_METADATA}" == "1",
     "hybrid_apc_disable_unbacked_prefix_reads": enable_hybrid_apc and "${HYBRID_APC_DISABLE_UNBACKED_PREFIX_READS}" == "1",
     "hybrid_apc_enable_backed_prefix_reads": enable_hybrid_apc and "${HYBRID_APC_ENABLE_BACKED_PREFIX_READS}" == "1",
+    "use_qwen_hybrid_chunked_prefill": enable_chunked,
+    "use_qwen_hybrid_chunked_prefill_nki": enable_chunked,
     "override_neuron_config": neuron_config,
 }))
 PY

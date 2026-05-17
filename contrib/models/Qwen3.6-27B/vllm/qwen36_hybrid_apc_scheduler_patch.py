@@ -52,12 +52,29 @@ def _get_hf_config(vllm_config: Any) -> Any:
     return getattr(model_config, "hf_config", None)
 
 
+def _get_additional_config(vllm_config: Any) -> dict[str, Any]:
+    additional_config = getattr(vllm_config, "additional_config", None)
+    return additional_config if isinstance(additional_config, dict) else {}
+
+
 def _config_flag(config: Any, name: str, default: bool = False) -> bool:
     return bool(getattr(config, name, default))
 
 
 def _config_value(config: Any, name: str, default: Any) -> Any:
     return getattr(config, name, default)
+
+
+def _scheduler_config_flag(
+    scheduler: Any,
+    name: str,
+    default: bool = False,
+) -> bool:
+    vllm_config = getattr(scheduler, "vllm_config", None)
+    additional_config = _get_additional_config(vllm_config)
+    if name in additional_config:
+        return bool(additional_config[name])
+    return _config_flag(_get_hf_config(vllm_config), name, default)
 
 
 def _normalize_dtype(value: Any, default: str) -> str:
@@ -242,14 +259,13 @@ def _supports_backed_prefix_reads(scheduler: Any) -> bool:
     if _env_flag("QWEN36_HYBRID_APC_ENABLE_BACKED_PREFIX_READS"):
         return True
 
-    hf_config = _get_hf_config(getattr(scheduler, "vllm_config", None))
-    if not _config_flag(hf_config, "hybrid_apc_enable_backed_prefix_reads"):
+    if not _scheduler_config_flag(scheduler, "hybrid_apc_enable_backed_prefix_reads"):
         return False
 
     # A backed GDN checkpoint is not enough on its own. The CTE graph must also
     # consume attention KV prefix state; otherwise warm requests restore GDN
     # state but full-attention layers still see only the suffix.
-    return _config_flag(hf_config, "use_qwen_hybrid_chunked_prefill")
+    return _scheduler_config_flag(scheduler, "use_qwen_hybrid_chunked_prefill")
 
 
 def should_disable_unbacked_prefix_reads(scheduler: Any, request: Any = None) -> bool:
@@ -265,13 +281,12 @@ def should_disable_unbacked_prefix_reads(scheduler: Any, request: Any = None) ->
     if _env_flag("QWEN36_HYBRID_APC_ENABLE_PREFIX_READS"):
         return False
 
-    hf_config = _get_hf_config(getattr(scheduler, "vllm_config", None))
     disable_requested = _env_flag("QWEN36_HYBRID_APC_DISABLE_UNBACKED_PREFIX_READS")
     if not disable_requested:
-        if not _config_flag(hf_config, "use_hybrid_apc_manager"):
+        if not _scheduler_config_flag(scheduler, "use_hybrid_apc_manager"):
             return False
-        disable_requested = _config_flag(
-            hf_config,
+        disable_requested = _scheduler_config_flag(
+            scheduler,
             "hybrid_apc_disable_unbacked_prefix_reads",
         )
     if not disable_requested:

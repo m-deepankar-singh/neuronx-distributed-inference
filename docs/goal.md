@@ -117,6 +117,88 @@ to prove whether the CTE restore path itself becomes exact once GDN state is
 restored. The production fix should pass full prompt hashes or explicit restore
 metadata from vLLM/vLLM-Neuron into the Qwen model request.
 
+After commit `1c3d9dd`, the guarded diagnostic passed with forced vLLM prefix
+reads:
+
+```text
+full_prefix_exact=true
+partial_prefix_exact=true
+real_generated_tokens_passed=true
+warm_partial elapsed: 1.3459s
+cold_partial elapsed: 1.9542s
+```
+
+The key debug proof is:
+
+```text
+apply-suffix prompt_len=272 restore_len=256 suffix_len=16 restore_slot=0
+attention_hit_len=256 restore_len=256 computed=tensor([[256]]) num_queries=tensor([[16]])
+restore_mask=tensor([1])
+qwen-cte-call input_shape=(1, 16) position_minmax=256:271 computed=[256] restore_prefix=[256]
+pad-pre prefill_len=16 prefix_len=256 prefill_bucket=256 prefix_bucket=256
+```
+
+Artifacts:
+
+- JSON:
+  `/home/ubuntu/validation_logs/hybrid_apc_real_tokens/bf16_hybrid_apc_backed_prefix_d061df5_suffix_restore_diag_1c3d9dd.json`
+- Log:
+  `/home/ubuntu/validation_logs/hybrid_apc_real_tokens/bf16_hybrid_apc_backed_prefix_d061df5_suffix_restore_diag_1c3d9dd.log`
+
+This proves the CTE restore/padding/model execution contract can be exact for
+the 256-token backed prefix.
+
+The next scheduler-gated run exposed a runtime config propagation bug: the
+serving `additional_config` advertised
+`hybrid_apc_enable_backed_prefix_reads=True` and
+`use_qwen_hybrid_chunked_prefill=True`, but the scheduler gate only read
+`vllm_config.model_config.hf_config`. It therefore printed:
+
+```text
+backed_hit_len=256
+supports_backed=False
+```
+
+The fix is to have the scheduler gate read Hybrid APC safety flags from
+`vllm_config.additional_config` before falling back to `hf_config`.
+
+After that fix, the same 2K boundary validation passed without global
+`QWEN36_HYBRID_APC_ENABLE_PREFIX_READS`:
+
+```text
+full_prefix_exact=true
+partial_prefix_exact=true
+real_generated_tokens_passed=true
+cold_partial elapsed: 1.9555s
+warm_partial elapsed: 1.3282s
+```
+
+Key debug proof:
+
+```text
+scheduler-decision backed_hit_len=256 supports_backed=True prompt_len=272 registry_size=1
+apply-suffix prompt_len=272 restore_len=256 suffix_len=16 restore_slot=0
+attention_hit_len=256 restore_len=256 computed=tensor([[256]]) num_queries=tensor([[16]])
+qwen-cte-call input_shape=(1, 16) position_minmax=256:271 computed=[256] restore_mask=[1]
+```
+
+Artifacts:
+
+- JSON:
+  `/home/ubuntu/validation_logs/hybrid_apc_real_tokens/bf16_hybrid_apc_backed_prefix_d061df5_scheduler_gate_boundary_additional_config.json`
+- Log:
+  `/home/ubuntu/validation_logs/hybrid_apc_real_tokens/bf16_hybrid_apc_backed_prefix_d061df5_scheduler_gate_boundary_additional_config.log`
+
+This proves the scheduler-gated backed-prefix path is correct for the current
+single-request diagnostic. The remaining production blocker is narrower:
+
+```text
+QWEN36_HYBRID_APC_ALLOW_UNHASHED_SINGLE_PREFIX_RESTORE=1 still restores by
+unique prefix length when vLLM-Neuron has already sliced the prompt to suffix.
+Production needs an explicit restore identity: full prompt hashes, a scheduler
+selected GDN key, or a restore slot carried from scheduler/runner into Qwen.
+```
+
 The base BF16 host-logits path is not the current blocker when using the per-chunk DeltaNet CTE path:
 
 - Fused CTE artifact goes NaN around 105-106 tokens.
@@ -134,7 +216,7 @@ vLLM recomputes the active prompt as a no-prefix request
 cold and warm outputs match
 ```
 
-The real performance path is not done:
+The diagnostic performance path is now proven:
 
 ```text
 attention KV prefix hit exists
@@ -142,16 +224,8 @@ matching GDN checkpoint exists
 model restores GDN state and runs only the suffix
 ```
 
-That backed-restore path now activates, but the warm partial-prefix output is still wrong. The current failure is no longer "scheduler cannot find a GDN checkpoint"; it is now in the CTE restore/padding/model execution contract after a valid 256-token restore is selected.
-
-Follow-up inspection found an additional required condition: the current BF16 artifact has:
-
-```text
-use_qwen_hybrid_chunked_prefill=False
-use_qwen_hybrid_chunked_prefill_nki=False
-```
-
-With that artifact, Qwen CTE restores GDN state but does not consume attention KV prefix state for full-attention layers. A registered GDN checkpoint is therefore not sufficient to make an attention prefix read safe.
+It is still guarded as diagnostic because suffix-only restore must not rely on
+prefix length alone in multi-prefix or multi-tenant serving.
 
 ## Overnight Operating Rule
 
@@ -167,6 +241,22 @@ If the same failure mode or error repeats more than twice, stop local trial-and-
 Then record the finding in this file before applying the next patch or starting another compile.
 
 ## Confirmed Validation
+
+Local and remote focused tests after the scheduler/additional-config fix:
+
+```text
+59 passed
+```
+
+Remote 2K BF16 boundary validation after the scheduler/additional-config fix:
+
+```text
+full_prefix_exact=true
+partial_prefix_exact=true
+real_generated_tokens_passed=true
+backed_hit_len=256 supports_backed=True
+apply-suffix prompt_len=272 restore_len=256 suffix_len=16
+```
 
 Local focused tests after `7d1138e`:
 
@@ -421,11 +511,19 @@ The CTE-prefix implementation patch adds the pieces needed for the next artifact
 The exact current problem is:
 
 ```text
-Correctness is protected on the old artifact by falling back to no-prefix execution.
-The unresolved work is proving the real performance path on a newly compiled backed-prefix artifact.
+Correctness is protected by the scheduler fallback when no matching GDN
+checkpoint exists.
+
+The scheduler-gated backed-prefix diagnostic now also works: vLLM reuses the
+256-token attention prefix, Qwen restores the matching GDN checkpoint, runs the
+16-token suffix, and cold/warm outputs match.
+
+The remaining production problem is carrying a stable restore identity through
+vLLM/vLLM-Neuron into Qwen after chunked prefill slices the prompt to suffix.
+The current successful diagnostic uses a guarded unique-prefix-length restore.
 ```
 
-The old failing backed run exposed this contract:
+The proven backed run uses this contract:
 
 ```text
 suffix input length: 16
@@ -433,28 +531,31 @@ restored prefix length: 256
 computed_context_lens: [256]
 num_queries: [16]
 slot_mapping: suffix slots only
-block_table: 8 prefix blocks
-current artifact: use_qwen_hybrid_chunked_prefill=False
-old padding wrapper: reset/collapsed prefix side during CTE bucket padding
-old artifact: full-attention layers did not consume attention KV prefix in CTE
+block_table: prefix plus suffix physical blocks
+runtime config: use_qwen_hybrid_chunked_prefill=True
+restore_mask: [1]
 ```
 
-`d6df06a` fixes the known wrapper/model contract in code and focused unit tests:
+The current code fixes the known wrapper/model/scheduler contracts in code and
+focused unit tests:
 
 ```text
 16-token suffix plus 256-token restored prefix pads as prefill_bucket=256, prefix_bucket=256
 Hybrid APC restore tensors stay suffix-only through padding
 Qwen CTE full-attention layers can consume selected prefix KV
 backed prefix reads remain opt-in
+the scheduler gate honors serving additional_config, not only hf_config
 ```
 
-The next required proof is a new BF16 2K artifact compiled with backed CTE prefix support. The old artifact is expected to keep falling back.
+The next required proof is production metadata wiring without
+QWEN36_HYBRID_APC_ALLOW_UNHASHED_SINGLE_PREFIX_RESTORE.
 
 Primary files changed or relevant:
 
 - `src/neuronx_distributed_inference/models/model_wrapper.py`
 - `contrib/models/Qwen3.6-27B/src/modeling_qwen35.py`
 - `contrib/models/Qwen3.6-27B/vllm/qwen36_hybrid_apc_scheduler_patch.py`
+- `contrib/models/Qwen3.6-27B/vllm/run_offline_inference.py`
 
 ## Why The Earlier Artifacts Did Not Work
 
@@ -469,11 +570,17 @@ The existing BF16 per-chunk artifact was generated before the backed-prefix CTE 
 
 ## Recommended Next Work
 
-1. Compile exactly one BF16 2K artifact with `--enable-vllm-chunked-prefill` and `--hybrid-apc-enable-backed-prefix-reads`.
-2. Use `--load-after-compile` so a broken artifact is caught immediately.
-3. Do not start parallel compile variants unless the first compile result proves the artifact shape is wrong.
-4. Rerun the same 2K checkpoint-boundary validation with `--hybrid-apc-enable-backed-prefix-reads`.
-5. Expected backed-prefix debug:
+1. Replace the guarded suffix-only restore with explicit production metadata:
+   carry either full prompt hashes, a scheduler-selected GDN key, or a restore
+   slot from vLLM/vLLM-Neuron into Qwen.
+2. Keep the current scheduler rule: vLLM prefix reads are allowed only when a
+   matching GDN checkpoint exists and the runtime config advertises backed CTE
+   prefix support.
+3. Add a negative test where two checkpoints share the same prefix length and
+   prove production mode does not use the length-only restore.
+4. Rerun the same 2K checkpoint-boundary validation without
+   `QWEN36_HYBRID_APC_ALLOW_UNHASHED_SINGLE_PREFIX_RESTORE`.
+5. Expected backed-prefix debug stays:
 
 ```text
 attention_hit_len=256

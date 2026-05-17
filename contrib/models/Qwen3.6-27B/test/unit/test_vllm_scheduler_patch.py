@@ -33,6 +33,7 @@ def _scheduler(
     use_qwen_hybrid_chunked_prefill=False,
     block_size=2,
     model_revision="rev-a",
+    additional_config=None,
 ):
     hf_config_kwargs = dict(
         use_hybrid_apc_manager=use_hybrid_apc,
@@ -48,7 +49,10 @@ def _scheduler(
         hf_config_kwargs["hybrid_apc_model_revision"] = model_revision
     hf_config = types.SimpleNamespace(**hf_config_kwargs)
     model_config = types.SimpleNamespace(hf_config=hf_config)
-    vllm_config = types.SimpleNamespace(model_config=model_config)
+    vllm_config = types.SimpleNamespace(
+        model_config=model_config,
+        additional_config=additional_config or {},
+    )
     cache_config = types.SimpleNamespace(block_size=block_size)
     return types.SimpleNamespace(vllm_config=vllm_config, cache_config=cache_config)
 
@@ -200,6 +204,47 @@ class TestQwen36HybridAPCSchedulerPatch(unittest.TestCase):
             self.assertFalse(
                 self.patch.should_disable_unbacked_prefix_reads(scheduler, request)
             )
+
+    def test_additional_config_allows_prefix_read_when_hf_config_is_stale(self):
+        scheduler = _scheduler(
+            block_size=2,
+            enable_backed_prefix_reads=False,
+            use_qwen_hybrid_chunked_prefill=False,
+            additional_config={
+                "use_hybrid_apc_manager": True,
+                "hybrid_apc_disable_unbacked_prefix_reads": True,
+                "hybrid_apc_enable_backed_prefix_reads": True,
+                "use_qwen_hybrid_chunked_prefill": True,
+            },
+        )
+        token_ids = [10, 11, 12, 13, 14]
+        hashes = self.patch._local_cumulative_prefix_hashes(
+            token_ids,
+            block_size=2,
+            max_prefix_len=4,
+        )
+        self.patch.register_hybrid_apc_gdn_checkpoint(
+            self.patch.HybridGDNPrefixKey(
+                cumulative_prefix_hash=hashes[4],
+                prefix_len=4,
+                block_size=2,
+                cache_salt=None,
+                model_revision="rev-a",
+                layout_version=1,
+                tp_rank=0,
+                recurrent_dtype="float32",
+                conv_dtype="bfloat16",
+            )
+        )
+        request = types.SimpleNamespace(
+            prompt_token_ids=token_ids,
+            num_tokens=len(token_ids),
+            cache_salt=None,
+        )
+
+        self.assertFalse(
+            self.patch.should_disable_unbacked_prefix_reads(scheduler, request)
+        )
 
     def test_mismatched_gdn_checkpoint_keeps_prefix_read_disabled(self):
         scheduler = _scheduler(block_size=2)

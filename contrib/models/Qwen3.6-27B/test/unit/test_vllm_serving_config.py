@@ -156,6 +156,12 @@ class TestVllmServingConfig(unittest.TestCase):
 
         self.assertTrue(config["hybrid_apc_enable_backed_prefix_reads"])
 
+    def test_chunked_prefill_runtime_flags_are_forwarded(self):
+        config = self.runner._override_config(_args(enable_vllm_chunked_prefill=True))
+
+        self.assertTrue(config["use_qwen_hybrid_chunked_prefill"])
+        self.assertTrue(config["use_qwen_hybrid_chunked_prefill_nki"])
+
 
 if __name__ == "__main__":
     unittest.main()

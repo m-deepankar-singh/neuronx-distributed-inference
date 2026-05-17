@@ -167,6 +167,8 @@ def _override_config(args: argparse.Namespace) -> dict:
             "hybrid_apc_enable_backed_prefix_reads",
             False,
         ),
+        "use_qwen_hybrid_chunked_prefill": args.enable_vllm_chunked_prefill,
+        "use_qwen_hybrid_chunked_prefill_nki": args.enable_vllm_chunked_prefill,
         "override_neuron_config": neuron_config,
     }
 
