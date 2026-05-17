@@ -332,11 +332,11 @@ def apply_hybrid_apc_prefill_plan(
     ):
         output["inputs_embeds"] = inputs_embeds[:, restore_len:prompt_len]
 
-    def _slot_mapping_is_missing_or_padding(value) -> bool:
+    def _slot_mapping_needs_repair(value) -> bool:
         return (
             not isinstance(value, torch.Tensor)
             or value.numel() == 0
-            or bool((value.to(torch.int64) < 0).all().item())
+            or bool((value.to(torch.int64) < 0).any().item())
         )
 
     def _synthesize_suffix_slot_mapping() -> torch.Tensor | None:
@@ -386,7 +386,7 @@ def apply_hybrid_apc_prefill_plan(
         elif slot_mapping.numel() >= batch_size * prompt_len:
             flattened = slot_mapping.reshape(batch_size, -1)
             output["slot_mapping"] = flattened[:, restore_len:prompt_len]
-    if _slot_mapping_is_missing_or_padding(output.get("slot_mapping")):
+    if _slot_mapping_needs_repair(output.get("slot_mapping")):
         synthesized_slot_mapping = _synthesize_suffix_slot_mapping()
         if synthesized_slot_mapping is not None:
             dtype = (
@@ -394,7 +394,18 @@ def apply_hybrid_apc_prefill_plan(
                 if isinstance(slot_mapping, torch.Tensor)
                 else torch.int32
             )
-            output["slot_mapping"] = synthesized_slot_mapping.to(dtype=dtype)
+            repaired_slot_mapping = synthesized_slot_mapping.to(dtype=dtype)
+            current_slot_mapping = output.get("slot_mapping")
+            if (
+                isinstance(current_slot_mapping, torch.Tensor)
+                and current_slot_mapping.numel() == repaired_slot_mapping.numel()
+            ):
+                repaired_slot_mapping = torch.where(
+                    current_slot_mapping.to(torch.int64) < 0,
+                    repaired_slot_mapping.reshape(current_slot_mapping.shape),
+                    current_slot_mapping,
+                )
+            output["slot_mapping"] = repaired_slot_mapping
 
     position_template = input_dict.get("position_ids")
     position_dtype = (
