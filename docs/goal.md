@@ -321,6 +321,18 @@ Remote scheduler subset after additional-config key metadata hardening:
 14 passed
 ```
 
+Local focused tests after batched debug-override guard:
+
+```text
+63 passed
+```
+
+Remote scheduler subset after batched debug-override guard:
+
+```text
+15 passed
+```
+
 Local focused tests after `7d1138e`:
 
 ```text
@@ -639,7 +651,8 @@ The existing BF16 per-chunk artifact was generated before the backed-prefix CTE 
 
 1. Replace the in-process authorized-key queue with request-id scoped metadata
    for batched/concurrent serving. Current code safely disables backed prefix
-   reads when `max_num_seqs != 1`.
+   reads when `max_num_seqs != 1`, including the debug
+   `QWEN36_HYBRID_APC_ENABLE_BACKED_PREFIX_READS` path.
 2. Keep the current scheduler rule: vLLM prefix reads are allowed only when a
    matching GDN checkpoint exists and the runtime config advertises backed CTE
    prefix support.

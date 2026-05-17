@@ -338,12 +338,13 @@ def backed_gdn_prefix_hit_len(scheduler: Any, request: Any) -> int:
 def _supports_backed_prefix_reads(scheduler: Any) -> bool:
     """Return whether this artifact can consume a backed Hybrid APC prefix."""
 
+    if _max_num_seqs_for_scheduler(scheduler) != 1:
+        return False
+
     if _env_flag("QWEN36_HYBRID_APC_ENABLE_BACKED_PREFIX_READS"):
         return True
 
     if not _scheduler_config_flag(scheduler, "hybrid_apc_enable_backed_prefix_reads"):
-        return False
-    if _max_num_seqs_for_scheduler(scheduler) != 1:
         return False
 
     # A backed GDN checkpoint is not enough on its own. The CTE graph must also

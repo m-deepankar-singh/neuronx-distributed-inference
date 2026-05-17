@@ -314,6 +314,49 @@ class TestQwen36HybridAPCSchedulerPatch(unittest.TestCase):
             )
         )
 
+    def test_env_backed_prefix_override_does_not_bypass_batched_guard(self):
+        scheduler = _scheduler(
+            block_size=2,
+            enable_backed_prefix_reads=False,
+            use_qwen_hybrid_chunked_prefill=False,
+            max_num_seqs=2,
+        )
+        token_ids = [10, 11, 12, 13, 14]
+        hashes = self.patch._local_cumulative_prefix_hashes(
+            token_ids,
+            block_size=2,
+            max_prefix_len=4,
+        )
+        self.patch.register_hybrid_apc_gdn_checkpoint(
+            self.patch.HybridGDNPrefixKey(
+                cumulative_prefix_hash=hashes[4],
+                prefix_len=4,
+                block_size=2,
+                cache_salt=None,
+                model_revision="rev-a",
+                layout_version=1,
+                tp_rank=0,
+                recurrent_dtype="float32",
+                conv_dtype="bfloat16",
+            )
+        )
+        request = types.SimpleNamespace(
+            prompt_token_ids=token_ids,
+            num_tokens=len(token_ids),
+            cache_salt=None,
+        )
+
+        with patch.dict(
+            os.environ,
+            {
+                "QWEN36_HYBRID_APC_DISABLE_UNBACKED_PREFIX_READS": "1",
+                "QWEN36_HYBRID_APC_ENABLE_BACKED_PREFIX_READS": "1",
+            },
+        ):
+            self.assertTrue(
+                self.patch.should_disable_unbacked_prefix_reads(scheduler, request)
+            )
+
     def test_additional_config_overrides_scheduler_registry_key_metadata(self):
         scheduler = _scheduler(
             block_size=2,
