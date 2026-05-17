@@ -19,6 +19,17 @@ from pathlib import Path
 import torch
 
 
+_FP8_ENV_DEFAULTS = {
+    "XLA_HANDLE_SPECIAL_SCALAR": "1",
+    "UNSAFE_FP8FNCAST": "1",
+}
+
+
+def _ensure_fp8_environment() -> None:
+    for name, value in _FP8_ENV_DEFAULTS.items():
+        os.environ.setdefault(name, value)
+
+
 def _repo_root(path: str | None) -> Path:
     if path:
         return Path(path).expanduser().resolve()
@@ -89,13 +100,17 @@ def _prefix_buckets(args: argparse.Namespace, cte_buckets: list[int]) -> list[in
 def _pa_num_blocks(args: argparse.Namespace) -> int:
     min_blocks = max(1, (args.seq_len + args.block_size - 1) // args.block_size)
     if args.pa_num_blocks is None:
-        return min_blocks
-    if args.pa_num_blocks < min_blocks:
+        requested_blocks = min_blocks
+    else:
+        requested_blocks = args.pa_num_blocks
+    if requested_blocks < min_blocks:
         raise ValueError(
-            f"--pa-num-blocks {args.pa_num_blocks} is too small for seq_len="
+            f"--pa-num-blocks {requested_blocks} is too small for seq_len="
             f"{args.seq_len} and block_size={args.block_size}; need at least {min_blocks}"
         )
-    return args.pa_num_blocks
+    # vLLM Neuron reserves one additional null block at runtime. Compile the
+    # physical PA table with the same extra block so block ids stay in-bounds.
+    return requested_blocks + 1
 
 
 def _mlp_only_modules_to_not_convert(num_layers: int) -> list[str]:
@@ -263,7 +278,9 @@ def _build_config(args: argparse.Namespace):
         "activation_quantization_type": None,
     }
     if args.disable_on_device_sampling:
-        neuron_config_kwargs["output_logits"] = False
+        # vLLM/host-side sampling consumes logits from the Neuron trace. Without
+        # logits, the serving path can only surface placeholder token ids.
+        neuron_config_kwargs["output_logits"] = True
     else:
         neuron_config_kwargs["on_device_sampling_config"] = OnDeviceSamplingConfig(
             do_sample=False,
@@ -350,6 +367,7 @@ def main() -> int:
     contrib_model_dir = repo / "contrib" / "models" / "Qwen3.6-27B"
     sys.path.insert(0, str(repo))
     sys.path.insert(0, str(contrib_model_dir))
+    _ensure_fp8_environment()
 
     from src.modeling_qwen35 import NeuronQwen35ForCausalLM  # noqa: WPS433
 
@@ -363,6 +381,8 @@ def main() -> int:
     print("MODEL_PATH", str(model_path), flush=True)
     print("COMPILED_PATH", str(compiled_path), flush=True)
     print("QUANTIZED_CHECKPOINTS_PATH", str(quantized_path), flush=True)
+    for env_name in _FP8_ENV_DEFAULTS:
+        print(env_name, os.environ.get(env_name), flush=True)
     print("MODULES_TO_NOT_CONVERT_COUNT", len(modules_to_not_convert), flush=True)
     print(
         "CONTEXT_TRACE_SHAPE",

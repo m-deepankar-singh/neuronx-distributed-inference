@@ -11,6 +11,17 @@ import time
 from pathlib import Path
 
 
+_FP8_ENV_DEFAULTS = {
+    "XLA_HANDLE_SPECIAL_SCALAR": "1",
+    "UNSAFE_FP8FNCAST": "1",
+}
+
+
+def _ensure_fp8_environment() -> None:
+    for name, value in _FP8_ENV_DEFAULTS.items():
+        os.environ.setdefault(name, value)
+
+
 def _contrib_root(repo_root: str | None) -> Path:
     if repo_root:
         return Path(repo_root).expanduser().resolve() / "contrib" / "models" / "Qwen3.6-27B"
@@ -233,6 +244,7 @@ def main() -> int:
         os.environ["NEURON_COMPILED_ARTIFACTS"] = str(
             Path(args.compiled_artifacts).expanduser().resolve()
         )
+        _ensure_fp8_environment()
 
     from hf_qwen35_config import register_qwen35_config  # noqa: WPS433
 

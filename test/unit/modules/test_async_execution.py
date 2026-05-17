@@ -1,4 +1,6 @@
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
 from types import SimpleNamespace
 from typing import List
 from unittest.mock import patch
@@ -426,6 +428,45 @@ class TestHybridAPCAsyncBridge(unittest.TestCase):
         self.assertEqual(bridge.finished, ["req-1"])
         self.assertNotIn("_hybrid_apc_prepared", input_dict)
 
+    def test_hybrid_apc_debug_trace_includes_restore_commit_evidence(self):
+        bridge = _FakeHybridBridge()
+        base = SimpleNamespace(
+            config=SimpleNamespace(use_hybrid_apc_manager=True),
+            hybrid_apc_bridge=bridge,
+        )
+        input_dict = _prefix_input_dict()
+        input_dict.update(
+            {
+                "request_id": "req-debug",
+                "vllm_attention_hit_len": torch.tensor([2], dtype=torch.int32),
+            }
+        )
+
+        stdout = StringIO()
+        with patch.dict("os.environ", {"QWEN36_HYBRID_APC_DEBUG": "1"}):
+            with redirect_stdout(stdout):
+                prepared = prepare_hybrid_apc_request_for_execution(base, input_dict)
+
+        log = stdout.getvalue()
+        self.assertIn("[hybrid_apc_debug] prepare", log)
+        self.assertIn("request_id='req-debug'", log)
+        self.assertIn("attention_hit_len=2", log)
+        self.assertIn("restore_len=2", log)
+        self.assertIn("commit_prefix_len=4", log)
+        self.assertIn("restore_slot=5", log)
+        self.assertIn("commit_slot=7", log)
+        self.assertIn("input_shape=(1, 4)", log)
+        self.assertIn("prepared_shape=(1, 2)", log)
+        self.assertIn("computed=tensor([[2]], dtype=torch.int32)", log)
+        self.assertIn("restore_mask=tensor([1], dtype=torch.int32)", log)
+        self.assertIn("commit_mask=tensor([1], dtype=torch.int32)", log)
+        self.assertTrue(
+            torch.equal(
+                prepared["input_ids"],
+                torch.tensor([[12, 13]], dtype=torch.int32),
+            )
+        )
+
     def test_prefix_caching_execution_cancels_hybrid_apc_on_model_failure(self):
         base = SimpleNamespace(
             config=SimpleNamespace(use_hybrid_apc_manager=True),
@@ -616,6 +657,12 @@ class _FakeHybridBridge:
         return SimpleNamespace(
             request_id=kwargs["request_id"],
             input_dict=input_dict,
+            plan=SimpleNamespace(
+                restore_checkpoint_prefix_len=2,
+                checkpoint_slot=5,
+            ),
+            commit_prefix_len=4,
+            commit_slot=7,
             attention_block_refs=(11, 12),
         )
 

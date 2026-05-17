@@ -2728,6 +2728,19 @@ class HybridGDNCheckpointCache(nn.Module):
 # ============================================================
 
 
+def _effective_lm_head_pad_size(lm_head, logits, config):
+    pad_size = getattr(lm_head, "pad_size", None)
+    if not pad_size:
+        return pad_size
+
+    if getattr(lm_head, "gather_output", False):
+        vocab_size = getattr(config, "vocab_size", None)
+        if vocab_size is not None:
+            return max(int(logits.shape[-1]) - int(vocab_size), 0)
+
+    return pad_size
+
+
 class NeuronQwen35Model(NeuronBaseModel):
     def setup_attr_for_model(self, config: Qwen35InferenceConfig):
         self.on_device_sampling = (
@@ -3225,7 +3238,12 @@ class NeuronQwen35Model(NeuronBaseModel):
             )
 
             logits = mask_padded_logits(
-                logits, rank_id, world_size, pad_size=self.lm_head.pad_size
+                logits,
+                rank_id,
+                world_size,
+                pad_size=_effective_lm_head_pad_size(
+                    self.lm_head, logits, self.config
+                ),
             )
 
         if self.on_device_sampling:
@@ -3236,7 +3254,7 @@ class NeuronQwen35Model(NeuronBaseModel):
             res = logits
 
         outputs = [res]
-        if self.neuron_config.output_logits:
+        if self.neuron_config.output_logits and self.on_device_sampling:
             outputs += [logits]
         outputs += updated_kv_cache
 
@@ -3490,11 +3508,27 @@ def convert_qwen35_hf_to_neuron_state_dict(neuron_state_dict, config):
 class Qwen35DecoderModelInstance(DecoderModelInstance):
     """Custom DecoderModelInstance that adds DeltaNet state buffers to input_output_aliases."""
 
+    @staticmethod
+    def _num_trace_outputs_before_aliases(neuron_config):
+        if (
+            getattr(neuron_config, "output_logits", False)
+            and getattr(neuron_config, "on_device_sampling_config", None) is not None
+        ):
+            return 2
+        return 1
+
     def get(self, bucket_rank, **kwargs):
         """Override to add DeltaNet state aliases after KV cache aliases."""
         module, input_output_aliases = super().get(bucket_rank, **kwargs)
 
-        num_output_from_trace = 1 if not self.neuron_config.output_logits else 2
+        num_output_from_trace = self._num_trace_outputs_before_aliases(
+            self.neuron_config
+        )
+        base_num_output_from_trace = 1 if not self.neuron_config.output_logits else 2
+        if num_output_from_trace != base_num_output_from_trace:
+            alias_shift = base_num_output_from_trace - num_output_from_trace
+            for param in list(input_output_aliases.keys()):
+                input_output_aliases[param] -= alias_shift
 
         if module.kv_mgr is not None:
             num_kv = len(module.kv_mgr.past_key_values)
@@ -3876,12 +3910,9 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
         if getattr(self.config, "use_hybrid_cache_manager", False):
             return
 
-        num_output_from_trace = 1
-        if (
-            self.neuron_config.output_logits
-            and self.neuron_config.on_device_sampling_config
-        ):
-            num_output_from_trace = 2
+        num_output_from_trace = Qwen35DecoderModelInstance._num_trace_outputs_before_aliases(
+            self.neuron_config
+        )
 
         if (
             hasattr(self, "token_generation_model")

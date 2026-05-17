@@ -28,6 +28,15 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 QWEN_ROOT = REPO_ROOT / "contrib" / "models" / "Qwen3.6-27B"
 RUNNER_PATH = QWEN_ROOT / "vllm" / "run_offline_inference.py"
 HYBRID_APC_PATH = QWEN_ROOT / "src" / "hybrid_apc.py"
+FP8_ENV_DEFAULTS = {
+    "XLA_HANDLE_SPECIAL_SCALAR": "1",
+    "UNSAFE_FP8FNCAST": "1",
+}
+
+
+def _ensure_fp8_environment() -> None:
+    for name, value in FP8_ENV_DEFAULTS.items():
+        os.environ.setdefault(name, value)
 
 
 def _load_module(name: str, path: Path):
@@ -87,6 +96,7 @@ def _build_llm(args, *, enable_hybrid_apc: bool):
         os.environ["NEURON_COMPILED_ARTIFACTS"] = str(
             Path(args.compiled_artifacts).expanduser().resolve()
         )
+        _ensure_fp8_environment()
 
     runner = _load_module("qwen36_run_offline_inference_validation", RUNNER_PATH)
     from hf_qwen35_config import register_qwen35_config  # noqa: WPS433
@@ -197,6 +207,35 @@ def _generate_batch(args, *, enable_hybrid_apc: bool, labeled_prompts):
     return message["results"]
 
 
+def _token_check(label: str, result: dict, dummy_token_ids: set[int]) -> dict:
+    tokens = [int(token) for token in result.get("tokens", [])]
+    unique_token_ids = sorted(set(tokens))
+    non_dummy_tokens = [token for token in tokens if token not in dummy_token_ids]
+    passed = bool(non_dummy_tokens)
+    check = {
+        "label": label,
+        "generated_token_count": len(tokens),
+        "unique_token_ids": unique_token_ids,
+        "dummy_token_ids": sorted(dummy_token_ids),
+        "non_dummy_token_count": len(non_dummy_tokens),
+        "passed": passed,
+    }
+    if not passed:
+        check["failure"] = "generated tokens are empty or all configured dummy tokens"
+    return check
+
+
+def _real_token_checks(results_by_label: dict[str, dict], dummy_token_ids: set[int]) -> dict:
+    checks = {
+        label: _token_check(label, result, dummy_token_ids)
+        for label, result in sorted(results_by_label.items())
+    }
+    return {
+        "passed": bool(checks) and all(check["passed"] for check in checks.values()),
+        "checks": checks,
+    }
+
+
 def run_exactness(args) -> int:
     shared = args.shared_prefix
     prompt_a = shared + args.suffix_a
@@ -234,6 +273,17 @@ def run_exactness(args) -> int:
     warmup_full = warm_results["warmup_full"]
     warm_full = warm_results["warm_full"]
     warm_partial = warm_results["warm_partial"]
+    all_results = {
+        "cold_full": cold_full,
+        "warmup_full": warmup_full,
+        "warm_full": warm_full,
+        "cold_partial": cold_partial,
+        "warm_partial": warm_partial,
+    }
+    real_token_checks = _real_token_checks(
+        all_results,
+        {int(token_id) for token_id in args.dummy_token_ids},
+    )
 
     report = {
         "full_prefix_exact": cold_full["tokens"] == warm_full["tokens"],
@@ -243,13 +293,24 @@ def run_exactness(args) -> int:
         "warm_full": warm_full,
         "cold_partial": cold_partial,
         "warm_partial": warm_partial,
+        "real_generated_tokens_required": args.require_real_tokens,
+        "real_generated_tokens_passed": real_token_checks["passed"],
+        "real_generated_token_checks": real_token_checks["checks"],
         "negative_tests": {
             "missing_gdn_state_fallback": "requires scheduler fault injection",
             "zeroed_conv_state": "requires model debug hook",
         },
     }
+    if args.output_json:
+        args.output_json.expanduser().write_text(
+            json.dumps(report, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
     print(json.dumps(report, indent=2, sort_keys=True))
-    return 0 if report["full_prefix_exact"] and report["partial_prefix_exact"] else 1
+    passed = report["full_prefix_exact"] and report["partial_prefix_exact"]
+    if args.require_real_tokens:
+        passed = passed and real_token_checks["passed"]
+    return 0 if passed else 1
 
 
 def run_hbm(args) -> int:
@@ -307,6 +368,22 @@ def parse_args():
     exact.add_argument("--shared-prefix", default="System: answer deterministically.\n" * 64)
     exact.add_argument("--suffix-a", default="\nUser: What is 17 * 23?\nAssistant:")
     exact.add_argument("--suffix-b", default="\nUser: What is 19 * 29?\nAssistant:")
+    exact.add_argument(
+        "--require-real-tokens",
+        action="store_true",
+        help=(
+            "Fail exactness if every generated token for any checked request is a "
+            "configured dummy token."
+        ),
+    )
+    exact.add_argument(
+        "--dummy-token-ids",
+        nargs="+",
+        type=int,
+        default=[0],
+        help="Token ids treated as dummy generated output when --require-real-tokens is set.",
+    )
+    exact.add_argument("--output-json", type=Path)
     exact.set_defaults(func=run_exactness)
 
     hbm = subparsers.add_parser("hbm")
