@@ -59,6 +59,36 @@ def _single_batch_tensor(value: Any) -> bool:
     return isinstance(value, torch.Tensor) and value.ndim >= 1 and value.shape[0] == 1
 
 
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _hybrid_gdn_restore_disabled() -> bool:
+    return _env_flag("QWEN36_DISABLE_HYBRID_GDN_RESTORE") or _env_flag(
+        "QWEN36_DISABLE_HYBRID_GDN_RESTORE_COMMIT"
+    )
+
+
+def _hybrid_gdn_commit_disabled() -> bool:
+    return _env_flag("QWEN36_DISABLE_HYBRID_GDN_COMMIT") or _env_flag(
+        "QWEN36_DISABLE_HYBRID_GDN_RESTORE_COMMIT"
+    )
+
+
+def _zero_mask_if_present(input_dict: Dict[str, Any], key: str):
+    value = input_dict.get(key)
+    if isinstance(value, torch.Tensor):
+        input_dict[key] = torch.zeros_like(value)
+
+
+def _apply_hybrid_gdn_debug_switches(input_dict: Dict[str, Any]) -> Dict[str, Any]:
+    if _hybrid_gdn_restore_disabled():
+        _zero_mask_if_present(input_dict, "hybrid_restore_mask")
+    if _hybrid_gdn_commit_disabled():
+        _zero_mask_if_present(input_dict, "hybrid_commit_mask")
+    return input_dict
+
+
 def _get_hybrid_apc_bridge(
     neuron_base_instance: "NeuronBaseForCausalLM",
     input_dict: Dict[str, Any],
@@ -224,6 +254,7 @@ def prepare_hybrid_apc_request_for_execution(
     )
     input_dict["_hybrid_apc_bridge"] = bridge
     input_dict["_hybrid_apc_prepared"] = prepared
+    _apply_hybrid_gdn_debug_switches(prepared.input_dict)
     if os.environ.get("QWEN36_HYBRID_APC_DEBUG") == "1":
         prepared_inputs = prepared.input_dict
         print(
@@ -254,6 +285,9 @@ def finish_hybrid_apc_request(input_dict: Dict[str, Any]):
         input_dict.get("hybrid_actual_attention_block_refs"),
         getattr(prepared, "attention_block_refs", None),
     )
+    if _hybrid_gdn_commit_disabled():
+        bridge.cancel_request(prepared)
+        return
     try:
         bridge.commit_prefill(prepared, attention_block_refs=actual_refs)
     except Exception:
@@ -402,6 +436,14 @@ def prepare_hybrid_apc_model_inputs(
         )
     else:
         commit_mask = torch.zeros((batch_size,), dtype=torch.int32)
+
+    switch_inputs = {
+        "hybrid_restore_mask": restore_mask,
+        "hybrid_commit_mask": commit_mask,
+    }
+    _apply_hybrid_gdn_debug_switches(switch_inputs)
+    restore_mask = switch_inputs["hybrid_restore_mask"]
+    commit_mask = switch_inputs["hybrid_commit_mask"]
 
     _validate_hybrid_apc_slot_inputs(
         neuron_base_instance,

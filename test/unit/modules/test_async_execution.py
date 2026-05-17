@@ -333,6 +333,28 @@ class TestHybridAPCAsyncBridge(unittest.TestCase):
         self.assertTrue(torch.equal(args[10], torch.tensor([0], dtype=torch.int32)))
         self.assertTrue(torch.equal(args[11], torch.tensor([256], dtype=torch.int32)))
 
+    def test_bridge_debug_switches_zero_restore_and_commit_masks(self):
+        base = SimpleNamespace(config=SimpleNamespace(use_hybrid_apc_manager=True))
+        input_dict = {
+            "seq_ids": torch.tensor([3, 4], dtype=torch.int32),
+            "computed_context_lens": torch.tensor([[256], [0]], dtype=torch.int32),
+            "hybrid_restore_slot_ids": torch.tensor([7, 0], dtype=torch.int32),
+            "hybrid_restore_mask": torch.tensor([1, 0], dtype=torch.int32),
+            "hybrid_commit_slot_ids": torch.tensor([8, 9], dtype=torch.int32),
+            "hybrid_commit_mask": torch.tensor([1, 1], dtype=torch.int32),
+        }
+
+        with patch.dict(
+            "os.environ",
+            {"QWEN36_DISABLE_HYBRID_GDN_RESTORE_COMMIT": "1"},
+        ):
+            args = prepare_hybrid_apc_model_inputs(base, input_dict)
+
+        self.assertTrue(torch.equal(args[9], torch.tensor([7, 0], dtype=torch.int32)))
+        self.assertTrue(torch.equal(args[10], torch.tensor([0, 0], dtype=torch.int32)))
+        self.assertTrue(torch.equal(args[12], torch.tensor([8, 9], dtype=torch.int32)))
+        self.assertTrue(torch.equal(args[13], torch.tensor([0, 0], dtype=torch.int32)))
+
     def test_bridge_rejects_active_slot_out_of_range(self):
         base = SimpleNamespace(
             config=SimpleNamespace(
@@ -428,6 +450,33 @@ class TestHybridAPCAsyncBridge(unittest.TestCase):
         self.assertEqual(bridge.finished, ["req-1"])
         self.assertNotIn("_hybrid_apc_prepared", input_dict)
 
+    def test_commit_debug_switch_cancels_instead_of_committing_metadata(self):
+        base = SimpleNamespace(
+            config=SimpleNamespace(use_hybrid_apc_manager=True),
+            neuron_config=SimpleNamespace(
+                enable_fused_speculation=False,
+                enable_eagle_speculation=False,
+            ),
+        )
+        bridge = _FakeHybridBridge()
+        model = _FakePrefixModel()
+        input_dict = _prefix_input_dict()
+        input_dict.update(
+            {
+                "hybrid_apc_bridge": bridge,
+                "request_id": "req-no-commit",
+                "vllm_attention_hit_len": torch.tensor([2], dtype=torch.int32),
+            }
+        )
+
+        with patch.dict("os.environ", {"QWEN36_DISABLE_HYBRID_GDN_COMMIT": "1"}):
+            execute_model_prefix_caching(base, model, input_dict)
+            finish_hybrid_apc_request(input_dict)
+
+        self.assertEqual(bridge.committed, [])
+        self.assertEqual(bridge.cancelled[0].request_id, "req-no-commit")
+        self.assertNotIn("_hybrid_apc_prepared", input_dict)
+
     def test_hybrid_apc_debug_trace_includes_restore_commit_evidence(self):
         bridge = _FakeHybridBridge()
         base = SimpleNamespace(
@@ -464,6 +513,51 @@ class TestHybridAPCAsyncBridge(unittest.TestCase):
             torch.equal(
                 prepared["input_ids"],
                 torch.tensor([[12, 13]], dtype=torch.int32),
+            )
+        )
+
+    def test_prepare_debug_switches_zero_prepared_restore_commit_masks(self):
+        bridge = _FakeHybridBridge()
+        base = SimpleNamespace(
+            config=SimpleNamespace(use_hybrid_apc_manager=True),
+            hybrid_apc_bridge=bridge,
+        )
+        input_dict = _prefix_input_dict()
+        input_dict.update(
+            {
+                "request_id": "req-debug-switches",
+                "vllm_attention_hit_len": torch.tensor([2], dtype=torch.int32),
+            }
+        )
+
+        with patch.dict(
+            "os.environ",
+            {"QWEN36_DISABLE_HYBRID_GDN_RESTORE_COMMIT": "1"},
+        ):
+            prepared = prepare_hybrid_apc_request_for_execution(base, input_dict)
+
+        self.assertTrue(
+            torch.equal(
+                prepared["hybrid_restore_slot_ids"],
+                torch.tensor([5], dtype=torch.int32),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                prepared["hybrid_restore_mask"],
+                torch.tensor([0], dtype=torch.int32),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                prepared["hybrid_commit_slot_ids"],
+                torch.tensor([7], dtype=torch.int32),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                prepared["hybrid_commit_mask"],
+                torch.tensor([0], dtype=torch.int32),
             )
         )
 

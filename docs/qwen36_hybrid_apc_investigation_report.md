@@ -56,6 +56,16 @@ Added repo-side checks for the next debugging pass:
   prefix-cache/mRoPE/vision contract and omit Hybrid APC restore/commit tensors.
   This matches the currently compiled legacy artifacts; Neuron pruned the extra
   CTE Hybrid APC metadata inputs from the serialized trace.
+- `NXDI_RAW_OUTPUT_DEBUG=1` now prints raw runtime output slot summaries before
+  `CausalLMOutputWithPast` construction. The latest Hybrid APC BF16 host-logits
+  validation showed exactly one raw output slot and that slot was already all
+  NaN, so the NaNs were not hidden in a different output slot.
+- `QWEN36_DISABLE_HYBRID_GDN_RESTORE=1`,
+  `QWEN36_DISABLE_HYBRID_GDN_COMMIT=1`, and the combined
+  `QWEN36_DISABLE_HYBRID_GDN_RESTORE_COMMIT=1` are no-recompile isolation
+  switches. They preserve the traced argument positions but force the
+  restore/commit masks to zero. Commit disabling also skips CPU metadata commit
+  so an unwritten checkpoint slot is not marked reusable.
 
 Minimal BF16 host-logits control to run on Trainium:
 
@@ -198,6 +208,32 @@ Important runs:
 - After patching compile to emit 9 physical blocks for user-intended 8 blocks,
   the PA9 artifact compiled and loaded, but generation still hit Neuron runtime
   OOB in `token_generation_model`.
+- Minimal BF16 host-logits control with prefix caching, chunked prefill, and
+  Hybrid APC disabled compiled, loaded, and produced finite real logits:
+  - Artifact:
+    `/home/ubuntu/qwen_artifacts/qwen36_27b_2048_bf16_host_logits_no_prefix_353306f`
+  - Compile log:
+    `/home/ubuntu/validation_logs/host_logits_controls/bf16_host_logits_no_prefix_353306f_compile.log`
+  - Smoke log:
+    `/home/ubuntu/validation_logs/host_logits_controls/bf16_host_logits_no_prefix_353306f_smoke.log`
+  - Raw output summary repeated on every step:
+    `raw_output[0] shape=(1, 1, 248320) dtype=torch.float32 finite=248320/248320 nan=0`
+  - Generated token ids:
+    `[271, 248068, 271, 248069]`
+  - Conclusion: base Qwen3.6 BF16 host logits and CPU sampling are healthy
+    without prefix/Hybrid APC.
+- Hybrid APC BF16 host-logits validation with raw-slot debug still produced
+  all-NaN logits:
+  - Artifact:
+    `/home/ubuntu/qwen_artifacts/qwen36_27b_2048_bf16_hybrid_apc_host_logits_decay_clamp_980b918`
+  - Raw-slot validation log:
+    `/home/ubuntu/validation_logs/hybrid_apc_real_tokens/legacy_tkg_bf16_host_logits_decay_clamp_980b918_rawslots_96e15f7_validation.log`
+  - Raw output summary:
+    `raw_output[0] shape=(1, 1, 248320) dtype=torch.float32 finite=0/248320 nan=248320`
+  - TKG metadata remained in range with `arg_mode=prefix24_legacy`,
+    `input_shape=(1, 1)`, `num_queries=[1]`, and `pa_num_blocks=9`.
+  - Conclusion: the remaining all-NaN host-logits failure is tied to the
+    prefix/Hybrid APC path, not FP8 and not raw-output slot selection.
 
 Latest PA9 artifact run:
 
