@@ -698,6 +698,29 @@ class TestHybridAPCSchedulerBridge(unittest.TestCase):
                 attention_hit_len=128,
             )
 
+    def test_bridge_env_can_allow_unbacked_attention_fallback(self):
+        bridge = HybridAPCSchedulerBridge(
+            store=_store(),
+            slot_allocator=HybridAPCSlotAllocator(num_slots=2),
+            cache_salt="tenant-a",
+            model_revision="rev-a",
+        )
+
+        with patch.dict(
+            os.environ,
+            {"QWEN36_ALLOW_UNBACKED_HYBRID_APC_FALLBACK": "1"},
+        ):
+            prepared = bridge.prepare_request(
+                request_id="req-unbacked-fallback",
+                input_dict={
+                    "input_ids": torch.arange(256, dtype=torch.int32).unsqueeze(0)
+                },
+                attention_hit_len=128,
+            )
+
+        self.assertIsNone(prepared.plan.checkpoint_key)
+        self.assertEqual(prepared.input_dict["hybrid_restore_mask"].item(), 0)
+
     def test_bridge_does_not_commit_mid_prompt_checkpoint_boundary(self):
         store = _store()
         allocator = HybridAPCSlotAllocator(num_slots=2)

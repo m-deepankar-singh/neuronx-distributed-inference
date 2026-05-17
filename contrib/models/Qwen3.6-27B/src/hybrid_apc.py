@@ -665,6 +665,7 @@ class HybridAPCSchedulerBridge:
             )
         if (
             self.reject_unbacked_attention_hits
+            and not _env_flag("QWEN36_ALLOW_UNBACKED_HYBRID_APC_FALLBACK")
             and not disable_restore
             and int(attention_hit_len) > 0
             and plan.checkpoint_slot is None
