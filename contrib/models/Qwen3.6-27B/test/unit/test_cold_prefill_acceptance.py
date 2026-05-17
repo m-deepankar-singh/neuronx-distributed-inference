@@ -400,9 +400,12 @@ def _strict_final_complete_rows(acceptance):
                         )
 
     long_profiles = {
-        "H_128k_candidate": (131072, [256, 512, 1024, 2048], (128, 1024, 128)),
-        "I_262k_recovery_block256": (262144, [256], (128, 1024, 256)),
-        "J_262k_recovery_block128": (262144, [256], (128, 1024, 128)),
+        "H_128k_candidate": (131072, [128, 256, 512, 1024], (128, 1024, 128)),
+        "J_262k_recovery_block128": (
+            262144,
+            [128, 256, 512, 1024],
+            (128, 1024, 128),
+        ),
     }
     for prompt_len in (131072, 262144):
         for max_tokens in (1, 32):
@@ -1264,19 +1267,9 @@ class TestColdPrefillAcceptance(unittest.TestCase):
                 q_tile=128,
                 kv_tile=1024,
                 block_size=128,
-                cte_buckets=[256, 512, 1024, 2048],
+                cte_buckets=[128, 256, 512, 1024],
             ),
             _row("A_single512_old_chunked", 262144, 2000.0, 131072.0),
-            _long_artifact_row(
-                "I_262k_recovery_block256",
-                262144,
-                1800.0,
-                145000.0,
-                q_tile=128,
-                kv_tile=1024,
-                block_size=256,
-                cte_buckets=[256],
-            ),
             _long_artifact_row(
                 "J_262k_recovery_block128",
                 262144,
@@ -1285,7 +1278,7 @@ class TestColdPrefillAcceptance(unittest.TestCase):
                 q_tile=128,
                 kv_tile=1024,
                 block_size=128,
-                cte_buckets=[256],
+                cte_buckets=[128, 256, 512, 1024],
             ),
         ]
 
@@ -1301,7 +1294,7 @@ class TestColdPrefillAcceptance(unittest.TestCase):
 
         self.assertTrue(report["passed"], report)
         self.assertTrue(report["long_artifact_requirements"]["saw_128k_candidate"])
-        self.assertTrue(report["long_artifact_requirements"]["saw_262k_block256"])
+        self.assertFalse(report["long_artifact_requirements"]["saw_262k_block256"])
         self.assertTrue(report["long_artifact_requirements"]["saw_262k_block128"])
         audit = {item["name"]: item for item in report["audit_checklist"]}
         self.assertEqual(
@@ -1322,7 +1315,7 @@ class TestColdPrefillAcceptance(unittest.TestCase):
                 q_tile=128,
                 kv_tile=1024,
                 block_size=256,
-                cte_buckets=[256, 512, 1024, 2048],
+                cte_buckets=[128, 256, 512, 1024],
             ),
         ]
 
@@ -1361,14 +1354,14 @@ class TestColdPrefillAcceptance(unittest.TestCase):
             _row("F_short_text_compact_fused_cold_zero", 128, 60.0, 1600.0),
             _row("A_single512_old_chunked", 262144, 2000.0, 131072.0),
             _long_artifact_row(
-                "I_262k_recovery_block256",
+                "J_262k_recovery_block128",
                 262144,
                 1800.0,
                 145000.0,
                 q_tile=128,
                 kv_tile=1024,
-                block_size=256,
-                cte_buckets=[256, 512],
+                block_size=128,
+                cte_buckets=[128, 256],
             ),
         ]
         rows[-1]["metrics"]["text_only_cte_enabled"] = False
@@ -1390,7 +1383,7 @@ class TestColdPrefillAcceptance(unittest.TestCase):
             any("text-only CTE and compact CTE mask" in failure for failure in report["failures"])
         )
         check = report["long_artifact_profile_checks"][0]
-        self.assertEqual(check["expected_cte_buckets"], [256])
+        self.assertEqual(check["expected_cte_buckets"], [128, 256, 512, 1024])
         self.assertFalse(check["matches_required_flags"])
 
     def test_acceptance_fails_when_required_262k_artifact_row_missing(self):
@@ -1409,7 +1402,7 @@ class TestColdPrefillAcceptance(unittest.TestCase):
         )
 
         self.assertFalse(report["passed"])
-        self.assertTrue(any("262K block256" in failure for failure in report["failures"]))
+        self.assertTrue(any("262K KV-FP8 block128" in failure for failure in report["failures"]))
 
     def test_long_artifact_row_without_baseline_skips_exactness(self):
         rows = [
@@ -1423,7 +1416,7 @@ class TestColdPrefillAcceptance(unittest.TestCase):
                 q_tile=128,
                 kv_tile=1024,
                 block_size=128,
-                cte_buckets=[256, 512, 1024, 2048],
+                cte_buckets=[128, 256, 512, 1024],
             ),
         ]
 
@@ -2396,7 +2389,7 @@ class TestColdPrefillAcceptance(unittest.TestCase):
         )
         self.assertTrue(
             any(
-                "I_262k_recovery_block256 prompt=262144 max_tokens=32 long-artifact row"
+                "J_262k_recovery_block128 prompt=262144 max_tokens=32 long-artifact row"
                 in failure
                 for failure in report["failures"]
             )
@@ -2622,8 +2615,10 @@ class TestColdPrefillAcceptance(unittest.TestCase):
         self.assertEqual(audit["HBM usage regression"]["status"], "fail")
         self.assertEqual(audit["GDN recurrent/conv state diff bounds"]["status"], "fail")
         self.assertEqual(audit["128K artifact load/run"]["status"], "fail")
-        self.assertEqual(audit["262K block256 artifact load/run"]["status"], "fail")
-        self.assertEqual(audit["262K block128 comparison load/run"]["status"], "fail")
+        self.assertEqual(
+            audit["262K KV-FP8 block128 artifact load/run"]["status"],
+            "fail",
+        )
         self.assertEqual(audit["strict-final repeated samples"]["status"], "fail")
         self.assertEqual(audit["A-G launch profiles"]["status"], "fail")
         self.assertEqual(audit["GDN CTE kernel launch profiles"]["status"], "fail")
@@ -2683,9 +2678,7 @@ class TestColdPrefillAcceptance(unittest.TestCase):
         self.assertTrue(
             any("--baseline-cold-tok-per-s-target" in failure for failure in report["failures"])
         )
-        self.assertTrue(
-            any("262K block128 comparison" in failure for failure in report["failures"])
-        )
+        self.assertTrue(any("262K KV-FP8 block128" in failure for failure in report["failures"]))
         self.assertTrue(any("2048-token baseline" in failure for failure in report["failures"]))
         self.assertTrue(any("8K+ prompt row" in failure for failure in report["failures"]))
         self.assertTrue(any("feature delta missing" in failure for failure in report["failures"]))

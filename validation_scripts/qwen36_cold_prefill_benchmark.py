@@ -71,26 +71,44 @@ def _prompt_for_target_tokens(target_tokens: int, tokenizer=None) -> tuple[str, 
         prompt = _prompt_from_filler_count(max(target_tokens - 16, 1))
         return prompt, None
 
+    best_prompt = None
+    best_count = None
+
+    def consider(prompt: str, count: int | None) -> None:
+        nonlocal best_prompt, best_count
+        if count is None:
+            return
+        if best_count is None:
+            best_prompt = prompt
+            best_count = count
+            return
+        if count <= target_tokens:
+            if best_count > target_tokens or count > best_count:
+                best_prompt = prompt
+                best_count = count
+            return
+        if best_count > target_tokens and count < best_count:
+            best_prompt = prompt
+            best_count = count
+
     low = 0
     high = max(target_tokens, 1)
     while True:
-        count = _token_count(_prompt_from_filler_count(high), tokenizer)
+        prompt = _prompt_from_filler_count(high)
+        count = _token_count(prompt, tokenizer)
+        consider(prompt, count)
         if count is None or count >= target_tokens or high > target_tokens * 4:
             break
         low = high + 1
         high *= 2
 
-    best_prompt = _prompt_from_filler_count(high)
-    best_count = _token_count(best_prompt, tokenizer)
     while low <= high:
         mid = (low + high) // 2
         prompt = _prompt_from_filler_count(mid)
         count = _token_count(prompt, tokenizer)
         if count is None:
             return prompt, None
-        if best_count is None or abs(count - target_tokens) < abs(best_count - target_tokens):
-            best_prompt = prompt
-            best_count = count
+        consider(prompt, count)
         if count < target_tokens:
             low = mid + 1
         elif count > target_tokens:
@@ -112,6 +130,14 @@ def _prompt_file(args, spec_name: str, prompt_len: int, prompt: str) -> Path:
     if not path.exists():
         path.write_text(prompt, encoding="utf-8")
     return path
+
+
+def _effective_prompt_target_tokens(
+    prompt_len: int, seq_len: int, max_tokens: int
+) -> int:
+    if max_tokens <= 1 or prompt_len + max_tokens <= seq_len:
+        return prompt_len
+    return max(seq_len - max_tokens, 1)
 
 
 def _compiled_artifacts_by_len(args) -> dict[int, str]:
@@ -138,6 +164,34 @@ def _compiled_artifacts_by_len(args) -> dict[int, str]:
 
 def _compiled_artifacts_for_case(args, seq_len: int) -> str | None:
     return _compiled_artifacts_by_len(args).get(seq_len) or args.compiled_artifacts
+
+
+def _num_gpu_blocks_override_by_len(args) -> dict[int, int]:
+    cached = getattr(args, "_num_gpu_blocks_override_by_len_cache", None)
+    if cached is not None:
+        return cached
+
+    mapping: dict[int, int] = {}
+    for raw in getattr(args, "num_gpu_blocks_override_by_len", None) or []:
+        if "=" not in raw:
+            raise ValueError(
+                "--num-gpu-blocks-override-by-len entries must be shaped LEN=BLOCKS"
+            )
+        seq_len_raw, blocks_raw = raw.split("=", 1)
+        seq_len = int(seq_len_raw)
+        blocks = int(blocks_raw)
+        if seq_len <= 0 or blocks <= 0:
+            raise ValueError(f"sequence length and block count must be positive: {raw}")
+        mapping[seq_len] = blocks
+    setattr(args, "_num_gpu_blocks_override_by_len_cache", mapping)
+    return mapping
+
+
+def _num_gpu_blocks_override_for_case(args, seq_len: int) -> int | None:
+    return (
+        _num_gpu_blocks_override_by_len(args).get(seq_len)
+        or args.num_gpu_blocks_override
+    )
 
 
 def _compiled_artifact_path_evidence(compiled_artifacts: str | None) -> dict:
@@ -199,9 +253,30 @@ def _base_command(
         command.append("--enable-vllm-chunked-prefill")
     if compiled_artifacts:
         command.extend(["--compiled-artifacts", compiled_artifacts])
-    if args.num_gpu_blocks_override is not None:
+    if getattr(args, "compiled_max_prompt_length", None) is not None:
         command.extend(
-            ["--num-gpu-blocks-override", str(args.num_gpu_blocks_override)]
+            ["--compiled-max-prompt-length", str(args.compiled_max_prompt_length)]
+        )
+    if getattr(args, "enable_prefix_caching", False):
+        command.append("--enable-prefix-caching")
+    if getattr(args, "enable_hybrid_apc", False):
+        command.append("--enable-hybrid-apc")
+    if getattr(args, "hybrid_apc_require_vllm_metadata", False):
+        command.append("--hybrid-apc-require-vllm-metadata")
+    if getattr(args, "gdn_checkpoint_interval", None) is not None:
+        command.extend(
+            ["--gdn-checkpoint-interval", str(args.gdn_checkpoint_interval)]
+        )
+    if getattr(args, "max_gdn_checkpoint_slots", None) is not None:
+        command.extend(
+            ["--max-gdn-checkpoint-slots", str(args.max_gdn_checkpoint_slots)]
+        )
+    if getattr(args, "hybrid_cache_mode", None):
+        command.extend(["--hybrid-cache-mode", args.hybrid_cache_mode])
+    num_gpu_blocks_override = _num_gpu_blocks_override_for_case(args, seq_len)
+    if num_gpu_blocks_override is not None:
+        command.extend(
+            ["--num-gpu-blocks-override", str(num_gpu_blocks_override)]
         )
     return command
 
@@ -310,7 +385,7 @@ def _variant_specs():
         },
         {
             "name": "H_128k_candidate",
-            "cte": ["--cte-buckets", "256,512,1024,2048"],
+            "cte": ["--cte-bucket-profile", "short"],
             "flags": ["--text-only-cte", "--compact-cte-attention-mask"],
             "env": fused_env,
             "tile_sweep": False,
@@ -332,7 +407,7 @@ def _variant_specs():
         },
         {
             "name": "J_262k_recovery_block128",
-            "cte": ["--cte-bucket-profile", "262k"],
+            "cte": ["--cte-bucket-profile", "short"],
             "flags": ["--text-only-cte", "--compact-cte-attention-mask"],
             "env": fused_env,
             "tile_cases": [
@@ -358,13 +433,20 @@ def _tile_cases(spec, args):
                 "block_size": args.block_size,
             }
         ]
-    return [
+    tile_cases = [
         {"kernel_q_tile_size": 128, "kernel_kv_tile_size": 512, "block_size": 128},
         {"kernel_q_tile_size": 128, "kernel_kv_tile_size": 1024, "block_size": 128},
         {"kernel_q_tile_size": 128, "kernel_kv_tile_size": 2048, "block_size": 128},
         {"kernel_q_tile_size": 256, "kernel_kv_tile_size": 1024, "block_size": 128},
-        {"kernel_q_tile_size": 128, "kernel_kv_tile_size": 1024, "block_size": 256},
     ]
+    if (
+        not getattr(args, "enable_hybrid_apc", False)
+        or getattr(args, "gdn_checkpoint_interval", None) == 256
+    ):
+        tile_cases.append(
+            {"kernel_q_tile_size": 128, "kernel_kv_tile_size": 1024, "block_size": 256}
+        )
+    return tile_cases
 
 
 def _spec_supports_prompt_len(spec, prompt_len: int) -> bool:
@@ -374,9 +456,12 @@ def _spec_supports_prompt_len(spec, prompt_len: int) -> bool:
 
 def _extract_prefixed_json(stdout: str, prefix: str) -> dict | None:
     payload = None
+    marker = f"{prefix} "
     for line in stdout.splitlines():
-        if line.startswith(f"{prefix} "):
-            payload = json.loads(line.split(" ", 1)[1])
+        if line.startswith(marker):
+            payload = json.loads(line[len(marker) :])
+        elif prefix == "GDN_STATE_DIFF" and marker in line:
+            payload = json.loads(line.split(marker, 1)[1])
     return payload
 
 
@@ -537,14 +622,20 @@ def _run_case(
     repetition: int = 0,
 ) -> dict:
     seq_len = max(args.seq_len, prompt_len, 1024)
+    effective_prompt_target = _effective_prompt_target_tokens(
+        prompt_len, seq_len, max_tokens
+    )
     prompt_cache = getattr(args, "_prompt_cache", None)
     if prompt_cache is None:
         prompt_cache = {}
         setattr(args, "_prompt_cache", prompt_cache)
     tokenizer = getattr(args, "_tokenizer", None)
-    if prompt_len not in prompt_cache:
-        prompt_cache[prompt_len] = _prompt_for_target_tokens(prompt_len, tokenizer)
-    prompt, prompt_token_count = prompt_cache[prompt_len]
+    prompt_cache_key = (effective_prompt_target, max_tokens)
+    if prompt_cache_key not in prompt_cache:
+        prompt_cache[prompt_cache_key] = _prompt_for_target_tokens(
+            effective_prompt_target, tokenizer
+        )
+    prompt, prompt_token_count = prompt_cache[prompt_cache_key]
     prompt_file = _prompt_file(args, spec["name"], prompt_len, prompt)
     compiled_artifacts = _compiled_artifacts_for_case(args, seq_len)
     enable_chunked_prefill = bool(spec.get("enable_chunked_prefill", True))
@@ -576,6 +667,7 @@ def _run_case(
         "runner": str(RUNNER),
         "variant": spec["name"],
         "target_prompt_tokens": prompt_len,
+        "effective_prompt_target_tokens": effective_prompt_target,
         "prompt_token_count": prompt_token_count,
         "prompt_sha256": _prompt_sha256(prompt),
         "prompt_bytes": len(prompt.encode("utf-8")),
@@ -591,6 +683,14 @@ def _run_case(
         "max_tokens": max_tokens,
         "temperature": 0,
         "top_k": 1,
+        "enable_prefix_caching": getattr(args, "enable_prefix_caching", False),
+        "enable_hybrid_apc": getattr(args, "enable_hybrid_apc", False),
+        "hybrid_apc_require_vllm_metadata": getattr(
+            args, "hybrid_apc_require_vllm_metadata", False
+        ),
+        "gdn_checkpoint_interval": getattr(args, "gdn_checkpoint_interval", None),
+        "max_gdn_checkpoint_slots": getattr(args, "max_gdn_checkpoint_slots", None),
+        "hybrid_cache_mode": getattr(args, "hybrid_cache_mode", None),
         "repetition": repetition,
         **tile_case,
         "prompt_file": str(prompt_file),
@@ -599,6 +699,7 @@ def _run_case(
         "flags": list(spec["flags"]),
         "env": spec["env"],
         "enable_vllm_chunked_prefill": enable_chunked_prefill,
+        "num_gpu_blocks_override": _num_gpu_blocks_override_for_case(args, seq_len),
     }
     if args.dry_run:
         row["dry_run"] = True
@@ -688,10 +789,30 @@ def parse_args():
     parser.add_argument("--logical-nc-config", type=int, default=2)
     parser.add_argument("--max-num-seqs", type=int, default=1)
     parser.add_argument("--ctx-batch-size", type=int, default=1)
+    parser.add_argument("--compiled-max-prompt-length", type=int)
     parser.add_argument("--block-size", type=int, default=128)
     parser.add_argument("--kernel-q-tile-size", type=int, default=128)
     parser.add_argument("--kernel-kv-tile-size", type=int, default=1024)
     parser.add_argument("--num-gpu-blocks-override", type=int)
+    parser.add_argument(
+        "--num-gpu-blocks-override-by-len",
+        nargs="+",
+        default=None,
+        help=(
+            "Override vLLM physical block count per selected seq_len, e.g. "
+            "2048=16 8192=64 32768=256 131072=1024 262144=2048. "
+            "Falls back to --num-gpu-blocks-override when a length is omitted."
+        ),
+    )
+    parser.add_argument("--enable-prefix-caching", action="store_true")
+    parser.add_argument("--enable-hybrid-apc", action="store_true")
+    parser.add_argument(
+        "--hybrid-apc-require-vllm-metadata",
+        action="store_true",
+    )
+    parser.add_argument("--gdn-checkpoint-interval", type=int)
+    parser.add_argument("--max-gdn-checkpoint-slots", type=int)
+    parser.add_argument("--hybrid-cache-mode")
     parser.add_argument("--prompt-dir", type=Path)
     parser.add_argument(
         "--include-128k",

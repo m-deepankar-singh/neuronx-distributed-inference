@@ -4,11 +4,13 @@ import logging
 import importlib
 import os
 import warnings
+from enum import Enum
 from typing import Dict, List, Type, Union, Optional
 
 import torch
 from neuronx_distributed.quantization.quantization_config import (
     ActivationQuantizationType,
+    QuantizationType,
     QuantizedDtype,
     KVQuantizationConfig,
 )
@@ -64,6 +66,8 @@ def to_dict(obj):
         return {k: to_dict(v) for k, v in obj.items()}
     elif type(obj) is list:
         return [to_dict(v) for v in obj]
+    elif isinstance(obj, Enum):
+        return obj.value
     elif inspect.isclass(obj):
         return {
             "__module__": obj.__module__,
@@ -75,6 +79,29 @@ def to_dict(obj):
         return str(obj).split(".")[1]
     else:
         return obj
+
+
+def _restore_quantization_type(value):
+    if isinstance(value, QuantizationType):
+        return value
+    if isinstance(value, str):
+        return QuantizationType(value)
+    if isinstance(value, dict):
+        if "_value_" in value:
+            return QuantizationType(value["_value_"])
+        if "_name_" in value:
+            return QuantizationType[value["_name_"]]
+    return value
+
+
+def _restore_kv_quant_config(value):
+    kwargs = dict(value)
+    for key in ("k_quant_method", "v_quant_method"):
+        if key in kwargs:
+            kwargs[key] = _restore_quantization_type(kwargs[key])
+    if isinstance(kwargs.get("quant_dtype"), str):
+        kwargs["quant_dtype"] = to_torch_dtype(kwargs["quant_dtype"])
+    return KVQuantizationConfig(**kwargs)
 
 
 class IncompatibleConfigError(ValueError):
@@ -299,9 +326,7 @@ class NeuronConfig:
         # KV Quantization
         self.kv_quant_config = kwargs.pop("kv_quant_config", None)
         if type(self.kv_quant_config) is dict:
-            self.kv_quant_config = KVQuantizationConfig(
-                **self.kv_quant_config
-            )
+            self.kv_quant_config = _restore_kv_quant_config(self.kv_quant_config)
 
         self.is_chunked_prefill = self.chunked_prefill_config is not None
         if self.is_chunked_prefill:

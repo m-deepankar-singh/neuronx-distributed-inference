@@ -978,12 +978,28 @@ class ModelWrapper(torch.nn.Module):
             horizontal_dim = args[14]
 
         if not self.tag == CONTEXT_ENCODING_MODEL_TAG:
+            default_vertical_dim = (
+                args[0].shape[1]
+                if len(args) > 0 and hasattr(args[0], "shape") and len(args[0].shape) > 1
+                else 1
+            )
             # Determine all buckets that meet horizontal condition
-            horizontal_max = torch.max(horizontal_dim)
-            horizontal_mask = buckets[:, 1] > horizontal_max + speculation_length
+            horizontal_max = (
+                torch.max(horizontal_dim)
+                if horizontal_dim.numel() > 0
+                else torch.tensor(0, dtype=torch.int32)
+            )
+            if horizontal_max == 0 and speculation_length == 0:
+                horizontal_mask = buckets[:, 1] >= horizontal_max
+            else:
+                horizontal_mask = buckets[:, 1] > horizontal_max + speculation_length
 
             # Determine all buckets that meet vertical condition
-            vertical_max = torch.max(vertical_dim)
+            vertical_max = (
+                torch.max(vertical_dim)
+                if vertical_dim.numel() > 0
+                else torch.tensor(default_vertical_dim, dtype=torch.int32)
+            )
             vertical_mask = buckets[:, 0] >= vertical_max
 
             mask = horizontal_mask & vertical_mask
@@ -998,7 +1014,9 @@ class ModelWrapper(torch.nn.Module):
                     bucket_idx = min(bucket_idx + 1, len(buckets) - 1)
             # If no buckets remain, take the largest bucket if input truncation enabled
             else:
-                if not self.neuron_config.allow_input_truncation:
+                if horizontal_dim.numel() == 0 or vertical_dim.numel() == 0:
+                    bucket_idx = -1
+                elif not self.neuron_config.allow_input_truncation:
                     raise ValueError(
                         f"Input len {vertical_dim} exceeds largest bucket ({buckets[-1][1]}) for {self.tag}"
                     )
@@ -1007,8 +1025,21 @@ class ModelWrapper(torch.nn.Module):
             return buckets[bucket_idx]
         # recover the bucket for special handling
         else:
-            horizontal_dim = horizontal_dim[0][0]
-            vertical_dim = vertical_dim[0][0]
+            default_vertical_dim = (
+                args[0].shape[1]
+                if len(args) > 0 and hasattr(args[0], "shape") and len(args[0].shape) > 1
+                else 0
+            )
+            horizontal_dim = (
+                horizontal_dim.reshape(-1)[0]
+                if horizontal_dim.numel() > 0
+                else torch.tensor(0, dtype=torch.int32)
+            )
+            vertical_dim = (
+                vertical_dim.reshape(-1)[0]
+                if vertical_dim.numel() > 0
+                else torch.tensor(default_vertical_dim, dtype=torch.int32)
+            )
             prefix_buckets = []
             prefill_buckets = []
             for b in buckets:
@@ -1068,16 +1099,41 @@ class ModelWrapper(torch.nn.Module):
         prefill_bucket, prefix_bucket = self.get_target_2d_bucket_for_prefix_caching(*args, strategy=pad_type)
 
         if self.tag == CONTEXT_ENCODING_MODEL_TAG:
+            default_prefill_len = (
+                args[0].shape[1]
+                if len(args) > 0 and hasattr(args[0], "shape") and len(args[0].shape) > 1
+                else 0
+            )
             if self.neuron_config.enable_fused_speculation:
                 slot_mapping = args[7]
                 block_table = args[8]
-                prefill_len = args[9][0]
-                prefix_len = args[10][0]
+                prefill_len = (
+                    args[9].reshape(-1)[0]
+                    if args[9].numel() > 0
+                    else torch.tensor(default_prefill_len, dtype=torch.int32)
+                )
+                prefix_len = (
+                    args[10].reshape(-1)[0]
+                    if args[10].numel() > 0
+                    else torch.tensor(0, dtype=torch.int32)
+                )
             else:
                 slot_mapping = args[11]
                 block_table = args[12]
-                prefill_len = args[13][0]
-                prefix_len = args[14][0]
+                prefill_len = (
+                    args[13].reshape(-1)[0]
+                    if args[13].numel() > 0
+                    else torch.tensor(default_prefill_len, dtype=torch.int32)
+                )
+                prefix_len = (
+                    args[14].reshape(-1)[0]
+                    if args[14].numel() > 0
+                    else torch.tensor(0, dtype=torch.int32)
+                )
+            if hasattr(slot_mapping, "ndim") and slot_mapping.ndim == 1 and slot_mapping.numel() > 0:
+                slot_mapping = slot_mapping.unsqueeze(0)
+            if hasattr(block_table, "ndim") and block_table.ndim == 1 and block_table.numel() > 0:
+                block_table = block_table.unsqueeze(0)
             if self.neuron_config.enable_eagle_speculation:
                 target_recomputation = 0 if prefix_bucket == 0 else self.neuron_config.pa_block_size
                 extra_prefill_slots = max(0, prefill_bucket - prefill_len - target_recomputation)
@@ -1121,22 +1177,45 @@ class ModelWrapper(torch.nn.Module):
                 args = (padded_inputs, padded_attn_mask, padded_position_id, *args[3:7], padded_slot_mapping, padded_block_table, *args[9:11], target_padded_inputs, target_padded_attn_mask, target_padded_position_id, target_padded_slot_mapping, target_padded_block_table)
                 return tuple(args)
             else:
-                extra_prefill_slots = max(0, prefill_bucket - prefill_len)
-                adjusted_prefix_len = max(0, prefix_len - extra_prefill_slots)
-                sliced_inputs = args[0][:, adjusted_prefix_len:]
+                prefill_len_value = (
+                    int(prefill_len.item())
+                    if hasattr(prefill_len, "item")
+                    else int(prefill_len)
+                )
+                prefix_len_value = (
+                    int(prefix_len.item())
+                    if hasattr(prefix_len, "item")
+                    else int(prefix_len)
+                )
+                prefill_bucket_value = (
+                    int(prefill_bucket.item())
+                    if hasattr(prefill_bucket, "item")
+                    else int(prefill_bucket)
+                )
+                prefix_bucket_value = (
+                    int(prefix_bucket.item())
+                    if hasattr(prefix_bucket, "item")
+                    else int(prefix_bucket)
+                )
+                extra_prefill_slots = max(0, prefill_bucket_value - prefill_len_value)
+                adjusted_prefix_len = max(0, prefix_len_value - extra_prefill_slots)
+                input_slice_start = (
+                    0 if args[0].shape[1] <= prefill_len_value else adjusted_prefix_len
+                )
+                sliced_inputs = args[0][:, input_slice_start:]
                 sliced_attn_mask = args[1][:, :adjusted_prefix_len]
-                sliced_position_id = args[2][:, adjusted_prefix_len:]
+                sliced_position_id = args[2][:, input_slice_start:]
 
-                padded_inputs = F.pad(sliced_inputs, (0, prefill_bucket - sliced_inputs.shape[1]), "constant", self.config.pad_token_id)
-                if prefix_bucket == 0:
+                padded_inputs = F.pad(sliced_inputs, (0, prefill_bucket_value - sliced_inputs.shape[1]), "constant", self.config.pad_token_id)
+                if prefix_bucket_value == 0:
                     padded_attn_mask = torch.zeros(1, dtype=torch.int)
                 else:
-                    padded_attn_mask = F.pad(sliced_attn_mask, (0, prefix_bucket - sliced_attn_mask.shape[1]), "constant", 0)
-                padded_position_id = F.pad(sliced_position_id, (0, prefill_bucket - sliced_position_id.shape[1]), "constant", 1)
-                padded_slot_mapping = F.pad(slot_mapping, (prefix_len - adjusted_prefix_len, 0), "constant", -1)
-                padded_slot_mapping = F.pad(padded_slot_mapping, (0, prefill_bucket - padded_slot_mapping.shape[1]), "constant", -1)
+                    padded_attn_mask = F.pad(sliced_attn_mask, (0, prefix_bucket_value - sliced_attn_mask.shape[1]), "constant", 0)
+                padded_position_id = F.pad(sliced_position_id, (0, prefill_bucket_value - sliced_position_id.shape[1]), "constant", 1)
+                padded_slot_mapping = F.pad(slot_mapping, (prefix_len_value - adjusted_prefix_len, 0), "constant", -1)
+                padded_slot_mapping = F.pad(padded_slot_mapping, (0, prefill_bucket_value - padded_slot_mapping.shape[1]), "constant", -1)
 
-                num_blocks = prefix_bucket // self.neuron_config.pa_block_size
+                num_blocks = prefix_bucket_value // self.neuron_config.pa_block_size
                 if num_blocks == 0:
                     padded_block_table = torch.zeros(1, dtype=torch.int)
                 else:
@@ -1150,9 +1229,26 @@ class ModelWrapper(torch.nn.Module):
             padded_attn_mask = F.pad(args[1], (0, prefix_bucket - args[1].shape[1]), "constant", 0)
             block_table_arg_idx = 8 if self.neuron_config.enable_fused_speculation else 12
             block_table = args[block_table_arg_idx]
-            pad_right = (prefix_bucket // self.neuron_config.pa_block_size) - block_table.shape[1]
-            block_table_padding = -1 if self.neuron_config.attn_block_tkg_nki_kernel_enabled else 0
-            padded_block_table = F.pad(block_table, (0, pad_right), "constant", block_table_padding)
+            num_blocks = prefix_bucket // self.neuron_config.pa_block_size
+            block_table_padding = 0
+            if hasattr(block_table, "numel") and block_table.numel() == 0:
+                if num_blocks == 0:
+                    padded_block_table = torch.zeros(1, dtype=torch.int)
+                else:
+                    batch_size = (
+                        args[0].shape[0]
+                        if len(args) > 0 and hasattr(args[0], "shape") and len(args[0].shape) > 0
+                        else 1
+                    )
+                    padded_block_table = torch.zeros(
+                        (batch_size, num_blocks),
+                        dtype=torch.int32,
+                    )
+            else:
+                if hasattr(block_table, "ndim") and block_table.ndim == 1:
+                    block_table = block_table.unsqueeze(0)
+                pad_right = num_blocks - block_table.shape[1]
+                padded_block_table = F.pad(block_table, (0, pad_right), "constant", block_table_padding)
             new_args = list(args)
             new_args[1] = padded_attn_mask
             new_args[block_table_arg_idx] = padded_block_table

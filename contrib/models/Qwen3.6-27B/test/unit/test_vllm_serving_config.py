@@ -32,6 +32,7 @@ def _args(**overrides):
         max_num_seqs=1,
         ctx_batch_size=1,
         max_model_len=2048,
+        compiled_max_prompt_length=None,
         max_tokens=1,
         logical_nc_config=2,
         block_size=128,
@@ -111,6 +112,22 @@ class TestVllmServingConfig(unittest.TestCase):
         self.assertTrue(neuron_config["enable_bucketing"])
         self.assertEqual(config["max_prompt_length"], 1024)
 
+    def test_compiled_max_prompt_length_can_exceed_logical_cte_bucket(self):
+        config = self.runner._override_config(
+            _args(cte_bucket=512, compiled_max_prompt_length=1024)
+        )
+        neuron_config = config["override_neuron_config"]
+
+        self.assertEqual(neuron_config["context_encoding_buckets"], [512])
+        self.assertEqual(neuron_config["max_context_length"], 1024)
+        self.assertEqual(config["max_prompt_length"], 1024)
+
+    def test_compiled_max_prompt_length_must_cover_cte_bucket(self):
+        with self.assertRaisesRegex(ValueError, "compiled-max-prompt-length"):
+            self.runner._override_config(
+                _args(cte_bucket_profile="short", compiled_max_prompt_length=512)
+            )
+
     def test_named_cte_profiles_match_cold_prefill_plan(self):
         expected = {
             "short": [128, 256, 512, 1024],
@@ -160,6 +177,71 @@ class TestVllmServingConfig(unittest.TestCase):
         self.assertEqual(metrics["end_to_end_generated_tok_per_s"], 4.0)
         self.assertIsNone(metrics["decode_tok_per_s"])
         self.assertEqual(metrics["hbm_usage"], {"bytes_used": 123})
+
+    def test_neuron_monitor_hbm_parser_reports_peak_runtime_bytes(self):
+        stdout = "\n".join(
+            [
+                json.dumps(
+                    {
+                        "neuron_runtime_data": [
+                            {
+                                "report": {
+                                    "memory_used": {
+                                        "neuron_runtime_used_bytes": {
+                                            "neuron_device": 1024,
+                                            "usage_breakdown": {
+                                                "neuroncore_memory_usage": {
+                                                    "0": {"tensors": 64},
+                                                    "1": {"tensors": 128},
+                                                }
+                                            },
+                                        }
+                                    }
+                                }
+                            }
+                        ]
+                    }
+                ),
+                json.dumps(
+                    {
+                        "neuron_runtime_data": [
+                            {
+                                "report": {
+                                    "memory_used": {
+                                        "neuron_runtime_used_bytes": {
+                                            "neuron_device": 2048,
+                                            "usage_breakdown": {
+                                                "neuroncore_memory_usage": {
+                                                    "0": {"tensors": 256},
+                                                }
+                                            },
+                                        }
+                                    }
+                                }
+                            }
+                        ]
+                    }
+                ),
+            ]
+        )
+
+        usage = self.runner._parse_neuron_monitor_hbm(stdout)
+
+        self.assertEqual(usage["source"], "neuron-monitor")
+        self.assertEqual(usage["bytes_used"], 2048)
+        self.assertEqual(usage["neuron_device_bytes_used"], 2048)
+        self.assertEqual(usage["tensor_bytes"], 256)
+        self.assertEqual(usage["samples"], 2)
+
+    def test_neuron_monitor_hbm_parser_returns_none_without_runtime_samples(self):
+        stdout = json.dumps(
+            {
+                "neuron_runtime_data": [],
+                "neuron_hardware_info": {"neuron_device_memory_size": 103079215104},
+            }
+        )
+
+        self.assertIsNone(self.runner._parse_neuron_monitor_hbm(stdout))
 
     def test_cold_prefill_metrics_account_for_chunked_long_prompts(self):
         args = _args(cte_bucket_profile="short")

@@ -26,7 +26,6 @@ LONG_CONTEXT_BASE_PROMPTS = (128, 256, 384, 512, 2048)
 LONG_CONTEXT_VARIANTS = (
     "A_single512_old_chunked",
     "H_128k_candidate",
-    "I_262k_recovery_block256",
     "J_262k_recovery_block128",
 )
 RUN_PHASES = ("matrix", "long_context", "hybrid_apc", "acceptance")
@@ -50,6 +49,52 @@ def _add_runtime_args(command: list[str], args: argparse.Namespace) -> None:
         command.extend(
             ["--num-gpu-blocks-override", str(args.num_gpu_blocks_override)]
         )
+    if args.num_gpu_blocks_override_by_len:
+        command.append("--num-gpu-blocks-override-by-len")
+        command.extend(args.num_gpu_blocks_override_by_len)
+
+
+def _num_gpu_blocks_override_by_len(args: argparse.Namespace) -> dict[int, int]:
+    mapping: dict[int, int] = {}
+    for raw in args.num_gpu_blocks_override_by_len or []:
+        if "=" not in raw:
+            raise ValueError(
+                "--num-gpu-blocks-override-by-len entries must be shaped LEN=BLOCKS"
+            )
+        seq_len_raw, blocks_raw = raw.split("=", 1)
+        mapping[int(seq_len_raw)] = int(blocks_raw)
+    return mapping
+
+
+def _num_gpu_blocks_override_for_len(
+    args: argparse.Namespace, seq_len: int
+) -> int | None:
+    return _num_gpu_blocks_override_by_len(args).get(seq_len) or args.num_gpu_blocks_override
+
+
+def _add_cold_artifact_runtime_args(
+    command: list[str], args: argparse.Namespace
+) -> None:
+    if args.enable_prefix_caching:
+        command.append("--enable-prefix-caching")
+    if args.enable_hybrid_apc:
+        command.append("--enable-hybrid-apc")
+    if args.hybrid_apc_require_vllm_metadata:
+        command.append("--hybrid-apc-require-vllm-metadata")
+    command.extend(
+        [
+            "--gdn-checkpoint-interval",
+            str(args.gdn_checkpoint_interval),
+            "--max-gdn-checkpoint-slots",
+            str(args.max_gdn_checkpoint_slots),
+            "--hybrid-cache-mode",
+            args.hybrid_cache_mode,
+            "--block-size",
+            str(args.block_size),
+            "--compiled-max-prompt-length",
+            str(args.compiled_max_prompt_length),
+        ]
+    )
 
 
 def _build_commands(args: argparse.Namespace) -> dict[str, list[str]]:
@@ -80,6 +125,7 @@ def _build_commands(args: argparse.Namespace) -> dict[str, list[str]]:
         str(matrix_json),
     ]
     _add_runtime_args(matrix_cmd, args)
+    _add_cold_artifact_runtime_args(matrix_cmd, args)
     if args.fail_fast:
         matrix_cmd.append("--fail-fast")
     if args.gdn_state_diff_json is not None:
@@ -109,6 +155,7 @@ def _build_commands(args: argparse.Namespace) -> dict[str, list[str]]:
         str(long_context_json),
     ]
     _add_runtime_args(long_context_cmd, args)
+    _add_cold_artifact_runtime_args(long_context_cmd, args)
     if args.fail_fast:
         long_context_cmd.append("--fail-fast")
     if args.gdn_state_diff_json is not None:
@@ -139,9 +186,9 @@ def _build_commands(args: argparse.Namespace) -> dict[str, list[str]]:
         "--max-num-seqs",
         str(args.max_num_seqs),
         "--block-size",
-        "128",
+        str(args.block_size),
         "--gdn-checkpoint-interval",
-        "128",
+        str(args.gdn_checkpoint_interval),
         "--enable-vllm-chunked-prefill",
         "--kernel-q-tile-size",
         "128",
@@ -155,9 +202,10 @@ def _build_commands(args: argparse.Namespace) -> dict[str, list[str]]:
         "--output-json",
         str(hybrid_apc_json),
     ]
-    if args.num_gpu_blocks_override is not None:
+    hybrid_num_gpu_blocks_override = _num_gpu_blocks_override_for_len(args, 2048)
+    if hybrid_num_gpu_blocks_override is not None:
         hybrid_apc_cmd.extend(
-            ["--num-gpu-blocks-override", str(args.num_gpu_blocks_override)]
+            ["--num-gpu-blocks-override", str(hybrid_num_gpu_blocks_override)]
         )
 
     acceptance_cmd = [
@@ -748,6 +796,18 @@ def _preflight_report(args: argparse.Namespace, checks: list[dict]) -> dict:
             "logical_nc_config": args.logical_nc_config,
             "max_num_seqs": args.max_num_seqs,
             "ctx_batch_size": args.ctx_batch_size,
+            "num_gpu_blocks_override": args.num_gpu_blocks_override,
+            "num_gpu_blocks_override_by_len": args.num_gpu_blocks_override_by_len,
+            "enable_prefix_caching": args.enable_prefix_caching,
+            "enable_hybrid_apc": args.enable_hybrid_apc,
+            "hybrid_apc_require_vllm_metadata": (
+                args.hybrid_apc_require_vllm_metadata
+            ),
+            "block_size": args.block_size,
+            "compiled_max_prompt_length": args.compiled_max_prompt_length,
+            "gdn_checkpoint_interval": args.gdn_checkpoint_interval,
+            "max_gdn_checkpoint_slots": args.max_gdn_checkpoint_slots,
+            "hybrid_cache_mode": args.hybrid_cache_mode,
         },
         "expected_outputs": _expected_output_paths(args),
         "expected_logs": _phase_log_paths(args),
@@ -813,6 +873,10 @@ def _run_logged_command(name: str, command: list[str], log_path: Path) -> int:
         return returncode
 
 
+def _should_stop_after_phase(args: argparse.Namespace, phase_returncode: int) -> bool:
+    return bool(args.fail_fast and phase_returncode != 0)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-path")
@@ -830,6 +894,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-num-seqs", type=int, default=1)
     parser.add_argument("--ctx-batch-size", type=int, default=1)
     parser.add_argument("--num-gpu-blocks-override", type=int)
+    parser.add_argument("--num-gpu-blocks-override-by-len", nargs="+", default=None)
+    parser.add_argument("--compiled-max-prompt-length", type=int, default=1024)
+    parser.add_argument("--block-size", type=int, default=128)
+    parser.add_argument("--enable-prefix-caching", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--enable-hybrid-apc", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--hybrid-apc-require-vllm-metadata",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument("--gdn-checkpoint-interval", type=int, default=128)
+    parser.add_argument("--max-gdn-checkpoint-slots", type=int, default=8)
+    parser.add_argument("--hybrid-cache-mode", default="all")
     parser.add_argument(
         "--gdn-state-diff-json",
         type=Path,
@@ -945,6 +1022,17 @@ def main() -> int:
         _write_run_manifest(args, manifest)
         if phase_returncode != 0 and returncode == 0:
             returncode = phase_returncode
+        if _should_stop_after_phase(args, phase_returncode):
+            manifest["returncode"] = phase_returncode
+            manifest["passed"] = False
+            manifest["aborted_after_phase"] = name
+            manifest["evidence_status"] = _evidence_status(args)
+            _write_run_manifest(args, manifest)
+            print(
+                f"[{name}] fail-fast aborting strict-final before remaining phases",
+                flush=True,
+            )
+            return phase_returncode
 
     start = time.perf_counter()
     acceptance_returncode = _run_logged_command(

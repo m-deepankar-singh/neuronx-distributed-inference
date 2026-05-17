@@ -45,8 +45,21 @@ if [[ -n "${QWEN36_GDN_STATE_DIFF_JSON:-}" ]]; then
   common_args+=(--gdn-state-diff-json "${QWEN36_GDN_STATE_DIFF_JSON}")
 fi
 
-if [[ -n "${QWEN36_NUM_GPU_BLOCKS_OVERRIDE:-}" ]]; then
+if [[ -n "${QWEN36_NUM_GPU_BLOCKS_OVERRIDE_BY_LEN:-}" ]]; then
+  # shellcheck disable=SC2206
+  block_overrides=(${QWEN36_NUM_GPU_BLOCKS_OVERRIDE_BY_LEN})
+  common_args+=(--num-gpu-blocks-override-by-len "${block_overrides[@]}")
+elif [[ -n "${QWEN36_NUM_GPU_BLOCKS_OVERRIDE:-}" ]]; then
   common_args+=(--num-gpu-blocks-override "${QWEN36_NUM_GPU_BLOCKS_OVERRIDE}")
+else
+  common_args+=(
+    --num-gpu-blocks-override-by-len
+    2048=16
+    8192=64
+    32768=256
+    131072=1024
+    262144=2048
+  )
 fi
 
 if [[ "${QWEN36_FAIL_FAST:-0}" == "1" ]]; then

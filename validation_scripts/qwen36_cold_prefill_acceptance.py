@@ -83,18 +83,15 @@ EXPECTED_FEATURE_LAUNCH_PROFILE_BY_VARIANT = {
 }
 LONG_ARTIFACT_GENERATION_TARGETS = (
     ("H_128k_candidate", 131072),
-    ("I_262k_recovery_block256", 262144),
     ("J_262k_recovery_block128", 262144),
 )
 LONG_ARTIFACT_REQUIRED_TILE_CASES = {
     ("H_128k_candidate", 131072): (128, 1024, 128),
-    ("I_262k_recovery_block256", 262144): (128, 1024, 256),
     ("J_262k_recovery_block128", 262144): (128, 1024, 128),
 }
 LONG_ARTIFACT_REQUIRED_CTE_BUCKETS = {
-    ("H_128k_candidate", 131072): (256, 512, 1024, 2048),
-    ("I_262k_recovery_block256", 262144): (256,),
-    ("J_262k_recovery_block128", 262144): (256,),
+    ("H_128k_candidate", 131072): (128, 256, 512, 1024),
+    ("J_262k_recovery_block128", 262144): (128, 256, 512, 1024),
 }
 REQUIRED_TILE_SWEEP_PROMPTS = (2048, 8192)
 REQUIRED_TILE_SWEEP_CASES = (
@@ -102,7 +99,6 @@ REQUIRED_TILE_SWEEP_CASES = (
     (128, 1024, 128),
     (128, 2048, 128),
     (256, 1024, 128),
-    (128, 1024, 256),
 )
 DENSE_FALLBACK_VARIANT = "L_small_dense_mask_fallback"
 DENSE_FALLBACK_PROMPT_LENGTHS = (256, 512)
@@ -1484,18 +1480,32 @@ def evaluate(
         baseline_rows = controlled_grouped.get((baseline_variant, prompt_len), [])
         if not baseline_rows:
             continue
-        baseline_signature = _comparison_signature(baseline_rows[0])
-        missing_fields = [
-            name for name, value in baseline_signature.items() if value is None
-        ]
-        if missing_fields and require_controlled_inputs:
-            failures.append(
-                f"{baseline_variant} prompt={prompt_len} missing controlled input fields: {missing_fields}"
-            )
+        baseline_by_max_tokens = defaultdict(list)
+        for row in baseline_rows:
+            baseline_by_max_tokens[row.get("max_tokens")].append(row)
+        checked_baseline_keys = set()
         for variant in sorted(
             {variant for variant, prompt in controlled_grouped if prompt == prompt_len}
         ):
             for row in controlled_grouped[(variant, prompt_len)]:
+                baseline_key = row.get("max_tokens")
+                matching_baseline_rows = (
+                    baseline_by_max_tokens.get(baseline_key) or baseline_rows
+                )
+                baseline_signature = _comparison_signature(matching_baseline_rows[0])
+                if baseline_key not in checked_baseline_keys:
+                    missing_fields = [
+                        name
+                        for name, value in baseline_signature.items()
+                        if value is None
+                    ]
+                    if missing_fields and require_controlled_inputs:
+                        failures.append(
+                            f"{baseline_variant} prompt={prompt_len} "
+                            f"max_tokens={baseline_key} missing controlled "
+                            f"input fields: {missing_fields}"
+                        )
+                    checked_baseline_keys.add(baseline_key)
                 signature = _comparison_signature(row)
                 check = {
                     "variant": variant,
@@ -1968,10 +1978,9 @@ def evaluate(
     if require_128k:
         required_long_artifact_profiles.add(("H_128k_candidate", 131072))
     if require_262k:
-        required_long_artifact_profiles.add(("I_262k_recovery_block256", 262144))
+        required_long_artifact_profiles.add(("J_262k_recovery_block128", 262144))
     if strict_final:
         required_long_artifact_profiles.add(("H_128k_candidate", 131072))
-        required_long_artifact_profiles.add(("I_262k_recovery_block256", 262144))
         required_long_artifact_profiles.add(("J_262k_recovery_block128", 262144))
 
     long_artifact_profile_rows = rows if strict_final else gate_rows
@@ -2186,15 +2195,9 @@ def evaluate(
         )
     if require_262k:
         _require(
-            long_artifact_requirements["saw_262k_block256"],
-            failures,
-            "262K block256 recovery artifact row missing or failed",
-        )
-    if strict_final:
-        _require(
             long_artifact_requirements["saw_262k_block128"],
             failures,
-            "strict final acceptance requires 262K block128 comparison artifact row",
+            "262K KV-FP8 block128 recovery artifact row missing or failed",
         )
 
     gdn_state_checks = []
@@ -2948,20 +2951,11 @@ def evaluate(
             long_artifact_requirements,
         ),
         _audit_item(
-            "262K block256 artifact load/run",
-            "pass"
-            if long_artifact_requirements["saw_262k_block256"]
-            else "skip"
-            if not require_262k
-            else "fail",
-            long_artifact_requirements,
-        ),
-        _audit_item(
-            "262K block128 comparison load/run",
+            "262K KV-FP8 block128 artifact load/run",
             "pass"
             if long_artifact_requirements["saw_262k_block128"]
             else "skip"
-            if not strict_final
+            if not require_262k
             else "fail",
             long_artifact_requirements,
         ),

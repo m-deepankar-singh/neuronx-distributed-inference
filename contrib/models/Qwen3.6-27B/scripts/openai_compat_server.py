@@ -12,7 +12,10 @@ the stock Neuron inference venv. It supports non-streaming:
 import argparse
 import json
 import os
+import shutil
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -113,6 +116,17 @@ def _bucketed_prefill_work(
 
 
 def _hbm_usage_if_available():
+    probe_mode = os.environ.get("QWEN36_HBM_PROBE", "neuron-monitor").lower()
+    if probe_mode in {"0", "false", "none", "off"}:
+        return None
+    if probe_mode != "xla":
+        usage = _hbm_usage_from_neuron_monitor()
+        if usage is not None or probe_mode == "neuron-monitor":
+            return usage
+    return _xla_hbm_usage_if_available() if probe_mode == "xla" else None
+
+
+def _xla_hbm_usage_if_available():
     try:
         import torch_xla.core.xla_model as xm
 
@@ -120,6 +134,104 @@ def _hbm_usage_if_available():
         return xm.get_memory_info(device)
     except Exception:
         return None
+
+
+def _safe_int(value) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _parse_neuron_monitor_hbm(stdout: str) -> Dict[str, Any] | None:
+    peak_device_bytes = 0
+    peak_tensor_bytes = 0
+    samples = 0
+
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            report = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        for runtime in report.get("neuron_runtime_data", []):
+            memory_used = runtime.get("report", {}).get("memory_used", {})
+            used = memory_used.get("neuron_runtime_used_bytes", {})
+            peak_device_bytes = max(
+                peak_device_bytes,
+                _safe_int(used.get("neuron_device")),
+            )
+            nc_usage = (
+                used.get("usage_breakdown", {}).get("neuroncore_memory_usage", {})
+            )
+            tensor_bytes = sum(
+                _safe_int(core.get("tensors"))
+                for core in nc_usage.values()
+                if isinstance(core, dict)
+            )
+            peak_tensor_bytes = max(peak_tensor_bytes, tensor_bytes)
+            samples += 1
+
+    bytes_used = peak_device_bytes or peak_tensor_bytes
+    if samples == 0 or bytes_used <= 0:
+        return None
+    return {
+        "source": "neuron-monitor",
+        "bytes_used": bytes_used,
+        "neuron_device_bytes_used": peak_device_bytes,
+        "tensor_bytes": peak_tensor_bytes,
+        "samples": samples,
+    }
+
+
+def _hbm_usage_from_neuron_monitor() -> Dict[str, Any] | None:
+    neuron_monitor = shutil.which("neuron-monitor")
+    if neuron_monitor is None:
+        return None
+    timeout_seconds = float(os.environ.get("QWEN36_HBM_MONITOR_SECONDS", "1.0"))
+    config = {
+        "period": "0.25s",
+        "neuron_runtimes": [
+            {
+                "tag_filter": ".*",
+                "metrics": [{"type": "memory_used", "period": "0.25s"}],
+            }
+        ],
+    }
+    config_path = None
+    proc = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            suffix=".json",
+            delete=False,
+        ) as handle:
+            json.dump(config, handle)
+            config_path = handle.name
+        proc = subprocess.Popen(
+            [neuron_monitor, "--config-file", config_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        time.sleep(max(timeout_seconds, 0.1))
+        proc.terminate()
+        stdout, _stderr = proc.communicate(timeout=5)
+        return _parse_neuron_monitor_hbm(stdout)
+    except Exception:
+        if proc is not None and proc.poll() is None:
+            proc.kill()
+            proc.communicate()
+        return None
+    finally:
+        if config_path is not None:
+            try:
+                os.unlink(config_path)
+            except OSError:
+                pass
 
 
 def _cold_prefill_metrics(

@@ -27,6 +27,7 @@ Config compatibility notes:
 """
 
 import gc
+import json
 import math
 import logging
 import os
@@ -112,6 +113,25 @@ from neuronx_distributed_inference.models.layer_boundary_marker import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+_TRUE_ENV_VALUES = {"1", "true", "yes", "on"}
+
+
+def _emit_gdn_state_diff_enabled() -> bool:
+    return os.environ.get("QWEN36_EMIT_GDN_STATE_DIFF", "").lower() in _TRUE_ENV_VALUES
+
+
+def _safe_tensor_max_abs_diff(lhs: torch.Tensor, rhs: torch.Tensor) -> float:
+    if tuple(lhs.shape) != tuple(rhs.shape):
+        raise ValueError(f"shape mismatch: {tuple(lhs.shape)} != {tuple(rhs.shape)}")
+    if lhs.numel() == 0:
+        return 0.0
+    return float((lhs.detach().float() - rhs.detach().float()).abs().max().item())
+
+
+def _max_optional(current: float | None, value: float) -> float:
+    return value if current is None else max(current, value)
 
 
 try:
@@ -371,6 +391,7 @@ class NeuronGatedDeltaNet(nn.Module):
     def __init__(self, config, layer_idx: int):
         super().__init__()
         tc = config
+        self.config = tc
 
         self.hidden_size = tc.hidden_size  # 5120
         self.tp_degree = tc.neuron_config.tp_degree
@@ -940,12 +961,17 @@ class NeuronGatedDeltaNet(nn.Module):
         batch_size, seq_len, _ = hidden_states.shape
 
         seq_ids = kwargs.get("seq_ids", None)
+        is_for_context_encoding = bool(kwargs.get("is_for_context_encoding", False))
         qwen_chunked_prefill_active = (
             self.use_qwen_hybrid_chunked_prefill
             and past_key_value is not None
             and seq_len > 1
         )
-        is_decode = past_key_value is not None and not qwen_chunked_prefill_active
+        is_decode = (
+            past_key_value is not None
+            and not qwen_chunked_prefill_active
+            and not is_for_context_encoding
+        )
 
         # Padding mask for DeltaNet: [B, S, 1] with 1.0 for real tokens, 0.0 for padding.
         # Passed from get_model_output where it's computed from input_ids != pad_token_id.
@@ -962,7 +988,10 @@ class NeuronGatedDeltaNet(nn.Module):
             self.use_hybrid_apc_manager
             and past_key_value is not None
             and len(past_key_value) == 2
+            and getattr(past_key_value[0], "dim", lambda: 0)() == 4
             and getattr(past_key_value[1], "dim", lambda: 0)() == 3
+            and past_key_value[0].shape[1:] == self.recurrent_state_buffer.shape[1:]
+            and past_key_value[1].shape[1:] == self.conv_state_buffer.shape[1:]
         ):
             recurrent_state_cache, conv_state_cache = past_key_value
 
@@ -1032,7 +1061,9 @@ class NeuronGatedDeltaNet(nn.Module):
             else:
                 new_conv_state = new_conv_state + self.conv_state_buffer * 0
         else:
-            if qwen_chunked_prefill_active and conv_state_cache is not None:
+            if conv_state_cache is not None and (
+                qwen_chunked_prefill_active or is_for_context_encoding
+            ):
                 cold_prefill_from_zero = _safe_cold_zero_conv_fast_path(
                     self.config,
                     position_ids,
@@ -1227,7 +1258,9 @@ class NeuronGatedDeltaNet(nn.Module):
             use_sequential = os.environ.get("DELTANET_SEQUENTIAL") == "1"
             use_pytorch_chunk = os.environ.get("USE_PYTORCH_CHUNK") == "1"
 
-            if qwen_chunked_prefill_active and recurrent_state_cache is not None:
+            if recurrent_state_cache is not None and (
+                qwen_chunked_prefill_active or is_for_context_encoding
+            ):
                 initial_state = recurrent_state_cache[:batch_size].float()
                 if position_ids is not None:
                     reset_mask = (position_ids[:, :1].long() == 0).to(
@@ -2712,9 +2745,17 @@ class NeuronQwen35Model(NeuronBaseModel):
             and attention_mask is not None
             and attention_mask.ndim == 2
         ):
-            deltanet_padding_mask = attention_mask.unsqueeze(-1).to(
+            attention_padding_mask = attention_mask.unsqueeze(-1).to(
                 inputs_embeds.dtype
             )
+            if attention_padding_mask.shape[1] == inputs_embeds.shape[1]:
+                deltanet_padding_mask = attention_padding_mask
+            else:
+                deltanet_padding_mask = (
+                    (input_ids != self.padding_idx)
+                    .unsqueeze(-1)
+                    .to(inputs_embeds.dtype)
+                )
         else:
             deltanet_padding_mask = (
                 (input_ids != self.padding_idx).unsqueeze(-1).to(inputs_embeds.dtype)
@@ -3738,11 +3779,45 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
         tkg_params = getattr(tkg_model, "_deltanet_state_params", [])
         cte_params = getattr(cte_model, "_deltanet_state_params", [])
 
+        emit_state_diff = _emit_gdn_state_diff_enabled()
+        recurrent_max_abs_diff = None
+        conv_max_abs_diff = None
+        recurrent_tensor_count = 0
+        conv_tensor_count = 0
+        state_diff_errors = []
+
         if len(tkg_params) > 0 and state_start + len(tkg_params) <= len(outputs):
             for i, (tkg_param, cte_param) in enumerate(zip(tkg_params, cte_params)):
                 new_state = outputs[state_start + i]
                 tkg_param.data = new_state
                 cte_param.data = new_state
+                if emit_state_diff:
+                    try:
+                        tkg_cte_diff = _safe_tensor_max_abs_diff(
+                            tkg_param.data,
+                            cte_param.data,
+                        )
+                        output_tkg_diff = _safe_tensor_max_abs_diff(
+                            new_state,
+                            tkg_param.data,
+                        )
+                        tensor_diff = max(tkg_cte_diff, output_tkg_diff)
+                        if i % 2 == 0:
+                            recurrent_max_abs_diff = _max_optional(
+                                recurrent_max_abs_diff,
+                                tensor_diff,
+                            )
+                            recurrent_tensor_count += 1
+                        else:
+                            conv_max_abs_diff = _max_optional(
+                                conv_max_abs_diff,
+                                tensor_diff,
+                            )
+                            conv_tensor_count += 1
+                    except Exception as exc:  # pragma: no cover - diagnostic only
+                        state_diff_errors.append(
+                            f"deltanet_state[{i}]: {type(exc).__name__}: {exc}"
+                        )
 
         checkpoint_start = state_start + len(tkg_params)
         tkg_checkpoint_params = getattr(tkg_model, "_hybrid_gdn_checkpoint_params", [])
@@ -3757,6 +3832,54 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
                 new_state = outputs[checkpoint_start + i]
                 tkg_param.data = new_state
                 cte_param.data = new_state
+                if emit_state_diff:
+                    try:
+                        tkg_cte_diff = _safe_tensor_max_abs_diff(
+                            tkg_param.data,
+                            cte_param.data,
+                        )
+                        output_tkg_diff = _safe_tensor_max_abs_diff(
+                            new_state,
+                            tkg_param.data,
+                        )
+                        tensor_diff = max(tkg_cte_diff, output_tkg_diff)
+                        if i % 2 == 0:
+                            recurrent_max_abs_diff = _max_optional(
+                                recurrent_max_abs_diff,
+                                tensor_diff,
+                            )
+                            recurrent_tensor_count += 1
+                        else:
+                            conv_max_abs_diff = _max_optional(
+                                conv_max_abs_diff,
+                                tensor_diff,
+                            )
+                            conv_tensor_count += 1
+                    except Exception as exc:  # pragma: no cover - diagnostic only
+                        state_diff_errors.append(
+                            f"checkpoint_state[{i}]: {type(exc).__name__}: {exc}"
+                        )
+
+        if emit_state_diff and (
+            recurrent_max_abs_diff is not None
+            or conv_max_abs_diff is not None
+            or state_diff_errors
+        ):
+            payload = {
+                "source": "qwen35_copy_past_key_values",
+                "comparison": "context_trace_output_vs_tkg_and_cte_state_buffers_after_copy",
+                "recurrent_state_tensor_count": recurrent_tensor_count,
+                "conv_state_tensor_count": conv_tensor_count,
+            }
+            if recurrent_max_abs_diff is not None:
+                payload["recurrent_max_abs_diff"] = recurrent_max_abs_diff
+                payload["recurrent_state_max_abs_diff"] = recurrent_max_abs_diff
+            if conv_max_abs_diff is not None:
+                payload["conv_max_abs_diff"] = conv_max_abs_diff
+                payload["conv_state_max_abs_diff"] = conv_max_abs_diff
+            if state_diff_errors:
+                payload["errors"] = state_diff_errors
+            print("GDN_STATE_DIFF", json.dumps(payload, sort_keys=True), flush=True)
 
     def get_required_kwargs(self):
         """Return extra kwargs for HF generation loop."""
@@ -3786,8 +3909,11 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
     ):
         """Override to pass all 24 positional args explicitly."""
         is_prefill = self._is_prefill(position_ids) or (
-            getattr(self.config, "use_qwen_hybrid_chunked_prefill", False)
-            and input_ids.shape[-1] > 1
+            input_ids.shape[-1] > 1
+            and (
+                getattr(self.config, "use_qwen_hybrid_chunked_prefill", False)
+                or getattr(self.neuron_config, "is_prefix_caching", False)
+            )
         )
 
         seq_len = input_ids.shape[1]
@@ -3846,6 +3972,23 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
         if hybrid_commit_mask is None:
             hybrid_commit_mask = torch.zeros((batch_size,), dtype=torch.int32)
 
+        def _as_batched_metadata(tensor):
+            if (
+                tensor is None
+                or not hasattr(tensor, "ndim")
+                or tensor.ndim != 1
+                or tensor.numel() == 0
+                or batch_size <= 0
+                or tensor.numel() % batch_size != 0
+            ):
+                return tensor
+            return tensor.reshape(batch_size, -1)
+
+        slot_mapping = _as_batched_metadata(slot_mapping)
+        block_table = _as_batched_metadata(block_table)
+        full_context_lens = _as_batched_metadata(full_context_lens)
+        computed_context_lens = _as_batched_metadata(computed_context_lens)
+
         if is_prefill:
             ctx_bs = self.context_encoding_model.neuron_config.batch_size
             output_logits = []
@@ -3864,14 +4007,7 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
                 chunk_restore_prefix = hybrid_restore_prefix_lens[cb:cb_end]
                 chunk_commit_slots = hybrid_commit_slot_ids[cb:cb_end]
                 chunk_commit_mask = hybrid_commit_mask[cb:cb_end]
-                chunk_prev_hidden = (
-                    prev_hidden[cb:cb_end]
-                    if prev_hidden is not None
-                    and hasattr(prev_hidden, "ndim")
-                    and prev_hidden.ndim > 0
-                    and prev_hidden.shape[0] > 0
-                    else prev_hidden
-                )
+                chunk_prev_hidden = torch.empty(0)
                 chunk_adapter_ids = (
                     adapter_ids[cb:cb_end]
                     if adapter_ids is not None
@@ -3879,6 +4015,38 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
                     and adapter_ids.ndim > 0
                     and adapter_ids.shape[0] > 0
                     else adapter_ids
+                )
+                chunk_slot_mapping = (
+                    slot_mapping[cb:cb_end]
+                    if slot_mapping is not None
+                    and hasattr(slot_mapping, "ndim")
+                    and slot_mapping.ndim > 0
+                    and slot_mapping.shape[0] > 0
+                    else torch.empty(0)
+                )
+                chunk_block_table = (
+                    block_table[cb:cb_end]
+                    if block_table is not None
+                    and hasattr(block_table, "ndim")
+                    and block_table.ndim > 0
+                    and block_table.shape[0] > 0
+                    else torch.empty(0)
+                )
+                chunk_full_context_lens = (
+                    full_context_lens[cb:cb_end]
+                    if full_context_lens is not None
+                    and hasattr(full_context_lens, "ndim")
+                    and full_context_lens.ndim > 0
+                    and full_context_lens.shape[0] > 0
+                    else torch.empty(0)
+                )
+                chunk_computed_context_lens = (
+                    computed_context_lens[cb:cb_end]
+                    if computed_context_lens is not None
+                    and hasattr(computed_context_lens, "ndim")
+                    and computed_context_lens.ndim > 0
+                    and computed_context_lens.shape[0] > 0
+                    else torch.empty(0)
                 )
 
                 if mrope_position_ids.ndim == 3:
@@ -3932,19 +4100,6 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
                         dim=0,
                     )
                     if (
-                        chunk_prev_hidden is not None
-                        and hasattr(chunk_prev_hidden, "ndim")
-                        and chunk_prev_hidden.ndim > 0
-                        and chunk_prev_hidden.shape[0] > 0
-                    ):
-                        chunk_prev_hidden = torch.cat(
-                            [
-                                chunk_prev_hidden,
-                                chunk_prev_hidden[:1].expand(pad_n, -1),
-                            ],
-                            dim=0,
-                        )
-                    if (
                         chunk_adapter_ids is not None
                         and hasattr(chunk_adapter_ids, "ndim")
                         and chunk_adapter_ids.ndim > 0
@@ -3954,6 +4109,52 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
                             [
                                 chunk_adapter_ids,
                                 chunk_adapter_ids[:1].expand(pad_n, -1),
+                            ],
+                            dim=0,
+                        )
+                    if chunk_slot_mapping.ndim > 0 and chunk_slot_mapping.shape[0] > 0:
+                        chunk_slot_mapping = torch.cat(
+                            [
+                                chunk_slot_mapping,
+                                chunk_slot_mapping[:1].expand(
+                                    pad_n, *chunk_slot_mapping.shape[1:]
+                                ),
+                            ],
+                            dim=0,
+                        )
+                    if chunk_block_table.ndim > 0 and chunk_block_table.shape[0] > 0:
+                        chunk_block_table = torch.cat(
+                            [
+                                chunk_block_table,
+                                chunk_block_table[:1].expand(
+                                    pad_n, *chunk_block_table.shape[1:]
+                                ),
+                            ],
+                            dim=0,
+                        )
+                    if (
+                        chunk_full_context_lens.ndim > 0
+                        and chunk_full_context_lens.shape[0] > 0
+                    ):
+                        chunk_full_context_lens = torch.cat(
+                            [
+                                chunk_full_context_lens,
+                                chunk_full_context_lens[:1].expand(
+                                    pad_n, *chunk_full_context_lens.shape[1:]
+                                ),
+                            ],
+                            dim=0,
+                        )
+                    if (
+                        chunk_computed_context_lens.ndim > 0
+                        and chunk_computed_context_lens.shape[0] > 0
+                    ):
+                        chunk_computed_context_lens = torch.cat(
+                            [
+                                chunk_computed_context_lens,
+                                chunk_computed_context_lens[:1].expand(
+                                    pad_n, *chunk_computed_context_lens.shape[1:]
+                                ),
                             ],
                             dim=0,
                         )
@@ -3985,6 +4186,28 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
                             dim=0,
                         )
 
+                if (
+                    chunk_full_context_lens.ndim > 0
+                    and chunk_computed_context_lens.ndim > 0
+                    and chunk_full_context_lens.numel() > 0
+                    and chunk_computed_context_lens.numel() > 0
+                ):
+                    chunk_num_queries = (
+                        chunk_full_context_lens.to(torch.int32)
+                        - chunk_computed_context_lens.to(torch.int32)
+                    )
+                else:
+                    chunk_num_queries = torch.full(
+                        (chunk_input_ids.shape[0], 1),
+                        chunk_input_ids.shape[1],
+                        dtype=torch.int32,
+                    )
+
+                chunk_optional_args = list(empties)
+                chunk_optional_args[4] = chunk_slot_mapping
+                chunk_optional_args[5] = chunk_block_table
+                chunk_optional_args[6] = chunk_num_queries
+                chunk_optional_args[7] = chunk_computed_context_lens
                 chunk_out = self.context_encoding_model(
                     chunk_input_ids,
                     chunk_attn_mask,
@@ -3993,7 +4216,7 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
                     chunk_sampling,
                     chunk_prev_hidden,
                     chunk_adapter_ids,
-                    *empties,
+                    *chunk_optional_args,
                     chunk_mrope,
                     chunk_vis_emb,
                     chunk_vis_mask,
@@ -4015,15 +4238,100 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
             self.kv_cache_populated = True
             is_run_on_neuron = self.context_encoding_model.is_neuron()
         else:
+            token_slot_mapping = (
+                slot_mapping
+                if slot_mapping is not None
+                and hasattr(slot_mapping, "ndim")
+                and slot_mapping.ndim > 0
+                and slot_mapping.numel() > 0
+                else torch.zeros((batch_size, seq_len), dtype=torch.int32)
+            )
+            token_block_table = (
+                block_table
+                if block_table is not None
+                and hasattr(block_table, "ndim")
+                and block_table.ndim > 0
+                and block_table.numel() > 0
+                else torch.empty(0)
+            )
+            token_computed_context_lens = (
+                computed_context_lens
+                if computed_context_lens is not None
+                and hasattr(computed_context_lens, "ndim")
+                and computed_context_lens.ndim > 0
+                and computed_context_lens.numel() > 0
+                else torch.full(
+                    (batch_size, 1),
+                    max(attention_mask.shape[-1] - seq_len, 0),
+                    dtype=torch.int32,
+                )
+            )
+            if (
+                full_context_lens is not None
+                and hasattr(full_context_lens, "ndim")
+                and full_context_lens.ndim > 0
+                and full_context_lens.numel() > 0
+                and token_computed_context_lens.numel() > 0
+            ):
+                token_num_queries = (
+                    full_context_lens.to(torch.int32)
+                    - token_computed_context_lens.to(torch.int32)
+                )
+            else:
+                token_num_queries = torch.full(
+                    (batch_size, 1),
+                    seq_len,
+                    dtype=torch.int32,
+                )
+            token_optional_args = list(empties)
+            token_optional_args[4] = token_slot_mapping
+            token_optional_args[5] = token_block_table
+            token_optional_args[6] = token_num_queries
+            token_optional_args[7] = token_computed_context_lens
+            token_prev_hidden = (
+                torch.empty(0)
+                if getattr(self.neuron_config, "is_prefix_caching", False)
+                else prev_hidden
+            )
+            if os.environ.get("QWEN36_DEBUG_TKG_METADATA") == "1":
+                def _debug_tensor(name, tensor):
+                    if tensor is None or not hasattr(tensor, "shape"):
+                        return {name: None}
+                    flat = tensor.detach().cpu().reshape(-1)
+                    info = {
+                        "shape": list(tensor.shape),
+                        "dtype": str(tensor.dtype),
+                        "numel": int(tensor.numel()),
+                    }
+                    if tensor.numel() > 0:
+                        info["head"] = flat[: min(8, flat.numel())].tolist()
+                        info["min"] = flat.min().item()
+                        info["max"] = flat.max().item()
+                    return {name: info}
+
+                debug_payload = {}
+                for debug_name, debug_tensor in (
+                    ("input_ids", input_ids),
+                    ("attention_mask", attention_mask),
+                    ("position_ids", position_ids),
+                    ("seq_ids", seq_ids),
+                    ("slot_mapping", token_slot_mapping),
+                    ("block_table", token_block_table),
+                    ("num_queries", token_num_queries),
+                    ("computed_context_lens", token_computed_context_lens),
+                    ("full_context_lens", full_context_lens),
+                ):
+                    debug_payload.update(_debug_tensor(debug_name, debug_tensor))
+                print("QWEN36_TKG_METADATA", debug_payload, flush=True)
             outputs = self.token_generation_model(
                 input_ids,
                 attention_mask,
                 position_ids,
                 seq_ids,
                 sampling_params,
-                prev_hidden,
+                token_prev_hidden,
                 adapter_ids,
-                *empties,
+                *token_optional_args,
                 mrope_position_ids,
                 vision_embeddings,
                 vision_mask,

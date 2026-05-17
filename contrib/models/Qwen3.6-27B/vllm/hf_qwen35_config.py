@@ -63,6 +63,18 @@ def register_qwen35_vllm_architecture() -> None:
             ModelRegistry.register_model(arch, qwen3_impl)
 
 
+def register_qwen35_nxdi_model_type() -> None:
+    try:
+        from neuronx_distributed_inference.utils.constants import MODEL_TYPES
+        from src.modeling_qwen35 import NeuronQwen35ForCausalLM
+    except Exception:
+        return
+
+    MODEL_TYPES.setdefault("qwen3_5", {})["causal-lm"] = NeuronQwen35ForCausalLM
+    MODEL_TYPES.setdefault("qwen3_5_text", {})["causal-lm"] = NeuronQwen35ForCausalLM
+
+
 def register_qwen35_config() -> None:
     register_qwen35_hf_config()
     register_qwen35_vllm_architecture()
+    register_qwen35_nxdi_model_type()

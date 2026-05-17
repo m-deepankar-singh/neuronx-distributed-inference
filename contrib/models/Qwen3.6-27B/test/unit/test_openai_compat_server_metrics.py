@@ -4,6 +4,7 @@
 """CPU-only tests for Qwen3.6 minimal OpenAI server cold-prefill metrics."""
 
 import importlib.util
+import json
 import os
 import unittest
 from pathlib import Path
@@ -50,6 +51,60 @@ class TestOpenAICompatColdPrefillMetrics(unittest.TestCase):
         self.assertEqual(metrics["actual_tok_per_s"], 38.0)
         self.assertEqual(metrics["bucket_tok_per_s"], 40.0)
         self.assertEqual(metrics["block_size"], 128)
+
+    def test_neuron_monitor_hbm_parser_reports_peak_runtime_bytes(self):
+        stdout = "\n".join(
+            [
+                json.dumps(
+                    {
+                        "neuron_runtime_data": [
+                            {
+                                "report": {
+                                    "memory_used": {
+                                        "neuron_runtime_used_bytes": {
+                                            "neuron_device": 1024,
+                                            "usage_breakdown": {
+                                                "neuroncore_memory_usage": {
+                                                    "0": {"tensors": 64},
+                                                }
+                                            },
+                                        }
+                                    }
+                                }
+                            }
+                        ]
+                    }
+                ),
+                json.dumps(
+                    {
+                        "neuron_runtime_data": [
+                            {
+                                "report": {
+                                    "memory_used": {
+                                        "neuron_runtime_used_bytes": {
+                                            "neuron_device": 2048,
+                                            "usage_breakdown": {
+                                                "neuroncore_memory_usage": {
+                                                    "0": {"tensors": 256},
+                                                }
+                                            },
+                                        }
+                                    }
+                                }
+                            }
+                        ]
+                    }
+                ),
+            ]
+        )
+
+        usage = self.server._parse_neuron_monitor_hbm(stdout)
+
+        self.assertEqual(usage["source"], "neuron-monitor")
+        self.assertEqual(usage["bytes_used"], 2048)
+        self.assertEqual(usage["neuron_device_bytes_used"], 2048)
+        self.assertEqual(usage["tensor_bytes"], 256)
+        self.assertEqual(usage["samples"], 2)
 
     def test_metrics_fall_back_to_chunk_size_when_no_cte_config(self):
         metrics = self.server._cold_prefill_metrics(

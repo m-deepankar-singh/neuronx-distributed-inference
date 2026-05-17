@@ -1,624 +1,534 @@
-Use `experimental` as the base branch, but make cold prefill a **separate patch stack** on top of the hybrid APC work. The branch already has the right scaffolding: dynamic CTE profiles, `TEXT_ONLY_CTE`, `COMPACT_CTE_ATTENTION_MASK`, `COLD_ZERO_CONV_FAST_PATH`, tunable `kernel_q_tile_size` / `kernel_kv_tile_size`, block size default `128`, and hybrid APC knobs in `start_vllm_server.sh`.
+# Qwen3.6 Cold-Prefill Perf Goal
 
-The cold-prefill plan should be:
+## Working Rule
 
-```text
-experimental
-  └── qwen36-cold-prefill-perf
-        01 instrumentation
-        02 dynamic CTE buckets
-        03 text-only CTE graph
-        04 compact CTE mask hardening
-        05 fused GDN CTE as default
-        06 safe cold-zero conv fast path
-        07 attention tile sweep
-        08 benchmark + acceptance gates
-```
+Work stays on `qwen36-cold-prefill-perf`.
 
-## Architecture goal
-
-Cold prefill cannot skip the prompt. So the goal is to reduce:
-
-```text
-padded token work
-dummy tensor work
-dense mask work
-GDN kernel overhead
-conv/state overhead
-attention tiling overhead
-KV/block-layout overhead
-```
-
-For Qwen3.6 this is especially important because the model is dominated by GDN: the model description says 48 of 64 layers are Gated DeltaNet and 16 are standard attention layers.
-
----
-
-# 1. Patch 01: cold-prefill instrumentation
-
-Add this first. Do not optimize blind.
-
-## Add metrics
-
-For every cold prefill request, log:
-
-```text
-actual_prompt_len
-selected_cte_bucket
-padding_tokens = selected_cte_bucket - actual_prompt_len
-padding_ratio
-ctx_batch_size
-block_size
-kernel_q_tile_size
-kernel_kv_tile_size
-text_only_cte_enabled
-compact_mask_enabled
-cold_zero_conv_fast_path_enabled
-use_nki_fused
-prefill_latency_ms
-actual_tok_per_s
-bucket_tok_per_s
-HBM usage if available
-```
-
-## Files
-
-Add to:
-
-```text
-contrib/models/Qwen3.6-27B/vllm/run_offline_inference.py
-contrib/models/Qwen3.6-27B/vllm/start_vllm_server.sh
-validation_scripts/qwen36_hybrid_apc_validation.py
-```
-
-The experimental branch already has launcher wiring for CTE buckets, ctx batch size, tile sizes, text-only CTE, compact CTE mask, and cold-zero conv fast path, so instrumentation should report those values directly from config.
-
-## Acceptance gate
-
-Before any optimization:
-
-```text
-Reproduce current cold prefill:
-~420 tok/s cold baseline
-same prompt set
-same max_model_len
-same compiled artifact
-```
-
-Then all later changes must compare against this baseline.
-
----
-
-# 2. Patch 02: dynamic CTE bucket profiles
-
-This is the highest-ROI cold-prefill lever.
-
-The experimental branch already supports:
+The experimental-branch compiled artifacts are not compatible with this branch.
+Compile branch-specific artifacts from:
 
 ```bash
---cte-buckets
---cte-bucket-profile
+/home/ubuntu/inferentia-gdn-cold-prefill
 ```
 
-and validates that CTE buckets are 128-aligned because DeltaNet CTE uses 128-token chunks.
-
-## Use these profiles
-
-### Short latency profile
-
-```text
-[128, 256, 512, 1024]
-```
-
-### General production profile
-
-```text
-[256, 512, 1024, 2048]
-```
-
-### Long context profile
-
-```text
-[4096, 8192, 16384, 32768]
-```
-
-### 262K recovery profile
-
-```text
-[256]
-```
-
-The `experimental` launcher already defines these profiles.
-
-## Immediate experiment
-
-Run:
+Do not use or overwrite the experimental checkout at:
 
 ```bash
-git checkout experimental
-git checkout -b qwen36-cold-prefill-perf
+/home/ubuntu/inferentia-gdn
+```
 
-contrib/models/Qwen3.6-27B/vllm/start_vllm_server.sh \
-  --model-path /path/to/Qwen3.6-27B \
-  --compiled-artifacts /path/to/artifacts \
-  --max-model-len 2048 \
+Trainium instance:
+
+```bash
+ssh -i /Users/deepankarsingh1312/Downloads/trainium.pem ubuntu@16.26.90.15
+```
+
+Remote environment:
+
+```bash
+cd /home/ubuntu/inferentia-gdn-cold-prefill
+export PATH=/opt/aws_neuronx_venv_pytorch_inference_vllm_0_16/bin:$PATH
+export PYTHONPATH=/home/ubuntu/inferentia-gdn-cold-prefill/src:/home/ubuntu/inferentia-gdn-cold-prefill:/home/ubuntu/inferentia-gdn-cold-prefill/contrib/models/Qwen3.6-27B
+export PYTHONUNBUFFERED=1
+```
+
+Common paths:
+
+```bash
+export QWEN36_MODEL=/home/ubuntu/models/Qwen3.6-27B
+export QWEN36_QUANT=/home/ubuntu/models/Qwen3.6-27B-fp8-mlp-only
+export QWEN36_OUT=/home/ubuntu/validation_logs/qwen36_cold_prefill_evidence
+mkdir -p "$QWEN36_OUT"
+```
+
+## Current Branch Artifact
+
+Branch-specific artifacts compiled from the cold checkout as of
+2026-05-17 09:17 IST:
+
+| length | artifact | compile log | status |
+| ---: | --- | --- | --- |
+| 2048 | `/home/ubuntu/qwen_artifacts_cold/qwen36_cold_prefill_branch_2048_fp8_mlp_only_hybrid_apc_b128_host_sampling_v6` | `/home/ubuntu/validation_logs/cold_prefill_compile/compile_2k_host_sampling_v6.log` | compiled, smoke-tested |
+| 8192 | `/home/ubuntu/qwen_artifacts_cold/qwen36_cold_prefill_branch_8192_fp8_mlp_only_hybrid_apc_b128_host_sampling_v1` | `/home/ubuntu/validation_logs/cold_prefill_compile/compile_8k_host_sampling_v1.log` | compiled, smoke-tested |
+| 32768 | `/home/ubuntu/qwen_artifacts_cold/qwen36_cold_prefill_branch_32768_fp8_mlp_only_hybrid_apc_b128_host_sampling_v1` | `/home/ubuntu/validation_logs/cold_prefill_compile/compile_32k_host_sampling_v1.log` | compiled, smoke-tested |
+| 131072 | `/home/ubuntu/qwen_artifacts_cold/qwen36_cold_prefill_branch_131072_fp8_mlp_only_hybrid_apc_b128_host_sampling_v1` | `/home/ubuntu/validation_logs/cold_prefill_compile/compile_128k_host_sampling_v1.log` | compiled, smoke-tested |
+| 262144 | `/home/ubuntu/qwen_artifacts_cold/qwen36_cold_prefill_branch_262144_fp8_mlp_only_kvfp8_hybrid_apc_b128_host_sampling_v1` | `/home/ubuntu/validation_logs/cold_prefill_compile/compile_262k_kvfp8_host_sampling_v1.log` | compiled, smoke-tested; KV cache uses FP8 direct-cast |
+
+262K branch-specific compile attempts from the cold checkout did not produce a
+usable artifact on the current `trn2.3xlarge` instance:
+
+| length | attempted artifact | compile log | status |
+| ---: | --- | --- | --- |
+| 262144 | `/home/ubuntu/qwen_artifacts_cold/qwen36_cold_prefill_branch_262144_fp8_mlp_only_hybrid_apc_b128_host_sampling_v1` | `/home/ubuntu/validation_logs/cold_prefill_compile/compile_262k_host_sampling_v1.log` | failed during TKG Neuron compile with Trainium2 HBM verifier |
+| 262144 | `/home/ubuntu/qwen_artifacts_cold/qwen36_cold_prefill_branch_262144_fp8_mlp_only_hybrid_apc_b256_host_sampling_v1` | `/home/ubuntu/validation_logs/cold_prefill_compile/compile_262k_b256_host_sampling_v1.log` | failed during TKG Neuron compile with Trainium2 HBM verifier |
+
+Shared shape/config:
+
+```text
+max_context_length: 1024
+context_encoding_buckets: [128, 256, 512, 1024]
+prefix_buckets: [128, 256, 512, 1024]
+block_size: 128
+tp_degree: 4
+logical_nc_config: 2
+prefix_caching: enabled
+hybrid_apc: enabled
+gdn_checkpoint_interval: 128
+max_gdn_checkpoint_slots: 8
+sampling: host/vLLM CPU sampling, not Neuron on-device sampling
+KV cache: BF16 for the 2K/8K/32K/128K artifacts; FP8 direct-cast for the
+262K recovery artifact because the BF16-KV TKG graph exceeds Trainium2 HBM on
+this instance.
+```
+
+Length-specific PA blocks:
+
+| seq_len | pa_num_blocks | runtime override |
+| ---: | ---: | ---: |
+| 2048 | 16 | `--num-gpu-blocks-override 16` |
+| 8192 | 64 | `--num-gpu-blocks-override 64` |
+| 32768 | 256 | `--num-gpu-blocks-override 256` |
+| 131072 | 1024 | `--num-gpu-blocks-override 1024` |
+| 262144 | 2048 | `--num-gpu-blocks-override 2048` |
+
+The older branch artifact:
+
+```bash
+/home/ubuntu/qwen_artifacts_cold/qwen36_cold_prefill_branch_2048_fp8_mlp_only_hybrid_apc_b128_v5
+```
+
+was deleted to recover disk. It loaded and ran pure prefill, but was not valid
+for decode validation because it was compiled with on-device sampling and
+emitted invalid huge first-token IDs such as `2143289344`, which then caused TKG
+out-of-bounds failures.
+
+## Reproduce 2K Compile
+
+```bash
+cd /home/ubuntu/inferentia-gdn-cold-prefill
+
+PATH=/opt/aws_neuronx_venv_pytorch_inference_vllm_0_16/bin:$PATH \
+PYTHONPATH=/home/ubuntu/inferentia-gdn-cold-prefill/src:/home/ubuntu/inferentia-gdn-cold-prefill:/home/ubuntu/inferentia-gdn-cold-prefill/contrib/models/Qwen3.6-27B \
+PYTHONUNBUFFERED=1 \
+/opt/aws_neuronx_venv_pytorch_inference_vllm_0_16/bin/python \
+  contrib/models/Qwen3.6-27B/test/integration/qwen36_27b_compile_fp8.py \
+  --repo-root /home/ubuntu/inferentia-gdn-cold-prefill \
+  --model-path /home/ubuntu/models/Qwen3.6-27B \
+  --compiled-path /home/ubuntu/qwen_artifacts_cold/qwen36_cold_prefill_branch_2048_fp8_mlp_only_hybrid_apc_b128_host_sampling_v6 \
+  --quantized-checkpoints-path /home/ubuntu/models/Qwen3.6-27B-fp8-mlp-only \
   --seq-len 2048 \
-  --cte-bucket-profile short \
+  --cte-buckets 128 256 512 1024 \
+  --prefix-buckets 128 256 512 1024 \
+  --block-size 128 \
+  --pa-num-blocks 16 \
+  --tp-degree 4 \
+  --logical-nc-config 2 \
+  --enable-prefix-caching \
+  --enable-hybrid-apc \
+  --disable-on-device-sampling \
+  --kernel-q-tile-size 128 \
+  --kernel-kv-tile-size 1024 \
+  --gdn-checkpoint-interval 128 \
+  --max-gdn-checkpoint-slots 8 \
+  --hybrid-apc-require-vllm-metadata
+```
+
+Do not compile this artifact with `--enable-vllm-chunked-prefill`; current NxDI
+compile rejects that mode with `NotImplementedError: Chunked Prefill is not
+available in NxDI for now`. Runtime vLLM chunked prefill is still used by the
+benchmark command.
+
+## Runtime Flags That Matter
+
+Always pass the compiled PA block count for the artifact being tested:
+
+```bash
+--num-gpu-blocks-override <compiled_pa_num_blocks>
+```
+
+Without that override, vLLM can allocate a much larger physical block table than
+the compiled Neuron cache supports.
+
+For the current F-path smoke, use:
+
+```bash
+--enable-prefix-caching \
+--enable-hybrid-apc \
+--hybrid-apc-require-vllm-metadata \
+--gdn-checkpoint-interval 128 \
+--max-gdn-checkpoint-slots 8 \
+--hybrid-cache-mode all \
+--block-size 128
+```
+
+The runner and minimal OpenAI-compatible server now read HBM usage through
+`neuron-monitor` instead of allocating a second XLA device after vLLM has loaded
+the model. This keeps successful rows from emitting misleading NRT logical-core
+allocation errors. Set `QWEN36_HBM_PROBE=xla` only when explicitly debugging the
+older XLA memory-info path, or `QWEN36_HBM_PROBE=none` to disable HBM
+collection.
+
+The Neuron config serializer/loader also normalizes serialized
+`kv_quant_config` values back to `QuantizationType` enums and torch dtypes.
+This is required for loading artifacts compiled with KV-cache quantization; the
+first 262K load attempt failed before model load until this was fixed.
+
+Always pass the compiled context-model prompt shape when loading these artifacts:
+
+```bash
+--compiled-max-prompt-length 1024
+```
+
+The first strict-final collection attempt with the branch-specific artifacts
+failed on the first A row because the runtime additional config advertised
+`max_prompt_length=512` while the artifact was compiled with
+`max_prompt_length=1024`. The runner now applies the compiled prompt length to
+both the top-level vLLM additional config and
+`override_neuron_config.max_context_length`.
+
+## Evidence Collected
+
+Direct TKG sanity with host-sampling v6 passed:
+
+```bash
+/home/ubuntu/validation_logs/qwen36_cold_prefill_evidence/qwen36_cold_direct_hybrid_vllm_chunk_probe_2k_max_tokens2_host_sampling_v6.log
+```
+
+Result:
+
+```text
+returncode: 0
+prompt tokens: 16
+generated tokens: 2
+token IDs: [0, 0]
+selected CTE bucket: 128
+```
+
+HBM-probe patch smoke:
+
+```bash
+/home/ubuntu/validation_logs/qwen36_cold_prefill_evidence/qwen36_cold_smoke_2k_F_hbm_probe_patch_128_mt1.json
+/home/ubuntu/validation_logs/qwen36_cold_prefill_evidence/qwen36_cold_smoke_2k_F_hbm_probe_patch_128_mt1.log
+```
+
+Result:
+
+```text
+returncode: 0
+artifact_load_success: true
+prompt tokens: 127
+token IDs: [0]
+selected CTE bucket: 128
+hbm_usage.source: neuron-monitor
+hbm_usage.bytes_used: 50,608,832,912
+output tail has no NRT logical-core allocation infodump
+```
+
+All-length `max_tokens=1` smoke:
+
+```bash
+/home/ubuntu/validation_logs/qwen36_cold_prefill_evidence/qwen36_cold_smoke_2k_F_host_sampling_all_lengths_mt1.json
+/home/ubuntu/validation_logs/qwen36_cold_prefill_evidence/qwen36_cold_smoke_2k_F_host_sampling_all_lengths_mt1.log
+```
+
+| target | prompt tokens | returncode | token IDs | selected bucket | chunks | prefill ms | actual tok/s |
+| --- | ---: | ---: | --- | ---: | ---: | ---: | ---: |
+| 128 | 127 | 0 | `[0]` | 128 | 1 | 114.185 | 1112.231 |
+| 256 | 256 | 0 | `[0]` | 256 | 1 | 144.259 | 1774.587 |
+| 512 | 509 | 0 | `[0]` | 512 | 1 | 232.890 | 2185.584 |
+| 1024 | 1021 | 0 | `[0]` | 1024 | 1 | 453.145 | 2253.140 |
+| 2048 | 2045 | 0 | `[0]` | 1024 | 2 | 454.612 | 4498.343 |
+
+Longer-artifact `max_tokens=1` smoke:
+
+```bash
+/home/ubuntu/validation_logs/qwen36_cold_prefill_evidence/qwen36_cold_smoke_8k_F_host_sampling_mt1.json
+/home/ubuntu/validation_logs/qwen36_cold_prefill_evidence/qwen36_cold_smoke_32k_F_host_sampling_mt1.json
+/home/ubuntu/validation_logs/qwen36_cold_prefill_evidence/qwen36_cold_smoke_128k_F_host_sampling_mt1.json
+```
+
+| target | prompt tokens | returncode | token IDs | selected bucket | chunks | prefill ms | actual tok/s |
+| --- | ---: | ---: | --- | ---: | ---: | ---: | ---: |
+| 8192 | 8189 | 0 | `[0]` | 1024 | 8 | 463.339 | 17673.892 |
+| 32768 | 32765 | 0 | `[0]` | 1024 | 32 | 499.072 | 65651.797 |
+| 131072 | 131071 | 0 | `[0]` | 1024 | 128 | 611.900 | 214203.265 |
+
+262K KV-FP8 recovery compile:
+
+```bash
+/home/ubuntu/validation_logs/cold_prefill_compile/compile_262k_kvfp8_host_sampling_v1.log
+```
+
+Result:
+
+```text
+KV_CACHE_QUANT {"direct_cast": true, "enabled": true, "quant_dtype": "float8_e4m3fn"}
+token_generation_model priority HLO compiled in 658.774 s
+all HLOs compiled in 360.748 s
+COMPILE_DONE
+```
+
+262K KV-FP8 `max_tokens=1` smoke:
+
+```bash
+/home/ubuntu/validation_logs/qwen36_cold_prefill_evidence/qwen36_cold_smoke_262k_F_kvfp8_host_sampling_mt1.json
+/home/ubuntu/validation_logs/qwen36_cold_prefill_evidence/qwen36_cold_smoke_262k_F_kvfp8_host_sampling_mt1.log
+```
+
+| target | prompt tokens | returncode | token IDs | selected bucket | chunks | prefill ms | actual tok/s | HBM source |
+| --- | ---: | ---: | --- | ---: | ---: | ---: | ---: | --- |
+| 262144 | 262143 | 0 | `[0]` | 1024 | 256 | 807.770 | 324526.660 | `neuron-monitor` |
+
+262K compile failure evidence:
+
+```bash
+/home/ubuntu/validation_logs/cold_prefill_compile/compile_262k_host_sampling_v1.log
+/home/ubuntu/validation_logs/cold_prefill_compile/compile_262k_b256_host_sampling_v1.log
+```
+
+Both 262K attempts reached HLO generation and failed when compiling
+`token_generation_model` with:
+
+```text
+[NCC_EVRF009] Size of total input and output tensors exceeds HBM limit of Trainium2.
+```
+
+The block-128 attempt needed `26,541,173,020` bytes vs. `25,769,803,776`
+available. The block-256 attempt needed `26,549,557,532` bytes vs.
+`25,769,803,776` available. The block-256 top tensors were:
+
+```text
+input329 of shape bf16[248320,1280]
+input1386 of shape bf16[62080,5120]
+input105 of shape bf16[1025,256,1,256]
+```
+
+Short-length `max_tokens=32` TKG smoke:
+
+```bash
+/home/ubuntu/validation_logs/qwen36_cold_prefill_evidence/qwen36_cold_smoke_2k_F_host_sampling_short_lengths_mt32.json
+/home/ubuntu/validation_logs/qwen36_cold_prefill_evidence/qwen36_cold_smoke_2k_F_host_sampling_short_lengths_mt32.log
+```
+
+| target | prompt tokens | returncode | generated IDs | unique IDs | selected bucket | chunks | generated | decode tokens | request ms |
+| --- | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| 128 | 127 | 0 | 32 | `[0]` | 128 | 1 | 32 | 31 | 1707.120 |
+| 256 | 256 | 0 | 32 | `[0]` | 256 | 1 | 32 | 31 | 1727.281 |
+| 512 | 509 | 0 | 32 | `[0]` | 512 | 1 | 32 | 31 | 1825.483 |
+| 1024 | 1021 | 0 | 32 | `[0]` | 1024 | 1 | 32 | 31 | 2042.913 |
+
+The standalone smoke intentionally skipped the 2048 prompt for `max_tokens=32`
+because approximately `2045 + 32` tokens exceeds the compiled
+`max_length=2048`. The strict-final benchmark runner now reserves decode budget
+for generation rows at an artifact's max length by setting
+`effective_prompt_target_tokens = seq_len - max_tokens` while keeping the
+nominal target prompt length for acceptance accounting.
+
+Strict-final orchestration preflight and dry-run evidence:
+
+```bash
+/home/ubuntu/validation_logs/qwen36_cold_prefill_strict_final/qwen36_cold_prefill_cold_branch_preflight.json
+/home/ubuntu/validation_logs/qwen36_cold_prefill_strict_final/qwen36_cold_prefill_cold_branch_dryrun_g_tiles.json
+/home/ubuntu/validation_logs/qwen36_cold_prefill_strict_final/qwen36_cold_prefill_cold_branch_dryrun_long_hj.json
+```
+
+Result:
+
+```text
+preflight branch: qwen36-cold-prefill-perf
+all five compiled artifact paths: present and non-empty
+long-context variants: A_single512_old_chunked, H_128k_candidate, J_262k_recovery_block128
+G tile dry-run block sizes: 128 only
+H/J CTE args: --cte-bucket-profile short
+H effective prompt target for max_tokens=32: 131040 of 131072
+J effective prompt target for max_tokens=32: 262112 of 262144
+```
+
+Strict-final first launch evidence:
+
+```bash
+/home/ubuntu/validation_logs/qwen36_cold_prefill_strict_final/qwen36_cold_prefill_cold_branch_strict_full_v1_matrix.log
+/home/ubuntu/validation_logs/qwen36_cold_prefill_strict_final/qwen36_cold_prefill_cold_branch_strict_full_v1_console.log
+/home/ubuntu/validation_logs/qwen36_cold_prefill_strict_final/qwen36_cold_prefill_cold_branch_strict_full_v1_manifest.json
+```
+
+Result:
+
+```text
+first A_single512_old_chunked row failed before the compiled prompt fix
+artifact_load_success: false
+root cause: additional_config max_prompt_length/max_context_length was 512,
+but the compiled artifact expects 1024
+```
+
+Post-fix strict canary evidence:
+
+```bash
+/home/ubuntu/validation_logs/qwen36_cold_prefill_strict_final/qwen36_cold_prefill_failed_A_retry_compiled_prompt_context_1024.json
+/home/ubuntu/validation_logs/qwen36_cold_prefill_strict_final/qwen36_cold_prefill_canary_A_to_G_prompt128_mt1_mt32.json
+/home/ubuntu/validation_logs/qwen36_cold_prefill_strict_final/qwen36_cold_prefill_long_canary_H_J_mt1.json
+```
+
+Result:
+
+```text
+A retry: returncode=0, artifact_load_success=true
+A-G short canary: 20 rows, all returncode=0 and artifact_load_success=true
+G tile cases: (q,kv,block) = (128,512,128), (128,1024,128),
+  (128,2048,128), (256,1024,128)
+H long canary: 131071 prompt tokens, bucket 1024, 128 chunks,
+  prefill 609.962 ms, token IDs [0]
+J long canary: 262143 prompt tokens, bucket 1024, 256 chunks,
+  prefill 815.319 ms, token IDs [0]
+```
+
+Strict-final v2 launch:
+
+```bash
+/home/ubuntu/validation_logs/qwen36_cold_prefill_strict_final/qwen36_cold_prefill_cold_branch_strict_full_v2_preflight.json
+/home/ubuntu/validation_logs/qwen36_cold_prefill_strict_final/qwen36_cold_prefill_cold_branch_strict_full_v2_dryrun.txt
+/home/ubuntu/validation_logs/qwen36_cold_prefill_strict_final/qwen36_cold_prefill_cold_branch_strict_full_v2_console.log
+/home/ubuntu/validation_logs/qwen36_cold_prefill_strict_final/qwen36_cold_prefill_cold_branch_strict_full_v2_matrix.log
+/home/ubuntu/validation_logs/qwen36_cold_prefill_strict_final/qwen36_cold_prefill_cold_branch_strict_full_v2_run_manifest.json
+```
+
+Result:
+
+```text
+preflight: passed
+dry-run: includes all five branch-specific artifacts, PA block overrides,
+  --compiled-max-prompt-length 1024, H/J long variants, and block128 G sweep
+collection: stopped intentionally during matrix phase after 12 completed rows
+matrix rows: artifact_load_success=true, returncode=0
+blocker: every completed row had gdn_state_diff=null
+```
+
+The strict-final orchestrator now aborts remaining phases when `--fail-fast` is
+set and a phase returns nonzero. This prevents repeating the earlier behavior
+where a failed matrix launch continued into long-context collection.
+
+The branch now has an opt-in host-side `GDN_STATE_DIFF` emission path in
+`Qwen35ModelWrapper._copy_past_key_values`, enabled automatically by
+`run_offline_inference.py` for `--enable-hybrid-apc` runs. The payload measures
+the context trace output versus the TKG/CTE recurrent and conv state buffers
+after host copy. This is intended to satisfy the existing strict gate with
+measured state-copy evidence instead of a fabricated sidecar.
+
+## Commands Used For Current Smoke
+
+All-length prefill smoke:
+
+```bash
+python validation_scripts/qwen36_cold_prefill_benchmark.py \
+  --model-path /home/ubuntu/models/Qwen3.6-27B \
+  --compiled-artifacts /home/ubuntu/qwen_artifacts_cold/qwen36_cold_prefill_branch_2048_fp8_mlp_only_hybrid_apc_b128_host_sampling_v6 \
+  --prompt-lengths 128 256 512 1024 2048 \
+  --variants F_short_text_compact_fused_cold_zero \
+  --max-tokens-values 1 \
+  --repetitions 1 \
+  --output-json /home/ubuntu/validation_logs/qwen36_cold_prefill_evidence/qwen36_cold_smoke_2k_F_host_sampling_all_lengths_mt1.json \
   --tensor-parallel-size 4 \
   --logical-nc-config 2 \
   --max-num-seqs 1 \
   --ctx-batch-size 1 \
   --block-size 128 \
-  --enable-vllm-chunked-prefill \
-  --text-only-cte \
-  --compact-cte-attention-mask
+  --num-gpu-blocks-override 16 \
+  --enable-prefix-caching \
+  --enable-hybrid-apc \
+  --hybrid-apc-require-vllm-metadata \
+  --gdn-checkpoint-interval 128 \
+  --max-gdn-checkpoint-slots 8 \
+  --hybrid-cache-mode all \
+  --fail-fast
 ```
 
-## Acceptance gate
-
-For prompts under 512 tokens:
-
-```text
-p50 cold prefill latency improves ≥1.5x
-actual tok/s improves
-bucket tok/s does not regress badly
-outputs match baseline
-```
-
----
-
-# 3. Patch 03: text-only CTE graph hardening
-
-The experimental branch already passes empty vision tensors for text-only CTE when `use_text_only_cte_inputs` is enabled. That avoids allocating full dummy `[batch, seq, hidden]` vision embeddings in text-only serving.
-
-But the model still has this fallback behavior:
-
-```python
-elif is_for_context_encoding and vision_embeddings.numel() > 0:
-    inputs_embeds = inputs_embeds + vision_embeddings.sum() * 0
-    inputs_embeds = inputs_embeds + vision_mask.sum().to(inputs_embeds.dtype) * 0
-```
-
-So the plan is:
-
-## Keep
-
-```python
-vision_embeddings = torch.zeros((0,), dtype=torch_dtype)
-vision_mask = torch.zeros((0,), dtype=torch.int32)
-```
-
-for text-only CTE.
-
-## Add explicit assert in text-only mode
-
-```python
-if is_for_context_encoding and self.config.use_text_only_cte_inputs:
-    assert vision_embeddings.numel() == 0
-    assert vision_mask.numel() == 0
-```
-
-Only allow dense dummy vision tensors in a separate multimodal artifact.
-
-## Acceptance gate
-
-Compare:
-
-```text
-text_only_cte = 1
-text_only_cte = 0
-```
-
-Expected:
-
-```text
-same output token IDs
-lower cold prefill latency
-lower HBM traffic / lower input staging cost
-```
-
----
-
-# 4. Patch 04: compact CTE attention mask hardening
-
-The experimental branch already avoids converting 2D masks into dense 4D `[B, 1, S, S]` masks on Neuron CTE paths. It only builds dense masks when compact mode is disabled and the model is not using the Neuron CTE/block-KV path.
-
-That is good. Harden it.
-
-## Add guard
-
-```python
-if is_for_context_encoding and seq_length > 2048:
-    assert use_compact_cte_attention_mask or use_neuron_cte_attention
-```
-
-Do not allow accidental dense mask construction for long context.
-
-## Add test
-
-```text
-S = 4096
-compact mask enabled
-assert no dense causal SxS allocation path
-```
-
-## Acceptance gate
-
-```text
-2K / 8K / 32K prefill does not allocate dense SxS mask
-outputs match dense fallback at small S, e.g. 256/512
-```
-
----
-
-# 5. Patch 05: make fused GDN CTE the default everywhere
-
-This is already partly done on `experimental`.
-
-The branch added `initial_state` support to `_fused_chunked_forward`, and the fused NKI kernel now accepts `initial_state` as a recurrent checkpoint or zeros.
-
-The kernel copies `initial_state` into SBUF and keeps state there across chunks.
-
-The model path now uses `_fused_chunked_forward(..., initial_state=initial_state)` for the chunked-prefill recurrent-state path unless explicitly forced to the older NKI chunked or PyTorch paths.
-
-## Next work
-
-Make this explicit and testable:
-
-```text
-USE_NKI_FUSED=1 default
-USE_NKI_CHUNKED=0 default
-USE_PYTORCH_CHUNK=0 default
-```
-
-Add a startup log:
-
-```text
-GDN_CTE_KERNEL=fused_initial_state
-```
-
-Add benchmark toggles:
+Decode smoke:
 
 ```bash
-USE_NKI_FUSED=1
-USE_NKI_FUSED=0 USE_NKI_CHUNKED=1
-USE_PYTORCH_CHUNK=1
-```
-
-## Acceptance gate
-
-For cold prefill:
-
-```text
-fused_initial_state >= old chunked NKI
-fused_initial_state output token IDs match baseline
-GDN final_state numerical diff within tolerance
-```
-
----
-
-# 6. Patch 06: make cold-zero conv fast path safe
-
-The experimental branch has `COLD_ZERO_CONV_FAST_PATH`, and the GDN layer uses a fast `F.conv1d` path when the flag is enabled.
-
-But the current logic is too broad:
-
-```python
-cold_prefill_from_zero = getattr(self.config, "use_cold_zero_conv_fast_path", False)
-```
-
-That only checks the flag. It should also verify the prefill is truly starting from zero prefix. Otherwise a partial-prefix restore could incorrectly ignore `conv_state_cache`.
-
-## Change it to
-
-```python
-cold_prefill_from_zero = (
-    getattr(self.config, "use_cold_zero_conv_fast_path", False)
-    and position_ids is not None
-    and bool((position_ids[:, :1].long() == 0).all())
-    and recurrent_state_cache is not None
-    and conv_state_cache is not None
-    and not getattr(self.config, "use_hybrid_apc_manager", False)
-)
-```
-
-For hybrid APC partial-prefix restore, only use fast path when:
-
-```python
-hybrid_restore_mask is empty/zero
-position_ids[:, 0] == 0
-```
-
-Do **not** use it when:
-
-```text
-position_ids[:, 0] > 0
-restore_prefix_len > 0
-partial prefix hit exists
-decode path
-```
-
-## Add tests
-
-```text
-cold prefill position 0:
-  fast conv == stateful conv
-
-partial prefix position > 0:
-  fast conv disabled
-
-deliberately force fast conv on partial prefix:
-  test should fail or output should diverge
-```
-
-## Acceptance gate
-
-```text
-cold-zero fast path improves latency
-partial-prefix exactness remains intact
-```
-
----
-
-# 7. Patch 07: attention tile and block-size sweep
-
-The experimental launcher exposes:
-
-```bash
---kernel-q-tile-size
---kernel-kv-tile-size
---block-size
-```
-
-and passes the tile sizes into `chunked_prefill_config`.
-
-## Sweep
-
-For 2K / 8K cold prefill:
-
-```text
-q_tile=128, kv_tile=512
-q_tile=128, kv_tile=1024
-q_tile=128, kv_tile=2048
-q_tile=256, kv_tile=1024
-```
-
-For block size:
-
-```text
-block_size=128
-block_size=256
-```
-
-Do not start with 64 for cold prefill unless APC reuse is the main goal. For pure cold prefill, smaller block size can increase block metadata/layout overhead.
-
-## Acceptance gate
-
-Pick two production profiles:
-
-```text
-latency profile:
-  block_size=128
-  cte_profile=short
-  ctx_batch_size=1
-
-long-context profile:
-  block_size=256 or 128, whichever loads/runs faster
-  cte_profile=262k or long
-  ctx_batch_size=1
-```
-
----
-
-# 8. Patch 08: benchmark matrix
-
-Use a fixed prompt suite:
-
-```text
-128 tokens
-256 tokens
-384 tokens
-512 tokens
-1K tokens
-2K tokens
-8K tokens
-32K tokens
-128K tokens if artifact available
-262K tokens if artifact loads
-```
-
-Run each with:
-
-```text
-temperature=0
-top_k=1
-max_tokens=1 for pure prefill timing
-max_tokens=32 for end-to-end timing
-```
-
-## Matrix
-
-```text
-A. baseline experimental, single CTE bucket 512
-B. short CTE profile [128,256,512,1024]
-C. B + text-only CTE
-D. C + compact CTE mask
-E. D + fused GDN CTE
-F. E + cold-zero conv fast path
-G. F + tile sweep
-```
-
-Track:
-
-```text
-cold prefill p50/p95 latency
-actual tok/s
-bucket tok/s
-decode tok/s
-first token latency
-HBM usage
-artifact load success
-token exactness
-GDN state diff
-```
-
----
-
-# Exact launch commands
-
-## 2K short-prompt cold-prefill candidate
-
-```bash
-contrib/models/Qwen3.6-27B/vllm/start_vllm_server.sh \
-  --model-path /path/to/Qwen3.6-27B \
-  --compiled-artifacts /path/to/2k/artifacts \
-  --max-model-len 2048 \
-  --seq-len 2048 \
-  --cte-bucket-profile short \
+python validation_scripts/qwen36_cold_prefill_benchmark.py \
+  --model-path /home/ubuntu/models/Qwen3.6-27B \
+  --compiled-artifacts /home/ubuntu/qwen_artifacts_cold/qwen36_cold_prefill_branch_2048_fp8_mlp_only_hybrid_apc_b128_host_sampling_v6 \
+  --prompt-lengths 128 256 512 1024 \
+  --variants F_short_text_compact_fused_cold_zero \
+  --max-tokens-values 32 \
+  --repetitions 1 \
+  --output-json /home/ubuntu/validation_logs/qwen36_cold_prefill_evidence/qwen36_cold_smoke_2k_F_host_sampling_short_lengths_mt32.json \
   --tensor-parallel-size 4 \
   --logical-nc-config 2 \
   --max-num-seqs 1 \
   --ctx-batch-size 1 \
   --block-size 128 \
-  --kernel-q-tile-size 128 \
-  --kernel-kv-tile-size 1024 \
-  --enable-vllm-chunked-prefill \
-  --text-only-cte \
-  --compact-cte-attention-mask \
-  --cold-zero-conv-fast-path
+  --num-gpu-blocks-override 16 \
+  --enable-prefix-caching \
+  --enable-hybrid-apc \
+  --hybrid-apc-require-vllm-metadata \
+  --gdn-checkpoint-interval 128 \
+  --max-gdn-checkpoint-slots 8 \
+  --hybrid-cache-mode all \
+  --fail-fast
 ```
 
-## 128K candidate
+## Next Work
 
-```bash
-contrib/models/Qwen3.6-27B/vllm/start_vllm_server.sh \
-  --model-path /path/to/Qwen3.6-27B \
-  --compiled-artifacts /path/to/128k/artifacts \
-  --max-model-len 131072 \
-  --seq-len 131072 \
-  --cte-buckets 256,512,1024,2048 \
-  --tensor-parallel-size 4 \
-  --logical-nc-config 2 \
-  --max-num-seqs 1 \
-  --ctx-batch-size 1 \
-  --block-size 128 \
-  --kernel-q-tile-size 128 \
-  --kernel-kv-tile-size 1024 \
-  --enable-vllm-chunked-prefill \
-  --text-only-cte \
-  --compact-cte-attention-mask
-```
+1. Sync the state-diff emission patch to the Trainium cold checkout and run a
+   short A-G canary to confirm rows now carry `gdn_state_diff`.
+2. Relaunch strict-final only after the canary proves state-diff rows are
+   present; keep the stopped v2 evidence as the pre-patch failure record.
+3. Watch the full run for performance regressions, DMA spill evidence, and any
+   vLLM block-index mismatch against the compiled PA cache. Short A-G and long
+   H/J canaries have already passed artifact-load compatibility.
+4. If strict acceptance still fails only because GDN recurrent/conv state-diff
+   fields are missing, collect an alternate measured sidecar and pass it through
+   `--gdn-state-diff-json`; do not fabricate a sidecar.
+5. If strict acceptance fails on performance rather than launch shape, keep the
+   row evidence and tune from the current block128/short-bucket baseline.
 
-## 262K candidate
+Suggested PA block counts for block size 128:
 
-```bash
-contrib/models/Qwen3.6-27B/vllm/start_vllm_server.sh \
-  --model-path /path/to/Qwen3.6-27B \
-  --compiled-artifacts /path/to/262k/artifacts \
-  --max-model-len 262144 \
-  --seq-len 262144 \
-  --cte-bucket-profile 262k \
-  --tensor-parallel-size 4 \
-  --logical-nc-config 2 \
-  --max-num-seqs 1 \
-  --ctx-batch-size 1 \
-  --block-size 256 \
-  --kernel-q-tile-size 128 \
-  --kernel-kv-tile-size 1024 \
-  --enable-vllm-chunked-prefill \
-  --text-only-cte \
-  --compact-cte-attention-mask
-```
+| seq_len | pa_num_blocks |
+| ---: | ---: |
+| 2048 | 16 |
+| 8192 | 64 |
+| 32768 | 256 |
+| 131072 | 1024 |
+| 262144 | 2048 |
 
-For 262K, start with `block_size=256` and `[256]` only. After it loads and runs, try `block_size=128`.
+262K block-size 128 and block-size 256 have both been tried. Block size did not
+remove the TKG HBM compile limit because the largest sequence-sized PA tensor
+remains effectively `seq_len`-scaled.
 
----
+Current disk state after retaining the 2K, 8K, 32K, 128K, and 262K successful
+artifacts leaves roughly 37G free on `/home/ubuntu`.
 
-# What to add to `experimental` immediately
+## Stop Conditions
 
-## Must add/fix
+Stop and debug if any of these occur:
 
 ```text
-1. Cold-prefill benchmark logging.
-2. Safer cold-zero conv fast-path guard.
-3. Unit test: fast conv equals stateful conv only at position 0.
-4. Unit test: compact mask avoids dense SxS for long CTE.
-5. Unit test: text-only CTE passes empty vision tensors.
-6. Runtime log of selected GDN CTE kernel.
-7. Benchmark script for bucket/tile/block-size matrix.
+artifact_load_success is false
+returncode is nonzero
+token IDs are outside the tokenizer vocabulary
+selected CTE bucket does not match the prompt length
+2048 max_tokens=1 does not report two 1024-token CTE chunks
+output_tail contains DMA spill evidence
+vLLM receives block indexes outside the compiled PA cache
 ```
 
-## Already present and should be kept
+## Current Status
 
-```text
-dynamic CTE bucket profiles
-128-aligned bucket validation
-text-only CTE flag
-compact CTE attention mask flag
-fused GDN CTE with initial_state
-tunable q/kv tile sizes
-block size default 128
-hybrid APC config separation
-```
+The 2K, 8K, 32K, 128K, and 262K cold-branch host-sampling artifacts are compiled
+and smoke-tested on the Trainium instance. The 262K artifact is a KV-FP8
+recovery variant; the earlier BF16-KV 262K attempts still document the TKG HBM
+limit. The 2K artifact fixes the invalid on-device-sampling token IDs and the
+follow-on TKG out-of-bounds failure seen with the first branch artifact. The HBM
+probe now uses `neuron-monitor` in both runtime entrypoints, and the smoke rows
+confirm successful metrics collection without the previous post-run NRT
+allocation infodump.
 
-The launcher already wires most of those into `additional_config`, including `use_text_only_cte_inputs`, `use_compact_cte_attention_mask`, `use_cold_zero_conv_fast_path`, GDN cache dtype knobs, and Neuron `chunked_prefill_config`.
-
----
-
-# Acceptance criteria
-
-I would not call the cold-prefill patch stack successful unless it hits these:
-
-```text
-Short prompts:
-  ≥1.5x p50 latency improvement vs single 512 bucket
-
-2K prompts:
-  no regression vs baseline
-  exact token match
-
-8K+ prompts:
-  no dense SxS mask allocation
-  stable compile/load
-  no HBM spill regression
-
-GDN:
-  fused path token IDs match old path
-  final recurrent_state diff bounded
-  conv_state diff bounded
-
-262K:
-  TP=4 [256] artifact loads
-  cold prefill runs without DMA spill-ring allocation failure
-```
-
----
-
-# Priority order
-
-Build in this order:
-
-```text
-1. Instrumentation and benchmark harness
-2. Dynamic CTE bucket validation
-3. Text-only CTE validation
-4. Compact mask hardening
-5. Fused GDN CTE validation
-6. Safe cold-zero conv fast path
-7. Tile and block-size sweep
-8. 128K / 262K load and HBM sweep
-```
-
-The most likely cold-prefill wins are:
-
-```text
-dynamic CTE buckets
-text-only CTE inputs
-compact CTE masks
-fused GDN CTE everywhere
-safe cold-zero conv fast path
-```
-
-The riskiest change is `cold-zero-conv-fast-path`, because it is only correct for true position-0 cold prefill. Keep it behind the flag until the partial-prefix tests prove it cannot activate on restored-prefix requests.
-
-
-i dont hv access to instance right now but u can code in the experimental branch
+The full long-context goal is not complete yet. The remaining blocker is no
+longer branch-specific artifact compilation or launch-shape compatibility. The
+full strict-final v2 run was stopped after proving the matrix loads and runs
+with the agreed 262K KV-FP8 recovery shape but does not emit measured GDN
+recurrent/conv state-diff evidence. The next gate is a short Trainium canary
+with the new runtime state-diff emission patch, followed by a fresh strict-final
+run if the canary rows include `gdn_state_diff`.

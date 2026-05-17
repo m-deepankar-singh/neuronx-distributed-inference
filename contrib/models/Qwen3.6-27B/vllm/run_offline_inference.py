@@ -6,7 +6,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
+import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -115,6 +118,17 @@ def _use_nki_fused_from_env(env: dict[str, str] | None = None) -> bool:
 
 
 def _hbm_usage_if_available():
+    probe_mode = os.environ.get("QWEN36_HBM_PROBE", "neuron-monitor").lower()
+    if probe_mode in {"0", "false", "none", "off"}:
+        return None
+    if probe_mode != "xla":
+        usage = _hbm_usage_from_neuron_monitor()
+        if usage is not None or probe_mode == "neuron-monitor":
+            return usage
+    return _xla_hbm_usage_if_available() if probe_mode == "xla" else None
+
+
+def _xla_hbm_usage_if_available():
     try:
         import torch_xla.core.xla_model as xm  # noqa: WPS433
 
@@ -122,6 +136,104 @@ def _hbm_usage_if_available():
         return xm.get_memory_info(device)
     except Exception:
         return None
+
+
+def _safe_int(value) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _parse_neuron_monitor_hbm(stdout: str) -> dict | None:
+    peak_device_bytes = 0
+    peak_tensor_bytes = 0
+    samples = 0
+
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            report = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        for runtime in report.get("neuron_runtime_data", []):
+            memory_used = runtime.get("report", {}).get("memory_used", {})
+            used = memory_used.get("neuron_runtime_used_bytes", {})
+            peak_device_bytes = max(
+                peak_device_bytes,
+                _safe_int(used.get("neuron_device")),
+            )
+            nc_usage = (
+                used.get("usage_breakdown", {}).get("neuroncore_memory_usage", {})
+            )
+            tensor_bytes = sum(
+                _safe_int(core.get("tensors"))
+                for core in nc_usage.values()
+                if isinstance(core, dict)
+            )
+            peak_tensor_bytes = max(peak_tensor_bytes, tensor_bytes)
+            samples += 1
+
+    bytes_used = peak_device_bytes or peak_tensor_bytes
+    if samples == 0 or bytes_used <= 0:
+        return None
+    return {
+        "source": "neuron-monitor",
+        "bytes_used": bytes_used,
+        "neuron_device_bytes_used": peak_device_bytes,
+        "tensor_bytes": peak_tensor_bytes,
+        "samples": samples,
+    }
+
+
+def _hbm_usage_from_neuron_monitor() -> dict | None:
+    neuron_monitor = shutil.which("neuron-monitor")
+    if neuron_monitor is None:
+        return None
+    timeout_seconds = float(os.environ.get("QWEN36_HBM_MONITOR_SECONDS", "1.0"))
+    config = {
+        "period": "0.25s",
+        "neuron_runtimes": [
+            {
+                "tag_filter": ".*",
+                "metrics": [{"type": "memory_used", "period": "0.25s"}],
+            }
+        ],
+    }
+    config_path = None
+    proc = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            suffix=".json",
+            delete=False,
+        ) as handle:
+            json.dump(config, handle)
+            config_path = handle.name
+        proc = subprocess.Popen(
+            [neuron_monitor, "--config-file", config_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        time.sleep(max(timeout_seconds, 0.1))
+        proc.terminate()
+        stdout, _stderr = proc.communicate(timeout=5)
+        return _parse_neuron_monitor_hbm(stdout)
+    except Exception:
+        if proc is not None and proc.poll() is None:
+            proc.kill()
+            proc.communicate()
+        return None
+    finally:
+        if config_path is not None:
+            try:
+                os.unlink(config_path)
+            except OSError:
+                pass
 
 
 def _prompt_token_count(model_path: str, prompt: str, tokenizer=None) -> int:
@@ -333,6 +445,11 @@ def _override_config(args: argparse.Namespace) -> dict:
     _validate_hybrid_apc_args(args)
     cte_buckets = _cte_buckets(args)
     max_cte_bucket = cte_buckets[-1]
+    max_prompt_length = args.compiled_max_prompt_length or max_cte_bucket
+    if max_prompt_length < max_cte_bucket:
+        raise ValueError(
+            "--compiled-max-prompt-length must be at least the largest CTE bucket"
+        )
     recurrent_cache_dtype = (
         args.hybrid_gdn_recurrent_cache_dtype or args.gdn_recurrent_cache_dtype
     )
@@ -344,7 +461,7 @@ def _override_config(args: argparse.Namespace) -> dict:
         "tkg_batch_size": args.max_num_seqs,
         "seq_len": args.seq_len,
         "max_length": args.seq_len,
-        "max_context_length": max_cte_bucket,
+        "max_context_length": max_prompt_length,
         "context_encoding_buckets": cte_buckets,
         "token_generation_buckets": [args.seq_len],
         "enable_bucketing": len(cte_buckets) > 1,
@@ -373,7 +490,7 @@ def _override_config(args: argparse.Namespace) -> dict:
             }
         )
     return {
-        "max_prompt_length": max_cte_bucket,
+        "max_prompt_length": max_prompt_length,
         "use_hybrid_apc_manager": args.enable_hybrid_apc,
         "use_text_only_cte_inputs": args.text_only_cte,
         "use_compact_cte_attention_mask": args.compact_cte_attention_mask,
@@ -442,6 +559,7 @@ def main() -> int:
     parser.add_argument("--ctx-batch-size", type=int, default=1)
     parser.add_argument("--max-model-len", type=int, default=512)
     parser.add_argument("--seq-len", type=int, default=512)
+    parser.add_argument("--compiled-max-prompt-length", type=int, default=None)
     parser.add_argument("--cte-bucket", type=int, default=512)
     parser.add_argument("--cte-buckets", nargs="+", default=None)
     parser.add_argument(
@@ -483,6 +601,8 @@ def main() -> int:
     os.environ.setdefault("USE_PYTORCH_CHUNK", "0")
     if args.enable_vllm_chunked_prefill:
         os.environ["DISABLE_NEURON_CUSTOM_SCHEDULER"] = "1"
+    if args.enable_hybrid_apc:
+        os.environ.setdefault("QWEN36_EMIT_GDN_STATE_DIFF", "1")
     if args.compiled_artifacts:
         os.environ["NEURON_COMPILED_ARTIFACTS"] = str(
             Path(args.compiled_artifacts).expanduser().resolve()

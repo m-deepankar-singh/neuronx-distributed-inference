@@ -51,6 +51,15 @@ def _args(output_dir: Path):
         max_num_seqs=1,
         ctx_batch_size=1,
         num_gpu_blocks_override=None,
+        num_gpu_blocks_override_by_len=None,
+        compiled_max_prompt_length=1024,
+        block_size=128,
+        enable_prefix_caching=True,
+        enable_hybrid_apc=True,
+        hybrid_apc_require_vllm_metadata=True,
+        gdn_checkpoint_interval=128,
+        max_gdn_checkpoint_slots=8,
+        hybrid_cache_mode="all",
         gdn_state_diff_json=None,
         short_latency_speedup=1.5,
         baseline_cold_tok_per_s_target=420.0,
@@ -115,6 +124,8 @@ class TestColdPrefillStrictFinal(unittest.TestCase):
         self.assertIn("--include-dense-fallback", matrix)
         self.assertIn("--max-num-seqs", matrix)
         self.assertIn("1", matrix)
+        self.assertIn("--compiled-max-prompt-length", matrix)
+        self.assertIn("1024", matrix)
         matrix_max_tokens_index = matrix.index("--max-tokens-values")
         self.assertEqual(
             matrix[matrix_max_tokens_index + 1 : matrix_max_tokens_index + 3],
@@ -125,6 +136,7 @@ class TestColdPrefillStrictFinal(unittest.TestCase):
         self.assertIn("131072=/tmp/artifacts-128k", long_context)
         self.assertIn("262144=/tmp/artifacts-262k", long_context)
         self.assertIn("J_262k_recovery_block128", long_context)
+        self.assertIn("--compiled-max-prompt-length", long_context)
         long_context_max_tokens_index = long_context.index("--max-tokens-values")
         self.assertEqual(
             long_context[
@@ -145,6 +157,14 @@ class TestColdPrefillStrictFinal(unittest.TestCase):
         self.assertIn("420.0", acceptance)
         self.assertIn("--strict-min-samples", acceptance)
         self.assertIn("3", acceptance)
+
+    def test_fail_fast_stops_after_first_failed_phase(self):
+        args = _args(Path("/tmp/out"))
+        self.assertFalse(self.strict_final._should_stop_after_phase(args, 1))
+
+        args.fail_fast = True
+        self.assertFalse(self.strict_final._should_stop_after_phase(args, 0))
+        self.assertTrue(self.strict_final._should_stop_after_phase(args, 1))
 
     def test_build_commands_threads_gdn_state_diff_sidecar_to_benchmarks(self):
         with tempfile.TemporaryDirectory() as tmpdir:

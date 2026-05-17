@@ -39,6 +39,7 @@ def _args(prompt_dir: Path):
         logical_nc_config=2,
         max_num_seqs=1,
         ctx_batch_size=1,
+        compiled_max_prompt_length=None,
         block_size=128,
         kernel_q_tile_size=128,
         kernel_kv_tile_size=1024,
@@ -62,12 +63,17 @@ class _WhitespaceTokenizer:
         return prompt.split()
 
 
+class _EvenTokenCountTokenizer:
+    def encode(self, prompt, add_special_tokens=False):
+        return [0] * (len(prompt.split()) * 2)
+
+
 class TestColdPrefillBenchmark(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.benchmark = _load_benchmark()
 
-    def test_128k_candidate_uses_general_buckets_and_prompt_file(self):
+    def test_128k_candidate_uses_short_buckets_and_prompt_file(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             spec = next(
                 item
@@ -88,8 +94,8 @@ class TestColdPrefillBenchmark(unittest.TestCase):
         self.assertEqual(row["benchmark_schema_version"], 1)
         self.assertTrue(row["benchmark_script"].endswith("qwen36_cold_prefill_benchmark.py"))
         self.assertTrue(row["runner"].endswith("run_offline_inference.py"))
-        self.assertIn("--cte-buckets", row["command"])
-        self.assertIn("256,512,1024,2048", row["command"])
+        self.assertIn("--cte-bucket-profile", row["command"])
+        self.assertIn("short", row["command"])
         self.assertIn("--compact-cte-attention-mask", row["command"])
         self.assertIn("--text-only-cte", row["command"])
         self.assertEqual(row["block_size"], 128)
@@ -108,6 +114,30 @@ class TestColdPrefillBenchmark(unittest.TestCase):
         self.assertEqual(len(row["prompt_sha256"]), 64)
         self.assertEqual(row["command"][row["command"].index("--max-tokens") + 1], "1")
         self.assertLess(len(" ".join(row["command"])), 2000)
+
+    def test_compiled_max_prompt_length_is_passed_to_runner(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args = _args(Path(tmpdir))
+            args.compiled_max_prompt_length = 1024
+            spec = next(
+                item
+                for item in self.benchmark._variant_specs()
+                if item["name"] == "A_single512_old_chunked"
+            )
+
+            row = self.benchmark._run_case(
+                args,
+                spec,
+                128,
+                self.benchmark._tile_cases(spec, args)[0],
+                1,
+            )
+
+        self.assertIn("--compiled-max-prompt-length", row["command"])
+        self.assertEqual(
+            row["command"][row["command"].index("--compiled-max-prompt-length") + 1],
+            "1024",
+        )
 
     def test_per_length_compiled_artifacts_override_default_path(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -226,6 +256,15 @@ class TestColdPrefillBenchmark(unittest.TestCase):
         self.assertEqual(token_count, 32)
         self.assertEqual(len(prompt.split()), 32)
 
+    def test_prompt_generation_prefers_not_to_overshoot_target(self):
+        _prompt, token_count = self.benchmark._prompt_for_target_tokens(
+            31,
+            _EvenTokenCountTokenizer(),
+        )
+
+        self.assertLessEqual(token_count, 31)
+        self.assertEqual(token_count, 30)
+
     def test_load_tokenizer_skips_missing_absolute_paths(self):
         self.assertIsNone(self.benchmark._load_tokenizer("/definitely/missing/qwen"))
 
@@ -277,10 +316,11 @@ class TestColdPrefillBenchmark(unittest.TestCase):
             ],
             128,
         )
-        for spec in specs.values():
+        for name, spec in specs.items():
             self.assertTrue(self.benchmark._spec_supports_prompt_len(spec, 262144))
             self.assertFalse(self.benchmark._spec_supports_prompt_len(spec, 131072))
-            self.assertEqual(spec["cte"], ["--cte-bucket-profile", "262k"])
+            expected_profile = "262k" if name.startswith("I_262k") else "short"
+            self.assertEqual(spec["cte"], ["--cte-bucket-profile", expected_profile])
             self.assertNotIn("--cold-zero-conv-fast-path", spec["flags"])
 
     def test_kernel_toggle_variants_cover_old_fused_and_pytorch_chunk_paths(self):
@@ -392,6 +432,17 @@ class TestColdPrefillBenchmark(unittest.TestCase):
         state_diff = self.benchmark._extract_gdn_state_diff(stdout)
 
         self.assertEqual(prefill["prefill_latency_ms"], 100.0)
+        self.assertEqual(state_diff["recurrent_max_abs_diff"], 0.001)
+        self.assertEqual(state_diff["conv_max_abs_diff"], 0.002)
+
+    def test_extracts_gdn_state_diff_from_enginecore_prefixed_line(self):
+        stdout = (
+            '(EngineCore_DP0 pid=123) GDN_STATE_DIFF '
+            '{"recurrent_max_abs_diff": 0.001, "conv_max_abs_diff": 0.002}'
+        )
+
+        state_diff = self.benchmark._extract_gdn_state_diff(stdout)
+
         self.assertEqual(state_diff["recurrent_max_abs_diff"], 0.001)
         self.assertEqual(state_diff["conv_max_abs_diff"], 0.002)
 
