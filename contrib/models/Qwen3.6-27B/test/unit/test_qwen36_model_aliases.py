@@ -421,6 +421,34 @@ class TestQwen36ModelAliases(unittest.TestCase):
             )
         )
 
+    def test_flattened_slot_mapping_is_normalized_before_batch_chunking(self):
+        flattened = torch.arange(256, 719, dtype=torch.int32)
+
+        normalized = self.qwen_module._normalize_qwen36_slot_mapping(
+            flattened,
+            batch_size=1,
+            active_tokens=463,
+        )
+
+        self.assertEqual(normalized.shape, (1, 463))
+        self.assertTrue(torch.equal(normalized[0], flattened))
+
+    def test_flattened_decode_slot_mapping_is_normalized_by_batch(self):
+        flattened = torch.tensor([1488, 1489], dtype=torch.int32)
+
+        normalized = self.qwen_module._normalize_qwen36_slot_mapping(
+            flattened,
+            batch_size=2,
+            active_tokens=1,
+        )
+
+        self.assertTrue(
+            torch.equal(
+                normalized,
+                torch.tensor([[1488], [1489]], dtype=torch.int32),
+            )
+        )
+
     def test_stage_builders_keep_cte_and_tkg_contracts_explicit(self):
         wrapper = _make_wrapper(
             self.qwen_module,

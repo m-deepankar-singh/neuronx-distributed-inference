@@ -26,6 +26,9 @@ runtime behavior.
   metadata.
 - Added unit coverage for the FP8 compile config, Qwen alias accounting, and
   real-token validation gate.
+- Normalized flattened prefix-cache `slot_mapping` tensors in the Qwen custom
+  runtime path before CTE/TKG batch chunking, and sliced flattened
+  `slot_mapping` in Hybrid APC warm-suffix request prep.
 
 ## 2026-05-17 Follow-Up Instrumentation
 
@@ -234,6 +237,23 @@ Important runs:
     `input_shape=(1, 1)`, `num_queries=[1]`, and `pa_num_blocks=9`.
   - Conclusion: the remaining all-NaN host-logits failure is tied to the
     prefix/Hybrid APC path, not FP8 and not raw-output slot selection.
+- Restore/commit disabled isolation on commit `55ae0ca` kept the same compiled
+  BF16 Hybrid APC artifact and forced all Hybrid GDN restore/commit masks to
+  zero:
+  - Log:
+    `/home/ubuntu/validation_logs/hybrid_apc_real_tokens/restore_commit_disabled_55ae0ca_validation.log`
+  - JSON:
+    `/home/ubuntu/validation_logs/hybrid_apc_real_tokens/restore_commit_disabled_55ae0ca_validation.json`
+  - CTE debug confirmed the switch worked:
+    `restore_mask=[0]` and `commit_mask=[0]`.
+  - Raw logits still stayed all NaN:
+    `raw_output[0] shape=(1, 1, 248320) dtype=torch.float32 finite=0/248320 nan=248320`
+  - The same log exposed the next concrete contract bug: CTE was called with
+    hundreds of active tokens but only one slot mapping entry, for example
+    `input_shape=(1, 463)` with `slot_shape=(1,)`.
+  - Conclusion: restore/commit state is not the first NaN source for this
+    artifact. The current leading suspect is malformed prefix-cache CTE
+    `slot_mapping` before cache update.
 
 Latest PA9 artifact run:
 

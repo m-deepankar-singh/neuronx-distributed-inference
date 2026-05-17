@@ -2775,6 +2775,27 @@ def _debug_tensor_shape(tensor):
     return tuple(tensor.shape)
 
 
+def _normalize_qwen36_slot_mapping(slot_mapping, batch_size: int, active_tokens: int):
+    if (
+        slot_mapping is None
+        or not hasattr(slot_mapping, "numel")
+        or slot_mapping.numel() == 0
+        or not hasattr(slot_mapping, "ndim")
+    ):
+        return slot_mapping
+    if slot_mapping.ndim != 1:
+        return slot_mapping
+
+    batch_size = int(batch_size)
+    active_tokens = int(active_tokens)
+    total_slots = int(slot_mapping.numel())
+    if batch_size > 0 and active_tokens > 0 and total_slots == batch_size * active_tokens:
+        return slot_mapping.reshape(batch_size, active_tokens)
+    if batch_size == 1:
+        return slot_mapping.reshape(1, total_slots)
+    return slot_mapping
+
+
 def _use_legacy_tkg_args() -> bool:
     return os.environ.get("QWEN36_TKG_LEGACY_ARGS") == "1"
 
@@ -4488,6 +4509,11 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
                         attention_mask.shape[-1] if attention_mask is not None else 0,
                     )
             slot_mapping_arg = _optional_tensor(slot_mapping)
+            slot_mapping_arg = _normalize_qwen36_slot_mapping(
+                slot_mapping_arg,
+                batch_size,
+                seq_len,
+            )
             block_table_arg = _optional_tensor(block_table)
         else:
             computed_context_lens_arg = _empty()

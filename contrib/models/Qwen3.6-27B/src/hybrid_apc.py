@@ -339,6 +339,12 @@ def apply_hybrid_apc_prefill_plan(
         and slot_mapping.shape[1] >= prompt_len
     ):
         output["slot_mapping"] = slot_mapping[:, restore_len:prompt_len]
+    elif isinstance(slot_mapping, torch.Tensor) and slot_mapping.ndim == 1:
+        if batch_size == 1 and slot_mapping.numel() >= prompt_len:
+            output["slot_mapping"] = slot_mapping[restore_len:prompt_len]
+        elif slot_mapping.numel() >= batch_size * prompt_len:
+            flattened = slot_mapping.reshape(batch_size, -1)
+            output["slot_mapping"] = flattened[:, restore_len:prompt_len]
 
     position_template = input_dict.get("position_ids")
     position_dtype = (
