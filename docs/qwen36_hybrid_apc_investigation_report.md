@@ -354,6 +354,13 @@ Important runs:
     - Cold and warm outputs match for the early tokens but drift later in
       decode. This is now the leading remaining BF16 host-logits correctness
       issue; it is no longer a NaN/OOB or dummy-token failure.
+  - Decode-22 exactness after the fix:
+    `/home/ubuntu/validation_logs/hybrid_apc_real_tokens/bf16_hybrid_apc_host_logits_nki_chunked_b59e3a2_decode22.json`
+    - `full_prefix_exact=true`
+    - `partial_prefix_exact=true`
+    - `real_generated_tokens_passed=true`
+    - This confirms the remaining drift starts after the short exactness
+      window, around token 23 for the current deterministic prompts.
   - Runtime-enabling `--enable-vllm-chunked-prefill` against the non-chunked
     compiled artifact is not a valid workaround:
     `/home/ubuntu/validation_logs/hybrid_apc_real_tokens/bf16_hybrid_apc_host_logits_nki_chunked_b59e3a2_chunked_runtime_decode4.json`
