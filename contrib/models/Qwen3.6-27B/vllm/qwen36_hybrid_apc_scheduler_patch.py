@@ -220,13 +220,30 @@ def backed_gdn_prefix_hit_len(scheduler: Any, request: Any) -> int:
     return 0
 
 
+def _supports_backed_prefix_reads(scheduler: Any) -> bool:
+    """Return whether this artifact can consume a backed Hybrid APC prefix."""
+
+    if _env_flag("QWEN36_HYBRID_APC_ENABLE_BACKED_PREFIX_READS"):
+        return True
+
+    hf_config = _get_hf_config(getattr(scheduler, "vllm_config", None))
+    if not _config_flag(hf_config, "hybrid_apc_enable_backed_prefix_reads"):
+        return False
+
+    # A backed GDN checkpoint is not enough on its own. The CTE graph must also
+    # consume attention KV prefix state; otherwise warm requests restore GDN
+    # state but full-attention layers still see only the suffix.
+    return _config_flag(hf_config, "use_qwen_hybrid_chunked_prefill")
+
+
 def should_disable_unbacked_prefix_reads(scheduler: Any, request: Any = None) -> bool:
     """Return whether this scheduler should avoid vLLM APC reads.
 
     The current Qwen Hybrid APC control plane can prove an attention hit is
     invalid only inside model request prep. That is too late for allocation.
     This opt-in fallback makes vLLM allocate the request as no-prefix unless
-    the scheduler process has a registered matching GDN checkpoint boundary.
+    the scheduler process has a registered matching GDN checkpoint boundary and
+    the compiled artifact can consume the matching attention KV prefix in CTE.
     """
 
     if _env_flag("QWEN36_HYBRID_APC_ENABLE_PREFIX_READS"):
@@ -243,7 +260,10 @@ def should_disable_unbacked_prefix_reads(scheduler: Any, request: Any = None) ->
         )
     if not disable_requested:
         return False
-    if backed_gdn_prefix_hit_len(scheduler, request) > 0:
+    if (
+        backed_gdn_prefix_hit_len(scheduler, request) > 0
+        and _supports_backed_prefix_reads(scheduler)
+    ):
         return False
     return True
 

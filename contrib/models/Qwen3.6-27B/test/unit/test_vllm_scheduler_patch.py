@@ -29,12 +29,16 @@ def _scheduler(
     *,
     use_hybrid_apc=True,
     disable_unbacked_prefix_reads=False,
+    enable_backed_prefix_reads=False,
+    use_qwen_hybrid_chunked_prefill=False,
     block_size=2,
     model_revision="rev-a",
 ):
     hf_config_kwargs = dict(
         use_hybrid_apc_manager=use_hybrid_apc,
         hybrid_apc_disable_unbacked_prefix_reads=disable_unbacked_prefix_reads,
+        hybrid_apc_enable_backed_prefix_reads=enable_backed_prefix_reads,
+        use_qwen_hybrid_chunked_prefill=use_qwen_hybrid_chunked_prefill,
         hybrid_apc_layout_version=1,
         hybrid_recurrent_cache_dtype="float32",
         hybrid_conv_cache_dtype="bfloat16",
@@ -115,8 +119,51 @@ class TestQwen36HybridAPCSchedulerPatch(unittest.TestCase):
         self.assertEqual(calls, [True])
         self.assertTrue(request.skip_reading_prefix_cache)
 
-    def test_registered_gdn_checkpoint_allows_prefix_read(self):
+    def test_registered_gdn_checkpoint_keeps_prefix_read_disabled_without_cte_support(self):
         scheduler = _scheduler(block_size=2)
+        token_ids = [10, 11, 12, 13, 14]
+        hashes = self.patch._local_cumulative_prefix_hashes(
+            token_ids,
+            block_size=2,
+            max_prefix_len=4,
+        )
+        self.patch.register_hybrid_apc_gdn_checkpoint(
+            self.patch.HybridGDNPrefixKey(
+                cumulative_prefix_hash=hashes[4],
+                prefix_len=4,
+                block_size=2,
+                cache_salt=None,
+                model_revision="rev-a",
+                layout_version=1,
+                tp_rank=0,
+                recurrent_dtype="float32",
+                conv_dtype="bfloat16",
+            )
+        )
+        request = types.SimpleNamespace(
+            prompt_token_ids=token_ids,
+            num_tokens=len(token_ids),
+            cache_salt=None,
+        )
+
+        with patch.dict(
+            os.environ,
+            {"QWEN36_HYBRID_APC_DISABLE_UNBACKED_PREFIX_READS": "1"},
+        ):
+            self.assertEqual(
+                self.patch.backed_gdn_prefix_hit_len(scheduler, request),
+                4,
+            )
+            self.assertTrue(
+                self.patch.should_disable_unbacked_prefix_reads(scheduler, request)
+            )
+
+    def test_registered_gdn_checkpoint_allows_prefix_read_when_cte_supports_it(self):
+        scheduler = _scheduler(
+            block_size=2,
+            enable_backed_prefix_reads=True,
+            use_qwen_hybrid_chunked_prefill=True,
+        )
         token_ids = [10, 11, 12, 13, 14]
         hashes = self.patch._local_cumulative_prefix_hashes(
             token_ids,
