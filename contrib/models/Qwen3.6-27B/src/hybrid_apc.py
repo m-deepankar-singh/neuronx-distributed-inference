@@ -271,6 +271,7 @@ def apply_hybrid_apc_prefill_plan(
     plan: HybridAPCHitPlan,
     commit_slot: int | None = None,
     request_prefix_len: int | None = None,
+    block_size: int | None = None,
 ) -> dict[str, torch.Tensor]:
     """Materialize model inputs for a scheduler-selected hybrid APC hit plan.
 
@@ -331,6 +332,46 @@ def apply_hybrid_apc_prefill_plan(
     ):
         output["inputs_embeds"] = inputs_embeds[:, restore_len:prompt_len]
 
+    def _slot_mapping_is_missing_or_padding(value) -> bool:
+        return (
+            not isinstance(value, torch.Tensor)
+            or value.numel() == 0
+            or bool((value.to(torch.int64) < 0).all().item())
+        )
+
+    def _synthesize_suffix_slot_mapping() -> torch.Tensor | None:
+        if block_size is None or int(block_size) <= 0 or suffix_len <= 0:
+            return None
+        block_table = input_dict.get("block_table")
+        if not isinstance(block_table, torch.Tensor) or block_table.numel() == 0:
+            return None
+        table = block_table
+        if table.ndim == 1:
+            table = table.unsqueeze(0)
+        if table.ndim != 2 or table.shape[0] < batch_size:
+            return None
+        block_size_int = int(block_size)
+        positions = torch.arange(
+            restore_len,
+            prompt_len,
+            dtype=torch.int64,
+            device=table.device,
+        )
+        logical_blocks = torch.div(positions, block_size_int, rounding_mode="floor")
+        if logical_blocks.numel() == 0 or int(logical_blocks.max().item()) >= table.shape[1]:
+            return None
+        offsets = positions.remainder(block_size_int)
+        rows = []
+        table_i64 = table.to(torch.int64)
+        for batch_idx in range(batch_size):
+            physical_blocks = torch.index_select(
+                table_i64[batch_idx],
+                0,
+                logical_blocks,
+            )
+            rows.append(physical_blocks * block_size_int + offsets)
+        return torch.stack(rows, dim=0)
+
     slot_mapping = input_dict.get("slot_mapping")
     if (
         isinstance(slot_mapping, torch.Tensor)
@@ -345,6 +386,15 @@ def apply_hybrid_apc_prefill_plan(
         elif slot_mapping.numel() >= batch_size * prompt_len:
             flattened = slot_mapping.reshape(batch_size, -1)
             output["slot_mapping"] = flattened[:, restore_len:prompt_len]
+    if _slot_mapping_is_missing_or_padding(output.get("slot_mapping")):
+        synthesized_slot_mapping = _synthesize_suffix_slot_mapping()
+        if synthesized_slot_mapping is not None:
+            dtype = (
+                slot_mapping.dtype
+                if isinstance(slot_mapping, torch.Tensor)
+                else torch.int32
+            )
+            output["slot_mapping"] = synthesized_slot_mapping.to(dtype=dtype)
 
     position_template = input_dict.get("position_ids")
     position_dtype = (
@@ -594,6 +644,7 @@ class HybridAPCSchedulerBridge:
             plan=plan,
             commit_slot=commit_slot,
             request_prefix_len=prompt_len,
+            block_size=self.store.block_size,
         )
         record = self.store.on_request_restore(
             request_id=request_id,

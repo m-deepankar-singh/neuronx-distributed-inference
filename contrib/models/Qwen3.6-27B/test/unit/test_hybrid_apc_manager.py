@@ -462,6 +462,36 @@ class TestHybridAPCPrefillPlanInputs(unittest.TestCase):
             torch.equal(output["slot_mapping"], torch.tensor([104, 105, 106], dtype=torch.int32))
         )
 
+    def test_prefill_plan_synthesizes_padding_suffix_slots_from_block_table(self):
+        plan = HybridAPCHitPlan(
+            attention_hit_len=4,
+            recurrent_hit_len=4,
+            conv_hit_len=4,
+            usable_hit_len=4,
+            restore_checkpoint_prefix_len=4,
+            residual_replay_len=0,
+            suffix_len=3,
+            checkpoint_slot=9,
+            checkpoint_key=None,
+        )
+        input_dict = {
+            "input_ids": torch.tensor([[10, 11, 12, 13, 14, 15, 16]], dtype=torch.int32),
+            "position_ids": torch.arange(7, dtype=torch.int32).unsqueeze(0),
+            "slot_mapping": torch.full((1, 7), -1, dtype=torch.int32),
+            "block_table": torch.tensor([[1, 3, 4, 5]], dtype=torch.int32),
+        }
+
+        output = apply_hybrid_apc_prefill_plan(
+            input_dict,
+            plan=plan,
+            commit_slot=10,
+            block_size=4,
+        )
+
+        self.assertTrue(
+            torch.equal(output["slot_mapping"], torch.tensor([[12, 13, 14]], dtype=torch.int32))
+        )
+
 
 class TestHybridAPCSchedulerBridge(unittest.TestCase):
     def test_slot_allocator_validates_lifecycle(self):
