@@ -245,6 +245,17 @@ class TestQwen36HybridAPCSchedulerPatch(unittest.TestCase):
         self.assertFalse(
             self.patch.should_disable_unbacked_prefix_reads(scheduler, request)
         )
+        authorized = self.patch.pop_hybrid_apc_authorized_prefix_key(
+            prefix_len=4,
+            cache_salt=None,
+            model_revision="rev-a",
+            layout_version=1,
+            tp_rank=0,
+            recurrent_dtype="float32",
+            conv_dtype="bfloat16",
+        )
+        self.assertIsNotNone(authorized)
+        self.assertEqual(authorized.cumulative_prefix_hash, hashes[4])
 
     def test_mismatched_gdn_checkpoint_keeps_prefix_read_disabled(self):
         scheduler = _scheduler(block_size=2)

@@ -190,13 +190,37 @@ Artifacts:
   `/home/ubuntu/validation_logs/hybrid_apc_real_tokens/bf16_hybrid_apc_backed_prefix_d061df5_scheduler_gate_boundary_additional_config.log`
 
 This proves the scheduler-gated backed-prefix path is correct for the current
-single-request diagnostic. The remaining production blocker is narrower:
+single-request diagnostic.
+
+The next patch removed the length-only dependency for this case. The scheduler
+now records the exact GDN prefix key when it allows a backed prefix read, and
+Qwen consumes that authorized key for suffix-only restore before falling back to
+the guarded diagnostic path. The same boundary validation passed with
+`QWEN36_HYBRID_APC_ALLOW_UNHASHED_SINGLE_PREFIX_RESTORE` unset:
 
 ```text
-QWEN36_HYBRID_APC_ALLOW_UNHASHED_SINGLE_PREFIX_RESTORE=1 still restores by
-unique prefix length when vLLM-Neuron has already sliced the prompt to suffix.
-Production needs an explicit restore identity: full prompt hashes, a scheduler
-selected GDN key, or a restore slot carried from scheduler/runner into Qwen.
+full_prefix_exact=true
+partial_prefix_exact=true
+real_generated_tokens_passed=true
+cold_partial elapsed: 1.9669s
+warm_partial elapsed: 1.3296s
+```
+
+Artifacts:
+
+- JSON:
+  `/home/ubuntu/validation_logs/hybrid_apc_real_tokens/bf16_hybrid_apc_backed_prefix_d061df5_scheduler_authorized_key_no_unhashed.json`
+- Log:
+  `/home/ubuntu/validation_logs/hybrid_apc_real_tokens/bf16_hybrid_apc_backed_prefix_d061df5_scheduler_authorized_key_no_unhashed.log`
+
+The current remaining production hardening is for batched/concurrent serving:
+
+```text
+The scheduler/model process currently uses an in-process authorized-prefix key
+handoff. This is correct for the single-request validation path and avoids
+length-only restore, but concurrent requests should carry request-id scoped
+restore metadata or a runner-provided restore slot/key to avoid queue-order
+assumptions.
 ```
 
 The base BF16 host-logits path is not the current blocker when using the per-chunk DeltaNet CTE path:
@@ -249,6 +273,17 @@ Local and remote focused tests after the scheduler/additional-config fix:
 ```
 
 Remote 2K BF16 boundary validation after the scheduler/additional-config fix:
+
+```text
+full_prefix_exact=true
+partial_prefix_exact=true
+real_generated_tokens_passed=true
+backed_hit_len=256 supports_backed=True
+apply-suffix prompt_len=272 restore_len=256 suffix_len=16
+```
+
+Remote 2K BF16 boundary validation after scheduler-authorized key restore,
+with `QWEN36_HYBRID_APC_ALLOW_UNHASHED_SINGLE_PREFIX_RESTORE` unset:
 
 ```text
 full_prefix_exact=true
@@ -514,13 +549,14 @@ The exact current problem is:
 Correctness is protected by the scheduler fallback when no matching GDN
 checkpoint exists.
 
-The scheduler-gated backed-prefix diagnostic now also works: vLLM reuses the
-256-token attention prefix, Qwen restores the matching GDN checkpoint, runs the
-16-token suffix, and cold/warm outputs match.
+The scheduler-gated backed-prefix path now works: vLLM reuses the 256-token
+attention prefix, Qwen restores the scheduler-authorized GDN checkpoint key,
+runs the 16-token suffix, and cold/warm outputs match.
 
-The remaining production problem is carrying a stable restore identity through
-vLLM/vLLM-Neuron into Qwen after chunked prefill slices the prompt to suffix.
-The current successful diagnostic uses a guarded unique-prefix-length restore.
+The remaining production problem is hardening that restore identity for
+concurrent/batched serving. The current successful path uses an in-process
+authorized-key handoff between scheduler and Qwen; a request-id scoped runner
+metadata field would be safer for multi-request serving.
 ```
 
 The proven backed run uses this contract:
@@ -534,6 +570,7 @@ slot_mapping: suffix slots only
 block_table: prefix plus suffix physical blocks
 runtime config: use_qwen_hybrid_chunked_prefill=True
 restore_mask: [1]
+scheduler restore identity: exact authorized GDN prefix key
 ```
 
 The current code fixes the known wrapper/model/scheduler contracts in code and
@@ -547,7 +584,8 @@ backed prefix reads remain opt-in
 the scheduler gate honors serving additional_config, not only hf_config
 ```
 
-The next required proof is production metadata wiring without
+The next required proof is request-id scoped metadata for batched/concurrent
+serving. The single-request boundary path already passes without
 QWEN36_HYBRID_APC_ALLOW_UNHASHED_SINGLE_PREFIX_RESTORE.
 
 Primary files changed or relevant:
@@ -570,15 +608,15 @@ The existing BF16 per-chunk artifact was generated before the backed-prefix CTE 
 
 ## Recommended Next Work
 
-1. Replace the guarded suffix-only restore with explicit production metadata:
-   carry either full prompt hashes, a scheduler-selected GDN key, or a restore
-   slot from vLLM/vLLM-Neuron into Qwen.
+1. Replace the in-process authorized-key queue with request-id scoped metadata
+   for batched/concurrent serving, or prove the queue cannot reorder under the
+   target `max_num_seqs` configuration.
 2. Keep the current scheduler rule: vLLM prefix reads are allowed only when a
    matching GDN checkpoint exists and the runtime config advertises backed CTE
    prefix support.
-3. Add a negative test where two checkpoints share the same prefix length and
-   prove production mode does not use the length-only restore.
-4. Rerun the same 2K checkpoint-boundary validation without
+3. Add an end-to-end batched validation with two warm partial requests sharing
+   a prefix length but requiring different GDN keys.
+4. Keep rerunning the 2K checkpoint-boundary validation without
    `QWEN36_HYBRID_APC_ALLOW_UNHASHED_SINGLE_PREFIX_RESTORE`.
 5. Expected backed-prefix debug stays:
 

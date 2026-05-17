@@ -34,6 +34,7 @@ class HybridGDNPrefixKey(NamedTuple):
 
 
 _GDN_PREFIX_KEYS: set[HybridGDNPrefixKey] = set()
+_AUTHORIZED_PREFIX_READS: dict[int, list[HybridGDNPrefixKey]] = {}
 
 
 def _env_flag(name: str) -> bool:
@@ -143,6 +144,53 @@ def unregister_hybrid_apc_gdn_checkpoint(key: Any) -> bool:
 
 def clear_hybrid_apc_gdn_checkpoint_registry() -> None:
     _GDN_PREFIX_KEYS.clear()
+    _AUTHORIZED_PREFIX_READS.clear()
+
+
+def authorize_hybrid_apc_prefix_read(key: Any) -> HybridGDNPrefixKey:
+    """Publish a scheduler-approved prefix read for suffix-only model prep."""
+
+    registry_key = _to_registry_key(key)
+    _AUTHORIZED_PREFIX_READS.setdefault(registry_key.prefix_len, []).append(
+        registry_key
+    )
+    return registry_key
+
+
+def pop_hybrid_apc_authorized_prefix_key(
+    *,
+    prefix_len: int,
+    cache_salt: Hashable | None = None,
+    model_revision: str = "unknown",
+    layout_version: int = 1,
+    tp_rank: int = 0,
+    recurrent_dtype: str = "float32",
+    conv_dtype: str = "bfloat16",
+) -> HybridGDNPrefixKey | None:
+    """Consume the exact key for a prefix read allowed by the scheduler."""
+
+    prefix_len = int(prefix_len)
+    candidates = _AUTHORIZED_PREFIX_READS.get(prefix_len)
+    if not candidates:
+        return None
+    recurrent_dtype = _normalize_dtype(recurrent_dtype, "float32")
+    conv_dtype = _normalize_dtype(conv_dtype, "bfloat16")
+    for idx, key in enumerate(candidates):
+        if key.cache_salt != cache_salt:
+            continue
+        if key.model_revision != str(model_revision):
+            continue
+        if key.layout_version != int(layout_version):
+            continue
+        if key.tp_rank != int(tp_rank):
+            continue
+        if key.recurrent_dtype != recurrent_dtype or key.conv_dtype != conv_dtype:
+            continue
+        matched = candidates.pop(idx)
+        if not candidates:
+            _AUTHORIZED_PREFIX_READS.pop(prefix_len, None)
+        return matched
+    return None
 
 
 def _block_size_for_scheduler(scheduler: Any) -> int:
@@ -222,17 +270,17 @@ def _request_registry_key(
     )
 
 
-def backed_gdn_prefix_hit_len(scheduler: Any, request: Any) -> int:
+def backed_gdn_prefix_hit(scheduler: Any, request: Any) -> HybridGDNPrefixKey | None:
     """Return the largest request prefix with a registered GDN checkpoint."""
 
     if request is None:
-        return 0
+        return None
     token_ids = getattr(request, "prompt_token_ids", None)
     if not token_ids:
-        return 0
+        return None
     block_size = _block_size_for_scheduler(scheduler)
     if block_size <= 0:
-        return 0
+        return None
     max_cache_hit_len = max(0, int(getattr(request, "num_tokens", len(token_ids))) - 1)
     max_cache_hit_len = min(max_cache_hit_len, len(token_ids))
     hashes = _local_cumulative_prefix_hashes(
@@ -249,8 +297,15 @@ def backed_gdn_prefix_hit_len(scheduler: Any, request: Any) -> int:
             block_size=block_size,
         )
         if key in _GDN_PREFIX_KEYS:
-            return prefix_len
-    return 0
+            return key
+    return None
+
+
+def backed_gdn_prefix_hit_len(scheduler: Any, request: Any) -> int:
+    hit = backed_gdn_prefix_hit(scheduler, request)
+    if hit is None:
+        return 0
+    return hit.prefix_len
 
 
 def _supports_backed_prefix_reads(scheduler: Any) -> bool:
@@ -291,7 +346,8 @@ def should_disable_unbacked_prefix_reads(scheduler: Any, request: Any = None) ->
         )
     if not disable_requested:
         return False
-    backed_hit_len = backed_gdn_prefix_hit_len(scheduler, request)
+    backed_hit = backed_gdn_prefix_hit(scheduler, request)
+    backed_hit_len = 0 if backed_hit is None else backed_hit.prefix_len
     supports_backed = _supports_backed_prefix_reads(scheduler)
     if _env_flag("QWEN36_HYBRID_APC_DEBUG"):
         prompt_len = len(getattr(request, "prompt_token_ids", ()) or ())
@@ -304,7 +360,8 @@ def should_disable_unbacked_prefix_reads(scheduler: Any, request: Any = None) ->
             f"registry_size={len(_GDN_PREFIX_KEYS)}",
             flush=True,
         )
-    if backed_hit_len > 0 and supports_backed:
+    if backed_hit is not None and supports_backed:
+        authorize_hybrid_apc_prefix_read(backed_hit)
         return False
     return True
 

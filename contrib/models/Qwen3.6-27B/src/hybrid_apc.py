@@ -853,10 +853,8 @@ class HybridAPCSchedulerBridge:
         attention_hit_len: int,
         request_prefix_len: int,
     ) -> HybridAPCPreparedRequest | None:
-        """Prepare a suffix-only request when explicitly allowed for diagnosis."""
+        """Prepare a suffix-only request using scheduler-approved restore metadata."""
 
-        if not _env_flag("QWEN36_HYBRID_APC_ALLOW_UNHASHED_SINGLE_PREFIX_RESTORE"):
-            return None
         if "input_ids" not in input_dict:
             raise KeyError("input_ids is required for hybrid APC request prep")
         input_ids = input_dict["input_ids"]
@@ -875,20 +873,63 @@ class HybridAPCSchedulerBridge:
         if restore_len <= 0 or request_prefix_len - restore_len != suffix_len:
             return None
 
-        checkpoint = self.store.lookup_unique_prefix_len(
-            prefix_len=restore_len,
-            cache_salt=self.cache_salt,
-            model_revision=self.model_revision,
-            layout_version=self.layout_version,
-            tp_rank=self.tp_rank,
-            recurrent_dtype=self.recurrent_dtype,
-            conv_dtype=self.conv_dtype,
-        )
+        checkpoint = None
+        checkpoint_key = None
+        try:
+            from qwen36_hybrid_apc_scheduler_patch import (  # noqa: WPS433
+                pop_hybrid_apc_authorized_prefix_key,
+            )
+        except Exception:
+            pop_hybrid_apc_authorized_prefix_key = None
+
+        if pop_hybrid_apc_authorized_prefix_key is not None:
+            checkpoint_key = pop_hybrid_apc_authorized_prefix_key(
+                prefix_len=restore_len,
+                cache_salt=self.cache_salt,
+                model_revision=self.model_revision or self.store.model_revision,
+                layout_version=(
+                    self.layout_version
+                    if self.layout_version is not None
+                    else self.store.layout_version
+                ),
+                tp_rank=self.tp_rank if self.tp_rank is not None else self.store.tp_rank,
+                recurrent_dtype=(
+                    self.recurrent_dtype
+                    if self.recurrent_dtype is not None
+                    else self.store.recurrent_dtype
+                ),
+                conv_dtype=(
+                    self.conv_dtype
+                    if self.conv_dtype is not None
+                    else self.store.conv_dtype
+                ),
+            )
+            if checkpoint_key is not None:
+                checkpoint = self.store.lookup(checkpoint_key)
+
+        if checkpoint is None and checkpoint_key is not None:
+            raise ValueError(
+                "suffix-only hybrid APC received a scheduler-authorized "
+                "prefix key that is missing from the GDN checkpoint store"
+            )
+
+        if checkpoint is None and _env_flag(
+            "QWEN36_HYBRID_APC_ALLOW_UNHASHED_SINGLE_PREFIX_RESTORE"
+        ):
+            checkpoint = self.store.lookup_unique_prefix_len(
+                prefix_len=restore_len,
+                cache_salt=self.cache_salt,
+                model_revision=self.model_revision,
+                layout_version=self.layout_version,
+                tp_rank=self.tp_rank,
+                recurrent_dtype=self.recurrent_dtype,
+                conv_dtype=self.conv_dtype,
+            )
         if checkpoint is None:
             if self.reject_unbacked_attention_hits:
                 raise ValueError(
                     "suffix-only hybrid APC received an attention prefix hit "
-                    "without a unique matching GDN checkpoint"
+                    "without scheduler-authorized GDN checkpoint metadata"
                 )
             return None
 

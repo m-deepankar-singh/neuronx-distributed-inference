@@ -770,14 +770,13 @@ class TestHybridAPCSchedulerBridge(unittest.TestCase):
         )
         suffix_ids = torch.arange(128, 256, dtype=torch.int32).unsqueeze(0)
 
-        self.assertIsNone(
+        with self.assertRaisesRegex(ValueError, "without scheduler-authorized"):
             bridge.prepare_suffix_only_request(
                 request_id="req-suffix-disabled",
                 input_dict={"input_ids": suffix_ids},
                 attention_hit_len=128,
                 request_prefix_len=256,
             )
-        )
 
         with patch.dict(
             os.environ,
@@ -801,6 +800,36 @@ class TestHybridAPCSchedulerBridge(unittest.TestCase):
         self.assertEqual(prepared.input_dict["computed_context_lens"].item(), 128)
         self.assertEqual(prepared.input_dict["num_queries"].item(), 128)
         self.assertEqual(prepared.input_dict["hybrid_restore_mask"].item(), 1)
+        self.assertEqual(prepared.input_dict["hybrid_restore_slot_ids"].item(), 1)
+
+    def test_bridge_suffix_only_restore_uses_scheduler_authorized_key(self):
+        store = _store()
+        _insert(store, 128, prefix_hash="h128-a", gdn_checkpoint_slot=0)
+        key_b, _checkpoint_b = _insert(
+            store,
+            128,
+            prefix_hash="h128-b",
+            gdn_checkpoint_slot=1,
+        )
+        bridge = HybridAPCSchedulerBridge(
+            store=store,
+            slot_allocator=HybridAPCSlotAllocator(num_slots=2),
+            cache_salt="tenant-a",
+            model_revision="rev-a",
+        )
+        _SCHEDULER_PATCH.authorize_hybrid_apc_prefix_read(key_b)
+
+        prepared = bridge.prepare_suffix_only_request(
+            request_id="req-authorized",
+            input_dict={
+                "input_ids": torch.arange(128, 256, dtype=torch.int32).unsqueeze(0)
+            },
+            attention_hit_len=128,
+            request_prefix_len=256,
+        )
+
+        self.assertIsNotNone(prepared)
+        self.assertEqual(prepared.plan.checkpoint_key, key_b)
         self.assertEqual(prepared.input_dict["hybrid_restore_slot_ids"].item(), 1)
 
     def test_bridge_suffix_only_restore_rejects_ambiguous_prefix_len(self):
