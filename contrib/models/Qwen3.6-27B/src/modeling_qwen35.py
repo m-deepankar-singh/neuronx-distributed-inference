@@ -4471,6 +4471,14 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
                 "full_context_lens": full_context_lens,
                 "computed_context_lens": computed_context_lens,
             }
+            request_ids = getattr(self, "_qwen36_vllm_request_ids", None)
+            if request_ids is not None:
+                if isinstance(request_ids, list):
+                    request_ids = tuple(request_ids)
+                if isinstance(request_ids, tuple) and len(request_ids) == 1:
+                    hybrid_apc_request_dict["hybrid_request_id"] = request_ids[0]
+                else:
+                    hybrid_apc_request_dict["hybrid_request_id"] = request_ids
             prepared_inputs = prepare_hybrid_apc_request_for_execution(
                 self,
                 hybrid_apc_request_dict,

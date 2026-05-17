@@ -19,6 +19,8 @@ from typing import Any, Hashable, NamedTuple
 
 logger = logging.getLogger(__name__)
 _SCHEDULER_MODULE = "vllm.v1.core.sched.scheduler"
+_VLLM_NEURON_RUNNER_MODULE = "vllm_neuron.worker.neuronx_distributed_model_runner"
+_PATCHED_MODULES = {_SCHEDULER_MODULE, _VLLM_NEURON_RUNNER_MODULE}
 
 
 class HybridGDNPrefixKey(NamedTuple):
@@ -35,6 +37,7 @@ class HybridGDNPrefixKey(NamedTuple):
 
 _GDN_PREFIX_KEYS: set[HybridGDNPrefixKey] = set()
 _AUTHORIZED_PREFIX_READS: dict[int, list[HybridGDNPrefixKey]] = {}
+_AUTHORIZED_PREFIX_READS_BY_REQUEST: dict[Hashable, list[HybridGDNPrefixKey]] = {}
 
 
 def _env_flag(name: str) -> bool:
@@ -111,6 +114,18 @@ def _normalize_dtype(value: Any, default: str) -> str:
     return aliases.get(normalized, normalized)
 
 
+def _normalize_request_id(request_id: Any) -> Hashable | None:
+    if request_id is None:
+        return None
+    if isinstance(request_id, list):
+        return tuple(request_id)
+    try:
+        hash(request_id)
+    except TypeError:
+        return repr(request_id)
+    return request_id
+
+
 def _to_registry_key(key: Any) -> HybridGDNPrefixKey:
     return HybridGDNPrefixKey(
         cumulative_prefix_hash=getattr(key, "cumulative_prefix_hash"),
@@ -163,37 +178,44 @@ def unregister_hybrid_apc_gdn_checkpoint(key: Any) -> bool:
 def clear_hybrid_apc_gdn_checkpoint_registry() -> None:
     _GDN_PREFIX_KEYS.clear()
     _AUTHORIZED_PREFIX_READS.clear()
+    _AUTHORIZED_PREFIX_READS_BY_REQUEST.clear()
 
 
-def authorize_hybrid_apc_prefix_read(key: Any) -> HybridGDNPrefixKey:
+def authorize_hybrid_apc_prefix_read(
+    key: Any,
+    *,
+    request_id: Hashable | None = None,
+) -> HybridGDNPrefixKey:
     """Publish a scheduler-approved prefix read for suffix-only model prep."""
 
     registry_key = _to_registry_key(key)
-    _AUTHORIZED_PREFIX_READS.setdefault(registry_key.prefix_len, []).append(
-        registry_key
-    )
+    normalized_request_id = _normalize_request_id(request_id)
+    if normalized_request_id is None:
+        _AUTHORIZED_PREFIX_READS.setdefault(registry_key.prefix_len, []).append(
+            registry_key
+        )
+    else:
+        _AUTHORIZED_PREFIX_READS_BY_REQUEST.setdefault(
+            normalized_request_id,
+            [],
+        ).append(registry_key)
     return registry_key
 
 
-def pop_hybrid_apc_authorized_prefix_key(
+def _pop_matching_authorized_key(
+    candidates: list[HybridGDNPrefixKey],
     *,
     prefix_len: int,
-    cache_salt: Hashable | None = None,
-    model_revision: str = "unknown",
-    layout_version: int = 1,
-    tp_rank: int = 0,
-    recurrent_dtype: str = "float32",
-    conv_dtype: str = "bfloat16",
+    cache_salt: Hashable | None,
+    model_revision: str,
+    layout_version: int,
+    tp_rank: int,
+    recurrent_dtype: str,
+    conv_dtype: str,
 ) -> HybridGDNPrefixKey | None:
-    """Consume the exact key for a prefix read allowed by the scheduler."""
-
-    prefix_len = int(prefix_len)
-    candidates = _AUTHORIZED_PREFIX_READS.get(prefix_len)
-    if not candidates:
-        return None
-    recurrent_dtype = _normalize_dtype(recurrent_dtype, "float32")
-    conv_dtype = _normalize_dtype(conv_dtype, "bfloat16")
     for idx, key in enumerate(candidates):
+        if key.prefix_len != prefix_len:
+            continue
         if key.cache_salt != cache_salt:
             continue
         if key.model_revision != str(model_revision):
@@ -204,9 +226,64 @@ def pop_hybrid_apc_authorized_prefix_key(
             continue
         if key.recurrent_dtype != recurrent_dtype or key.conv_dtype != conv_dtype:
             continue
-        matched = candidates.pop(idx)
-        if not candidates:
-            _AUTHORIZED_PREFIX_READS.pop(prefix_len, None)
+        return candidates.pop(idx)
+    return None
+
+
+def pop_hybrid_apc_authorized_prefix_key(
+    *,
+    prefix_len: int,
+    request_id: Hashable | None = None,
+    cache_salt: Hashable | None = None,
+    model_revision: str = "unknown",
+    layout_version: int = 1,
+    tp_rank: int = 0,
+    recurrent_dtype: str = "float32",
+    conv_dtype: str = "bfloat16",
+) -> HybridGDNPrefixKey | None:
+    """Consume the exact key for a prefix read allowed by the scheduler."""
+
+    prefix_len = int(prefix_len)
+    recurrent_dtype = _normalize_dtype(recurrent_dtype, "float32")
+    conv_dtype = _normalize_dtype(conv_dtype, "bfloat16")
+    normalized_request_id = _normalize_request_id(request_id)
+    if normalized_request_id is not None:
+        candidates = _AUTHORIZED_PREFIX_READS_BY_REQUEST.get(normalized_request_id)
+        if candidates:
+            matched = _pop_matching_authorized_key(
+                candidates,
+                prefix_len=prefix_len,
+                cache_salt=cache_salt,
+                model_revision=model_revision,
+                layout_version=layout_version,
+                tp_rank=tp_rank,
+                recurrent_dtype=recurrent_dtype,
+                conv_dtype=conv_dtype,
+            )
+            if matched is not None:
+                if not candidates:
+                    _AUTHORIZED_PREFIX_READS_BY_REQUEST.pop(
+                        normalized_request_id,
+                        None,
+                    )
+                return matched
+
+    candidates = _AUTHORIZED_PREFIX_READS.get(prefix_len)
+    if not candidates:
+        return None
+    matched = _pop_matching_authorized_key(
+        candidates,
+        prefix_len=prefix_len,
+        cache_salt=cache_salt,
+        model_revision=model_revision,
+        layout_version=layout_version,
+        tp_rank=tp_rank,
+        recurrent_dtype=recurrent_dtype,
+        conv_dtype=conv_dtype,
+    )
+    if matched is not None and not candidates:
+        _AUTHORIZED_PREFIX_READS.pop(prefix_len, None)
+    if matched is not None:
         return matched
     return None
 
@@ -335,6 +412,16 @@ def backed_gdn_prefix_hit_len(scheduler: Any, request: Any) -> int:
     return hit.prefix_len
 
 
+def _request_id_for_scheduler_request(request: Any) -> Hashable | None:
+    if request is None:
+        return None
+    for attr in ("request_id", "req_id", "id"):
+        request_id = getattr(request, attr, None)
+        if request_id is not None:
+            return _normalize_request_id(request_id)
+    return None
+
+
 def _supports_backed_prefix_reads(scheduler: Any) -> bool:
     """Return whether this artifact can consume a backed Hybrid APC prefix."""
 
@@ -391,7 +478,10 @@ def should_disable_unbacked_prefix_reads(scheduler: Any, request: Any = None) ->
             flush=True,
         )
     if backed_hit is not None and supports_backed:
-        authorize_hybrid_apc_prefix_read(backed_hit)
+        authorize_hybrid_apc_prefix_read(
+            backed_hit,
+            request_id=_request_id_for_scheduler_request(request),
+        )
         return False
     return True
 
@@ -432,6 +522,104 @@ def _patch_scheduler_module(module: Any) -> bool:
     return installed
 
 
+def _request_ids_from_model_input(model_input: Any) -> tuple[Hashable, ...] | None:
+    request_ids = getattr(model_input, "request_ids", None)
+    if request_ids is None:
+        return None
+    if isinstance(request_ids, tuple):
+        return request_ids
+    if isinstance(request_ids, list):
+        return tuple(request_ids)
+    if isinstance(request_ids, (str, bytes)):
+        return (request_ids,)
+    try:
+        return tuple(request_ids)
+    except TypeError:
+        return (request_ids,)
+
+
+def _request_id_target_models(model: Any) -> list[Any]:
+    targets = []
+    seen = set()
+    current = model
+    for _ in range(4):
+        if current is None:
+            break
+        current_id = id(current)
+        if current_id in seen:
+            break
+        seen.add(current_id)
+        targets.append(current)
+        current = getattr(current, "model", None)
+    return targets
+
+
+def patch_neuron_model_runner_class(runner_cls: type) -> bool:
+    """Patch vLLM-Neuron runner to expose request IDs during model execution."""
+
+    original_execute = getattr(runner_cls, "_execute_model_for_text", None)
+    if original_execute is None:
+        raise AttributeError(
+            f"{runner_cls!r} has no _execute_model_for_text method"
+        )
+    if getattr(original_execute, "_qwen36_hybrid_apc_request_ids_patched", False):
+        return False
+
+    missing = object()
+
+    def execute_model_for_text_with_request_ids(self, model_input, *args, **kwargs):
+        model = getattr(self, "model", None)
+        request_ids = _request_ids_from_model_input(model_input)
+        previous_values = []
+        if request_ids is not None:
+            for target in _request_id_target_models(model):
+                previous_values.append(
+                    (
+                        target,
+                        getattr(target, "_qwen36_vllm_request_ids", missing),
+                    )
+                )
+                target._qwen36_vllm_request_ids = request_ids
+        try:
+            return original_execute(self, model_input, *args, **kwargs)
+        finally:
+            for target, previous_request_ids in reversed(previous_values):
+                if previous_request_ids is missing:
+                    try:
+                        delattr(target, "_qwen36_vllm_request_ids")
+                    except AttributeError:
+                        pass
+                else:
+                    target._qwen36_vllm_request_ids = previous_request_ids
+
+    execute_model_for_text_with_request_ids._qwen36_hybrid_apc_request_ids_patched = (
+        True
+    )
+    execute_model_for_text_with_request_ids._qwen36_original_execute_model_for_text = (
+        original_execute
+    )
+    runner_cls._execute_model_for_text = execute_model_for_text_with_request_ids
+    return True
+
+
+def _patch_neuron_runner_module(module: Any) -> bool:
+    runner_cls = getattr(module, "NeuronxDistributedModelRunner", None)
+    if runner_cls is None:
+        return False
+    installed = patch_neuron_model_runner_class(runner_cls)
+    if installed:
+        logger.info("Installed Qwen Hybrid APC vLLM-Neuron runner patch")
+    return installed
+
+
+def _patch_module(module_name: str, module: Any) -> bool:
+    if module_name == _SCHEDULER_MODULE:
+        return _patch_scheduler_module(module)
+    if module_name == _VLLM_NEURON_RUNNER_MODULE:
+        return _patch_neuron_runner_module(module)
+    return False
+
+
 class _HybridAPCSchedulerPatchLoader(importlib.abc.Loader):
     _qwen36_hybrid_apc_loader = True
 
@@ -446,14 +634,14 @@ class _HybridAPCSchedulerPatchLoader(importlib.abc.Loader):
 
     def exec_module(self, module):
         self.wrapped_loader.exec_module(module)
-        _patch_scheduler_module(module)
+        _patch_module(module.__name__, module)
 
 
 class _HybridAPCSchedulerPatchFinder(importlib.abc.MetaPathFinder):
     _qwen36_hybrid_apc_import_hook = True
 
     def find_spec(self, fullname, path, target=None):
-        if fullname != _SCHEDULER_MODULE:
+        if fullname not in _PATCHED_MODULES:
             return None
         spec = importlib.machinery.PathFinder.find_spec(fullname, path)
         if spec is None or spec.loader is None:
@@ -465,16 +653,18 @@ class _HybridAPCSchedulerPatchFinder(importlib.abc.MetaPathFinder):
 
 
 def install_import_hook() -> bool:
-    """Patch Scheduler lazily, without importing vLLM at Python startup."""
+    """Patch vLLM components lazily, without importing vLLM at Python startup."""
 
-    module = sys.modules.get(_SCHEDULER_MODULE)
-    if module is not None:
-        return _patch_scheduler_module(module)
+    installed = False
+    for module_name in _PATCHED_MODULES:
+        module = sys.modules.get(module_name)
+        if module is not None:
+            installed = _patch_module(module_name, module) or installed
     for finder in sys.meta_path:
         if getattr(finder, "_qwen36_hybrid_apc_import_hook", False):
-            return False
+            return installed
     sys.meta_path.insert(0, _HybridAPCSchedulerPatchFinder())
-    return False
+    return installed
 
 
 def install() -> bool:
@@ -482,10 +672,15 @@ def install() -> bool:
 
     from vllm.v1.core.sched.scheduler import Scheduler  # noqa: WPS433
 
+    installed = False
     module = sys.modules.get(_SCHEDULER_MODULE)
     if module is not None:
-        return _patch_scheduler_module(module)
-    installed = patch_scheduler_class(Scheduler)
+        installed = _patch_scheduler_module(module)
+    else:
+        installed = patch_scheduler_class(Scheduler)
+    runner_module = sys.modules.get(_VLLM_NEURON_RUNNER_MODULE)
+    if runner_module is not None:
+        installed = _patch_neuron_runner_module(runner_module) or installed
     if installed:
         logger.info("Installed Qwen Hybrid APC scheduler fallback patch")
     return installed

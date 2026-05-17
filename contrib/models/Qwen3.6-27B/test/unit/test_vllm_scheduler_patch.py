@@ -16,6 +16,7 @@ _PATCH_PATH = os.path.join(
     "qwen36_hybrid_apc_scheduler_patch.py",
 )
 _SCHEDULER_MODULE = "vllm.v1.core.sched.scheduler"
+_VLLM_NEURON_RUNNER_MODULE = "vllm_neuron.worker.neuronx_distributed_model_runner"
 
 
 def _load_patch_module():
@@ -71,6 +72,7 @@ class TestQwen36HybridAPCSchedulerPatch(unittest.TestCase):
     def tearDown(self):
         self.patch.clear_hybrid_apc_gdn_checkpoint_registry()
         sys.modules.pop(_SCHEDULER_MODULE, None)
+        sys.modules.pop(_VLLM_NEURON_RUNNER_MODULE, None)
         sys.meta_path = [
             finder
             for finder in sys.meta_path
@@ -262,6 +264,112 @@ class TestQwen36HybridAPCSchedulerPatch(unittest.TestCase):
         )
         self.assertIsNotNone(authorized)
         self.assertEqual(authorized.cumulative_prefix_hash, hashes[4])
+
+    def test_authorized_prefix_read_can_be_request_scoped(self):
+        key = self.patch.HybridGDNPrefixKey(
+            cumulative_prefix_hash="hash-a",
+            prefix_len=4,
+            block_size=2,
+            cache_salt=None,
+            model_revision="rev-a",
+            layout_version=1,
+            tp_rank=0,
+            recurrent_dtype="float32",
+            conv_dtype="bfloat16",
+        )
+
+        self.patch.authorize_hybrid_apc_prefix_read(key, request_id="req-a")
+
+        self.assertIsNone(
+            self.patch.pop_hybrid_apc_authorized_prefix_key(
+                prefix_len=4,
+                request_id="req-b",
+                cache_salt=None,
+                model_revision="rev-a",
+                layout_version=1,
+                tp_rank=0,
+                recurrent_dtype="float32",
+                conv_dtype="bfloat16",
+            )
+        )
+        self.assertEqual(
+            self.patch.pop_hybrid_apc_authorized_prefix_key(
+                prefix_len=4,
+                request_id="req-a",
+                cache_salt=None,
+                model_revision="rev-a",
+                layout_version=1,
+                tp_rank=0,
+                recurrent_dtype="float32",
+                conv_dtype="bfloat16",
+            ),
+            key,
+        )
+
+    def test_scheduler_authorizes_backed_prefix_read_by_request_id(self):
+        scheduler = _scheduler(
+            block_size=2,
+            enable_backed_prefix_reads=True,
+            use_qwen_hybrid_chunked_prefill=True,
+        )
+        token_ids = [10, 11, 12, 13, 14]
+        hashes = self.patch._local_cumulative_prefix_hashes(
+            token_ids,
+            block_size=2,
+            max_prefix_len=4,
+        )
+        key = self.patch.HybridGDNPrefixKey(
+            cumulative_prefix_hash=hashes[4],
+            prefix_len=4,
+            block_size=2,
+            cache_salt=None,
+            model_revision="rev-a",
+            layout_version=1,
+            tp_rank=0,
+            recurrent_dtype="float32",
+            conv_dtype="bfloat16",
+        )
+        self.patch.register_hybrid_apc_gdn_checkpoint(key)
+        request = types.SimpleNamespace(
+            request_id="req-a",
+            prompt_token_ids=token_ids,
+            num_tokens=len(token_ids),
+            cache_salt=None,
+        )
+
+        with patch.dict(
+            os.environ,
+            {"QWEN36_HYBRID_APC_DISABLE_UNBACKED_PREFIX_READS": "1"},
+        ):
+            self.assertFalse(
+                self.patch.should_disable_unbacked_prefix_reads(scheduler, request)
+            )
+
+        self.assertIsNone(
+            self.patch.pop_hybrid_apc_authorized_prefix_key(
+                prefix_len=4,
+                request_id="req-b",
+                cache_salt=None,
+                model_revision="rev-a",
+                layout_version=1,
+                tp_rank=0,
+                recurrent_dtype="float32",
+                conv_dtype="bfloat16",
+            )
+        )
+        self.assertEqual(
+            self.patch.pop_hybrid_apc_authorized_prefix_key(
+                prefix_len=4,
+                request_id="req-a",
+                cache_salt=None,
+                model_revision="rev-a",
+                layout_version=1,
+                tp_rank=0,
+                recurrent_dtype="float32",
+                conv_dtype="bfloat16",
+            ),
+            key,
+        )
 
     def test_backed_prefix_read_stays_disabled_for_batched_scheduler(self):
         scheduler = _scheduler(
@@ -500,6 +608,53 @@ class TestQwen36HybridAPCSchedulerPatch(unittest.TestCase):
         self.assertTrue(installed)
         self.assertEqual(calls, [True])
         self.assertTrue(request.skip_reading_prefix_cache)
+
+    def test_runner_patch_exposes_request_ids_during_model_execution(self):
+        class FakeRunner:
+            def __init__(self):
+                self.model = types.SimpleNamespace(model=types.SimpleNamespace())
+
+            def _execute_model_for_text(self, model_input, intermediate_tensors=None):
+                self.seen_request_ids = getattr(
+                    self.model.model,
+                    "_qwen36_vllm_request_ids",
+                    None,
+                )
+                return self.seen_request_ids
+
+        installed = self.patch.patch_neuron_model_runner_class(FakeRunner)
+        runner = FakeRunner()
+        result = runner._execute_model_for_text(
+            types.SimpleNamespace(request_ids=["req-a"])
+        )
+
+        self.assertTrue(installed)
+        self.assertEqual(result, ("req-a",))
+        self.assertEqual(runner.seen_request_ids, ("req-a",))
+        self.assertFalse(hasattr(runner.model, "_qwen36_vllm_request_ids"))
+        self.assertFalse(hasattr(runner.model.model, "_qwen36_vllm_request_ids"))
+
+    def test_import_hook_patches_already_loaded_neuron_runner_module(self):
+        class FakeRunner:
+            def __init__(self):
+                self.model = types.SimpleNamespace(model=types.SimpleNamespace())
+
+            def _execute_model_for_text(self, model_input, intermediate_tensors=None):
+                return getattr(self.model.model, "_qwen36_vllm_request_ids", None)
+
+        module = types.SimpleNamespace(NeuronxDistributedModelRunner=FakeRunner)
+        sys.modules[_VLLM_NEURON_RUNNER_MODULE] = module
+
+        installed = self.patch.install_import_hook()
+        runner = FakeRunner()
+        result = runner._execute_model_for_text(
+            types.SimpleNamespace(request_ids=("req-a",))
+        )
+
+        self.assertTrue(installed)
+        self.assertEqual(result, ("req-a",))
+        self.assertFalse(hasattr(runner.model, "_qwen36_vllm_request_ids"))
+        self.assertFalse(hasattr(runner.model.model, "_qwen36_vllm_request_ids"))
 
 
 if __name__ == "__main__":

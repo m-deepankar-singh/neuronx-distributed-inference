@@ -885,6 +885,7 @@ class HybridAPCSchedulerBridge:
         if pop_hybrid_apc_authorized_prefix_key is not None:
             checkpoint_key = pop_hybrid_apc_authorized_prefix_key(
                 prefix_len=restore_len,
+                request_id=request_id,
                 cache_salt=self.cache_salt,
                 model_revision=self.model_revision or self.store.model_revision,
                 layout_version=(

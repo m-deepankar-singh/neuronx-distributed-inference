@@ -227,6 +227,90 @@ The scheduler now keeps backed prefix reads disabled when
 `scheduler_config.max_num_seqs != 1`, so batched serving falls back safely until
 request-scoped metadata is wired.
 
+### 2026-05-18 Late Update
+
+Current overnight target:
+
+```text
+Carry the scheduler-approved GDN restore key with the vLLM request identity,
+then expose that request identity to Qwen request prep through the
+vLLM-Neuron runner without changing the traced NEFF input signature.
+```
+
+The intended short patch is:
+
+- Scheduler authorizes backed prefix reads by exact request id when available.
+- vLLM-Neuron runner temporarily sets `_qwen36_vllm_request_ids` on the model
+  during `_execute_model_for_text`.
+- Qwen model request prep forwards the single request id as `hybrid_request_id`
+  into `prepare_hybrid_apc_request_for_execution`.
+- Hybrid APC suffix restore consumes the scheduler-authorized key with the same
+  request id before falling back to the old length-only diagnostic gate.
+
+This is still guarded by the single-request backed-prefix condition. It removes
+the queue-order assumption from the proven path and prepares the code for a
+later batched/concurrent validation.
+
+### 2026-05-18 Request-Scoped Runner Patch
+
+The request-scoped restore handoff is now wired for the proven single-request
+path:
+
+- Scheduler-authorized prefix reads are stored by exact vLLM request id when
+  the scheduler request exposes one.
+- The vLLM-Neuron runner import hook patches `_execute_model_for_text` and
+  temporarily exposes `model_input.request_ids` on both the runner model wrapper
+  and the nested Qwen model.
+- Qwen request prep forwards that request id as `hybrid_request_id`.
+- Hybrid APC suffix restore consumes the authorized key using the same request
+  id.
+
+One validation run caught the first implementation mistake: the request id was
+only attached to the Neuron wrapper, while Qwen `_get_model_outputs` runs on the
+nested model. That produced the old fallback request id:
+
+```text
+request_id=('seq_id', 0)
+ValueError: suffix-only hybrid APC received an attention prefix hit without scheduler-authorized GDN checkpoint metadata
+```
+
+The fix attaches/restores the temporary request-id attribute on the wrapper and
+nested `.model` chain.
+
+After that fix, the 2K BF16 backed-prefix boundary validation passed without
+`QWEN36_HYBRID_APC_ALLOW_UNHASHED_SINGLE_PREFIX_RESTORE`:
+
+```text
+full_prefix_exact=true
+partial_prefix_exact=true
+real_generated_tokens_passed=true
+cold_partial elapsed: 1.9467s
+warm_partial elapsed: 1.3388s
+```
+
+Key debug proof:
+
+```text
+Installed Qwen Hybrid APC vLLM-Neuron runner patch
+scheduler-decision backed_hit_len=256 supports_backed=True prompt_len=272 registry_size=1
+apply-suffix prompt_len=272 restore_len=256 suffix_len=16 restore_slot=0 input_shape=(1, 16)
+prepare request_id='3-880fa588' attention_hit_len=256 request_prefix_len=272 restore_len=256
+computed=tensor([[256]]) num_queries=tensor([[16]]) restore_mask=tensor([1])
+qwen-cte-call input_shape=(1, 16) position_minmax=256:271 computed=[256] restore_mask=[1]
+```
+
+Artifacts:
+
+- JSON:
+  `/home/ubuntu/validation_logs/hybrid_apc_real_tokens/bf16_hybrid_apc_backed_prefix_d061df5_request_scoped_nested_model_no_unhashed.json`
+- Log:
+  `/home/ubuntu/validation_logs/hybrid_apc_real_tokens/bf16_hybrid_apc_backed_prefix_d061df5_request_scoped_nested_model_no_unhashed.log`
+
+The remaining production work is not the single-request restore identity
+anymore. It is proving and safely enabling this through batched/concurrent
+serving, where `max_num_seqs > 1` is still intentionally disabled for backed
+prefix reads.
+
 The base BF16 host-logits path is not the current blocker when using the per-chunk DeltaNet CTE path:
 
 - Fused CTE artifact goes NaN around 105-106 tokens.
@@ -589,14 +673,15 @@ The exact current problem is:
 Correctness is protected by the scheduler fallback when no matching GDN
 checkpoint exists.
 
-The scheduler-gated backed-prefix path now works: vLLM reuses the 256-token
-attention prefix, Qwen restores the scheduler-authorized GDN checkpoint key,
+The scheduler-gated, request-scoped backed-prefix path now works for the
+single-request boundary case: vLLM reuses the 256-token attention prefix, Qwen
+restores the scheduler-authorized GDN checkpoint key for the same request id,
 runs the 16-token suffix, and cold/warm outputs match.
 
-The remaining production problem is hardening that restore identity for
-concurrent/batched serving. The current successful path uses an in-process
-authorized-key handoff between scheduler and Qwen; a request-id scoped runner
-metadata field would be safer for multi-request serving.
+The remaining production problem is batched/concurrent serving. Backed prefix
+reads are still disabled when scheduler `max_num_seqs != 1`, so the next proof
+must show request-scoped restore identity is correct for multiple live requests
+before that guard is relaxed.
 ```
 
 The proven backed run uses this contract:
@@ -649,15 +734,17 @@ The existing BF16 per-chunk artifact was generated before the backed-prefix CTE 
 
 ## Recommended Next Work
 
-1. Replace the in-process authorized-key queue with request-id scoped metadata
-   for batched/concurrent serving. Current code safely disables backed prefix
-   reads when `max_num_seqs != 1`, including the debug
+1. Add an end-to-end batched/concurrent validation with two warm partial
+   requests sharing a prefix length but requiring different request-scoped GDN
+   keys. Current code safely disables backed prefix reads when
+   `max_num_seqs != 1`, including the debug
    `QWEN36_HYBRID_APC_ENABLE_BACKED_PREFIX_READS` path.
 2. Keep the current scheduler rule: vLLM prefix reads are allowed only when a
    matching GDN checkpoint exists and the runtime config advertises backed CTE
    prefix support.
-3. Add an end-to-end batched validation with two warm partial requests sharing
-   a prefix length but requiring different GDN keys.
+3. After the batched validation exists, decide whether to relax the
+   `max_num_seqs == 1` backed-prefix guard or keep fallback-only behavior for
+   multi-request serving.
 4. Keep rerunning the 2K checkpoint-boundary validation without
    `QWEN36_HYBRID_APC_ALLOW_UNHASHED_SINGLE_PREFIX_RESTORE`.
 5. Expected backed-prefix debug stays:
