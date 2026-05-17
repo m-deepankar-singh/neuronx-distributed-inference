@@ -368,15 +368,46 @@ Follow-up ABI patch:
   - The stage-consistent 24-tensor legacy ABI fix compiles and loads.
   - Warm prefix-cache CTE/TKG length classification is fixed for the host-logits
     path.
+  - A fresh BF16 host-logits artifact built on `980b918` with the fused
+    DeltaNet CTE log-decay clamp reached `COMPILE_DONE` and
+    `LOAD_AFTER_COMPILE_OK`, but still returned all-NaN logits at the NxDI
+    output boundary. Every debug summary reported
+    `finite=0/248320 nan=248320`.
   - On-device BF16 decode still fails because the sampler/token handoff feeds a
     corrupt out-of-vocab token id into TKG.
   - BF16 host-side sampling avoids that corrupt token and no longer crashes on
-    the second/warm request, but logits/sampling still collapse to dummy token
-    `0`, so real generation is not proven.
+    the second/warm request, but NaN logits make CPU sampling collapse to dummy
+    token `0`, so real generation is not proven.
+- Fresh BF16 decay-clamp validation on `980b918`:
+  - Compile artifact:
+    `/home/ubuntu/qwen_artifacts/qwen36_27b_2048_bf16_hybrid_apc_host_logits_decay_clamp_980b918`
+  - Compile log:
+    `/home/ubuntu/validation_logs/hybrid_apc_real_tokens/legacy_tkg_bf16_host_logits_decay_clamp_980b918_compile.log`
+  - Validation log:
+    `/home/ubuntu/validation_logs/hybrid_apc_real_tokens/legacy_tkg_bf16_host_logits_decay_clamp_980b918_validation.log`
+  - Validation JSON:
+    `/home/ubuntu/validation_logs/hybrid_apc_real_tokens/legacy_tkg_bf16_host_logits_decay_clamp_980b918_validation.json`
+  - Result:
+    - Compile succeeded and loaded after compile.
+    - TKG debug stayed in the legacy 24-arg path with valid one-token decode:
+      `input_shape=(1, 1)`, `num_queries=[1]`, in-range slots, and
+      `pa_num_blocks=9`.
+    - Host logits remained all NaN:
+      `[nxdi_output_debug] name=logits shape=(1, 1, 248320) dtype=torch.float32 finite=0/248320 nan=248320`.
+    - The real-token gate failed because cold/warm/full/partial outputs were
+      all token `0`.
+  - Interpretation:
+    - The NaNs are not explained by FP8 MLP quantization, because the artifact
+      is BF16/no-FP8 and still returns all-NaN host logits.
+    - The fused DeltaNet log-decay clamp alone is insufficient. The remaining
+      fault is at or before the traced model's `logits` output slot for the
+      BF16 host-logits path, not only in vLLM CPU sampling.
 - Local verification:
   - `python3 -m py_compile contrib/models/Qwen3.6-27B/src/modeling_qwen35.py contrib/models/Qwen3.6-27B/test/integration/qwen36_27b_compile_fp8.py validation_scripts/qwen36_hybrid_apc_validation.py`
   - `python3 -m pytest contrib/models/Qwen3.6-27B/test/unit/test_qwen36_model_aliases.py contrib/models/Qwen3.6-27B/test/unit/test_qwen36_compile_fp8_config.py contrib/models/Qwen3.6-27B/test/unit/test_hybrid_apc_validation.py`
   - Result: `21 passed` after `f283e93`.
+  - After `980b918`, focused local and remote unit suites passed:
+    `22 passed`.
 
 ## External Reference
 
@@ -394,13 +425,12 @@ entrypoints.
 - Why does on-device sampling feed an invalid token id into TKG
   (`2143289344` in the BF16 PA9 run) even though the TKG block metadata is
   in range?
-- Why does BF16 host-side sampling repeatedly select dummy token `0` after the
-  artifact loads and decodes without the on-device OOB? The next check should
-  inspect the vLLM-Neuron loader/runner logits boundary, because the
-  `modeling_qwen35.py` logit-stage debug did not surface useful summaries from
-  the precompiled-artifact runtime path.
-- Why do host-side BF16 logits/CPU sampling collapse to dummy token `0` even
-  after CTE/TKG active-length handling is fixed?
+- Why does BF16 host-logits mode return all-NaN logits at the NxDI output
+  boundary even after the trace compiles, loads, and TKG metadata stays in
+  range? This is now proven on a fresh BF16/no-FP8 artifact from `980b918`.
+- Why do host-side BF16 logits/CPU sampling collapse to dummy token `0` after
+  CTE/TKG active-length handling is fixed? The dummy token is downstream of
+  all-NaN logits, not yet an independent sampler bug.
 - Why does FP8 host-side `output_logits=True` return all-NaN logits even when
   special scalar handling is set?
 - Whether the older `contrib/qwen36-27b-vllm-apc-pr` branch has a serving/runtime
