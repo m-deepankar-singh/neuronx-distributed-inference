@@ -261,8 +261,16 @@ Follow-up ABI patch:
   by model tag instead of active-token length.
 - With `QWEN36_TKG_LEGACY_ARGS=1`:
   - CTE trace/runtime keeps the expanded 29-tensor Hybrid APC contract.
-  - TKG trace/runtime uses the older 24-tensor prefixless contract.
+  - TKG trace/runtime uses a 24-tensor prefix-cache contract: it keeps
+    `slot_mapping`, `block_table`, `num_queries`, and
+    `computed_context_lens`, but omits the five Hybrid APC restore/commit
+    tensors.
   - Hard arg-count checks fail early if compile/runtime drift again.
+- Remote BF16 compile retry on `ba65161` confirmed the original CTE mismatch
+  is fixed: CTE HLO generation completed. It then failed during TKG tracing
+  when the legacy path blanked prefix-cache metadata, because
+  `BlockKVCacheManager` requires `active_block_table.shape`. The patch was
+  corrected so legacy TKG remains 24 args but retains prefix-cache metadata.
 - Local verification:
   - `python3 -m py_compile contrib/models/Qwen3.6-27B/src/modeling_qwen35.py contrib/models/Qwen3.6-27B/test/integration/qwen36_27b_compile_fp8.py validation_scripts/qwen36_hybrid_apc_validation.py`
   - `python3 -m pytest contrib/models/Qwen3.6-27B/test/unit/test_qwen36_model_aliases.py contrib/models/Qwen3.6-27B/test/unit/test_qwen36_compile_fp8_config.py contrib/models/Qwen3.6-27B/test/unit/test_hybrid_apc_validation.py`

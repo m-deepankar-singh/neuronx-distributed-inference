@@ -336,7 +336,7 @@ class TestQwen36ModelAliases(unittest.TestCase):
         self.assertEqual(generated[24].shape, (1,))
         self.assertEqual(generated[28].shape, (1,))
 
-    def test_legacy_tkg_trace_args_blank_prefix_metadata(self):
+    def test_legacy_tkg_trace_args_keep_prefix_metadata(self):
         wrapper = _make_wrapper(
             self.qwen_module,
             tag=self.qwen_module.TOKEN_GENERATION_MODEL_TAG,
@@ -346,8 +346,10 @@ class TestQwen36ModelAliases(unittest.TestCase):
             generated = wrapper.input_generator()[0]
 
         self.assertEqual(len(generated), 24)
-        for idx in range(11, 15):
-            self.assertEqual(generated[idx].numel(), 0)
+        self.assertEqual(generated[11].shape, (1, 1))
+        self.assertEqual(generated[12].shape, (1, 1))
+        self.assertEqual(generated[13].shape, (1, 1))
+        self.assertEqual(generated[14].shape, (1, 1))
 
     def test_nonlegacy_tkg_trace_args_keep_prefix_and_hybrid_metadata(self):
         wrapper = _make_wrapper(

@@ -2774,10 +2774,6 @@ def _use_expanded_hybrid_args_for_tag(config, tag: str) -> bool:
     return False
 
 
-def _use_legacy_tkg_prefixless_args_for_tag(tag: str) -> bool:
-    return tag == TOKEN_GENERATION_MODEL_TAG and _use_legacy_tkg_args()
-
-
 def _qwen36_expected_arg_count(config, tag: str) -> int:
     return 29 if _use_expanded_hybrid_args_for_tag(config, tag) else 24
 
@@ -3725,11 +3721,6 @@ class Qwen35ModelWrapper(ModelWrapper):
                 vision_mask = torch.zeros((0,), dtype=torch.int32)
 
             padded = list(bucket_inputs)
-            if _use_legacy_tkg_prefixless_args_for_tag(self.tag):
-                while len(padded) < 15:
-                    padded.append(torch.zeros((0,), dtype=torch.int32))
-                for idx in range(11, 15):
-                    padded[idx] = torch.zeros((0,), dtype=torch.int32)
             while len(padded) < 21:
                 padded.append(torch.zeros((0,), dtype=torch.int32))
             padded.append(mrope_position_ids)  # position 21
@@ -4525,7 +4516,7 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
                 )
                 print(
                     "[hybrid_apc_debug] qwen-tkg-call "
-                    f"arg_mode={'legacy' if legacy_tkg_args else 'hybrid'} "
+                    f"arg_mode={'prefix24_legacy' if legacy_tkg_args else 'hybrid29'} "
                     f"input_shape={_debug_tensor_shape(input_ids)} "
                     f"input_values={_debug_tensor_values(input_ids)} "
                     f"attention_shape={_debug_tensor_shape(attention_mask)} "
@@ -4543,59 +4534,44 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
                     f"seq_len={seq_len} max_model_len={max_model_len}",
                     flush=True,
                 )
-            if legacy_tkg_args:
-                tkg_args = [
-                    input_ids,
-                    attention_mask,
-                    position_ids,
-                    seq_ids,
-                    sampling_params,
-                    prev_hidden,
-                    adapter_ids,
-                    *[_empty() for _ in range(14)],
-                    mrope_position_ids,
-                    vision_embeddings,
-                    vision_mask,
-                ]
-            else:
-                tkg_args = [
-                    input_ids,
-                    attention_mask,
-                    position_ids,
-                    seq_ids,
-                    sampling_params,
-                    prev_hidden,
-                    adapter_ids,
-                    _empty(),
-                    _empty(),
-                    _empty(),
-                    _empty(),
-                    slot_mapping_arg,
-                    block_table_arg,
-                    num_queries_arg,
-                    computed_context_lens_arg,
-                    _empty(),
-                    _empty(),
-                    _empty(),
-                    _empty(),
-                    _empty(),
-                    _empty(),
-                    mrope_position_ids,
-                    vision_embeddings,
-                    vision_mask,
-                ]
-                if _use_expanded_hybrid_args_for_tag(
-                    self.config, TOKEN_GENERATION_MODEL_TAG
-                ):
-                    tkg_args.extend(
-                        [
-                            hybrid_restore_slot_ids,
-                            hybrid_restore_mask,
-                            hybrid_restore_prefix_lens,
-                            hybrid_commit_slot_ids,
-                            hybrid_commit_mask,
-                        ]
-                    )
+            tkg_args = [
+                input_ids,
+                attention_mask,
+                position_ids,
+                seq_ids,
+                sampling_params,
+                prev_hidden,
+                adapter_ids,
+                _empty(),
+                _empty(),
+                _empty(),
+                _empty(),
+                slot_mapping_arg,
+                block_table_arg,
+                num_queries_arg,
+                computed_context_lens_arg,
+                _empty(),
+                _empty(),
+                _empty(),
+                _empty(),
+                _empty(),
+                _empty(),
+                mrope_position_ids,
+                vision_embeddings,
+                vision_mask,
+            ]
+            if _use_expanded_hybrid_args_for_tag(
+                self.config, TOKEN_GENERATION_MODEL_TAG
+            ):
+                tkg_args.extend(
+                    [
+                        hybrid_restore_slot_ids,
+                        hybrid_restore_mask,
+                        hybrid_restore_prefix_lens,
+                        hybrid_commit_slot_ids,
+                        hybrid_commit_mask,
+                    ]
+                )
             _assert_qwen36_arg_count(
                 TOKEN_GENERATION_MODEL_TAG,
                 tkg_args,
