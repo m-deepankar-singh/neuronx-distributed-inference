@@ -47,6 +47,38 @@ def _load_module(name: str, path: Path):
     return module
 
 
+def _compiled_neuron_config(args) -> dict:
+    if not args.compiled_artifacts:
+        return {}
+    config_path = Path(args.compiled_artifacts).expanduser() / "neuron_config.json"
+    if not config_path.exists():
+        return {}
+    with config_path.open(encoding="utf-8") as handle:
+        config = json.load(handle)
+    nested = config.get("neuron_config")
+    return nested if isinstance(nested, dict) else config
+
+
+def _validate_generation_batch_support(args) -> None:
+    if args.max_tokens <= 0 or args.max_num_seqs <= 1:
+        return
+    neuron_config = _compiled_neuron_config(args)
+    if not neuron_config:
+        return
+    tkg_batch_size = int(
+        neuron_config.get("tkg_batch_size")
+        or neuron_config.get("batch_size")
+        or neuron_config.get("max_batch_size")
+        or 1
+    )
+    if args.max_num_seqs > tkg_batch_size:
+        raise ValueError(
+            "batched generation requires a compiled artifact with "
+            f"tkg_batch_size >= --max-num-seqs; got tkg_batch_size={tkg_batch_size} "
+            f"and max_num_seqs={args.max_num_seqs}"
+        )
+
+
 def _runner_args(args, *, enable_hybrid_apc: bool):
     return SimpleNamespace(
         cte_bucket=args.cte_bucket,
@@ -54,7 +86,7 @@ def _runner_args(args, *, enable_hybrid_apc: bool):
         cte_bucket_profile=args.cte_bucket_profile,
         seq_len=args.seq_len,
         tensor_parallel_size=args.tensor_parallel_size,
-        max_num_seqs=1,
+        max_num_seqs=args.max_num_seqs,
         ctx_batch_size=args.ctx_batch_size,
         logical_nc_config=args.logical_nc_config,
         block_size=args.block_size,
@@ -133,7 +165,7 @@ def _build_llm(args, *, enable_hybrid_apc: bool):
         "trust_remote_code": True,
         "dtype": "bfloat16",
         "tensor_parallel_size": args.tensor_parallel_size,
-        "max_num_seqs": 1,
+        "max_num_seqs": args.max_num_seqs,
         "max_model_len": args.max_model_len,
         "enable_prefix_caching": enable_hybrid_apc,
         "enable_chunked_prefill": args.enable_vllm_chunked_prefill,
@@ -162,6 +194,19 @@ def _generate(llm, sampling, prompt: str):
     elapsed = time.perf_counter() - start
     token_ids = list(outputs[0].outputs[0].token_ids)
     return {"tokens": token_ids, "elapsed_seconds": elapsed}
+
+
+def _generate_many(llm, sampling, labeled_prompts):
+    start = time.perf_counter()
+    outputs = llm.generate([prompt for _label, prompt in labeled_prompts], sampling)
+    elapsed = time.perf_counter() - start
+    return {
+        label: {
+            "tokens": list(output.outputs[0].token_ids),
+            "elapsed_seconds": elapsed,
+        }
+        for (label, _prompt), output in zip(labeled_prompts, outputs)
+    }
 
 
 def _shutdown_llm(llm) -> None:
@@ -212,6 +257,60 @@ def _generate_batch(args, *, enable_hybrid_apc: bool, labeled_prompts):
     proc = ctx.Process(
         target=_generate_batch_worker,
         args=(vars(args), enable_hybrid_apc, labeled_prompts, result_queue),
+    )
+    proc.start()
+    proc.join()
+
+    try:
+        message = result_queue.get(timeout=1.0)
+    except queue.Empty as exc:
+        raise RuntimeError(
+            f"generation worker exited with code {proc.exitcode} without a report"
+        ) from exc
+    if not message["ok"]:
+        raise RuntimeError(message["traceback"])
+    if proc.exitcode not in (0, None):
+        raise RuntimeError(f"generation worker exited with code {proc.exitcode}")
+    return message["results"]
+
+
+def _generate_grouped_batch_worker(
+    args_dict,
+    enable_hybrid_apc: bool,
+    labeled_prompt_groups,
+    result_queue,
+):
+    llm = None
+    try:
+        args = argparse.Namespace(**args_dict)
+        llm, sampling = _build_llm(args, enable_hybrid_apc=enable_hybrid_apc)
+        results = {}
+        for group in labeled_prompt_groups:
+            if os.environ.get("QWEN36_HYBRID_APC_DEBUG") == "1":
+                print(
+                    "[hybrid_apc_debug] generate-group "
+                    f"labels={[label for label, _prompt in group]} "
+                    f"enable_hybrid_apc={enable_hybrid_apc}",
+                    flush=True,
+                )
+            if len(group) == 1:
+                label, prompt = group[0]
+                results[label] = _generate(llm, sampling, prompt)
+            else:
+                results.update(_generate_many(llm, sampling, group))
+        result_queue.put({"ok": True, "results": results})
+    except BaseException:
+        result_queue.put({"ok": False, "traceback": traceback.format_exc()})
+    finally:
+        _shutdown_llm(llm)
+
+
+def _generate_grouped_batch(args, *, enable_hybrid_apc: bool, labeled_prompt_groups):
+    ctx = multiprocessing.get_context("spawn")
+    result_queue = ctx.Queue()
+    proc = ctx.Process(
+        target=_generate_grouped_batch_worker,
+        args=(vars(args), enable_hybrid_apc, labeled_prompt_groups, result_queue),
     )
     proc.start()
     proc.join()
@@ -335,6 +434,82 @@ def run_exactness(args) -> int:
     return 0 if passed else 1
 
 
+def run_batched_exactness(args) -> int:
+    if not args.shared_prefix_2:
+        raise ValueError("--shared-prefix-2 is required for batched-exactness")
+    _validate_generation_batch_support(args)
+
+    prompt_full_a = args.shared_prefix + args.suffix_a
+    prompt_partial_a = args.shared_prefix + args.suffix_b
+    prompt_full_b = args.shared_prefix_2 + args.suffix_c
+    prompt_partial_b = args.shared_prefix_2 + args.suffix_d
+
+    cold_partial_a = _generate_batch(
+        args,
+        enable_hybrid_apc=True,
+        labeled_prompts=[
+            ("cold_partial_a", prompt_partial_a),
+        ],
+    )["cold_partial_a"]
+    cold_partial_b = _generate_batch(
+        args,
+        enable_hybrid_apc=True,
+        labeled_prompts=[
+            ("cold_partial_b", prompt_partial_b),
+        ],
+    )["cold_partial_b"]
+    warm_results = _generate_grouped_batch(
+        args,
+        enable_hybrid_apc=True,
+        labeled_prompt_groups=[
+            [("warmup_full_a", prompt_full_a)],
+            [("warmup_full_b", prompt_full_b)],
+            [
+                ("warm_partial_a", prompt_partial_a),
+                ("warm_partial_b", prompt_partial_b),
+            ],
+        ],
+    )
+
+    all_results = {
+        "cold_partial_a": cold_partial_a,
+        "cold_partial_b": cold_partial_b,
+        **warm_results,
+    }
+    real_token_checks = _real_token_checks(
+        all_results,
+        {int(token_id) for token_id in args.dummy_token_ids},
+    )
+    report = {
+        "batched_partial_a_exact": (
+            cold_partial_a["tokens"] == warm_results["warm_partial_a"]["tokens"]
+        ),
+        "batched_partial_b_exact": (
+            cold_partial_b["tokens"] == warm_results["warm_partial_b"]["tokens"]
+        ),
+        "max_num_seqs": args.max_num_seqs,
+        "cold_partial_a": cold_partial_a,
+        "cold_partial_b": cold_partial_b,
+        "warmup_full_a": warm_results["warmup_full_a"],
+        "warmup_full_b": warm_results["warmup_full_b"],
+        "warm_partial_a": warm_results["warm_partial_a"],
+        "warm_partial_b": warm_results["warm_partial_b"],
+        "real_generated_tokens_required": args.require_real_tokens,
+        "real_generated_tokens_passed": real_token_checks["passed"],
+        "real_generated_token_checks": real_token_checks["checks"],
+    }
+    if args.output_json:
+        args.output_json.expanduser().write_text(
+            json.dumps(report, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+    print(json.dumps(report, indent=2, sort_keys=True))
+    passed = report["batched_partial_a_exact"] and report["batched_partial_b_exact"]
+    if args.require_real_tokens:
+        passed = passed and real_token_checks["passed"]
+    return 0 if passed else 1
+
+
 def run_hbm(args) -> int:
     hybrid_apc = _load_module("qwen36_hybrid_apc_validation", HYBRID_APC_PATH)
     rows = []
@@ -365,68 +540,82 @@ def parse_args():
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
 
+    def add_common_exact_args(exact):
+        exact.add_argument("--model-path", required=True)
+        exact.add_argument("--compiled-artifacts")
+        exact.add_argument(
+            "--skip-fp8-env",
+            action="store_true",
+            help="Do not set FP8 runtime environment defaults for BF16 control artifacts.",
+        )
+        exact.add_argument("--max-model-len", type=int, default=2048)
+        exact.add_argument("--seq-len", type=int, default=2048)
+        exact.add_argument("--cte-bucket", type=int, default=512)
+        exact.add_argument("--cte-buckets", nargs="+", default=["256,512"])
+        exact.add_argument("--cte-bucket-profile", default="single")
+        exact.add_argument("--tensor-parallel-size", type=int, default=4)
+        exact.add_argument("--max-num-seqs", type=int, default=1)
+        exact.add_argument("--logical-nc-config", type=int, default=2)
+        exact.add_argument("--ctx-batch-size", type=int, default=1)
+        exact.add_argument("--block-size", type=int, default=256)
+        exact.add_argument("--gdn-checkpoint-interval", type=int, default=256)
+        exact.add_argument("--max-gdn-checkpoint-slots", type=int, default=8)
+        exact.add_argument("--gdn-recurrent-cache-dtype", default="float32")
+        exact.add_argument("--gdn-conv-cache-dtype", default="bfloat16")
+        exact.add_argument("--hybrid-apc-require-vllm-metadata", action="store_true")
+        exact.add_argument(
+            "--hybrid-apc-reject-unbacked-attention-hits",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+        )
+        exact.add_argument(
+            "--hybrid-apc-disable-unbacked-prefix-reads",
+            action=argparse.BooleanOptionalAction,
+            default=False,
+        )
+        exact.add_argument(
+            "--hybrid-apc-enable-backed-prefix-reads",
+            action=argparse.BooleanOptionalAction,
+            default=False,
+        )
+        exact.add_argument("--enable-vllm-chunked-prefill", action="store_true")
+        exact.add_argument("--kernel-q-tile-size", type=int, default=128)
+        exact.add_argument("--kernel-kv-tile-size", type=int, default=1024)
+        exact.add_argument("--num-gpu-blocks-override", type=int)
+        exact.add_argument("--max-tokens", type=int, default=32)
+        exact.add_argument(
+            "--shared-prefix",
+            default="System: answer deterministically.\n" * 64,
+        )
+        exact.add_argument("--suffix-a", default="\nUser: What is 17 * 23?\nAssistant:")
+        exact.add_argument("--suffix-b", default="\nUser: What is 19 * 29?\nAssistant:")
+        exact.add_argument(
+            "--require-real-tokens",
+            action="store_true",
+            help=(
+                "Fail exactness if every generated token for any checked request is a "
+                "configured dummy token."
+            ),
+        )
+        exact.add_argument(
+            "--dummy-token-ids",
+            nargs="+",
+            type=int,
+            default=[0],
+            help="Token ids treated as dummy generated output when --require-real-tokens is set.",
+        )
+        exact.add_argument("--output-json", type=Path)
+
     exact = subparsers.add_parser("exactness")
-    exact.add_argument("--model-path", required=True)
-    exact.add_argument("--compiled-artifacts")
-    exact.add_argument(
-        "--skip-fp8-env",
-        action="store_true",
-        help="Do not set FP8 runtime environment defaults for BF16 control artifacts.",
-    )
-    exact.add_argument("--max-model-len", type=int, default=2048)
-    exact.add_argument("--seq-len", type=int, default=2048)
-    exact.add_argument("--cte-bucket", type=int, default=512)
-    exact.add_argument("--cte-buckets", nargs="+", default=["256,512"])
-    exact.add_argument("--cte-bucket-profile", default="single")
-    exact.add_argument("--tensor-parallel-size", type=int, default=4)
-    exact.add_argument("--logical-nc-config", type=int, default=2)
-    exact.add_argument("--ctx-batch-size", type=int, default=1)
-    exact.add_argument("--block-size", type=int, default=256)
-    exact.add_argument("--gdn-checkpoint-interval", type=int, default=256)
-    exact.add_argument("--max-gdn-checkpoint-slots", type=int, default=8)
-    exact.add_argument("--gdn-recurrent-cache-dtype", default="float32")
-    exact.add_argument("--gdn-conv-cache-dtype", default="bfloat16")
-    exact.add_argument("--hybrid-apc-require-vllm-metadata", action="store_true")
-    exact.add_argument(
-        "--hybrid-apc-reject-unbacked-attention-hits",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-    )
-    exact.add_argument(
-        "--hybrid-apc-disable-unbacked-prefix-reads",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-    )
-    exact.add_argument(
-        "--hybrid-apc-enable-backed-prefix-reads",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-    )
-    exact.add_argument("--enable-vllm-chunked-prefill", action="store_true")
-    exact.add_argument("--kernel-q-tile-size", type=int, default=128)
-    exact.add_argument("--kernel-kv-tile-size", type=int, default=1024)
-    exact.add_argument("--num-gpu-blocks-override", type=int)
-    exact.add_argument("--max-tokens", type=int, default=32)
-    exact.add_argument("--shared-prefix", default="System: answer deterministically.\n" * 64)
-    exact.add_argument("--suffix-a", default="\nUser: What is 17 * 23?\nAssistant:")
-    exact.add_argument("--suffix-b", default="\nUser: What is 19 * 29?\nAssistant:")
-    exact.add_argument(
-        "--require-real-tokens",
-        action="store_true",
-        help=(
-            "Fail exactness if every generated token for any checked request is a "
-            "configured dummy token."
-        ),
-    )
-    exact.add_argument(
-        "--dummy-token-ids",
-        nargs="+",
-        type=int,
-        default=[0],
-        help="Token ids treated as dummy generated output when --require-real-tokens is set.",
-    )
-    exact.add_argument("--output-json", type=Path)
+    add_common_exact_args(exact)
     exact.set_defaults(func=run_exactness)
+
+    batched = subparsers.add_parser("batched-exactness")
+    add_common_exact_args(batched)
+    batched.add_argument("--shared-prefix-2", required=True)
+    batched.add_argument("--suffix-c", default="")
+    batched.add_argument("--suffix-d", default="\nUser: What is 23 * 31?\nAssistant:")
+    batched.set_defaults(func=run_batched_exactness)
 
     hbm = subparsers.add_parser("hbm")
     hbm.add_argument("--context-lens", nargs="+", type=int, default=[131072, 262144])

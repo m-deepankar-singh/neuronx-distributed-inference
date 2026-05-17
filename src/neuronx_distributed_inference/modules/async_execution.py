@@ -55,6 +55,24 @@ def _single_batch_value(value: Any):
     return value
 
 
+def _multi_batch_int_values(value: Any) -> list[int] | None:
+    if value is None:
+        return None
+    if isinstance(value, torch.Tensor):
+        flat = value.reshape(-1)
+        if flat.numel() <= 1:
+            return None
+        return [int(item.item()) for item in flat]
+    if isinstance(value, (list, tuple)):
+        if len(value) <= 1:
+            return None
+        try:
+            return [int(item) for item in value]
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
 def _single_batch_tensor(value: Any) -> bool:
     return isinstance(value, torch.Tensor) and value.ndim >= 1 and value.shape[0] == 1
 
@@ -159,13 +177,27 @@ def prepare_hybrid_apc_request_for_execution(
         if seq_id is not None:
             request_id = ("seq_id", _to_python_int(seq_id))
 
-    attention_hit_len = _first_present(
+    attention_hit_len_source = _first_present(
         input_dict.get("vllm_attention_hit_len"),
         input_dict.get("hybrid_attention_hit_len"),
         input_dict.get("attention_hit_len"),
     )
-    if attention_hit_len is None:
-        attention_hit_len = _single_batch_value(input_dict.get("computed_context_lens"))
+    if attention_hit_len_source is None:
+        attention_hit_len_source = input_dict.get("computed_context_lens")
+    attention_hit_len = _single_batch_value(attention_hit_len_source)
+    multi_attention_hit_lens = _multi_batch_int_values(attention_hit_len_source)
+    if attention_hit_len is None and multi_attention_hit_lens is not None:
+        if all(hit_len == 0 for hit_len in multi_attention_hit_lens):
+            if requires_external_metadata:
+                raise ValueError(
+                    "hybrid APC v0 request prep supports one request at a time; "
+                    "vectorized continuous-batching metadata is not wired yet"
+                )
+            return input_dict
+        raise ValueError(
+            "hybrid APC v0 request prep supports one request at a time; "
+            "vectorized continuous-batching metadata is not wired yet"
+        )
 
     if request_id is None and attention_hit_len is None and not requires_external_metadata:
         return input_dict

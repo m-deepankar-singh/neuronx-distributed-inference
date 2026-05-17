@@ -666,6 +666,49 @@ class TestHybridAPCAsyncBridge(unittest.TestCase):
             )
         )
 
+    def test_vectorized_no_hit_batch_skips_hybrid_apc_request_prep(self):
+        bridge = _FakeHybridBridge()
+        base = SimpleNamespace(
+            config=SimpleNamespace(use_hybrid_apc_manager=True),
+            hybrid_apc_bridge=bridge,
+        )
+        input_dict = _prefix_input_dict()
+        input_dict.update(
+            {
+                "hybrid_request_id": ("req-a", "req-b"),
+                "full_context_lens": torch.tensor([4, 4], dtype=torch.int32),
+                "computed_context_lens": torch.tensor([0, 0], dtype=torch.int32),
+            }
+        )
+
+        prepared = prepare_hybrid_apc_request_for_execution(base, input_dict)
+
+        self.assertIs(prepared, input_dict)
+        self.assertIsNone(bridge.prepare_kwargs)
+        self.assertNotIn("_hybrid_apc_prepared", input_dict)
+
+    def test_vectorized_attention_hit_batch_fails_fast_until_restore_is_vectorized(self):
+        bridge = _FakeHybridBridge()
+        base = SimpleNamespace(
+            config=SimpleNamespace(use_hybrid_apc_manager=True),
+            hybrid_apc_bridge=bridge,
+        )
+        input_dict = _prefix_input_dict()
+        input_dict.update(
+            {
+                "hybrid_request_id": ("req-a", "req-b"),
+                "full_context_lens": torch.tensor([4, 4], dtype=torch.int32),
+                "computed_context_lens": torch.tensor([0, 2], dtype=torch.int32),
+            }
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "vectorized continuous-batching metadata is not wired yet",
+        ):
+            prepare_hybrid_apc_request_for_execution(base, input_dict)
+        self.assertIsNone(bridge.prepare_kwargs)
+
     def test_cancel_hybrid_apc_request_is_noop_without_prepared_request(self):
         input_dict = {}
 

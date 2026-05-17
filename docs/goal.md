@@ -311,6 +311,50 @@ anymore. It is proving and safely enabling this through batched/concurrent
 serving, where `max_num_seqs > 1` is still intentionally disabled for backed
 prefix reads.
 
+### 2026-05-18 Batched Validation Prep
+
+The next batched/concurrent slice added two safety pieces:
+
+- Core Hybrid APC request prep now explicitly handles vectorized no-hit
+  metadata. If a multi-request batch has `computed_context_lens=[0, ...]`, it
+  bypasses Hybrid APC prep and lets the scheduler fallback run as normal. If
+  any vectorized request has a nonzero attention hit, it fails fast because
+  vectorized GDN restore is not wired yet.
+- `validation_scripts/qwen36_hybrid_apc_validation.py` now has
+  `batched-exactness`, which warms two distinct prefixes and then submits two
+  partial prompts in a single `llm.generate([...])` group with configurable
+  `--max-num-seqs`.
+
+Focused local and remote tests for this slice:
+
+```text
+101 passed
+```
+
+The first full batched E2E attempt against the current 2K BF16 artifact did not
+reach Hybrid APC restore. It failed in token generation because the artifact was
+compiled for single-request TKG:
+
+```text
+sampling_params shape: [2, 3]
+compiled input_shape_map only has sampling_params shape: [1, 3]
+tkg_batch_size=1
+max_num_seqs=2
+```
+
+The validation harness now preflights this and fails clearly:
+
+```text
+ValueError: batched generation requires a compiled artifact with
+tkg_batch_size >= --max-num-seqs; got tkg_batch_size=1 and max_num_seqs=2
+```
+
+This means a real generated-token batched E2E proof needs either:
+
+- a 2K BF16 artifact compiled with `tkg_batch_size >= 2` / compatible
+  `max_num_seqs=2`, or
+- a separate prefill-only batched validator that does not enter TKG.
+
 The base BF16 host-logits path is not the current blocker when using the per-chunk DeltaNet CTE path:
 
 - Fused CTE artifact goes NaN around 105-106 tokens.
@@ -337,7 +381,8 @@ model restores GDN state and runs only the suffix
 ```
 
 It is guarded to `max_num_seqs=1` because batched/concurrent serving still
-needs request-scoped restore metadata.
+needs vectorized restore prep and an artifact or harness that can prove multiple
+scheduled requests.
 
 ## Overnight Operating Rule
 
@@ -680,8 +725,8 @@ runs the 16-token suffix, and cold/warm outputs match.
 
 The remaining production problem is batched/concurrent serving. Backed prefix
 reads are still disabled when scheduler `max_num_seqs != 1`, so the next proof
-must show request-scoped restore identity is correct for multiple live requests
-before that guard is relaxed.
+must show the request-scoped restore identity and vectorized metadata contract
+are correct for multiple live requests before that guard is relaxed.
 ```
 
 The proven backed run uses this contract:
@@ -710,16 +755,20 @@ the scheduler gate honors serving additional_config, not only hf_config
 the scheduler registry key also honors serving additional_config metadata
 ```
 
-The next required proof is request-id scoped metadata for batched/concurrent
-serving. The single-request boundary path already passes without
-QWEN36_HYBRID_APC_ALLOW_UNHASHED_SINGLE_PREFIX_RESTORE.
+The next required proof is batched/concurrent serving on an artifact or harness
+that can actually execute more than one scheduled request. The single-request
+boundary path already passes without
+QWEN36_HYBRID_APC_ALLOW_UNHASHED_SINGLE_PREFIX_RESTORE, and vectorized no-hit
+fallback is now unit-covered.
 
 Primary files changed or relevant:
 
+- `src/neuronx_distributed_inference/modules/async_execution.py`
 - `src/neuronx_distributed_inference/models/model_wrapper.py`
 - `contrib/models/Qwen3.6-27B/src/modeling_qwen35.py`
 - `contrib/models/Qwen3.6-27B/vllm/qwen36_hybrid_apc_scheduler_patch.py`
 - `contrib/models/Qwen3.6-27B/vllm/run_offline_inference.py`
+- `validation_scripts/qwen36_hybrid_apc_validation.py`
 
 ## Why The Earlier Artifacts Did Not Work
 
@@ -728,23 +777,27 @@ The earlier artifacts failed for different reasons:
 - Fused BF16 CTE artifact: numerical failure/NaNs around 105-106 tokens.
 - FP8 path: still needs BF16 comparison before chasing FP8-specific NaNs.
 - Old warm Hybrid APC runs: reused attention KV without matching GDN recurrent/conv state, so warm logits drifted.
-- Existing BF16 per-chunk artifact: works for correctness when unbacked prefix reads are disabled, but the true backed restore path now exposes a CTE restore/padding contract issue.
+- Existing BF16 per-chunk artifact: works for correctness fallback and the
+  single-request backed restore proof, but it cannot prove generated-token
+  batched serving because its TKG trace is batch 1.
 
-The existing BF16 per-chunk artifact was generated before the backed-prefix CTE path existed. It can prove the safety fallback, but it cannot prove the intended warm-prefix performance path.
+The existing BF16 per-chunk artifact was generated before the full
+backed-prefix and batched proof path existed. It can prove the safety fallback
+and single-request backed path, but not generated-token `max_num_seqs=2`.
 
 ## Recommended Next Work
 
-1. Add an end-to-end batched/concurrent validation with two warm partial
-   requests sharing a prefix length but requiring different request-scoped GDN
-   keys. Current code safely disables backed prefix reads when
-   `max_num_seqs != 1`, including the debug
-   `QWEN36_HYBRID_APC_ENABLE_BACKED_PREFIX_READS` path.
+1. Produce a runnable batched/concurrent proof. The current validation harness
+   has a `batched-exactness` mode, but the current BF16 artifact cannot run it
+   with generated tokens because `tkg_batch_size=1`. Either compile a small 2K
+   BF16 artifact with `tkg_batch_size >= 2` / `max_num_seqs=2`, or add a
+   prefill-only batched validator that avoids TKG.
 2. Keep the current scheduler rule: vLLM prefix reads are allowed only when a
    matching GDN checkpoint exists and the runtime config advertises backed CTE
    prefix support.
-3. After the batched validation exists, decide whether to relax the
-   `max_num_seqs == 1` backed-prefix guard or keep fallback-only behavior for
-   multi-request serving.
+3. After the batched generated-token or prefill-only proof exists, decide
+   whether to relax the `max_num_seqs == 1` backed-prefix guard or keep
+   fallback-only behavior for multi-request serving.
 4. Keep rerunning the 2K checkpoint-boundary validation without
    `QWEN36_HYBRID_APC_ALLOW_UNHASHED_SINGLE_PREFIX_RESTORE`.
 5. Expected backed-prefix debug stays:
@@ -764,9 +817,10 @@ prefix_bucket=256
 8. If the same failure repeats more than twice, search NVIDIA/vLLM implementation details and compare contracts before continuing.
 9. After BF16 backed restore exactness and perf are understood, revisit FP8 and TKG/on-device sampling separately.
 
-The next concrete engineering target is request-scoped restore metadata for
-batched/concurrent serving. The old compile/prove target is done for the 2K
-single-request BF16 boundary case.
+The next concrete engineering target is a runnable batched/concurrent proof.
+The old compile/prove target is done for the 2K single-request BF16 boundary
+case, but the current BF16 artifact cannot run generated-token
+`max_num_seqs=2` validation because its TKG trace is batch 1.
 
 ## NVIDIA/vLLM Comparison
 
@@ -784,8 +838,9 @@ usable_prefix_hit = attention_kv_hit intersect gdn_checkpoint_hit
 ```
 
 The compiled CTE input contract now honors the single-request backed hit during
-suffix-only execution. The remaining Neuron/vLLM gap is request-scoped restore
-identity for batched/concurrent serving.
+suffix-only execution. The remaining Neuron/vLLM gap is vectorized
+batched/concurrent restore handling, plus a generated-token artifact with
+`tkg_batch_size >= 2` or a prefill-only proof that avoids TKG.
 
 References:
 

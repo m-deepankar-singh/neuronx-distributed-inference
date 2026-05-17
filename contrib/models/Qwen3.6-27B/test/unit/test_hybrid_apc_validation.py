@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import importlib.util
+import json
 import sys
 import tempfile
 import unittest
@@ -26,6 +27,12 @@ def _args(**overrides):
         "shared_prefix": "shared",
         "suffix_a": " suffix a",
         "suffix_b": " suffix b",
+        "shared_prefix_2": "shared two",
+        "suffix_c": " suffix c",
+        "suffix_d": " suffix d",
+        "max_num_seqs": 2,
+        "max_tokens": 8,
+        "compiled_artifacts": None,
         "require_real_tokens": True,
         "dummy_token_ids": [0],
         "output_json": None,
@@ -45,6 +52,25 @@ def _fake_generate_batch(tokens_by_label):
         }
 
     return fake_generate_batch
+
+
+def _fake_generate_grouped_batch(tokens_by_label):
+    def fake_generate_grouped_batch(
+        _args,
+        *,
+        enable_hybrid_apc,
+        labeled_prompt_groups,
+    ):
+        results = {}
+        for group in labeled_prompt_groups:
+            for label, _prompt in group:
+                results[label] = {
+                    "tokens": list(tokens_by_label[label]),
+                    "elapsed_seconds": 0.01,
+                }
+        return results
+
+    return fake_generate_grouped_batch
 
 
 class TestHybridAPCValidationRealTokens(unittest.TestCase):
@@ -106,6 +132,57 @@ class TestHybridAPCValidationRealTokens(unittest.TestCase):
             rc = _VALIDATION.run_exactness(_args())
 
         self.assertEqual(rc, 0)
+
+    def test_batched_exactness_checks_two_concurrent_partials(self):
+        tokens_by_label = {
+            "cold_partial_a": [42, 0],
+            "cold_partial_b": [43, 0],
+            "warmup_full_a": [44, 0],
+            "warmup_full_b": [45, 0],
+            "warm_partial_a": [42, 0],
+            "warm_partial_b": [43, 0],
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_json = Path(tmpdir) / "batched_report.json"
+            with patch.object(
+                _VALIDATION,
+                "_generate_batch",
+                side_effect=_fake_generate_batch(tokens_by_label),
+            ):
+                with patch.object(
+                    _VALIDATION,
+                    "_generate_grouped_batch",
+                    side_effect=_fake_generate_grouped_batch(tokens_by_label),
+                ):
+                    rc = _VALIDATION.run_batched_exactness(
+                        _args(output_json=output_json)
+                    )
+
+            self.assertEqual(rc, 0)
+            report = output_json.read_text(encoding="utf-8")
+            self.assertIn('"batched_partial_a_exact": true', report)
+            self.assertIn('"batched_partial_b_exact": true', report)
+            self.assertIn('"max_num_seqs": 2', report)
+
+    def test_batched_exactness_requires_second_prefix(self):
+        with self.assertRaisesRegex(ValueError, "--shared-prefix-2 is required"):
+            _VALIDATION.run_batched_exactness(_args(shared_prefix_2=""))
+
+    def test_batched_exactness_preflights_tkg_batch_size(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "neuron_config.json"
+            config_path.write_text(
+                json.dumps({"neuron_config": {"tkg_batch_size": 1}}),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "tkg_batch_size=1 and max_num_seqs=2",
+            ):
+                _VALIDATION.run_batched_exactness(
+                    _args(compiled_artifacts=tmpdir, max_num_seqs=2)
+                )
 
 
 if __name__ == "__main__":
