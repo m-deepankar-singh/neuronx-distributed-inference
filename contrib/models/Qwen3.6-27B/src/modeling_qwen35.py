@@ -2767,10 +2767,15 @@ def _use_legacy_tkg_args() -> bool:
 def _use_expanded_hybrid_args_for_tag(config, tag: str) -> bool:
     if not getattr(config, "use_hybrid_apc_manager", False):
         return False
+    # The legacy ABI experiment intentionally keeps both traced stages on the
+    # older prefix-cache contract. Neuron prunes the extra CTE hybrid metadata
+    # inputs from the serialized trace, so runtime must not send them either.
+    if _use_legacy_tkg_args():
+        return False
     if tag == CONTEXT_ENCODING_MODEL_TAG:
         return True
     if tag == TOKEN_GENERATION_MODEL_TAG:
-        return not _use_legacy_tkg_args()
+        return True
     return False
 
 

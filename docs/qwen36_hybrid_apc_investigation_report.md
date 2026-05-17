@@ -52,10 +52,10 @@ Added repo-side checks for the next debugging pass:
 - The validation harness supports `--skip-fp8-env` so BF16 artifacts can run
   without `XLA_HANDLE_SPECIAL_SCALAR` / `UNSAFE_FP8FNCAST`.
 - `QWEN36_TKG_LEGACY_ARGS=1` is an experimental compile-time and runtime mode
-  for testing the older token-generation argument contract: CTE keeps the
-  current Hybrid APC expanded args, while TKG uses the older 24-argument
-  mRoPE/vision layout and does not pass prefix-cache or Hybrid APC
-  restore/commit tensors into decode.
+  for testing the older 24-tensor prefix-cache ABI. Both CTE and TKG use the
+  prefix-cache/mRoPE/vision contract and omit Hybrid APC restore/commit tensors.
+  This matches the currently compiled legacy artifacts; Neuron pruned the extra
+  CTE Hybrid APC metadata inputs from the serialized trace.
 
 Minimal BF16 host-logits control to run on Trainium:
 
@@ -260,8 +260,7 @@ Follow-up ABI patch:
 - Local patch after `5396ef3` makes the Qwen wrapper choose argument contracts
   by model tag instead of active-token length.
 - With `QWEN36_TKG_LEGACY_ARGS=1`:
-  - CTE trace/runtime keeps the expanded 29-tensor Hybrid APC contract.
-  - TKG trace/runtime uses a 24-tensor prefix-cache contract: it keeps
+  - CTE and TKG trace/runtime use a 24-tensor prefix-cache contract: it keeps
     `slot_mapping`, `block_table`, `num_queries`, and
     `computed_context_lens`, but omits the five Hybrid APC restore/commit
     tensors.
@@ -271,6 +270,11 @@ Follow-up ABI patch:
   when the legacy path blanked prefix-cache metadata, because
   `BlockKVCacheManager` requires `active_block_table.shape`. The patch was
   corrected so legacy TKG remains 24 args but retains prefix-cache metadata.
+- Remote BF16 compile on `fd47bd1` reached `COMPILE_DONE` and
+  `LOAD_AFTER_COMPILE_OK`, but validation failed before decode because the
+  serialized CTE trace exposed 24 tensor inputs while runtime still sent 29.
+  The latest local patch makes legacy mode stage-consistent with that artifact,
+  so the same artifact can be retested without recompiling.
 - Local verification:
   - `python3 -m py_compile contrib/models/Qwen3.6-27B/src/modeling_qwen35.py contrib/models/Qwen3.6-27B/test/integration/qwen36_27b_compile_fp8.py validation_scripts/qwen36_hybrid_apc_validation.py`
   - `python3 -m pytest contrib/models/Qwen3.6-27B/test/unit/test_qwen36_model_aliases.py contrib/models/Qwen3.6-27B/test/unit/test_qwen36_compile_fp8_config.py contrib/models/Qwen3.6-27B/test/unit/test_hybrid_apc_validation.py`

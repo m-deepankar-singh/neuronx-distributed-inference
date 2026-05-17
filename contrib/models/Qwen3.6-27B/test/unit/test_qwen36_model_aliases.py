@@ -322,7 +322,7 @@ class TestQwen36ModelAliases(unittest.TestCase):
         with patch.dict(os.environ, {"QWEN36_TKG_LEGACY_ARGS": "1"}, clear=True):
             self.assertTrue(self.qwen_module._use_legacy_tkg_args())
 
-    def test_legacy_tkg_does_not_disable_expanded_cte_trace_args(self):
+    def test_legacy_tkg_uses_prefix_contract_for_cte_trace_args(self):
         wrapper = _make_wrapper(
             self.qwen_module,
             tag=self.qwen_module.CONTEXT_ENCODING_MODEL_TAG,
@@ -331,10 +331,11 @@ class TestQwen36ModelAliases(unittest.TestCase):
         with patch.dict(os.environ, {"QWEN36_TKG_LEGACY_ARGS": "1"}, clear=True):
             generated = wrapper.input_generator()[0]
 
-        self.assertEqual(len(generated), 29)
+        self.assertEqual(len(generated), 24)
         self.assertEqual(generated[11].shape, (1, 1))
-        self.assertEqual(generated[24].shape, (1,))
-        self.assertEqual(generated[28].shape, (1,))
+        self.assertEqual(generated[12].shape, (1, 1))
+        self.assertEqual(generated[13].shape, (1, 1))
+        self.assertEqual(generated[14].shape, (1, 1))
 
     def test_legacy_tkg_trace_args_keep_prefix_metadata(self):
         wrapper = _make_wrapper(
