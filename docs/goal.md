@@ -223,6 +223,10 @@ restore metadata or a runner-provided restore slot/key to avoid queue-order
 assumptions.
 ```
 
+The scheduler now keeps backed prefix reads disabled when
+`scheduler_config.max_num_seqs != 1`, so batched serving falls back safely until
+request-scoped metadata is wired.
+
 The base BF16 host-logits path is not the current blocker when using the per-chunk DeltaNet CTE path:
 
 - Fused CTE artifact goes NaN around 105-106 tokens.
@@ -291,6 +295,18 @@ partial_prefix_exact=true
 real_generated_tokens_passed=true
 backed_hit_len=256 supports_backed=True
 apply-suffix prompt_len=272 restore_len=256 suffix_len=16
+```
+
+Local focused tests after the single-request guard:
+
+```text
+61 passed
+```
+
+Remote scheduler subset after the single-request guard:
+
+```text
+13 passed
 ```
 
 Local focused tests after `7d1138e`:
@@ -609,8 +625,8 @@ The existing BF16 per-chunk artifact was generated before the backed-prefix CTE 
 ## Recommended Next Work
 
 1. Replace the in-process authorized-key queue with request-id scoped metadata
-   for batched/concurrent serving, or prove the queue cannot reorder under the
-   target `max_num_seqs` configuration.
+   for batched/concurrent serving. Current code safely disables backed prefix
+   reads when `max_num_seqs != 1`.
 2. Keep the current scheduler rule: vLLM prefix reads are allowed only when a
    matching GDN checkpoint exists and the runtime config advertises backed CTE
    prefix support.

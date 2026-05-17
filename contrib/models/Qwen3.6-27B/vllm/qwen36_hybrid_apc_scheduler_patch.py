@@ -78,6 +78,12 @@ def _scheduler_config_flag(
     return _config_flag(_get_hf_config(vllm_config), name, default)
 
 
+def _max_num_seqs_for_scheduler(scheduler: Any) -> int:
+    scheduler_config = getattr(scheduler, "scheduler_config", None)
+    max_num_seqs = getattr(scheduler_config, "max_num_seqs", 1)
+    return int(max_num_seqs or 1)
+
+
 def _normalize_dtype(value: Any, default: str) -> str:
     if value is None:
         value = default
@@ -315,6 +321,8 @@ def _supports_backed_prefix_reads(scheduler: Any) -> bool:
         return True
 
     if not _scheduler_config_flag(scheduler, "hybrid_apc_enable_backed_prefix_reads"):
+        return False
+    if _max_num_seqs_for_scheduler(scheduler) != 1:
         return False
 
     # A backed GDN checkpoint is not enough on its own. The CTE graph must also
