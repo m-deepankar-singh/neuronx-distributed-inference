@@ -7,12 +7,16 @@ when the GDN checkpoint side is not integrated with the scheduler yet.
 
 from __future__ import annotations
 
+import importlib.abc
+import importlib.machinery
 import logging
 import os
+import sys
 from typing import Any
 
 
 logger = logging.getLogger(__name__)
+_SCHEDULER_MODULE = "vllm.v1.core.sched.scheduler"
 
 
 def _env_flag(name: str) -> bool:
@@ -81,11 +85,69 @@ def patch_scheduler_class(scheduler_cls: type) -> bool:
     return True
 
 
+def _patch_scheduler_module(module: Any) -> bool:
+    scheduler_cls = getattr(module, "Scheduler", None)
+    if scheduler_cls is None:
+        return False
+    installed = patch_scheduler_class(scheduler_cls)
+    if installed:
+        logger.info("Installed Qwen Hybrid APC scheduler fallback patch")
+    return installed
+
+
+class _HybridAPCSchedulerPatchLoader(importlib.abc.Loader):
+    _qwen36_hybrid_apc_loader = True
+
+    def __init__(self, wrapped_loader: importlib.abc.Loader):
+        self.wrapped_loader = wrapped_loader
+
+    def create_module(self, spec):
+        create_module = getattr(self.wrapped_loader, "create_module", None)
+        if create_module is None:
+            return None
+        return create_module(spec)
+
+    def exec_module(self, module):
+        self.wrapped_loader.exec_module(module)
+        _patch_scheduler_module(module)
+
+
+class _HybridAPCSchedulerPatchFinder(importlib.abc.MetaPathFinder):
+    _qwen36_hybrid_apc_import_hook = True
+
+    def find_spec(self, fullname, path, target=None):
+        if fullname != _SCHEDULER_MODULE:
+            return None
+        spec = importlib.machinery.PathFinder.find_spec(fullname, path)
+        if spec is None or spec.loader is None:
+            return spec
+        if getattr(spec.loader, "_qwen36_hybrid_apc_loader", False):
+            return spec
+        spec.loader = _HybridAPCSchedulerPatchLoader(spec.loader)
+        return spec
+
+
+def install_import_hook() -> bool:
+    """Patch Scheduler lazily, without importing vLLM at Python startup."""
+
+    module = sys.modules.get(_SCHEDULER_MODULE)
+    if module is not None:
+        return _patch_scheduler_module(module)
+    for finder in sys.meta_path:
+        if getattr(finder, "_qwen36_hybrid_apc_import_hook", False):
+            return False
+    sys.meta_path.insert(0, _HybridAPCSchedulerPatchFinder())
+    return False
+
+
 def install() -> bool:
     """Install the vLLM scheduler patch when vLLM is available."""
 
     from vllm.v1.core.sched.scheduler import Scheduler  # noqa: WPS433
 
+    module = sys.modules.get(_SCHEDULER_MODULE)
+    if module is not None:
+        return _patch_scheduler_module(module)
     installed = patch_scheduler_class(Scheduler)
     if installed:
         logger.info("Installed Qwen Hybrid APC scheduler fallback patch")

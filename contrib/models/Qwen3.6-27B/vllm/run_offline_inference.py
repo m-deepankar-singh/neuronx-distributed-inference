@@ -278,7 +278,7 @@ def main() -> int:
 
     from hf_qwen35_config import register_qwen35_config  # noqa: WPS433
     from qwen36_hybrid_apc_scheduler_patch import (  # noqa: WPS433
-        install as install_hybrid_apc_scheduler_patch,
+        install_import_hook as install_hybrid_apc_scheduler_patch,
     )
 
     register_qwen35_config()

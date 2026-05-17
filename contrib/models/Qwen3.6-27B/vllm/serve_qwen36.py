@@ -6,7 +6,9 @@ from __future__ import annotations
 import sys
 
 from hf_qwen35_config import register_qwen35_config
-from qwen36_hybrid_apc_scheduler_patch import install as install_hybrid_apc_scheduler_patch
+from qwen36_hybrid_apc_scheduler_patch import (
+    install_import_hook as install_hybrid_apc_scheduler_patch,
+)
 
 
 def main() -> int:
