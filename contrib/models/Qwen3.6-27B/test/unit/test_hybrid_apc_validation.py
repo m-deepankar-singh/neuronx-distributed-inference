@@ -172,13 +172,33 @@ class TestHybridAPCValidationRealTokens(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             config_path = Path(tmpdir) / "neuron_config.json"
             config_path.write_text(
-                json.dumps({"neuron_config": {"tkg_batch_size": 1}}),
+                json.dumps(
+                    {"neuron_config": {"tkg_batch_size": 1, "ctx_batch_size": 2}}
+                ),
                 encoding="utf-8",
             )
 
             with self.assertRaisesRegex(
                 ValueError,
                 "tkg_batch_size=1 and max_num_seqs=2",
+            ):
+                _VALIDATION.run_batched_exactness(
+                    _args(compiled_artifacts=tmpdir, max_num_seqs=2)
+                )
+
+    def test_batched_exactness_preflights_ctx_batch_size(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "neuron_config.json"
+            config_path.write_text(
+                json.dumps(
+                    {"neuron_config": {"tkg_batch_size": 2, "ctx_batch_size": 1}}
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "ctx_batch_size=1 and max_num_seqs=2",
             ):
                 _VALIDATION.run_batched_exactness(
                     _args(compiled_artifacts=tmpdir, max_num_seqs=2)

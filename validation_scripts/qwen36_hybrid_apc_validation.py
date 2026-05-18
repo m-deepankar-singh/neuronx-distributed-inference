@@ -77,6 +77,18 @@ def _validate_generation_batch_support(args) -> None:
             f"tkg_batch_size >= --max-num-seqs; got tkg_batch_size={tkg_batch_size} "
             f"and max_num_seqs={args.max_num_seqs}"
         )
+    ctx_batch_size = int(
+        neuron_config.get("ctx_batch_size")
+        or neuron_config.get("batch_size")
+        or neuron_config.get("max_batch_size")
+        or 1
+    )
+    if args.max_num_seqs > ctx_batch_size:
+        raise ValueError(
+            "batched generation requires a compiled artifact with "
+            f"ctx_batch_size >= --max-num-seqs for grouped prefill host logits; "
+            f"got ctx_batch_size={ctx_batch_size} and max_num_seqs={args.max_num_seqs}"
+        )
 
 
 def _runner_args(args, *, enable_hybrid_apc: bool):

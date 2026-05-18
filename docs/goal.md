@@ -387,6 +387,47 @@ contrib/models/Qwen3.6-27B/test/unit/test_qwen36_compile_fp8_config.py
 8 passed
 ```
 
+### 2026-05-18 Batch-2 TKG Artifact Result
+
+The first batch-2 artifact compiled and loaded:
+
+```text
+/mnt/trainium_artifacts/qwen_artifacts/qwen36_27b_2048_bf16_hybrid_apc_backed_prefix_tkg2_fa5f87e
+batch_size=2
+ctx_batch_size=1
+tkg_batch_size=2
+pa_num_blocks=17
+skip_warmup=True
+```
+
+This removed the old `sampling_params [2,3]` vs compiled `[1,3]` TKG mismatch.
+The batched generated-token validation then failed later in vLLM-Neuron
+host-logits sampling:
+
+```text
+IndexError: index 1 is out of bounds for dimension 0 with size 1
+File: /vllm/vllm_neuron/worker/neuronx_distributed_model_runner.py
+Function: _prepare_logits_for_sampling
+Line: return hidden_states[reorder_indices]
+```
+
+The important runtime clue is that the grouped prefill for two 26-token
+requests was packed into one CTE row:
+
+```text
+qwen-cte-call input_shape=(1, 52)
+sampling_params shape=(1, 3)
+num_queries=[26]
+computed=[0]
+```
+
+vLLM-Neuron then tried to reorder logits for two live request ids, but the model
+output only had one row. This strongly indicates the generated-token batched
+proof needs `ctx_batch_size >= 2` as well as `tkg_batch_size >= 2`, unless
+vLLM-Neuron host-logits sampling is patched to split packed CTE logits. The
+validation preflight now rejects `ctx_batch_size < --max-num-seqs` for batched
+generated-token runs.
+
 The base BF16 host-logits path is not the current blocker when using the per-chunk DeltaNet CTE path:
 
 - Fused CTE artifact goes NaN around 105-106 tokens.
@@ -821,10 +862,12 @@ and single-request backed path, but not generated-token `max_num_seqs=2`.
 ## Recommended Next Work
 
 1. Produce a runnable batched/concurrent proof. The current validation harness
-   has a `batched-exactness` mode, but the current BF16 artifact cannot run it
-   with generated tokens because `tkg_batch_size=1`. Either compile a small 2K
-   BF16 artifact with `tkg_batch_size >= 2` / `max_num_seqs=2`, or add a
-   prefill-only batched validator that avoids TKG.
+   has a `batched-exactness` mode. The batch-2 TKG artifact proved
+   `tkg_batch_size=2` is necessary but not sufficient: with
+   `ctx_batch_size=1`, vLLM-Neuron packs two prefills into one CTE row and then
+   host-logits sampling indexes a missing second row. Compile the next small 2K
+   BF16 artifact with both `tkg_batch_size >= 2` and `ctx_batch_size >= 2`, or
+   add a prefill-only batched validator that avoids host sampling.
 2. Keep the current scheduler rule: vLLM prefix reads are allowed only when a
    matching GDN checkpoint exists and the runtime config advertises backed CTE
    prefix support.
