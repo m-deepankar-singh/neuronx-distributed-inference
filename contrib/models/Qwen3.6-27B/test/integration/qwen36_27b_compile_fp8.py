@@ -30,6 +30,13 @@ _FP8_ENV_DEFAULTS = {
 
 _WEIGHT_DTYPE_FP8_MLP_ONLY = "fp8_mlp_only"
 _WEIGHT_DTYPE_BF16_CONTROL = "bf16_control"
+_DELTANET_CTE_BACKEND_ENV = {
+    "USE_NKI_FUSED",
+    "USE_NKI_CHUNKED",
+    "USE_NKI",
+    "DELTANET_SEQUENTIAL",
+    "USE_PYTORCH_CHUNK",
+}
 
 
 def _ensure_fp8_environment() -> None:
@@ -140,6 +147,32 @@ def _configure_base_compile_work_dir(
     work_dir.mkdir(parents=True, exist_ok=True)
     os.environ["BASE_COMPILE_WORK_DIR"] = str(work_dir)
     return work_dir
+
+
+def _configure_deltanet_cte_backend(backend: str) -> None:
+    """Select the DeltaNet CTE implementation used while tracing the artifact."""
+    if backend == "env":
+        return
+
+    for name in _DELTANET_CTE_BACKEND_ENV:
+        os.environ.pop(name, None)
+
+    if backend == "fused":
+        os.environ["USE_NKI_FUSED"] = "1"
+    elif backend == "nki_chunked":
+        os.environ["USE_NKI_FUSED"] = "0"
+        os.environ["USE_NKI_CHUNKED"] = "1"
+    elif backend == "pytorch_chunk":
+        os.environ["USE_NKI_FUSED"] = "0"
+        os.environ["USE_PYTORCH_CHUNK"] = "1"
+    elif backend == "sequential":
+        os.environ["USE_NKI_FUSED"] = "0"
+        os.environ["DELTANET_SEQUENTIAL"] = "1"
+    elif backend == "nki_recurrent":
+        os.environ["USE_NKI_FUSED"] = "0"
+        os.environ["USE_NKI"] = "1"
+    else:
+        raise ValueError(f"Unsupported DeltaNet CTE backend: {backend}")
 
 
 def _mlp_only_modules_to_not_convert(num_layers: int) -> list[str]:
@@ -407,6 +440,23 @@ def main() -> int:
     parser.add_argument("--enable-prefix-caching", action="store_true")
     parser.add_argument("--enable-hybrid-apc", action="store_true")
     parser.add_argument("--enable-vllm-chunked-prefill", action="store_true")
+    parser.add_argument(
+        "--deltanet-cte-backend",
+        choices=[
+            "env",
+            "fused",
+            "nki_chunked",
+            "pytorch_chunk",
+            "sequential",
+            "nki_recurrent",
+        ],
+        default="env",
+        help=(
+            "DeltaNet CTE backend to force during tracing. The default preserves "
+            "the caller's USE_NKI_* environment. Use nki_chunked or "
+            "pytorch_chunk to compile controls for fused-CTE NaNs."
+        ),
+    )
     parser.add_argument("--disable-on-device-sampling", action="store_true")
     parser.add_argument("--kernel-q-tile-size", type=int, default=128)
     parser.add_argument("--kernel-kv-tile-size", type=int, default=1024)
@@ -442,6 +492,7 @@ def main() -> int:
     sys.path.insert(0, str(contrib_model_dir))
     if args.weight_dtype == _WEIGHT_DTYPE_FP8_MLP_ONLY:
         _ensure_fp8_environment()
+    _configure_deltanet_cte_backend(args.deltanet_cte_backend)
 
     from src.modeling_qwen35 import NeuronQwen35ForCausalLM  # noqa: WPS433
 
@@ -467,6 +518,9 @@ def main() -> int:
     print("MODEL_PATH", str(model_path), flush=True)
     print("COMPILED_PATH", str(compiled_path), flush=True)
     print("BASE_COMPILE_WORK_DIR", str(base_compile_work_dir), flush=True)
+    print("DELTANET_CTE_BACKEND", args.deltanet_cte_backend, flush=True)
+    for env_name in sorted(_DELTANET_CTE_BACKEND_ENV):
+        print(env_name, os.environ.get(env_name), flush=True)
     if quantized_path is not None:
         print("QUANTIZED_CHECKPOINTS_PATH", str(quantized_path), flush=True)
     for env_name in _FP8_ENV_DEFAULTS:

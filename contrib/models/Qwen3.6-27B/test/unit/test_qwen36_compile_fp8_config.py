@@ -90,6 +90,7 @@ def _args(**overrides):
         enable_prefix_caching=True,
         enable_hybrid_apc=True,
         enable_vllm_chunked_prefill=False,
+        deltanet_cte_backend="env",
         disable_on_device_sampling=True,
         kernel_q_tile_size=128,
         kernel_kv_tile_size=1024,
@@ -262,6 +263,45 @@ class TestQwen36CompileFp8Config(unittest.TestCase):
 
             self.assertEqual(work_dir, Path("/tmp/explicit_nxd_workdir").resolve())
             self.assertEqual(os.environ["BASE_COMPILE_WORK_DIR"], str(work_dir))
+
+    def test_deltanet_cte_backend_preserves_environment_by_default(self):
+        with patch.dict(
+            os.environ,
+            {
+                "USE_NKI_FUSED": "custom",
+                "USE_NKI_CHUNKED": "custom",
+            },
+            clear=True,
+        ):
+            _COMPILE._configure_deltanet_cte_backend("env")
+
+            self.assertEqual(os.environ["USE_NKI_FUSED"], "custom")
+            self.assertEqual(os.environ["USE_NKI_CHUNKED"], "custom")
+
+    def test_deltanet_cte_backend_can_force_nki_chunked(self):
+        with patch.dict(
+            os.environ,
+            {
+                "USE_NKI_FUSED": "1",
+                "USE_PYTORCH_CHUNK": "1",
+                "DELTANET_SEQUENTIAL": "1",
+            },
+            clear=True,
+        ):
+            _COMPILE._configure_deltanet_cte_backend("nki_chunked")
+
+            self.assertEqual(os.environ["USE_NKI_FUSED"], "0")
+            self.assertEqual(os.environ["USE_NKI_CHUNKED"], "1")
+            self.assertNotIn("USE_PYTORCH_CHUNK", os.environ)
+            self.assertNotIn("DELTANET_SEQUENTIAL", os.environ)
+
+    def test_deltanet_cte_backend_can_force_pytorch_chunk(self):
+        with patch.dict(os.environ, {"USE_NKI_CHUNKED": "1"}, clear=True):
+            _COMPILE._configure_deltanet_cte_backend("pytorch_chunk")
+
+            self.assertEqual(os.environ["USE_NKI_FUSED"], "0")
+            self.assertEqual(os.environ["USE_PYTORCH_CHUNK"], "1")
+            self.assertNotIn("USE_NKI_CHUNKED", os.environ)
 
     def test_backed_prefix_read_compile_flag_is_forwarded(self):
         with patch.object(

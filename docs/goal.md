@@ -1005,7 +1005,10 @@ Current practical constraints:
 3. Also test a compile-time DeltaNet CTE backend switch before spending time on
    FP8: current artifacts trace the fused chunked path. A control compiled with
    the alternate chunked backend can separate fused-CTE numerical NaNs from
-   host-logits/output-alias contract bugs.
+   host-logits/output-alias contract bugs. Use
+   `--deltanet-cte-backend nki_chunked` on
+   `contrib/models/Qwen3.6-27B/test/integration/qwen36_27b_compile_fp8.py` for
+   that control.
 4. Preserve the current scheduler rule: vLLM prefix reads are allowed only when a
    matching GDN checkpoint exists and the runtime config advertises backed CTE
    prefix support.
