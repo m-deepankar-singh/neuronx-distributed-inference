@@ -22,8 +22,9 @@ Current useful hosts and paths:
 - Weights on Trn2/r7i: `/home/ubuntu/models/Qwen3.6-27B`
 - Current copied BF16 Hybrid APC artifact on Trn2:
   `/mnt/trainium_artifacts/qwen_artifacts/qwen36_27b_2048_bf16_hybrid_apc_backed_prefix_ctx2_tkg2_r7i_trn2_local_7306c2e`
-- Latest copied-artifact validation log:
-  `/home/ubuntu/validation_logs/hybrid_apc_real_tokens/bf16_hybrid_apc_batched_ctx2_tkg2_copied_r7i_db2ee21_20260518T205609Z.log`
+- Latest copied-artifact validation logs:
+  `/home/ubuntu/validation_logs/hybrid_apc_real_tokens/bf16_hybrid_apc_ctx2_tkg2_bucket_pad_probe_pathfix_20260518T215320Z.log`
+  `/home/ubuntu/validation_logs/hybrid_apc_real_tokens/bf16_hybrid_apc_batched_ctx2_tkg2_bucket_pad_validation_simple_20260518T215629Z.log`
 
 Current result:
 
@@ -34,8 +35,9 @@ Trn2 artifact load: passed
 vectorized Hybrid APC request prep: now runs past the old one-request guard
 mixed cached-decode + prefill CTE padding: now pads [2,511] to compiled [2,512]
 slot_mapping/block_table/seq_ids rank repair: passed the static Neuron checks
-batched grouped Hybrid APC validation: reaches generation but emits only token 0
-batched partial exactness: passes for both prompts
+short ctx2/tkg2 probe with commit disabled: finite raw logits and exit 0
+batched grouped Hybrid APC validation: no static CTE shape miss after padding fix
+batched grouped Hybrid APC validation with commit enabled: fails on all-NaN logits
 ```
 
 Current blocker:
@@ -56,12 +58,83 @@ runner_logits_after_prepare shape=(1, 248320)
 finite=0 nan=248320
 ```
 
-The no-Hybrid BF16 host-logits control is finite, so the remaining NaN issue is
-not the generic Qwen host-logits path, vLLM sampling, or vLLM-Neuron output
-slicing. The request-prep and bucket-shape contract now get through validation,
-including the mixed `[2,511]` vectorized CTE case padded to compiled `[2,512]`.
-The remaining issue is specific to the compiled Hybrid APC/chunked artifact
-contract that produces raw logits.
+The no-Hybrid BF16 host-logits control is finite, and the same Hybrid APC
+artifact produces finite raw logits when GDN checkpoint commit is disabled.
+So the remaining NaN issue is not the generic Qwen host-logits path, vLLM
+sampling, vLLM-Neuron output slicing, or the static CTE bucket selector.
+
+The request-prep and bucket-shape contract now get through validation,
+including short batched CTE padded from `[2,16]` to `[2,256]` and grouped
+batched CTE padded to compiled `[2,512]`. The remaining issue is specific to
+the compiled Hybrid APC GDN checkpoint commit/restore contract that produces
+raw all-NaN logits and, for two scheduled requests, only one logits row.
+
+The most likely source is the traced GDN checkpoint commit path. The existing
+compiled artifact still contains the old checkpoint-bank scatter behavior, so
+a real commit-path fix requires patching the model code and compiling a new
+artifact; it cannot be fully fixed by runtime Python padding against the
+already-compiled NEFF.
+
+### 2026-05-18 Batched CTE Bucket Padding Fix
+
+The runtime wrapper now pads batched prefix-cache CTE inputs at the final
+`ModelWrapper.pad_inputs` boundary instead of returning early for batch > 1.
+It selects the target prefill/prefix bucket from the max active/prefix lengths
+across rows and synthesizes the prefix attention mask for mixed rows.
+
+Validation against the existing ctx2/tkg2 artifact:
+
+```text
+short probe:
+  qwen-cte-call input_shape=(2, 16)
+  pad-post padded_input_shape=(2, 256)
+  raw_output[0] finite=248320/248320 nan=0
+  infer_exit:0
+
+batched grouped validation:
+  qwen-cte-call input_shape=(2, 512)
+  pad-post padded_input_shape=(2, 512)
+  no "Input shape not found" static Neuron error
+```
+
+The batched validation still fails after the shape fix:
+
+```text
+raw_output[0] shape=(1, 1, 248320)
+finite=0/248320 nan=248320
+request_ids=['2-b99eee03', '3-897b6f9b']
+prefill_completion_state=tensor([ True, False])
+IndexError: index 1 is out of bounds for dimension 0 with size 1
+validation_exit:1
+```
+
+Interpretation:
+
+```text
+Fixed:
+  static batched CTE bucket mismatch ([2,16]/[2,511] reaching Neuron)
+
+Still blocked:
+  compiled Hybrid APC checkpoint commit path corrupts/returns all-NaN logits
+  compiled graph returns one logits row for two scheduled rows
+
+Applied code fix before recompile:
+  HybridGDNCheckpointCache.commit_from_active_rows no longer uses scatter over
+  all padded rows. It writes only rows enabled by commit_mask, so duplicate
+  padded slot IDs such as commit_slot_ids=[0, 0] with commit_mask=[1, 0] cannot
+  let an inactive padded row overwrite the active checkpoint row.
+
+Validation:
+  local qwen36 alias tests: 17 passed
+  remote qwen36 alias tests on Trn2: 17 passed
+  remote model wrapper tests on Trn2: 34 passed
+  local async_execution tests: 33 passed
+
+Remaining required step:
+  compile a fresh Hybrid APC artifact with the commit-path fix. The existing
+  ctx2/tkg2 artifact still has the old scatter behavior baked into its NEFF, so
+  it can prove runtime padding but cannot prove the checkpoint commit fix.
+```
 
 ### 2026-05-18 No-Hybrid BF16 Host-Logits Control
 

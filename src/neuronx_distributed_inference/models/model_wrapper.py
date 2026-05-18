@@ -1050,14 +1050,24 @@ class ModelWrapper(torch.nn.Module):
             return buckets[bucket_idx]
         # recover the bucket for special handling
         else:
+            def _cte_bucket_dim_or_default(tensor, default_value):
+                if tensor.numel() == 0:
+                    return torch.tensor(default_value, dtype=torch.int32)
+                values = tensor.reshape(-1).to(torch.int32)
+                if args[0].shape[0] > 1:
+                    return torch.max(values)
+                return values[0]
+
             if horizontal_dim.numel() == 0:
                 horizontal_dim = torch.tensor(0, dtype=torch.int32)
             else:
-                horizontal_dim = horizontal_dim.reshape(-1)[0]
+                horizontal_dim = _cte_bucket_dim_or_default(horizontal_dim, 0)
             if vertical_dim.numel() == 0:
                 vertical_dim = torch.tensor(args[0].shape[-1], dtype=torch.int32)
             else:
-                vertical_dim = vertical_dim.reshape(-1)[0]
+                vertical_dim = _cte_bucket_dim_or_default(
+                    vertical_dim, args[0].shape[-1]
+                )
             prefix_buckets = []
             prefill_buckets = []
             for b in buckets:
@@ -1115,10 +1125,6 @@ class ModelWrapper(torch.nn.Module):
             return buckets[bucket_idx]
 
     def _pad_prefix_caching_inputs(self, *args, pad_type="first_fit"):
-        if self.tag == CONTEXT_ENCODING_MODEL_TAG and args[0].shape[0] > 1:
-            # We delay all paddings for CTE until we really need them
-            return args
-
         def _debug_int(value):
             if hasattr(value, "item"):
                 return int(value.item())
@@ -1172,11 +1178,20 @@ class ModelWrapper(torch.nn.Module):
                 num_queries = _length_matrix_or_default(args[13], prefill_len)
                 computed_context_lens = _length_matrix_or_default(args[14], prefix_len)
             if slot_mapping.dim() == 1:
-                slot_mapping = slot_mapping.view(1, -1)
+                if args[0].shape[0] > 1 and slot_mapping.shape[0] == args[0].shape[0]:
+                    slot_mapping = slot_mapping.view(args[0].shape[0], 1)
+                else:
+                    slot_mapping = slot_mapping.view(1, -1)
             if block_table.dim() == 1:
-                block_table = block_table.view(1, -1)
+                if args[0].shape[0] > 1 and block_table.shape[0] == args[0].shape[0]:
+                    block_table = block_table.view(args[0].shape[0], 1)
+                else:
+                    block_table = block_table.view(1, -1)
             slot_mapping = slot_mapping.to(torch.int32)
             block_table = block_table.to(torch.int32)
+            if args[0].shape[0] > 1:
+                prefill_len = torch.max(num_queries.reshape(-1))
+                prefix_len = torch.max(computed_context_lens.reshape(-1))
             if debug_hybrid_apc:
                 print(
                     "[hybrid_apc_debug] pad-pre "
@@ -1189,6 +1204,115 @@ class ModelWrapper(torch.nn.Module):
                     f"prefill_bucket={prefill_bucket} prefix_bucket={prefix_bucket}",
                     flush=True,
                 )
+            if args[0].shape[0] > 1:
+                batch_size = args[0].shape[0]
+                prefill_bucket_int = _debug_int(prefill_bucket)
+                prefix_bucket_int = _debug_int(prefix_bucket)
+
+                def _right_pad_or_trim_dim1(tensor, target_len, pad_value):
+                    if tensor.shape[1] > target_len:
+                        return tensor[:, :target_len]
+                    return F.pad(
+                        tensor,
+                        (0, target_len - tensor.shape[1]),
+                        "constant",
+                        pad_value,
+                    )
+
+                padded_inputs = _right_pad_or_trim_dim1(
+                    args[0], prefill_bucket_int, self.config.pad_token_id
+                )
+                padded_position_id = _right_pad_or_trim_dim1(
+                    args[2], prefill_bucket_int, 1
+                )
+                padded_slot_mapping = _right_pad_or_trim_dim1(
+                    slot_mapping, prefill_bucket_int, -1
+                )
+
+                if prefix_bucket_int == 0:
+                    padded_attn_mask = torch.zeros(
+                        1, dtype=torch.int32, device=args[1].device
+                    )
+                    padded_block_table = torch.zeros(
+                        1, dtype=torch.int32, device=block_table.device
+                    )
+                else:
+                    padded_attn_mask = torch.zeros(
+                        (batch_size, prefix_bucket_int),
+                        dtype=torch.int32,
+                        device=args[1].device,
+                    )
+                    prefix_lengths = computed_context_lens.reshape(-1).to(torch.int64)
+                    for row_idx in range(min(batch_size, int(prefix_lengths.numel()))):
+                        row_prefix_len = max(
+                            0,
+                            min(
+                                int(prefix_lengths[row_idx].item()),
+                                prefix_bucket_int,
+                            ),
+                        )
+                        if row_prefix_len:
+                            padded_attn_mask[row_idx, :row_prefix_len] = 1
+
+                    num_blocks = prefix_bucket_int // self.neuron_config.pa_block_size
+                    if block_table.shape[0] < batch_size:
+                        pad_rows = torch.zeros(
+                            (batch_size - block_table.shape[0], block_table.shape[1]),
+                            dtype=block_table.dtype,
+                            device=block_table.device,
+                        )
+                        block_table = torch.cat([block_table, pad_rows], dim=0)
+                    elif block_table.shape[0] > batch_size:
+                        block_table = block_table[:batch_size]
+                    if block_table.shape[1] > num_blocks:
+                        padded_block_table = block_table[:, :num_blocks]
+                    else:
+                        padded_block_table = F.pad(
+                            block_table,
+                            (0, num_blocks - block_table.shape[1]),
+                            "constant",
+                            0,
+                        )
+
+                if self.neuron_config.enable_fused_speculation:
+                    args = (
+                        padded_inputs,
+                        padded_attn_mask,
+                        padded_position_id,
+                        *args[3:7],
+                        padded_slot_mapping,
+                        padded_block_table,
+                        num_queries,
+                        computed_context_lens,
+                        *args[11:],
+                    )
+                else:
+                    args = (
+                        padded_inputs,
+                        padded_attn_mask,
+                        padded_position_id,
+                        *args[3:11],
+                        padded_slot_mapping,
+                        padded_block_table,
+                        num_queries,
+                        computed_context_lens,
+                        *args[15:],
+                    )
+                if debug_hybrid_apc:
+                    print(
+                        "[hybrid_apc_debug] pad-post "
+                        f"tag={self.tag} batched_cte=1 "
+                        f"prefill_bucket={prefill_bucket} prefix_bucket={prefix_bucket} "
+                        f"padded_input_shape={tuple(padded_inputs.shape)} "
+                        f"padded_attention_shape={tuple(padded_attn_mask.shape)} "
+                        f"padded_position_shape={tuple(padded_position_id.shape)} "
+                        f"padded_slot_shape={tuple(padded_slot_mapping.shape)} "
+                        f"padded_slot_minmax={_debug_minmax(padded_slot_mapping)} "
+                        f"padded_block_shape={tuple(padded_block_table.shape)} "
+                        f"padded_block_minmax={_debug_minmax(padded_block_table)}",
+                        flush=True,
+                    )
+                return tuple(args)
             if self.neuron_config.enable_eagle_speculation:
                 target_recomputation = 0 if prefix_bucket == 0 else self.neuron_config.pa_block_size
                 extra_prefill_slots = max(0, prefill_bucket - prefill_len - target_recomputation)

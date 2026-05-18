@@ -342,6 +342,55 @@ class TestQwen36ModelAliases(unittest.TestCase):
             self.qwen_module.FUSED_DELTANET_DECAY_MAX,
         )
 
+    def test_hybrid_checkpoint_commit_ignores_inactive_duplicate_slot_rows(self):
+        config = SimpleNamespace(
+            layer_types=["linear_attention"],
+            max_gdn_checkpoint_slots=3,
+            linear_num_value_heads=1,
+            linear_num_key_heads=1,
+            linear_key_head_dim=2,
+            linear_value_head_dim=2,
+            linear_conv_kernel_dim=3,
+            hybrid_recurrent_cache_dtype="float32",
+            hybrid_conv_cache_dtype="bfloat16",
+            neuron_config=SimpleNamespace(tp_degree=1),
+        )
+        cache = self.qwen_module.HybridGDNCheckpointCache(config)
+        with torch.no_grad():
+            cache.recurrent_slots[0].copy_(
+                torch.arange(12, dtype=torch.float32).reshape(3, 1, 2, 2)
+            )
+            cache.conv_slots[0].copy_(
+                torch.arange(36, dtype=torch.bfloat16).reshape(3, 6, 2)
+            )
+
+        old_recurrent = cache.recurrent_slots[0].detach().clone()
+        old_conv = cache.conv_slots[0].detach().clone()
+        recurrent_state = torch.stack(
+            [
+                torch.full((1, 2, 2), 101.0),
+                torch.full((1, 2, 2), 999.0),
+            ]
+        )
+        conv_state = torch.stack(
+            [
+                torch.full((6, 2), 11.0, dtype=torch.bfloat16),
+                torch.full((6, 2), 99.0, dtype=torch.bfloat16),
+            ]
+        )
+
+        recurrent_out, conv_out = cache.commit_from_active_rows(
+            layer_state_pairs=[(0, recurrent_state, conv_state)],
+            seq_ids=torch.tensor([0, 1], dtype=torch.int32),
+            checkpoint_slot_ids=torch.tensor([0, 0], dtype=torch.int32),
+            commit_mask=torch.tensor([1, 0], dtype=torch.int32),
+        )
+
+        self.assertTrue(torch.equal(recurrent_out[0], recurrent_state[0]))
+        self.assertTrue(torch.equal(conv_out[0], conv_state[0]))
+        self.assertTrue(torch.equal(recurrent_out[1:], old_recurrent[1:]))
+        self.assertTrue(torch.equal(conv_out[1:], old_conv[1:]))
+
     def test_legacy_tkg_args_are_env_gated(self):
         with patch.dict(os.environ, {}, clear=True):
             self.assertFalse(self.qwen_module._use_legacy_tkg_args())

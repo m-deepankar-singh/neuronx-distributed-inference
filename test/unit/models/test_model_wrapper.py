@@ -380,6 +380,89 @@ def test_prefix_caching_cte_input_generation_uses_valid_block_slots():
     assert torch.equal(computed_context_lens, torch.tensor([[512]], dtype=torch.int32))
 
 
+def _batched_prefix_cte_wrapper():
+    neuron_config = NeuronConfig(
+        batch_size=2,
+        torch_dtype=torch.float32,
+        buckets=[
+            [256, 0],
+            [256, 256],
+            [256, 512],
+            [512, 0],
+            [512, 256],
+            [512, 512],
+        ],
+        bucket_n_active_tokens=True,
+        is_prefix_caching=True,
+        is_block_kv_layout=True,
+        pa_block_size=256,
+        pa_num_blocks=16,
+        seq_len=512,
+        max_context_length=512,
+        max_length=512,
+    )
+    config = InferenceConfig(neuron_config=neuron_config)
+    config.pad_token_id = 0
+    config.hidden_size = 128
+    return ModelWrapper(config, MockModel, tag=CONTEXT_ENCODING_MODEL_TAG)
+
+
+def _batched_prefix_cte_args(active_len, *, query_lens, prefix_lens):
+    batch_size = len(query_lens)
+    empty = torch.empty(0)
+    return (
+        torch.ones((batch_size, active_len), dtype=torch.int32),
+        torch.ones((batch_size, active_len), dtype=torch.int32),
+        torch.arange(active_len, dtype=torch.int32).unsqueeze(0).expand(batch_size, -1),
+        torch.arange(batch_size, dtype=torch.int32),
+        torch.ones((batch_size, 3), dtype=torch.float32),
+        empty,
+        torch.zeros((batch_size,), dtype=torch.int32),
+        empty,
+        empty,
+        empty,
+        empty,
+        torch.arange(batch_size * active_len, dtype=torch.int32).reshape(
+            batch_size, active_len
+        ),
+        torch.arange(batch_size * 3, dtype=torch.int32).reshape(batch_size, 3),
+        torch.tensor(query_lens, dtype=torch.int32).reshape(batch_size, 1),
+        torch.tensor(prefix_lens, dtype=torch.int32).reshape(batch_size, 1),
+    )
+
+
+def test_prefix_caching_batched_cte_pad_inputs_to_prefill_bucket():
+    wrapper = _batched_prefix_cte_wrapper()
+    padded = wrapper.pad_inputs(
+        *_batched_prefix_cte_args(16, query_lens=[16, 16], prefix_lens=[0, 0])
+    )
+
+    assert padded[0].shape == (2, 256)
+    assert padded[1].shape == (1,)
+    assert padded[2].shape == (2, 256)
+    assert padded[11].shape == (2, 256)
+    assert padded[12].shape == (1,)
+    assert torch.equal(padded[13], torch.tensor([[16], [16]], dtype=torch.int32))
+    assert torch.equal(padded[14], torch.tensor([[0], [0]], dtype=torch.int32))
+
+
+def test_prefix_caching_batched_cte_uses_max_prefix_bucket_for_mixed_rows():
+    wrapper = _batched_prefix_cte_wrapper()
+    padded = wrapper.pad_inputs(
+        *_batched_prefix_cte_args(511, query_lens=[511, 1], prefix_lens=[0, 512])
+    )
+
+    assert padded[0].shape == (2, 512)
+    assert padded[1].shape == (2, 512)
+    assert padded[2].shape == (2, 512)
+    assert padded[11].shape == (2, 512)
+    assert padded[12].shape == (2, 2)
+    assert torch.equal(padded[1][0], torch.zeros(512, dtype=torch.int32))
+    assert torch.equal(padded[1][1], torch.ones(512, dtype=torch.int32))
+    assert torch.equal(padded[13], torch.tensor([[511], [1]], dtype=torch.int32))
+    assert torch.equal(padded[14], torch.tensor([[0], [512]], dtype=torch.int32))
+
+
 def test_batch_bucketing_target_bucket_selection():
     """Test get_target_bucket selects smallest bucket that fits."""
     config = create_base_config()

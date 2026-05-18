@@ -2779,6 +2779,22 @@ class HybridGDNCheckpointCache(nn.Module):
             layer_id: (recurrent_state, conv_state)
             for layer_id, recurrent_state, conv_state in layer_state_pairs
         }
+
+        def _commit_rows(slots, rows, row_mask):
+            output = slots * 1
+            slot_axis = torch.arange(
+                slots.shape[0], dtype=slot_ids.dtype, device=slot_ids.device
+            )
+            broadcast_shape = (slots.shape[0],) + (1,) * (slots.ndim - 1)
+            for row_idx in range(batch_size):
+                write_mask = torch.logical_and(
+                    row_mask[row_idx],
+                    slot_axis == slot_ids[row_idx],
+                ).view(broadcast_shape)
+                row_value = rows[row_idx : row_idx + 1].expand_as(output)
+                output = torch.where(write_mask, row_value, output)
+            return output
+
         outputs = []
         for bank_idx, layer_id in enumerate(self.gdn_layer_ids):
             recurrent_slots = self.recurrent_slots[bank_idx]
@@ -2796,24 +2812,8 @@ class HybridGDNCheckpointCache(nn.Module):
                 conv_slots.dtype
             )
 
-            old_recurrent_rows = torch.index_select(recurrent_slots, 0, slot_ids)
-            old_conv_rows = torch.index_select(conv_slots, 0, slot_ids)
-            recurrent_rows = torch.where(rec_mask, recurrent_rows, old_recurrent_rows)
-            conv_rows = torch.where(conv_mask, conv_rows, old_conv_rows)
-
-            recurrent_index = slot_ids.view(-1, 1, 1, 1).expand_as(recurrent_rows)
-            conv_index = slot_ids.view(-1, 1, 1).expand_as(conv_rows)
-            outputs.append(
-                torch.scatter(
-                    recurrent_slots,
-                    dim=0,
-                    index=recurrent_index,
-                    src=recurrent_rows,
-                )
-            )
-            outputs.append(
-                torch.scatter(conv_slots, dim=0, index=conv_index, src=conv_rows)
-            )
+            outputs.append(_commit_rows(recurrent_slots, recurrent_rows, commit_mask))
+            outputs.append(_commit_rows(conv_slots, conv_rows, commit_mask))
         return outputs
 
     def identity_outputs(self) -> list[torch.Tensor]:
@@ -4598,6 +4598,14 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
             pad = torch.full(pad_shape, fill_value, dtype=value.dtype)
             return torch.cat([value, pad], dim=0)
 
+        def _pad_batch_repeat_first(value, target_batch):
+            if value is None or not hasattr(value, "numel") or value.numel() == 0:
+                return value
+            if value.ndim == 0 or value.shape[0] >= target_batch:
+                return value
+            pad_n = target_batch - value.shape[0]
+            return torch.cat([value, value[:1].expand(pad_n, *value.shape[1:])], dim=0)
+
         if self.neuron_config.is_prefix_caching:
             if is_prefill:
                 computed_context_lens_arg = _length_matrix(computed_context_lens, 0)
@@ -4725,10 +4733,14 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
                         [chunk_sampling, chunk_sampling[:1].expand(pad_n, -1)], dim=0
                     )
                     chunk_slot_mapping = _pad_batch(chunk_slot_mapping, ctx_bs, -1)
-                    chunk_block_table = _pad_batch(chunk_block_table, ctx_bs, 0)
-                    chunk_num_queries = _pad_batch(chunk_num_queries, ctx_bs, 0)
-                    chunk_computed_context_lens = _pad_batch(
-                        chunk_computed_context_lens, ctx_bs, 0
+                    chunk_block_table = _pad_batch_repeat_first(
+                        chunk_block_table, ctx_bs
+                    )
+                    chunk_num_queries = _pad_batch_repeat_first(
+                        chunk_num_queries, ctx_bs
+                    )
+                    chunk_computed_context_lens = _pad_batch_repeat_first(
+                        chunk_computed_context_lens, ctx_bs
                     )
                     chunk_restore_slots = torch.cat(
                         [chunk_restore_slots, torch.zeros(pad_n, dtype=chunk_restore_slots.dtype)],
