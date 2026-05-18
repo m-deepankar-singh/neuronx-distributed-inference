@@ -1078,10 +1078,13 @@ weights download status: success
 weights size: 52G
 weights safetensors: 15
 weights log: /home/ubuntu/validation_logs/setup/qwen36_weights_download.log
-active compile pid: 4684
-active compile artifact: /mnt/trainium_artifacts/qwen_artifacts/qwen36_27b_2048_bf16_hybrid_apc_backed_prefix_ctx2_tkg2_256only_8c694f6
-active compile log: /home/ubuntu/validation_logs/hybrid_apc_real_tokens/bf16_hybrid_apc_backed_prefix_ctx2_tkg2_256only_8c694f6_compile.log
-active compile status: /home/ubuntu/validation_logs/hybrid_apc_real_tokens/bf16_hybrid_apc_backed_prefix_ctx2_tkg2_256only_8c694f6_compile.status
+256-only compile status: success
+256-only artifact: /mnt/trainium_artifacts/qwen_artifacts/qwen36_27b_2048_bf16_hybrid_apc_backed_prefix_ctx2_tkg2_256only_8c694f6
+256-only artifact size: 51G
+active compile pid: 5773
+active compile artifact: /mnt/trainium_artifacts/qwen_artifacts/qwen36_27b_2048_bf16_hybrid_apc_backed_prefix_ctx2_tkg2_512only_8c694f6
+active compile log: /home/ubuntu/validation_logs/hybrid_apc_real_tokens/bf16_hybrid_apc_backed_prefix_ctx2_tkg2_512only_8c694f6_compile.log
+active compile status: /home/ubuntu/validation_logs/hybrid_apc_real_tokens/bf16_hybrid_apc_backed_prefix_ctx2_tkg2_512only_8c694f6_compile.status
 ```
 
 Remote `py_compile` passed for:
