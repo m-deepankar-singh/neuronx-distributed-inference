@@ -1318,6 +1318,8 @@ Then copy the full `$ART` directory to the smaller inference instance under the
 same or another stable path. Validate there without running the compile helper:
 
 ```bash
+P2=$(python3 -c 'print("System B: answer deterministically.\n" * 62, end="")')
+
 QWEN36_HYBRID_APC_DEBUG=1 \
 python3 validation_scripts/qwen36_hybrid_apc_validation.py batched-exactness \
   --model-path /home/ubuntu/models/Qwen3.6-27B \
@@ -1325,6 +1327,7 @@ python3 validation_scripts/qwen36_hybrid_apc_validation.py batched-exactness \
   --max-model-len 2048 \
   --seq-len 2048 \
   --cte-buckets 256,512 \
+  --align-prompts-to-cte-buckets \
   --tensor-parallel-size 4 \
   --max-num-seqs 2 \
   --logical-nc-config 2 \
@@ -1339,7 +1342,8 @@ python3 validation_scripts/qwen36_hybrid_apc_validation.py batched-exactness \
   --num-gpu-blocks-override 16 \
   --max-tokens 8 \
   --require-real-tokens \
-  --skip-fp8-env
+  --skip-fp8-env \
+  --shared-prefix-2 "$P2"
 ```
 
 If the copied artifact fails to load on the smaller box, first inspect:
@@ -1422,14 +1426,11 @@ all-HLO compile phase: 616.075s
 final save/package: completed, COMPILE_EXIT=0
 ```
 
-This resolves the compile-capacity blocker from the smaller Trn2 host for the
-2K ctx2/tkg2 multi-bucket BF16 artifact. It does not yet prove runtime
-correctness. The next step is to copy the full artifact directory to a healthy
-Trn2 inference instance and run `batched-exactness` from
-`validation_scripts/qwen36_hybrid_apc_validation.py` with
-`--compiled-artifacts` pointing to the copied directory. That runtime test is
-where we will learn whether the remaining blocker is gone or whether the decode
-TKG input contract still causes `NRT_EXEC_OOB`.
+This resolved the compile-capacity blocker from the smaller Trn2 host for the
+2K ctx2/tkg2 multi-bucket BF16 artifact. The next section records the follow-up
+copy and runtime validation on Trn2. That run proved artifact portability and
+single-request generation, and narrowed the remaining blocker to vectorized
+Hybrid APC request-prep metadata rather than `NRT_EXEC_OOB`.
 
 ## 2026-05-19 Trn2 Copy And Runtime Result
 
@@ -1520,6 +1521,30 @@ request. vLLM's prefix caching design uses hash-addressed KV blocks, and its
 PagedAttention path maps logical request blocks to non-contiguous physical KV
 blocks; the Neuron path needs the same per-row contract for the GDN
 restore/commit metadata.
+
+Concrete implementation checklist for the next patch:
+
+```text
+1. In prepare_hybrid_apc_request_for_execution, replace the current vectorized
+   metadata guard with per-row preparation for batch-size > 1.
+2. Derive a stable per-row request identity from explicit scheduler metadata
+   when available, falling back to seq_ids only when that remains valid across
+   the full request lifecycle.
+3. For each row, read that row's attention hit length, full prefix length, full
+   input IDs, and cumulative prefix hashes.
+4. Call the Qwen Hybrid APC bridge independently per row so restore/commit
+   decisions are not collapsed to one request.
+5. Materialize batched tensors with shape [batch]:
+   hybrid_restore_slot_ids, hybrid_restore_mask,
+   hybrid_restore_prefix_lens, hybrid_commit_slot_ids, hybrid_commit_mask.
+6. Preserve the no-hit fallback path for rows that do not restore, while still
+   allowing other rows in the same batch to restore or commit.
+7. Add unit tests covering a mixed batch:
+   one no-hit row, one backed-prefix-hit row, and two commit slots.
+8. Rerun the copied-artifact Trn2 validation:
+   bf16_hybrid_apc_batched_ctx2_tkg2_copied_r7i_db2ee21 with
+   --align-prompts-to-cte-buckets.
+```
 
 References:
 
