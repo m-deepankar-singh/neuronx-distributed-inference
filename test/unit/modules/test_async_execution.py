@@ -687,7 +687,7 @@ class TestHybridAPCAsyncBridge(unittest.TestCase):
         self.assertIsNone(bridge.prepare_kwargs)
         self.assertNotIn("_hybrid_apc_prepared", input_dict)
 
-    def test_vectorized_attention_hit_batch_fails_fast_until_restore_is_vectorized(self):
+    def test_vectorized_attention_hit_batch_prepares_each_row(self):
         bridge = _FakeHybridBridge()
         base = SimpleNamespace(
             config=SimpleNamespace(use_hybrid_apc_manager=True),
@@ -698,16 +698,110 @@ class TestHybridAPCAsyncBridge(unittest.TestCase):
             {
                 "hybrid_request_id": ("req-a", "req-b"),
                 "full_context_lens": torch.tensor([4, 4], dtype=torch.int32),
-                "computed_context_lens": torch.tensor([0, 2], dtype=torch.int32),
+                "computed_context_lens": torch.tensor([2, 2], dtype=torch.int32),
             }
         )
+        input_dict["input_ids"] = input_dict["input_ids"].repeat(2, 1)
+        input_dict["attention_mask"] = input_dict["attention_mask"].repeat(2, 1)
+        input_dict["position_ids"] = input_dict["position_ids"].repeat(2, 1)
+        input_dict["seq_ids"] = torch.tensor([0, 1], dtype=torch.int32)
+        input_dict["sampling_params"] = input_dict["sampling_params"].repeat(2, 1)
+        input_dict["adapter_ids"] = torch.tensor([0, 0], dtype=torch.int32)
+        input_dict["slot_mapping"] = input_dict["slot_mapping"].repeat(2, 1)
+        input_dict["block_table"] = input_dict["block_table"].repeat(2, 1)
 
-        with self.assertRaisesRegex(
-            ValueError,
-            "vectorized continuous-batching metadata is not wired yet",
-        ):
-            prepare_hybrid_apc_request_for_execution(base, input_dict)
-        self.assertIsNone(bridge.prepare_kwargs)
+        prepared = prepare_hybrid_apc_request_for_execution(base, input_dict)
+
+        self.assertEqual(
+            [call["request_id"] for call in bridge.prepare_calls],
+            ["req-a", "req-b"],
+        )
+        self.assertTrue(
+            torch.equal(
+                prepared["input_ids"],
+                torch.tensor([[12, 13], [12, 13]], dtype=torch.int32),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                prepared["computed_context_lens"],
+                torch.tensor([[2], [2]], dtype=torch.int32),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                prepared["num_queries"],
+                torch.tensor([[2], [2]], dtype=torch.int32),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                prepared["hybrid_restore_mask"],
+                torch.tensor([1, 1], dtype=torch.int32),
+            )
+        )
+        self.assertEqual(len(input_dict["_hybrid_apc_prepared"]), 2)
+
+        finish_hybrid_apc_request(input_dict)
+
+        self.assertEqual([item[0].request_id for item in bridge.committed], ["req-a", "req-b"])
+        self.assertEqual(bridge.finished, ["req-a", "req-b"])
+
+    def test_vectorized_mixed_hit_batch_pads_prepared_rows(self):
+        bridge = _FakeHybridBridge()
+        base = SimpleNamespace(
+            config=SimpleNamespace(use_hybrid_apc_manager=True),
+            hybrid_apc_bridge=bridge,
+        )
+        input_dict = _prefix_input_dict()
+        input_dict.update(
+            {
+                "hybrid_request_id": ("req-a", "req-b"),
+                "full_context_lens": torch.tensor([[4], [4]], dtype=torch.int32),
+                "computed_context_lens": torch.tensor([[0], [2]], dtype=torch.int32),
+            }
+        )
+        input_dict["input_ids"] = input_dict["input_ids"].repeat(2, 1)
+        input_dict["attention_mask"] = input_dict["attention_mask"].repeat(2, 1)
+        input_dict["position_ids"] = input_dict["position_ids"].repeat(2, 1)
+        input_dict["seq_ids"] = torch.tensor([0, 1], dtype=torch.int32)
+        input_dict["sampling_params"] = input_dict["sampling_params"].repeat(2, 1)
+        input_dict["adapter_ids"] = torch.tensor([0, 0], dtype=torch.int32)
+        input_dict["slot_mapping"] = input_dict["slot_mapping"].repeat(2, 1)
+        input_dict["block_table"] = input_dict["block_table"].repeat(2, 1)
+
+        prepared = prepare_hybrid_apc_request_for_execution(base, input_dict)
+
+        self.assertTrue(
+            torch.equal(
+                prepared["input_ids"],
+                torch.tensor([[10, 11, 12, 13], [12, 13, 0, 0]], dtype=torch.int32),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                prepared["attention_mask"],
+                torch.tensor([[1, 1, 1, 1], [1, 1, 0, 0]], dtype=torch.int32),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                prepared["slot_mapping"],
+                torch.tensor([[0, 1, 2, 3], [2, 3, -1, -1]], dtype=torch.int32),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                prepared["num_queries"],
+                torch.tensor([[4], [2]], dtype=torch.int32),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                prepared["hybrid_restore_mask"],
+                torch.tensor([0, 1], dtype=torch.int32),
+            )
+        )
 
     def test_cancel_hybrid_apc_request_is_noop_without_prepared_request(self):
         input_dict = {}
@@ -768,25 +862,31 @@ def _prefix_input_dict():
 class _FakeHybridBridge:
     def __init__(self):
         self.prepare_kwargs = None
+        self.prepare_calls = []
         self.committed = []
         self.finished = []
         self.cancelled = []
 
     def prepare_request(self, **kwargs):
         self.prepare_kwargs = kwargs
+        self.prepare_calls.append(kwargs)
         input_dict = dict(kwargs["input_dict"])
+        restore_len = int(kwargs["attention_hit_len"])
+        prompt_len = int(input_dict["input_ids"].shape[1])
+        suffix_len = prompt_len - restore_len
+        restore_slot = 5 if restore_len > 0 else 0
         input_dict.update(
             {
-                "input_ids": input_dict["input_ids"][:, 2:],
-                "attention_mask": input_dict["attention_mask"][:, 2:],
-                "position_ids": input_dict["position_ids"][:, 2:],
-                "slot_mapping": input_dict["slot_mapping"][:, 2:],
-                "computed_context_lens": torch.tensor([[2]], dtype=torch.int32),
-                "full_context_lens": torch.tensor([[4]], dtype=torch.int32),
-                "num_queries": torch.tensor([[2]], dtype=torch.int32),
-                "hybrid_restore_slot_ids": torch.tensor([5], dtype=torch.int32),
-                "hybrid_restore_mask": torch.tensor([1], dtype=torch.int32),
-                "hybrid_restore_prefix_lens": torch.tensor([2], dtype=torch.int32),
+                "input_ids": input_dict["input_ids"][:, restore_len:prompt_len],
+                "attention_mask": input_dict["attention_mask"][:, restore_len:prompt_len],
+                "position_ids": input_dict["position_ids"][:, restore_len:prompt_len],
+                "slot_mapping": input_dict["slot_mapping"][:, restore_len:prompt_len],
+                "computed_context_lens": torch.tensor([[restore_len]], dtype=torch.int32),
+                "full_context_lens": torch.tensor([[prompt_len]], dtype=torch.int32),
+                "num_queries": torch.tensor([[suffix_len]], dtype=torch.int32),
+                "hybrid_restore_slot_ids": torch.tensor([restore_slot], dtype=torch.int32),
+                "hybrid_restore_mask": torch.tensor([1 if restore_len > 0 else 0], dtype=torch.int32),
+                "hybrid_restore_prefix_lens": torch.tensor([restore_len], dtype=torch.int32),
                 "hybrid_commit_slot_ids": torch.tensor([7], dtype=torch.int32),
                 "hybrid_commit_mask": torch.tensor([1], dtype=torch.int32),
             }
@@ -795,10 +895,10 @@ class _FakeHybridBridge:
             request_id=kwargs["request_id"],
             input_dict=input_dict,
             plan=SimpleNamespace(
-                restore_checkpoint_prefix_len=2,
-                checkpoint_slot=5,
+                restore_checkpoint_prefix_len=restore_len,
+                checkpoint_slot=restore_slot,
             ),
-            commit_prefix_len=4,
+            commit_prefix_len=prompt_len,
             commit_slot=7,
             attention_block_refs=(11, 12),
         )

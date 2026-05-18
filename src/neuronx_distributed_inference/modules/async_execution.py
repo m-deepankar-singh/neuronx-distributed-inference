@@ -77,6 +77,193 @@ def _single_batch_tensor(value: Any) -> bool:
     return isinstance(value, torch.Tensor) and value.ndim >= 1 and value.shape[0] == 1
 
 
+def _batch_size_from_input_dict(input_dict: Dict[str, Any]) -> int:
+    for key in (
+        "input_ids",
+        "seq_ids",
+        "computed_context_lens",
+        "full_context_lens",
+        "vllm_attention_hit_len",
+        "hybrid_attention_hit_len",
+        "attention_hit_len",
+    ):
+        value = input_dict.get(key)
+        if isinstance(value, torch.Tensor) and value.ndim >= 1:
+            return int(value.shape[0])
+        if isinstance(value, (list, tuple)):
+            return len(value)
+    return 1
+
+
+def _select_batch_item(value: Any, index: int, batch_size: int, *, key: str = ""):
+    if isinstance(value, torch.Tensor):
+        if value.numel() == 0 or value.ndim == 0:
+            return value
+        if (
+            key in {"rotary_position_id", "rotary_position_ids"}
+            and value.ndim >= 2
+            and value.shape[1] == batch_size
+        ):
+            return value[:, index : index + 1, ...]
+        if value.shape[0] == batch_size:
+            return value[index : index + 1]
+        return value
+    if key == "llava_args" and isinstance(value, (list, tuple)):
+        return [
+            _select_batch_item(item, index, batch_size, key=f"{key}[{idx}]")
+            for idx, item in enumerate(value)
+        ]
+    if isinstance(value, tuple) and len(value) == batch_size:
+        return value[index]
+    if isinstance(value, list) and len(value) == batch_size:
+        return value[index]
+    return value
+
+
+def _pad_value_for_key(
+    neuron_base_instance: "NeuronBaseForCausalLM",
+    key: str,
+) -> int:
+    if key == "input_ids":
+        return int(getattr(neuron_base_instance.config, "pad_token_id", 0) or 0)
+    if key in {
+        "attention_mask",
+        "hybrid_restore_mask",
+        "hybrid_restore_prefix_lens",
+        "hybrid_commit_mask",
+    }:
+        return 0
+    if key in {"position_ids", "rotary_position_id", "rotary_position_ids"}:
+        return 1
+    if key == "slot_mapping":
+        return -1
+    return 0
+
+
+def _right_pad_dim1(tensor: torch.Tensor, target_len: int, pad_value: int) -> torch.Tensor:
+    if tensor.ndim < 2 or tensor.shape[1] == target_len:
+        return tensor
+    if tensor.shape[1] > target_len:
+        raise ValueError(
+            f"cannot pad tensor with dim1 {tensor.shape[1]} down to {target_len}"
+        )
+    pad_shape = list(tensor.shape)
+    pad_shape[1] = target_len - tensor.shape[1]
+    pad = torch.full(
+        tuple(pad_shape),
+        pad_value,
+        dtype=tensor.dtype,
+        device=tensor.device,
+    )
+    return torch.cat([tensor, pad], dim=1)
+
+
+def _combine_vectorized_hybrid_apc_inputs(
+    neuron_base_instance: "NeuronBaseForCausalLM",
+    original_input_dict: Dict[str, Any],
+    row_input_dicts: list[Dict[str, Any]],
+) -> Dict[str, Any]:
+    combined = dict(original_input_dict)
+    keys: set[str] = set()
+    for row_input in row_input_dicts:
+        keys.update(row_input.keys())
+
+    for key in keys:
+        if key.startswith("_hybrid_apc"):
+            continue
+        values = [row_input.get(key) for row_input in row_input_dicts]
+        if not all(isinstance(value, torch.Tensor) for value in values):
+            continue
+
+        tensors = [value for value in values if isinstance(value, torch.Tensor)]
+        if all(tensor.numel() == 0 for tensor in tensors):
+            combined[key] = tensors[0]
+            continue
+        if all(tensor.ndim == 0 for tensor in tensors):
+            combined[key] = torch.stack(tensors)
+            continue
+        if all(tensor.ndim >= 1 and tensor.shape[0] == 1 for tensor in tensors):
+            max_dim1 = None
+            if any(tensor.ndim >= 2 for tensor in tensors):
+                max_dim1 = max(tensor.shape[1] if tensor.ndim >= 2 else 1 for tensor in tensors)
+            padded = []
+            for tensor in tensors:
+                current = tensor
+                if max_dim1 is not None and tensor.ndim >= 2:
+                    current = _right_pad_dim1(
+                        tensor,
+                        max_dim1,
+                        _pad_value_for_key(neuron_base_instance, key),
+                    )
+                padded.append(current)
+            try:
+                combined[key] = torch.cat(padded, dim=0)
+            except RuntimeError as exc:
+                raise ValueError(
+                    f"cannot combine vectorized hybrid APC tensor {key!r}: "
+                    f"{[tuple(tensor.shape) for tensor in padded]}"
+                ) from exc
+            continue
+        if all(tuple(tensor.shape) == tuple(tensors[0].shape) for tensor in tensors):
+            combined[key] = tensors[0]
+
+    return combined
+
+
+def _prepare_vectorized_hybrid_apc_requests(
+    neuron_base_instance: "NeuronBaseForCausalLM",
+    input_dict: Dict[str, Any],
+    *,
+    bridge: Any,
+    batch_size: int,
+) -> Dict[str, Any]:
+    row_outputs: list[Dict[str, Any]] = []
+    prepared_requests = []
+    try:
+        for index in range(batch_size):
+            row_input = {
+                key: _select_batch_item(value, index, batch_size, key=key)
+                for key, value in input_dict.items()
+                if not key.startswith("_hybrid_apc")
+            }
+            row_input["hybrid_apc_bridge"] = bridge
+            row_output = prepare_hybrid_apc_request_for_execution(
+                neuron_base_instance,
+                row_input,
+            )
+            row_outputs.append(row_output)
+            prepared = row_input.get("_hybrid_apc_prepared")
+            if prepared is not None:
+                prepared_requests.append(prepared)
+    except Exception:
+        for prepared in prepared_requests:
+            bridge.cancel_request(prepared)
+        raise
+
+    if prepared_requests:
+        input_dict["_hybrid_apc_bridge"] = bridge
+        input_dict["_hybrid_apc_prepared"] = prepared_requests
+
+    combined = _combine_vectorized_hybrid_apc_inputs(
+        neuron_base_instance,
+        input_dict,
+        row_outputs,
+    )
+    if os.environ.get("QWEN36_HYBRID_APC_DEBUG") == "1":
+        print(
+            "[hybrid_apc_debug] prepare-vectorized "
+            f"batch_size={batch_size} prepared={len(prepared_requests)} "
+            f"input_shape={tuple(input_dict['input_ids'].shape)} "
+            f"prepared_shape={tuple(combined['input_ids'].shape)} "
+            f"computed={combined.get('computed_context_lens')} "
+            f"num_queries={combined.get('num_queries')} "
+            f"restore_mask={combined.get('hybrid_restore_mask')} "
+            f"commit_mask={combined.get('hybrid_commit_mask')}",
+            flush=True,
+        )
+    return combined
+
+
 def _env_flag(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
@@ -186,6 +373,16 @@ def prepare_hybrid_apc_request_for_execution(
         attention_hit_len_source = input_dict.get("computed_context_lens")
     attention_hit_len = _single_batch_value(attention_hit_len_source)
     multi_attention_hit_lens = _multi_batch_int_values(attention_hit_len_source)
+    batch_size = _batch_size_from_input_dict(input_dict)
+    if attention_hit_len is None and multi_attention_hit_lens is not None and batch_size > 1:
+        if all(hit_len == 0 for hit_len in multi_attention_hit_lens) and not requires_external_metadata:
+            return input_dict
+        return _prepare_vectorized_hybrid_apc_requests(
+            neuron_base_instance,
+            input_dict,
+            bridge=bridge,
+            batch_size=batch_size,
+        )
     if attention_hit_len is None and multi_attention_hit_lens is not None:
         if all(hit_len == 0 for hit_len in multi_attention_hit_lens):
             if requires_external_metadata:
@@ -326,28 +523,34 @@ def finish_hybrid_apc_request(input_dict: Dict[str, Any]):
     if bridge is None or prepared is None:
         return
 
-    actual_refs = _first_present(
-        input_dict.get("actual_refs"),
-        input_dict.get("actual_attention_block_refs"),
-        input_dict.get("hybrid_actual_attention_block_refs"),
-        getattr(prepared, "attention_block_refs", None),
-    )
+    prepared_requests = prepared if isinstance(prepared, list) else [prepared]
     if _hybrid_gdn_commit_disabled():
-        bridge.cancel_request(prepared)
+        for prepared_request in prepared_requests:
+            bridge.cancel_request(prepared_request)
         return
-    try:
-        bridge.commit_prefill(prepared, attention_block_refs=actual_refs)
-    except Exception:
-        bridge.cancel_request(prepared)
-        raise
-    bridge.finish_request(prepared.request_id)
+    for prepared_request in prepared_requests:
+        actual_refs = _first_present(
+            input_dict.get("actual_refs"),
+            input_dict.get("actual_attention_block_refs"),
+            input_dict.get("hybrid_actual_attention_block_refs"),
+            getattr(prepared_request, "attention_block_refs", None),
+        )
+        try:
+            bridge.commit_prefill(prepared_request, attention_block_refs=actual_refs)
+        except Exception:
+            bridge.cancel_request(prepared_request)
+            raise
+        bridge.finish_request(prepared_request.request_id)
 
 
 def cancel_hybrid_apc_request(input_dict: Dict[str, Any]):
     bridge = input_dict.pop("_hybrid_apc_bridge", None)
     prepared = input_dict.pop("_hybrid_apc_prepared", None)
-    if bridge is not None and prepared is not None:
-        bridge.cancel_request(prepared)
+    if bridge is None or prepared is None:
+        return
+    prepared_requests = prepared if isinstance(prepared, list) else [prepared]
+    for prepared_request in prepared_requests:
+        bridge.cancel_request(prepared_request)
 
 
 def _active_hybrid_apc_slots(
