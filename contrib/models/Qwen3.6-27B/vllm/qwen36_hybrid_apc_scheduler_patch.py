@@ -572,6 +572,75 @@ def _request_id_target_models(model: Any) -> list[Any]:
     return targets
 
 
+def _debug_logits_tensor(stage: str, tensor: Any) -> None:
+    if not _env_flag("QWEN36_VLLM_LOGITS_DEBUG"):
+        return
+    if tensor is None or not hasattr(tensor, "numel"):
+        print(f"[qwen36_vllm_logits_debug] stage={stage} tensor=none", flush=True)
+        return
+    try:
+        import torch  # noqa: WPS433
+
+        if tensor.numel() == 0:
+            print(
+                "[qwen36_vllm_logits_debug] "
+                f"stage={stage} shape={tuple(tensor.shape)} dtype={tensor.dtype} empty",
+                flush=True,
+            )
+            return
+        flat = tensor.detach().reshape(-1)
+        if torch.is_floating_point(flat):
+            finite_mask = torch.isfinite(flat)
+            finite_count = int(finite_mask.sum().item())
+            nan_count = int(torch.isnan(flat).sum().item())
+            posinf_count = int(
+                torch.logical_and(torch.isinf(flat), flat > 0).sum().item()
+            )
+            neginf_count = int(
+                torch.logical_and(torch.isinf(flat), flat < 0).sum().item()
+            )
+            if finite_count:
+                finite_flat = flat[finite_mask].float()
+                finite_min = float(finite_flat.min().item())
+                finite_max = float(finite_flat.max().item())
+            else:
+                finite_min = "none"
+                finite_max = "none"
+            row_argmax = []
+            row_argmax_values = []
+            if tensor.ndim >= 2:
+                rows = tensor.detach().float().reshape(tensor.shape[0], -1)
+                argmax = rows.argmax(dim=-1)
+                row_argmax = [int(item) for item in argmax[:8].cpu().tolist()]
+                row_argmax_values = [
+                    float(rows[row, argmax[row]].item())
+                    for row in range(min(rows.shape[0], 8))
+                ]
+            print(
+                "[qwen36_vllm_logits_debug] "
+                f"stage={stage} shape={tuple(tensor.shape)} dtype={tensor.dtype} "
+                f"finite={finite_count} nan={nan_count} posinf={posinf_count} "
+                f"neginf={neginf_count} finite_min={finite_min} "
+                f"finite_max={finite_max} row_argmax={row_argmax} "
+                f"row_argmax_values={row_argmax_values}",
+                flush=True,
+            )
+        else:
+            flat_i64 = flat.to(torch.int64)
+            print(
+                "[qwen36_vllm_logits_debug] "
+                f"stage={stage} shape={tuple(tensor.shape)} dtype={tensor.dtype} "
+                f"min={int(flat_i64.min().item())} max={int(flat_i64.max().item())}",
+                flush=True,
+            )
+    except Exception as exc:  # pragma: no cover - diagnostic only
+        print(
+            "[qwen36_vllm_logits_debug] "
+            f"stage={stage} summary_error={type(exc).__name__}: {exc}",
+            flush=True,
+        )
+
+
 def patch_neuron_model_runner_class(runner_cls: type) -> bool:
     """Patch vLLM-Neuron runner to expose scheduler row metadata."""
 
@@ -581,6 +650,11 @@ def patch_neuron_model_runner_class(runner_cls: type) -> bool:
             f"{runner_cls!r} has no _execute_model_for_text method"
         )
     original_prepare = getattr(runner_cls, "_prepare_model_input", None)
+    original_prepare_logits = getattr(
+        runner_cls,
+        "_prepare_logits_for_sampling",
+        None,
+    )
 
     missing = object()
     installed = False
@@ -623,6 +697,47 @@ def patch_neuron_model_runner_class(runner_cls: type) -> bool:
             original_prepare
         )
         runner_cls._prepare_model_input = prepare_model_input_with_hybrid_apc_metadata
+        installed = True
+
+    if original_prepare_logits is not None and not getattr(
+        original_prepare_logits,
+        "_qwen36_vllm_logits_debug_patched",
+        False,
+    ):
+
+        def prepare_logits_for_sampling_with_debug(
+            self,
+            hidden_states,
+            model_input,
+            *args,
+            **kwargs,
+        ):
+            if _env_flag("QWEN36_VLLM_LOGITS_DEBUG"):
+                _debug_logits_tensor("runner_hidden_states_before_prepare", hidden_states)
+                prefill_state = getattr(model_input, "prefill_completion_state", None)
+                request_ids = getattr(model_input, "request_ids", None)
+                print(
+                    "[qwen36_vllm_logits_debug] "
+                    f"request_ids={request_ids} prefill_completion_state={prefill_state}",
+                    flush=True,
+                )
+            logits = original_prepare_logits(
+                self,
+                hidden_states,
+                model_input,
+                *args,
+                **kwargs,
+            )
+            _debug_logits_tensor("runner_logits_after_prepare", logits)
+            return logits
+
+        prepare_logits_for_sampling_with_debug._qwen36_vllm_logits_debug_patched = (
+            True
+        )
+        prepare_logits_for_sampling_with_debug._qwen36_original_prepare_logits = (
+            original_prepare_logits
+        )
+        runner_cls._prepare_logits_for_sampling = prepare_logits_for_sampling_with_debug
         installed = True
 
     if getattr(original_execute, "_qwen36_hybrid_apc_request_ids_patched", False):

@@ -288,6 +288,244 @@ def _right_pad_dim1(tensor: torch.Tensor, target_len: int, pad_value: int) -> to
     return torch.cat([tensor, pad], dim=1)
 
 
+def _resize_dim1(tensor: torch.Tensor, target_len: int, pad_value: int) -> torch.Tensor:
+    if tensor.ndim < 2 or tensor.shape[1] == target_len:
+        return tensor
+    if tensor.shape[1] > target_len:
+        return tensor[:, :target_len, ...]
+    return _right_pad_dim1(tensor, target_len, pad_value)
+
+
+def _configured_cte_bucket_len(
+    neuron_base_instance: "NeuronBaseForCausalLM",
+    current_len: int,
+) -> int:
+    bucket_sources = (
+        getattr(
+            getattr(neuron_base_instance, "neuron_config", None),
+            "context_encoding_buckets",
+            None,
+        ),
+        getattr(
+            getattr(
+                getattr(neuron_base_instance, "context_encoding_model", None),
+                "neuron_config",
+                None,
+            ),
+            "context_encoding_buckets",
+            None,
+        ),
+        getattr(
+            getattr(
+                getattr(neuron_base_instance, "context_encoding_model", None),
+                "neuron_config",
+                None,
+            ),
+            "buckets",
+            None,
+        ),
+    )
+    buckets: list[int] = []
+    for source in bucket_sources:
+        if source is None:
+            continue
+        for bucket in source:
+            if isinstance(bucket, (list, tuple)):
+                if not bucket:
+                    continue
+                bucket = bucket[0]
+            try:
+                buckets.append(int(bucket))
+            except (TypeError, ValueError):
+                continue
+        if buckets:
+            break
+    for bucket in sorted(set(buckets)):
+        if current_len <= bucket:
+            return bucket
+    return current_len
+
+
+def _pa_block_size(neuron_base_instance: "NeuronBaseForCausalLM") -> int | None:
+    for owner in (
+        getattr(neuron_base_instance, "neuron_config", None),
+        getattr(getattr(neuron_base_instance, "config", None), "neuron_config", None),
+    ):
+        block_size = getattr(owner, "pa_block_size", None)
+        if block_size:
+            return int(block_size)
+    return None
+
+
+def _active_block_table_target_len(
+    neuron_base_instance: "NeuronBaseForCausalLM",
+    target_context_len: int | None,
+) -> int | None:
+    if target_context_len is None:
+        return None
+    block_size = _pa_block_size(neuron_base_instance)
+    if not block_size:
+        return None
+    return max(1, (int(target_context_len) + block_size - 1) // block_size)
+
+
+def _synthesize_slots_from_block_table(
+    *,
+    block_table_row: torch.Tensor,
+    position_row: torch.Tensor,
+    q_len: int,
+    block_size: int,
+    dtype: torch.dtype,
+) -> torch.Tensor | None:
+    if q_len <= 0:
+        return torch.empty((0,), dtype=dtype, device=position_row.device)
+    positions = position_row[:q_len].to(torch.int64)
+    logical_blocks = torch.div(positions, block_size, rounding_mode="floor")
+    if logical_blocks.numel() == 0:
+        return torch.empty((0,), dtype=dtype, device=position_row.device)
+    if int(logical_blocks.max().item()) >= int(block_table_row.shape[0]):
+        return None
+    offsets = positions.remainder(block_size)
+    physical_blocks = torch.index_select(
+        block_table_row.to(torch.int64),
+        0,
+        logical_blocks,
+    )
+    return (physical_blocks * block_size + offsets).to(dtype=dtype)
+
+
+def _repair_vectorized_slot_mapping(
+    neuron_base_instance: "NeuronBaseForCausalLM",
+    combined: Dict[str, Any],
+) -> None:
+    input_ids = combined.get("input_ids")
+    position_ids = combined.get("position_ids")
+    block_table = combined.get("block_table")
+    if (
+        not isinstance(input_ids, torch.Tensor)
+        or input_ids.ndim != 2
+        or not isinstance(position_ids, torch.Tensor)
+        or position_ids.ndim != 2
+        or not isinstance(block_table, torch.Tensor)
+        or block_table.ndim != 2
+    ):
+        return
+
+    batch_size, target_len = int(input_ids.shape[0]), int(input_ids.shape[1])
+    if batch_size <= 0 or target_len <= 0:
+        return
+    block_size = _pa_block_size(neuron_base_instance)
+    if not block_size:
+        return
+
+    query_lengths = _vectorized_query_lengths(combined, batch_size=batch_size)
+    if query_lengths is None:
+        return
+
+    slot_mapping = combined.get("slot_mapping")
+    slot_dtype = (
+        slot_mapping.dtype
+        if isinstance(slot_mapping, torch.Tensor)
+        else torch.int32
+    )
+    slot_device = input_ids.device
+    scalar_slots = None
+    slot_rows = None
+    if isinstance(slot_mapping, torch.Tensor) and slot_mapping.numel() > 0:
+        slot_device = slot_mapping.device
+        if slot_mapping.ndim == 1 and int(slot_mapping.numel()) == batch_size:
+            scalar_slots = slot_mapping.to(dtype=slot_dtype)
+        elif slot_mapping.ndim >= 2 and slot_mapping.shape[0] >= batch_size:
+            slot_rows = _resize_dim1(
+                slot_mapping[:batch_size].to(dtype=slot_dtype),
+                target_len,
+                -1,
+            )
+
+    repaired = torch.full(
+        (batch_size, target_len),
+        -1,
+        dtype=slot_dtype,
+        device=slot_device,
+    )
+    changed = slot_rows is None or tuple(slot_rows.shape[:2]) != (batch_size, target_len)
+    for row_idx, query_len in enumerate(query_lengths[:batch_size]):
+        q_len = max(0, min(int(query_len), target_len))
+        if q_len == 0:
+            continue
+        if slot_rows is not None and bool((slot_rows[row_idx, :q_len] >= 0).all().item()):
+            repaired[row_idx, :q_len] = slot_rows[row_idx, :q_len]
+            if q_len < target_len:
+                repaired[row_idx, q_len:] = -1
+            continue
+        if scalar_slots is not None and q_len == 1 and int(scalar_slots.numel()) > row_idx:
+            repaired[row_idx, 0] = scalar_slots[row_idx]
+            changed = True
+            continue
+        synthesized = _synthesize_slots_from_block_table(
+            block_table_row=block_table[row_idx],
+            position_row=position_ids[row_idx],
+            q_len=q_len,
+            block_size=block_size,
+            dtype=slot_dtype,
+        )
+        if synthesized is None:
+            if slot_rows is not None:
+                repaired[row_idx] = slot_rows[row_idx]
+            elif scalar_slots is not None and int(scalar_slots.numel()) > row_idx:
+                repaired[row_idx, 0] = scalar_slots[row_idx]
+            continue
+        repaired[row_idx, :q_len] = synthesized
+        changed = True
+
+    if changed or slot_rows is None or bool((repaired[:, :target_len] != slot_rows).any().item()):
+        combined["slot_mapping"] = repaired
+
+
+def _repair_vectorized_batch_vectors(combined: Dict[str, Any]) -> None:
+    input_ids = combined.get("input_ids")
+    if not isinstance(input_ids, torch.Tensor) or input_ids.ndim < 2:
+        return
+    batch_size = int(input_ids.shape[0])
+    if batch_size <= 1:
+        return
+
+    seq_ids = combined.get("seq_ids")
+    if not isinstance(seq_ids, torch.Tensor) or seq_ids.reshape(-1).shape[0] != batch_size:
+        dtype = seq_ids.dtype if isinstance(seq_ids, torch.Tensor) else torch.int32
+        device = seq_ids.device if isinstance(seq_ids, torch.Tensor) else input_ids.device
+        combined["seq_ids"] = torch.arange(batch_size, dtype=dtype, device=device)
+
+    adapter_ids = combined.get("adapter_ids")
+    if (
+        not isinstance(adapter_ids, torch.Tensor)
+        or adapter_ids.numel() == 0
+        or adapter_ids.reshape(-1).shape[0] != batch_size
+    ):
+        dtype = adapter_ids.dtype if isinstance(adapter_ids, torch.Tensor) else torch.int32
+        device = adapter_ids.device if isinstance(adapter_ids, torch.Tensor) else input_ids.device
+        fill_value = (
+            int(adapter_ids.reshape(-1)[0].item())
+            if isinstance(adapter_ids, torch.Tensor) and adapter_ids.numel() > 0
+            else 0
+        )
+        combined["adapter_ids"] = torch.full(
+            (batch_size,),
+            fill_value,
+            dtype=dtype,
+            device=device,
+        )
+
+
+_VECTOR_CTE_SEQUENCE_KEYS = {
+    "input_ids",
+    "attention_mask",
+    "position_ids",
+    "slot_mapping",
+    "inputs_embeds",
+}
+
+
 def _with_zero_hybrid_apc_slots(input_dict: Dict[str, Any]) -> Dict[str, Any]:
     output = dict(input_dict)
     seq_ids = input_dict.get("seq_ids")
@@ -340,6 +578,31 @@ def _combine_vectorized_hybrid_apc_inputs(
     for row_input in row_input_dicts:
         keys.update(row_input.keys())
 
+    max_sequence_dim1 = None
+    for key in _VECTOR_CTE_SEQUENCE_KEYS:
+        tensors = [
+            row_input.get(key)
+            for row_input in row_input_dicts
+            if isinstance(row_input.get(key), torch.Tensor)
+        ]
+        if not tensors or not any(tensor.ndim >= 1 for tensor in tensors):
+            continue
+        key_max = max(tensor.shape[1] if tensor.ndim >= 2 else 1 for tensor in tensors)
+        max_sequence_dim1 = (
+            key_max
+            if max_sequence_dim1 is None
+            else max(max_sequence_dim1, key_max)
+        )
+    target_sequence_dim1 = (
+        _configured_cte_bucket_len(neuron_base_instance, max_sequence_dim1)
+        if max_sequence_dim1 is not None
+        else None
+    )
+    target_block_dim1 = _active_block_table_target_len(
+        neuron_base_instance,
+        target_sequence_dim1,
+    )
+
     for key in keys:
         if key.startswith("_hybrid_apc"):
             continue
@@ -358,17 +621,23 @@ def _combine_vectorized_hybrid_apc_inputs(
             max_dim1 = None
             if any(tensor.ndim >= 2 for tensor in tensors):
                 max_dim1 = max(tensor.shape[1] if tensor.ndim >= 2 else 1 for tensor in tensors)
+            target_dim1 = max_dim1
+            if key in _VECTOR_CTE_SEQUENCE_KEYS and target_sequence_dim1 is not None:
+                target_dim1 = target_sequence_dim1
+            elif key == "block_table" and target_block_dim1 is not None:
+                target_dim1 = target_block_dim1
             padded = []
             for tensor in tensors:
                 current = (
                     tensor.reshape(1, -1)
-                    if max_dim1 is not None and tensor.ndim == 1
+                    if target_dim1 is not None and tensor.ndim == 1
                     else tensor
                 )
-                if max_dim1 is not None and current.ndim >= 2:
-                    current = _right_pad_dim1(
+                if target_dim1 is not None and current.ndim >= 2:
+                    resize = _resize_dim1 if key == "block_table" else _right_pad_dim1
+                    current = resize(
                         current,
-                        max_dim1,
+                        target_dim1,
                         _pad_value_for_key(neuron_base_instance, key),
                     )
                 padded.append(current)
@@ -383,6 +652,8 @@ def _combine_vectorized_hybrid_apc_inputs(
         if all(tuple(tensor.shape) == tuple(tensors[0].shape) for tensor in tensors):
             combined[key] = tensors[0]
 
+    _repair_vectorized_batch_vectors(combined)
+    _repair_vectorized_slot_mapping(neuron_base_instance, combined)
     return combined
 
 

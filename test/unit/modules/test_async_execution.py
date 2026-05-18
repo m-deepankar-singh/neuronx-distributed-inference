@@ -9,6 +9,7 @@ import torch
 
 from neuronx_distributed_inference.modules.async_execution import (
     AsyncTensorWrapper,
+    _combine_vectorized_hybrid_apc_inputs,
     cancel_hybrid_apc_request,
     execute_model_prefix_caching,
     finish_hybrid_apc_request,
@@ -930,6 +931,129 @@ class TestHybridAPCAsyncBridge(unittest.TestCase):
             torch.equal(
                 prepared["full_context_lens"],
                 torch.tensor([[5], [3]], dtype=torch.int32),
+            )
+        )
+
+    def test_vectorized_cached_decode_row_pads_to_cte_bucket(self):
+        bridge = _FakeHybridBridge()
+        base = SimpleNamespace(
+            config=SimpleNamespace(
+                use_hybrid_apc_manager=True,
+                pad_token_id=0,
+            ),
+            neuron_config=SimpleNamespace(
+                context_encoding_buckets=[2, 4],
+                pa_block_size=2,
+            ),
+            hybrid_apc_bridge=bridge,
+        )
+        input_dict = _prefix_input_dict()
+        input_dict.update(
+            {
+                "hybrid_request_id": ("req-cached", "req-new"),
+                "hybrid_cached_request_ids": ("req-cached",),
+                "hybrid_prefill_completion_state": torch.tensor(
+                    [True, False],
+                    dtype=torch.bool,
+                ),
+                "input_ids": torch.tensor([[99, 20, 21, 22]], dtype=torch.int32),
+                "attention_mask": torch.ones((1, 4), dtype=torch.int32),
+                "position_ids": torch.tensor([[4, 0, 1, 2]], dtype=torch.int32),
+                "seq_ids": torch.tensor([0], dtype=torch.int32),
+                "adapter_ids": torch.tensor([0], dtype=torch.int32),
+                "slot_mapping": torch.tensor([[8, 10, 11, 12]], dtype=torch.int32),
+                "block_table": torch.tensor(
+                    [[1, 2, 3], [4, 5, 6]],
+                    dtype=torch.int32,
+                ),
+                "full_context_lens": torch.tensor([[5], [3]], dtype=torch.int32),
+                "computed_context_lens": torch.tensor([[4], [0]], dtype=torch.int32),
+                "num_queries": torch.tensor([[1], [3]], dtype=torch.int32),
+            }
+        )
+
+        prepared = prepare_hybrid_apc_request_for_execution(base, input_dict)
+
+        self.assertTrue(
+            torch.equal(
+                prepared["input_ids"],
+                torch.tensor(
+                    [[99, 0, 0, 0], [20, 21, 22, 0]],
+                    dtype=torch.int32,
+                ),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                prepared["attention_mask"],
+                torch.tensor([[1, 0, 0, 0], [1, 1, 1, 0]], dtype=torch.int32),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                prepared["slot_mapping"],
+                torch.tensor([[8, -1, -1, -1], [10, 11, 12, -1]], dtype=torch.int32),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                prepared["block_table"],
+                torch.tensor([[1, 2], [4, 5]], dtype=torch.int32),
+            )
+        )
+
+    def test_vectorized_combiner_repairs_short_active_slot_mapping(self):
+        base = SimpleNamespace(
+            config=SimpleNamespace(
+                use_hybrid_apc_manager=True,
+                pad_token_id=0,
+            ),
+            neuron_config=SimpleNamespace(
+                context_encoding_buckets=[4],
+                pa_block_size=2,
+            ),
+        )
+        row_cached_decode = {
+            "input_ids": torch.tensor([[99]], dtype=torch.int32),
+            "attention_mask": torch.ones((1, 1), dtype=torch.int32),
+            "position_ids": torch.tensor([[4]], dtype=torch.int32),
+            "seq_ids": torch.tensor([0], dtype=torch.int32),
+            "slot_mapping": torch.tensor([8], dtype=torch.int32),
+            "block_table": torch.tensor([[2, 3]], dtype=torch.int32),
+            "full_context_lens": torch.tensor([[5]], dtype=torch.int32),
+            "computed_context_lens": torch.tensor([[4]], dtype=torch.int32),
+            "num_queries": torch.tensor([[1]], dtype=torch.int32),
+        }
+        row_prefill = {
+            "input_ids": torch.tensor([[20, 21, 22]], dtype=torch.int32),
+            "attention_mask": torch.ones((1, 3), dtype=torch.int32),
+            "position_ids": torch.tensor([[0, 1, 2]], dtype=torch.int32),
+            "slot_mapping": torch.tensor([10], dtype=torch.int32),
+            "block_table": torch.tensor([[4, 5]], dtype=torch.int32),
+            "full_context_lens": torch.tensor([[3]], dtype=torch.int32),
+            "computed_context_lens": torch.tensor([[0]], dtype=torch.int32),
+            "num_queries": torch.tensor([[3]], dtype=torch.int32),
+        }
+
+        combined = _combine_vectorized_hybrid_apc_inputs(
+            base,
+            dict(row_cached_decode),
+            [row_cached_decode, row_prefill],
+        )
+
+        self.assertTrue(
+            torch.equal(
+                combined["slot_mapping"],
+                torch.tensor(
+                    [[8, -1, -1, -1], [8, 9, 10, -1]],
+                    dtype=torch.int32,
+                ),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                combined["seq_ids"],
+                torch.tensor([0, 1], dtype=torch.int32),
             )
         )
 

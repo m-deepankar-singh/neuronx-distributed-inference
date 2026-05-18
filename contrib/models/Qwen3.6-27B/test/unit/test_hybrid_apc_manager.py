@@ -530,6 +530,38 @@ class TestHybridAPCPrefillPlanInputs(unittest.TestCase):
             )
         )
 
+    def test_prefill_plan_repairs_too_short_active_slots_from_block_table(self):
+        plan = HybridAPCHitPlan(
+            attention_hit_len=0,
+            recurrent_hit_len=0,
+            conv_hit_len=0,
+            usable_hit_len=0,
+            restore_checkpoint_prefix_len=0,
+            residual_replay_len=0,
+            suffix_len=6,
+            checkpoint_slot=None,
+            checkpoint_key=None,
+        )
+        input_dict = {
+            "input_ids": torch.tensor([[10, 11, 12, 13, 14, 15]], dtype=torch.int32),
+            "position_ids": torch.arange(6, dtype=torch.int32).unsqueeze(0),
+            "slot_mapping": torch.tensor([12], dtype=torch.int32),
+            "block_table": torch.tensor([[2, 3]], dtype=torch.int32),
+        }
+
+        output = apply_hybrid_apc_prefill_plan(
+            input_dict,
+            plan=plan,
+            block_size=4,
+        )
+
+        self.assertTrue(
+            torch.equal(
+                output["slot_mapping"],
+                torch.tensor([[8, 9, 10, 11, 12, 13]], dtype=torch.int32),
+            )
+        )
+
     def test_prefill_plan_rebuilds_unbacked_attention_hit_slots(self):
         plan = HybridAPCHitPlan(
             attention_hit_len=4,

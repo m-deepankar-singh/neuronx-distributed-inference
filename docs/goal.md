@@ -13,14 +13,48 @@ Make Qwen3.6-27B Hybrid APC on Trainium correct first, then measure cold-prefill
 
 The active branch is `experimental`.
 
-Useful Trainium paths:
+Current useful hosts and paths:
 
-- Instance: `ubuntu@16.50.246.35`
 - Key: `/Users/deepankarsingh1312/Downloads/trainium.pem`
-- Remote repo: `/home/ubuntu/inferentia-gdn-experimental-test`
-- Weights: `/home/ubuntu/models/Qwen3.6-27B`
-- Main BF16 Hybrid APC artifact:
-  `/mnt/trainium_artifacts/qwen_artifacts/qwen36_27b_2048_bf16_hybrid_apc_backed_prefix_ctx2_tkg2_staged_3557925`
+- Trn2 runtime host: `ubuntu@16.26.98.193`
+- r7i compile host: `ubuntu@16.26.249.227`
+- Remote repo on both hosts: `/home/ubuntu/inferentia-gdn-experimental-test`
+- Weights on Trn2/r7i: `/home/ubuntu/models/Qwen3.6-27B`
+- Current copied BF16 Hybrid APC artifact on Trn2:
+  `/mnt/trainium_artifacts/qwen_artifacts/qwen36_27b_2048_bf16_hybrid_apc_backed_prefix_ctx2_tkg2_r7i_trn2_local_7306c2e`
+- Latest copied-artifact validation log:
+  `/home/ubuntu/validation_logs/hybrid_apc_real_tokens/bf16_hybrid_apc_batched_ctx2_tkg2_runnerlogits_20260518T204658Z.log`
+
+Current result:
+
+```text
+multi-CTE ctx2/tkg2 compile: passed on r7i
+artifact copy to Trn2: passed
+Trn2 artifact load: passed
+vectorized Hybrid APC request prep: now runs past the old one-request guard
+mixed cached-decode + prefill CTE padding: now pads [2,511] to compiled [2,512]
+slot_mapping/block_table/seq_ids rank repair: passed the static Neuron checks
+batched grouped Hybrid APC validation: reaches generation but emits only token 0
+```
+
+Current blocker:
+
+```text
+BF16 host-side logits from the Neuron/vLLM-Neuron output path are all NaN
+before vLLM sampling.
+
+runner_hidden_states_before_prepare shape=(1, 248320)
+finite=0 nan=248320
+
+runner_logits_after_prepare shape=(1, 248320)
+finite=0 nan=248320
+```
+
+The next engineering target is not another compile and not the `[2,511]` shape
+miss. The request-prep and bucket-shape contract now get through validation. The
+remaining issue is to isolate whether the all-NaN logits originate inside the
+compiled Qwen model path, or at the loaded-artifact/output-alias/host-logits
+serving contract.
 
 ### 2026-05-18 Overnight Update
 
@@ -909,12 +943,25 @@ What is proven:
 - Request-scoped restore identity is proven for the single-request path.
 - Vectorized no-hit fallback is unit-covered.
 - Single-bucket ctx2/tkg2 compiles have succeeded for 256-only and 512-only.
+- Combined multi-bucket `cte_buckets=256,512` ctx2/tkg2 BF16 compile succeeded
+  on the r7i compile host.
+- The combined artifact is portable to Trn2, loads there, and completes
+  single-request bucket-aligned CTE + TKG generation.
+- The generated-token batched harness now runs through vectorized request prep,
+  pads mixed `[2,511]` CTE rows up to the compiled `[2,512]` bucket, repairs
+  slot/block/row metadata, and avoids the previous static Neuron shape failures.
+- The latest grouped validation reaches sampling and proves the output reaching
+  vLLM is already all NaN before sampling.
 
 What is not proven yet:
 
-- Batched/concurrent backed-prefix serving is not proven.
+- Batched/concurrent backed-prefix serving is not real-token proven.
 - The `max_num_seqs > 1` backed-prefix guard should not be relaxed yet.
-- A combined multi-bucket ctx2/tkg2 artifact has not completed validation.
+- The final grouped `llm.generate([prompt_a, prompt_b])` path gets past the
+  vectorized metadata and static-shape blockers, but fails the real-token gate
+  because every sampled token is `0`.
+- BF16 host-logits correctness is not proven; the runner sees all-NaN logits
+  before sampling.
 - Cold-prefill performance has not been measured for the final batched path.
 - FP8 is not validated for this path and should not be used to debug the
   serving contract.
@@ -923,36 +970,42 @@ What is not proven yet:
 
 Current practical constraints:
 
-- Generated-token batch-2 validation needs both `ctx_batch_size=2` and
-  `tkg_batch_size=2`.
+- Generated-token batch-2 validation now has a copied artifact with both
+  `ctx_batch_size=2` and `tkg_batch_size=2`.
 - The artifact with `tkg_batch_size=2` but `ctx_batch_size=1` failed because
   vLLM-Neuron packed two prefills into one CTE row and host-logits sampling
   tried to index a missing second output row.
-- The smaller Trainium instance can compile single CTE buckets, but the
-  combined `cte_buckets=256,512` ctx2/tkg2 compile made SSH unresponsive during
-  all-HLO CTE compilation after TKG priority compile passed.
-- Without a larger compile box, the best next proof is to run batch-2
-  validation against the 256-only and 512-only ctx2/tkg2 artifacts separately,
-  or build a prefill-only batched validator that avoids generated-token TKG.
+- The smaller Trainium instance can compile single CTE buckets, but the combined
+  `cte_buckets=256,512` ctx2/tkg2 compile overloaded it. Use the r7i compile
+  host for large CPU/RAM/disk compile work, then copy the finished artifact to
+  Trn2.
+- The current blocker is no longer request metadata preparation or artifact
+  shape. It is all-NaN BF16 host logits from the loaded model output path.
 
 ## Recommended Next Work
 
-1. Produce a runnable batched/concurrent proof. The current validation harness
-   has a `batched-exactness` mode. The batch-2 TKG artifact proved
-   `tkg_batch_size=2` is necessary but not sufficient: with
-   `ctx_batch_size=1`, vLLM-Neuron packs two prefills into one CTE row and then
-   host-logits sampling indexes a missing second row. Compile the next small 2K
-   BF16 artifact with both `tkg_batch_size >= 2` and `ctx_batch_size >= 2`, or
-   add a prefill-only batched validator that avoids host sampling.
-2. Keep the current scheduler rule: vLLM prefix reads are allowed only when a
+1. Prove where the NaNs first appear in the BF16 host-logits path. The runner
+   already shows all-NaN values before sampling; next isolate compiled-model
+   output vs loaded-artifact/output-alias/host-logits serving contract.
+2. Run or build the smallest non-Hybrid BF16 host-logits control available for
+   the same Qwen wrapper and artifact style. If that is finite, the remaining
+   problem is Hybrid APC/output aliasing. If it is also NaN, the issue is the
+   Qwen host-logits path or artifact contract.
+3. Preserve the current scheduler rule: vLLM prefix reads are allowed only when a
    matching GDN checkpoint exists and the runtime config advertises backed CTE
    prefix support.
-3. After the batched generated-token or prefill-only proof exists, decide
-   whether to relax the `max_num_seqs == 1` backed-prefix guard or keep
-   fallback-only behavior for multi-request serving.
-4. Keep rerunning the 2K checkpoint-boundary validation without
+4. Keep the vectorized CTE bucket-padding and row-repair tests in place; they
+   cover the `[2,511]` to `[2,512]` fix, short slot mapping repair, and stale
+   `seq_ids` repair.
+5. Rerun the copied-artifact generated-token validation with
+   `QWEN36_VLLM_LOGITS_DEBUG=1` after each logits/output-contract change.
+6. Only after that generated-token proof passes with finite real tokens, decide
+   whether to relax the
+   `max_num_seqs == 1` backed-prefix guard or keep fallback-only behavior for
+   multi-request serving.
+7. Keep rerunning the 2K checkpoint-boundary validation without
    `QWEN36_HYBRID_APC_ALLOW_UNHASHED_SINGLE_PREFIX_RESTORE`.
-5. Expected backed-prefix debug stays:
+8. Expected backed-prefix debug stays:
 
 ```text
 attention_hit_len=256
@@ -964,16 +1017,19 @@ prefill_bucket=256
 prefix_bucket=256
 ```
 
-6. If backed BF16 exactness passes, measure cold vs warm prefill performance.
-7. If backed BF16 exactness fails, capture the first failing token/logit stage and inspect CTE prefix K/V selection before compiling again.
-8. If the same failure repeats more than twice, search NVIDIA/vLLM implementation details and compare contracts before continuing.
-9. After BF16 backed restore exactness and perf are understood, revisit FP8 and TKG/on-device sampling separately.
+9. If backed BF16 exactness passes, measure cold vs warm prefill performance.
+10. If backed BF16 exactness fails, capture the first failing token/logit stage
+   and inspect CTE prefix K/V selection before compiling again.
+11. If the same failure repeats more than twice, search NVIDIA/vLLM
+    implementation details and compare contracts before continuing.
+12. After BF16 backed restore exactness and perf are understood, revisit FP8 and
+    TKG/on-device sampling separately.
 
-The next concrete engineering target is a runnable batched/concurrent proof.
-The old compile/prove target is done for the 2K single-request BF16 boundary
-case. Generated-token `max_num_seqs=2` validation now needs an artifact with
-both `ctx_batch_size >= 2` and `tkg_batch_size >= 2`, or a prefill-only proof
-that avoids vLLM-Neuron host-logits sampling.
+The next concrete engineering target is no longer artifact production or
+vectorized request prep. The combined 2K BF16 `ctx_batch_size=2` /
+`tkg_batch_size=2` artifact exists, loads on Trn2, and reaches generation for the
+grouped two-request path. The next target is finite BF16 host logits from the
+Qwen output path.
 
 ## NVIDIA/vLLM Comparison
 
@@ -991,10 +1047,10 @@ usable_prefix_hit = attention_kv_hit intersect gdn_checkpoint_hit
 ```
 
 The compiled CTE input contract now honors the single-request backed hit during
-suffix-only execution. The remaining Neuron/vLLM gap is vectorized
-batched/concurrent restore handling, plus a generated-token artifact with
-`ctx_batch_size >= 2` and `tkg_batch_size >= 2` or a prefill-only proof that
-avoids host-logits sampling.
+suffix-only execution. The vectorized request-prep path now gets through the
+previous metadata and static-shape blockers. The remaining Neuron/vLLM gap is
+the host-logits/output contract: vLLM receives all-NaN BF16 logits before the
+sampler runs.
 
 ## 2026-05-18 Trainium Recovery Note
 

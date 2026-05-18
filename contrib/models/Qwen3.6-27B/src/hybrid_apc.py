@@ -369,12 +369,21 @@ def apply_hybrid_apc_prefill_plan(
     ):
         output["inputs_embeds"] = inputs_embeds[:, restore_len:prompt_len]
 
+    def _slot_mapping_covers_suffix(value: torch.Tensor) -> bool:
+        if value.ndim == 1:
+            if batch_size == 1:
+                return int(value.numel()) >= suffix_len
+            return int(value.numel()) >= batch_size * suffix_len
+        if value.ndim >= 2:
+            return value.shape[0] >= batch_size and value.shape[1] >= suffix_len
+        return False
+
     def _slot_mapping_needs_repair(value) -> bool:
-        return (
-            not isinstance(value, torch.Tensor)
-            or value.numel() == 0
-            or bool((value.to(torch.int64) < 0).any().item())
-        )
+        if not isinstance(value, torch.Tensor) or value.numel() == 0:
+            return True
+        if not _slot_mapping_covers_suffix(value):
+            return True
+        return bool((value.to(torch.int64) < 0).any().item())
 
     unbacked_attention_hit = (
         plan.checkpoint_slot is None
