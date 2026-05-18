@@ -1085,6 +1085,11 @@ weights log: /home/ubuntu/validation_logs/setup/qwen36_weights_download.log
 512-only artifact: /mnt/trainium_artifacts/qwen_artifacts/qwen36_27b_2048_bf16_hybrid_apc_backed_prefix_ctx2_tkg2_512only_8c694f6
 512-only artifact size: 51G
 512-only cache note: TKG reused cached NEFF from the 256-only stage
+active combined pid: 6725
+active combined artifact: /mnt/trainium_artifacts/qwen_artifacts/qwen36_27b_2048_bf16_hybrid_apc_backed_prefix_ctx2_tkg2_staged_3557925
+active combined log: /home/ubuntu/validation_logs/hybrid_apc_real_tokens/bf16_hybrid_apc_backed_prefix_ctx2_tkg2_staged_3557925_compile_validate.log
+active combined status: /home/ubuntu/validation_logs/hybrid_apc_real_tokens/bf16_hybrid_apc_backed_prefix_ctx2_tkg2_staged_3557925_compile_validate.status
+active combined validation json: /home/ubuntu/validation_logs/hybrid_apc_real_tokens/bf16_hybrid_apc_backed_prefix_ctx2_tkg2_staged_3557925_batched_exactness.json
 ```
 
 Remote `py_compile` passed for:
