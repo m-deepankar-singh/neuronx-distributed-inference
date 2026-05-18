@@ -6,6 +6,7 @@ import os
 import sys
 import types
 import unittest
+from dataclasses import dataclass
 from unittest.mock import patch
 
 
@@ -663,13 +664,17 @@ class TestQwen36HybridAPCSchedulerPatch(unittest.TestCase):
         self.assertFalse(hasattr(runner.model.model, "_qwen36_vllm_cached_request_ids"))
 
     def test_runner_patch_attaches_scheduler_request_sources_to_model_input(self):
+        @dataclass(frozen=True)
+        class FrozenModelInput:
+            request_ids: list[str]
+
         class FakeRunner:
             def __init__(self):
                 self.model = types.SimpleNamespace(model=types.SimpleNamespace())
 
             def _prepare_model_input(self, scheduler_output):
                 del scheduler_output
-                return types.SimpleNamespace(request_ids=["cached-1", "new-1"])
+                return FrozenModelInput(request_ids=["cached-1", "new-1"])
 
             def _execute_model_for_text(self, model_input, intermediate_tensors=None):
                 del intermediate_tensors

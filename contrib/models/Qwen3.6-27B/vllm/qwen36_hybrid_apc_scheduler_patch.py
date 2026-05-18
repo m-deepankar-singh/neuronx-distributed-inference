@@ -598,13 +598,21 @@ def patch_neuron_model_runner_class(runner_cls: type) -> bool:
             **kwargs,
         ):
             model_input = original_prepare(self, scheduler_output, *args, **kwargs)
-            model_input._qwen36_cached_request_ids = _request_ids_from_scheduler_output(
-                scheduler_output,
-                kind="cached",
+            object.__setattr__(
+                model_input,
+                "_qwen36_cached_request_ids",
+                _request_ids_from_scheduler_output(
+                    scheduler_output,
+                    kind="cached",
+                ),
             )
-            model_input._qwen36_new_request_ids = _request_ids_from_scheduler_output(
-                scheduler_output,
-                kind="new",
+            object.__setattr__(
+                model_input,
+                "_qwen36_new_request_ids",
+                _request_ids_from_scheduler_output(
+                    scheduler_output,
+                    kind="new",
+                ),
             )
             return model_input
 
