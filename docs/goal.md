@@ -1057,6 +1057,40 @@ combined compile and the `/mnt/trainium_artifacts` artifacts from that instance
 as lost unless the underlying volume was explicitly preserved and reattached.
 The durable state is the pushed `experimental` branch and this report.
 
+Replacement instance setup started on:
+
+```text
+ubuntu@16.50.246.35
+```
+
+Confirmed setup state:
+
+```text
+repo: /home/ubuntu/inferentia-gdn-experimental-test
+branch: experimental
+commit: 8c694f6a46f17a467907bba0323d3ce736b20ad0
+scratch: /mnt/trainium_artifacts on /dev/nvme1n1
+scratch free: 408G
+fstab: UUID mount added with nofail
+weights target: /home/ubuntu/models/Qwen3.6-27B
+weights source: Qwen/Qwen3.6-27B
+weights download status: success
+weights size: 52G
+weights safetensors: 15
+weights log: /home/ubuntu/validation_logs/setup/qwen36_weights_download.log
+active compile pid: 4684
+active compile artifact: /mnt/trainium_artifacts/qwen_artifacts/qwen36_27b_2048_bf16_hybrid_apc_backed_prefix_ctx2_tkg2_256only_8c694f6
+active compile log: /home/ubuntu/validation_logs/hybrid_apc_real_tokens/bf16_hybrid_apc_backed_prefix_ctx2_tkg2_256only_8c694f6_compile.log
+active compile status: /home/ubuntu/validation_logs/hybrid_apc_real_tokens/bf16_hybrid_apc_backed_prefix_ctx2_tkg2_256only_8c694f6_compile.status
+```
+
+Remote `py_compile` passed for:
+
+```text
+contrib/models/Qwen3.6-27B/test/integration/qwen36_27b_compile_fp8.py
+validation_scripts/qwen36_hybrid_apc_validation.py
+```
+
 Next new-instance bootstrap should:
 
 ```text
