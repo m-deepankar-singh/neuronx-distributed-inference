@@ -863,6 +863,60 @@ class TestHybridAPCAsyncBridge(unittest.TestCase):
             )
         )
 
+    def test_vectorized_cached_decode_row_does_not_require_prefix_restore(self):
+        bridge = _FakeHybridBridge()
+        base = SimpleNamespace(
+            config=SimpleNamespace(use_hybrid_apc_manager=True),
+            hybrid_apc_bridge=bridge,
+        )
+        input_dict = _prefix_input_dict()
+        input_dict.update(
+            {
+                "hybrid_request_id": ("req-cached", "req-new"),
+                "hybrid_cached_request_ids": ("req-cached",),
+                "hybrid_prefill_completion_state": torch.tensor(
+                    [True, False],
+                    dtype=torch.bool,
+                ),
+                "input_ids": torch.tensor([[99, 20, 21, 22]], dtype=torch.int32),
+                "attention_mask": torch.ones((1, 4), dtype=torch.int32),
+                "position_ids": torch.tensor([[4, 0, 1, 2]], dtype=torch.int32),
+                "seq_ids": torch.tensor([0], dtype=torch.int32),
+                "adapter_ids": torch.tensor([0], dtype=torch.int32),
+                "slot_mapping": torch.tensor([[4, 5, 6, 7]], dtype=torch.int32),
+                "block_table": torch.tensor([[1, 2], [3, 4]], dtype=torch.int32),
+                "full_context_lens": torch.tensor([[5], [3]], dtype=torch.int32),
+                "computed_context_lens": torch.tensor([[4], [0]], dtype=torch.int32),
+                "num_queries": torch.tensor([[1], [3]], dtype=torch.int32),
+            }
+        )
+
+        prepared = prepare_hybrid_apc_request_for_execution(base, input_dict)
+
+        self.assertEqual(
+            [call["request_id"] for call in bridge.prepare_calls],
+            ["req-new"],
+        )
+        self.assertEqual(bridge.suffix_prepare_calls, [])
+        self.assertTrue(
+            torch.equal(
+                prepared["input_ids"],
+                torch.tensor([[99, 0, 0], [20, 21, 22]], dtype=torch.int32),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                prepared["hybrid_restore_mask"],
+                torch.tensor([0, 0], dtype=torch.int32),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                prepared["hybrid_commit_mask"],
+                torch.tensor([0, 1], dtype=torch.int32),
+            )
+        )
+
     def test_cancel_hybrid_apc_request_is_noop_without_prepared_request(self):
         input_dict = {}
 

@@ -522,6 +522,10 @@ def _patch_scheduler_module(module: Any) -> bool:
 
 def _request_ids_from_model_input(model_input: Any) -> tuple[Hashable, ...] | None:
     request_ids = getattr(model_input, "request_ids", None)
+    return _as_request_id_tuple(request_ids)
+
+
+def _as_request_id_tuple(request_ids: Any) -> tuple[Hashable, ...] | None:
     if request_ids is None:
         return None
     if isinstance(request_ids, tuple):
@@ -534,6 +538,22 @@ def _request_ids_from_model_input(model_input: Any) -> tuple[Hashable, ...] | No
         return tuple(request_ids)
     except TypeError:
         return (request_ids,)
+
+
+def _request_ids_from_scheduler_output(
+    scheduler_output: Any,
+    *,
+    kind: str,
+) -> tuple[Hashable, ...] | None:
+    if kind == "cached":
+        cached_reqs = getattr(scheduler_output, "scheduled_cached_reqs", None)
+        return _as_request_id_tuple(getattr(cached_reqs, "req_ids", None))
+    if kind == "new":
+        new_reqs = getattr(scheduler_output, "scheduled_new_reqs", None)
+        if new_reqs is None:
+            return None
+        return tuple(getattr(req, "req_id") for req in new_reqs)
+    raise ValueError(f"unknown scheduler request kind: {kind}")
 
 
 def _request_id_target_models(model: Any) -> list[Any]:
@@ -553,42 +573,98 @@ def _request_id_target_models(model: Any) -> list[Any]:
 
 
 def patch_neuron_model_runner_class(runner_cls: type) -> bool:
-    """Patch vLLM-Neuron runner to expose request IDs during model execution."""
+    """Patch vLLM-Neuron runner to expose scheduler row metadata."""
 
     original_execute = getattr(runner_cls, "_execute_model_for_text", None)
     if original_execute is None:
         raise AttributeError(
             f"{runner_cls!r} has no _execute_model_for_text method"
         )
-    if getattr(original_execute, "_qwen36_hybrid_apc_request_ids_patched", False):
-        return False
+    original_prepare = getattr(runner_cls, "_prepare_model_input", None)
 
     missing = object()
+    installed = False
+
+    if original_prepare is not None and not getattr(
+        original_prepare,
+        "_qwen36_hybrid_apc_model_input_patched",
+        False,
+    ):
+
+        def prepare_model_input_with_hybrid_apc_metadata(
+            self,
+            scheduler_output,
+            *args,
+            **kwargs,
+        ):
+            model_input = original_prepare(self, scheduler_output, *args, **kwargs)
+            model_input._qwen36_cached_request_ids = _request_ids_from_scheduler_output(
+                scheduler_output,
+                kind="cached",
+            )
+            model_input._qwen36_new_request_ids = _request_ids_from_scheduler_output(
+                scheduler_output,
+                kind="new",
+            )
+            return model_input
+
+        prepare_model_input_with_hybrid_apc_metadata._qwen36_hybrid_apc_model_input_patched = (
+            True
+        )
+        prepare_model_input_with_hybrid_apc_metadata._qwen36_original_prepare_model_input = (
+            original_prepare
+        )
+        runner_cls._prepare_model_input = prepare_model_input_with_hybrid_apc_metadata
+        installed = True
+
+    if getattr(original_execute, "_qwen36_hybrid_apc_request_ids_patched", False):
+        return installed
 
     def execute_model_for_text_with_request_ids(self, model_input, *args, **kwargs):
         model = getattr(self, "model", None)
-        request_ids = _request_ids_from_model_input(model_input)
+        metadata = {
+            "_qwen36_vllm_request_ids": _request_ids_from_model_input(model_input),
+            "_qwen36_vllm_cached_request_ids": getattr(
+                model_input,
+                "_qwen36_cached_request_ids",
+                None,
+            ),
+            "_qwen36_vllm_new_request_ids": getattr(
+                model_input,
+                "_qwen36_new_request_ids",
+                None,
+            ),
+            "_qwen36_vllm_prefill_completion_state": getattr(
+                model_input,
+                "prefill_completion_state",
+                None,
+            ),
+        }
         previous_values = []
-        if request_ids is not None:
+        if any(value is not None for value in metadata.values()):
             for target in _request_id_target_models(model):
-                previous_values.append(
-                    (
-                        target,
-                        getattr(target, "_qwen36_vllm_request_ids", missing),
+                for attr, value in metadata.items():
+                    if value is None:
+                        continue
+                    previous_values.append(
+                        (
+                            target,
+                            attr,
+                            getattr(target, attr, missing),
+                        )
                     )
-                )
-                target._qwen36_vllm_request_ids = request_ids
+                    setattr(target, attr, value)
         try:
             return original_execute(self, model_input, *args, **kwargs)
         finally:
-            for target, previous_request_ids in reversed(previous_values):
-                if previous_request_ids is missing:
+            for target, attr, previous_value in reversed(previous_values):
+                if previous_value is missing:
                     try:
-                        delattr(target, "_qwen36_vllm_request_ids")
+                        delattr(target, attr)
                     except AttributeError:
                         pass
                 else:
-                    target._qwen36_vllm_request_ids = previous_request_ids
+                    setattr(target, attr, previous_value)
 
     execute_model_for_text_with_request_ids._qwen36_hybrid_apc_request_ids_patched = (
         True

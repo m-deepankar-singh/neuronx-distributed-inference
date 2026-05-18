@@ -77,6 +77,38 @@ def _single_batch_tensor(value: Any) -> bool:
     return isinstance(value, torch.Tensor) and value.ndim >= 1 and value.shape[0] == 1
 
 
+def _truthy_single_value(value: Any) -> bool:
+    item = _single_batch_value(value)
+    if item is None:
+        return False
+    if isinstance(item, torch.Tensor):
+        return bool(item.item())
+    return bool(item)
+
+
+def _request_id_matches(candidate: Any, request_id: Any) -> bool:
+    if candidate == request_id:
+        return True
+    try:
+        return str(candidate) == str(request_id)
+    except Exception:
+        return False
+
+
+def _request_id_in_collection(request_id: Any, values: Any) -> bool:
+    if request_id is None or values is None:
+        return False
+    if isinstance(values, torch.Tensor):
+        values = values.reshape(-1).tolist()
+    elif isinstance(values, (str, bytes)):
+        values = (values,)
+    try:
+        iterator = iter(values)
+    except TypeError:
+        return _request_id_matches(values, request_id)
+    return any(_request_id_matches(value, request_id) for value in iterator)
+
+
 def _batch_size_from_input_dict(input_dict: Dict[str, Any]) -> int:
     batch_size = 1
     for key in (
@@ -87,6 +119,7 @@ def _batch_size_from_input_dict(input_dict: Dict[str, Any]) -> int:
         "vllm_attention_hit_len",
         "hybrid_attention_hit_len",
         "attention_hit_len",
+        "hybrid_prefill_completion_state",
     ):
         value = input_dict.get(key)
         if isinstance(value, torch.Tensor) and value.ndim >= 1:
@@ -253,6 +286,48 @@ def _right_pad_dim1(tensor: torch.Tensor, target_len: int, pad_value: int) -> to
         device=tensor.device,
     )
     return torch.cat([tensor, pad], dim=1)
+
+
+def _with_zero_hybrid_apc_slots(input_dict: Dict[str, Any]) -> Dict[str, Any]:
+    output = dict(input_dict)
+    seq_ids = input_dict.get("seq_ids")
+    if isinstance(seq_ids, torch.Tensor) and seq_ids.ndim >= 1:
+        batch_size = int(seq_ids.reshape(-1).shape[0])
+        device = seq_ids.device
+    else:
+        input_ids = input_dict.get("input_ids")
+        batch_size = (
+            int(input_ids.shape[0])
+            if isinstance(input_ids, torch.Tensor) and input_ids.ndim >= 1
+            else 1
+        )
+        device = input_ids.device if isinstance(input_ids, torch.Tensor) else None
+    kwargs = {"dtype": torch.int32}
+    if device is not None:
+        kwargs["device"] = device
+    zeros = torch.zeros((batch_size,), **kwargs)
+    output.setdefault("hybrid_restore_slot_ids", zeros)
+    output.setdefault("hybrid_restore_mask", torch.zeros_like(zeros))
+    output.setdefault("hybrid_restore_prefix_lens", torch.zeros_like(zeros))
+    output.setdefault("hybrid_commit_slot_ids", torch.zeros_like(zeros))
+    output.setdefault("hybrid_commit_mask", torch.zeros_like(zeros))
+    return output
+
+
+def _is_completed_cached_decode_row(
+    input_dict: Dict[str, Any],
+    *,
+    request_id: Any,
+    query_len: int | None,
+) -> bool:
+    if not _request_id_in_collection(
+        request_id,
+        input_dict.get("hybrid_cached_request_ids"),
+    ):
+        return False
+    if not _truthy_single_value(input_dict.get("hybrid_prefill_completion_state")):
+        return False
+    return query_len is None or int(query_len) <= 1
 
 
 def _combine_vectorized_hybrid_apc_inputs(
@@ -515,6 +590,23 @@ def prepare_hybrid_apc_request_for_execution(
     )
     if request_prefix_len is not None:
         request_prefix_len = _to_python_int(request_prefix_len)
+
+    query_len = _single_batch_value(input_dict.get("num_queries"))
+    if (
+        query_len is None
+        and request_prefix_len is not None
+        and attention_hit_len is not None
+    ):
+        query_len = max(0, request_prefix_len - _to_python_int(attention_hit_len))
+    elif query_len is not None:
+        query_len = _to_python_int(query_len)
+
+    if _is_completed_cached_decode_row(
+        input_dict,
+        request_id=request_id,
+        query_len=query_len,
+    ):
+        return _with_zero_hybrid_apc_slots(input_dict)
 
     cumulative_hashes_by_prefix_len = _first_present(
         input_dict.get("vllm_or_local_prefix_hashes"),

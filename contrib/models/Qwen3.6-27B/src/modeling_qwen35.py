@@ -4479,6 +4479,24 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
                     hybrid_apc_request_dict["hybrid_request_id"] = request_ids[0]
                 else:
                     hybrid_apc_request_dict["hybrid_request_id"] = request_ids
+            cached_request_ids = getattr(
+                self,
+                "_qwen36_vllm_cached_request_ids",
+                None,
+            )
+            if cached_request_ids is not None:
+                hybrid_apc_request_dict["hybrid_cached_request_ids"] = (
+                    cached_request_ids
+                )
+            prefill_completion_state = getattr(
+                self,
+                "_qwen36_vllm_prefill_completion_state",
+                None,
+            )
+            if prefill_completion_state is not None:
+                hybrid_apc_request_dict[
+                    "hybrid_prefill_completion_state"
+                ] = prefill_completion_state
             prepared_inputs = prepare_hybrid_apc_request_for_execution(
                 self,
                 hybrid_apc_request_dict,

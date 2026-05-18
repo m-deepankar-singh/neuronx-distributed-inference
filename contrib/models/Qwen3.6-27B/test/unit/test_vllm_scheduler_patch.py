@@ -631,19 +631,61 @@ class TestQwen36HybridAPCSchedulerPatch(unittest.TestCase):
                     "_qwen36_vllm_request_ids",
                     None,
                 )
+                self.seen_cached_request_ids = getattr(
+                    self.model.model,
+                    "_qwen36_vllm_cached_request_ids",
+                    None,
+                )
+                self.seen_prefill_completion_state = getattr(
+                    self.model.model,
+                    "_qwen36_vllm_prefill_completion_state",
+                    None,
+                )
                 return self.seen_request_ids
 
         installed = self.patch.patch_neuron_model_runner_class(FakeRunner)
         runner = FakeRunner()
         result = runner._execute_model_for_text(
-            types.SimpleNamespace(request_ids=["req-a"])
+            types.SimpleNamespace(
+                request_ids=["req-a"],
+                _qwen36_cached_request_ids=("req-a",),
+                prefill_completion_state="done",
+            )
         )
 
         self.assertTrue(installed)
         self.assertEqual(result, ("req-a",))
         self.assertEqual(runner.seen_request_ids, ("req-a",))
+        self.assertEqual(runner.seen_cached_request_ids, ("req-a",))
+        self.assertEqual(runner.seen_prefill_completion_state, "done")
         self.assertFalse(hasattr(runner.model, "_qwen36_vllm_request_ids"))
         self.assertFalse(hasattr(runner.model.model, "_qwen36_vllm_request_ids"))
+        self.assertFalse(hasattr(runner.model.model, "_qwen36_vllm_cached_request_ids"))
+
+    def test_runner_patch_attaches_scheduler_request_sources_to_model_input(self):
+        class FakeRunner:
+            def __init__(self):
+                self.model = types.SimpleNamespace(model=types.SimpleNamespace())
+
+            def _prepare_model_input(self, scheduler_output):
+                del scheduler_output
+                return types.SimpleNamespace(request_ids=["cached-1", "new-1"])
+
+            def _execute_model_for_text(self, model_input, intermediate_tensors=None):
+                del intermediate_tensors
+                return model_input
+
+        installed = self.patch.patch_neuron_model_runner_class(FakeRunner)
+        runner = FakeRunner()
+        scheduler_output = types.SimpleNamespace(
+            scheduled_cached_reqs=types.SimpleNamespace(req_ids=["cached-1"]),
+            scheduled_new_reqs=[types.SimpleNamespace(req_id="new-1")],
+        )
+        model_input = runner._prepare_model_input(scheduler_output)
+
+        self.assertTrue(installed)
+        self.assertEqual(model_input._qwen36_cached_request_ids, ("cached-1",))
+        self.assertEqual(model_input._qwen36_new_request_ids, ("new-1",))
 
     def test_import_hook_patches_already_loaded_neuron_runner_module(self):
         class FakeRunner:
