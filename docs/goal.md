@@ -1351,6 +1351,86 @@ insufficient NeuronCores -> tp_degree/logical_nc_config too wide for target
 insufficient memory -> artifact shape is too large for target device memory
 ```
 
+## 2026-05-18 R7i Multi-CTE Compile Result
+
+The r7i compile host proved the previously blocked combined multi-CTE compile.
+The run was read-only monitored from the local machine and completed
+successfully:
+
+```text
+compile host: ubuntu@16.26.249.227
+instance: r7i.48xlarge
+repo: /home/ubuntu/inferentia-gdn-experimental-test
+branch/commit: experimental / 7306c2e
+model: /home/ubuntu/models/Qwen3.6-27B
+status: success
+exit: COMPILE_EXIT=0
+completed remote check: 2026-05-18T18:31:00+0000
+artifact size: 51G
+artifact path: /mnt/trainium_artifacts/qwen_artifacts/qwen36_27b_2048_bf16_hybrid_apc_backed_prefix_ctx2_tkg2_r7i_trn2_local_7306c2e
+```
+
+The compiled artifact contains the expected full artifact files:
+
+```text
+model.pt
+neuron_config.json
+weights/tp0_sharded_checkpoint.safetensors
+weights/tp1_sharded_checkpoint.safetensors
+weights/tp2_sharded_checkpoint.safetensors
+weights/tp3_sharded_checkpoint.safetensors
+```
+
+The exact compile contract was:
+
+```text
+target: trn2 via NEURON_PLATFORM_TARGET_OVERRIDE=trn2
+PYTHONPATH: local src and local contrib Qwen model path before site-packages
+weight dtype: bf16_control
+seq_len: 2048
+cte_buckets: 256,512
+prefix_buckets: 256,512
+block_size: 256
+user pa_num_blocks: 16
+compiled physical PA blocks: 17 with the helper null-block adjustment
+tp_degree: 4
+logical_nc_config: 2
+max_num_seqs: 2
+ctx_batch_size: 2
+tkg_batch_size: 2
+prefix caching: enabled
+Hybrid APC: enabled
+vLLM chunked prefill: enabled
+on-device sampling: disabled
+static hybrid cache: disabled
+GDN checkpoint interval: 256
+GDN checkpoint slots: 8
+GDN recurrent cache dtype: float32
+GDN conv cache dtype: bfloat16
+Hybrid APC backed prefix reads: enabled
+warmup: skipped
+```
+
+Important compile milestones from the log:
+
+```text
+HLO generation succeeded: 6 CTE HLOs + 1 TKG HLO in 73.521s
+TKG priority compile: PASS, 1262.218s
+weight layout optimization: 20.278s
+all six CTE HLOs: PASS
+all-HLO compile phase: 616.075s
+final save/package: completed, COMPILE_EXIT=0
+```
+
+This resolves the compile-capacity blocker from the smaller Trn2 host for the
+2K ctx2/tkg2 multi-bucket BF16 artifact. It does not yet prove runtime
+correctness. The next step is to copy the full artifact directory to a healthy
+Trn2 inference instance and run `batched-exactness` from
+`validation_scripts/qwen36_hybrid_apc_validation.py` with
+`--compiled-artifacts` pointing to the copied directory. That runtime test is
+where we will learn whether the remaining blocker is gone or whether the decode
+TKG input contract still causes `NRT_EXEC_OOB`.
+
 References:
 
 - vLLM PagedAttention: https://docs.vllm.ai/en/stable/design/paged_attention/
