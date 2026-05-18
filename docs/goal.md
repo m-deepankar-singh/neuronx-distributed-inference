@@ -351,8 +351,8 @@ tkg_batch_size >= --max-num-seqs; got tkg_batch_size=1 and max_num_seqs=2
 
 This means a real generated-token batched E2E proof needs either:
 
-- a 2K BF16 artifact compiled with `tkg_batch_size >= 2` / compatible
-  `max_num_seqs=2`, or
+- a 2K BF16 artifact compiled with both `ctx_batch_size >= 2` and
+  `tkg_batch_size >= 2` / compatible `max_num_seqs=2`, or
 - a separate prefill-only batched validator that does not enter TKG.
 
 ### 2026-05-18 Batched Compile Prep
@@ -427,6 +427,33 @@ proof needs `ctx_batch_size >= 2` as well as `tkg_batch_size >= 2`, unless
 vLLM-Neuron host-logits sampling is patched to split packed CTE logits. The
 validation preflight now rejects `ctx_batch_size < --max-num-seqs` for batched
 generated-token runs.
+
+### 2026-05-18 Ctx2/TKG2 Artifact Attempt
+
+The next artifact attempt is in flight:
+
+```text
+/mnt/trainium_artifacts/qwen_artifacts/qwen36_27b_2048_bf16_hybrid_apc_backed_prefix_ctx2_tkg2_4244d86
+batch_size=2
+ctx_batch_size=2
+tkg_batch_size=2
+pa_num_blocks=17
+skip_warmup=True
+```
+
+Last verified log before SSH stopped completing banner exchange:
+
+```text
+START_CTX2_TKG2_COMPILE_AND_VALIDATE date=2026-05-18T05:06:10+00:00
+CONTEXT_TRACE_SHAPE ... ctx_batch_size=2 ... max_num_seqs=2 ... tkg_batch_size=2
+INFO:Neuron:generating HLO: context_encoding_model, input example shape = torch.Size([2, 256])
+```
+
+This confirms the second compile is tracing CTE with a two-row prefill batch,
+unlike the previous `ctx_batch_size=1` artifact that packed two requests into
+`input_shape=(1, 52)` and failed in host-logits reorder. The remote instance
+became temporarily unreachable via SSH while this compile was running; recheck
+the log/status before deciding whether to recompile or patch vLLM-Neuron.
 
 The base BF16 host-logits path is not the current blocker when using the per-chunk DeltaNet CTE path:
 
@@ -895,8 +922,9 @@ prefix_bucket=256
 
 The next concrete engineering target is a runnable batched/concurrent proof.
 The old compile/prove target is done for the 2K single-request BF16 boundary
-case, but the current BF16 artifact cannot run generated-token
-`max_num_seqs=2` validation because its TKG trace is batch 1.
+case. Generated-token `max_num_seqs=2` validation now needs an artifact with
+both `ctx_batch_size >= 2` and `tkg_batch_size >= 2`, or a prefill-only proof
+that avoids vLLM-Neuron host-logits sampling.
 
 ## NVIDIA/vLLM Comparison
 
@@ -916,7 +944,8 @@ usable_prefix_hit = attention_kv_hit intersect gdn_checkpoint_hit
 The compiled CTE input contract now honors the single-request backed hit during
 suffix-only execution. The remaining Neuron/vLLM gap is vectorized
 batched/concurrent restore handling, plus a generated-token artifact with
-`tkg_batch_size >= 2` or a prefill-only proof that avoids TKG.
+`ctx_batch_size >= 2` and `tkg_batch_size >= 2` or a prefill-only proof that
+avoids host-logits sampling.
 
 References:
 
