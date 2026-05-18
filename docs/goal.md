@@ -15,12 +15,12 @@ The active branch is `experimental`.
 
 Useful Trainium paths:
 
-- Instance: `ubuntu@16.50.102.110`
+- Instance: `ubuntu@16.50.246.35`
 - Key: `/Users/deepankarsingh1312/Downloads/trainium.pem`
 - Remote repo: `/home/ubuntu/inferentia-gdn-experimental-test`
 - Weights: `/home/ubuntu/models/Qwen3.6-27B`
 - Main BF16 Hybrid APC artifact:
-  `/mnt/trainium_artifacts/qwen_artifacts/qwen36_27b_2048_bf16_hybrid_apc_backed_prefix_d061df5`
+  `/mnt/trainium_artifacts/qwen_artifacts/qwen36_27b_2048_bf16_hybrid_apc_backed_prefix_ctx2_tkg2_staged_3557925`
 
 ### 2026-05-18 Overnight Update
 
@@ -1091,6 +1091,50 @@ active combined log: /home/ubuntu/validation_logs/hybrid_apc_real_tokens/bf16_hy
 active combined status: /home/ubuntu/validation_logs/hybrid_apc_real_tokens/bf16_hybrid_apc_backed_prefix_ctx2_tkg2_staged_3557925_compile_validate.status
 active combined validation json: /home/ubuntu/validation_logs/hybrid_apc_real_tokens/bf16_hybrid_apc_backed_prefix_ctx2_tkg2_staged_3557925_batched_exactness.json
 ```
+
+Latest confirmed state on `16.50.246.35`:
+
+```text
+remote time: 2026-05-18T14:00:04+00:00
+repo branch: experimental
+repo commit: 3557925
+scratch: /mnt/trainium_artifacts mounted, 305G free
+weights: /home/ubuntu/models/Qwen3.6-27B, 52G
+main compile process: pid 6729, nice 10, elapsed 29:41
+neuronx-cc processes: 13
+status file: compile_started
+artifact size: 16K
+validation json: not created yet
+```
+
+The combined run generated all CTE/TKG HLOs, then the priority TKG compile
+passed:
+
+```text
+Generated all HLOs in 130.22113156318665 seconds
+Starting compilation for the priority HLO
+'token_generation_model' is the priority model with bucket rank 0
+Compiler status PASS
+Compilation Successfully Completed for model.MODULE_e2b47141f2b9df7d4250+63d0419b.hlo_module.pb
+Done compilation for the priority HLO in 1152.990659236908 seconds
+Done optimizing weight layout for all HLOs in 26.17424511909485 seconds
+Starting compilation for all HLOs
+```
+
+After that point, three lightweight SSH probes timed out during banner
+exchange:
+
+```text
+Connection timed out during banner exchange
+Connection to 16.50.246.35 port 22 timed out
+```
+
+Do not treat that alone as proof that the compile failed. The last successful
+read showed the compiler alive and actively compiling CTE HLOs. This is the
+same access-layer symptom seen when `neuronx-cc` saturates the host enough that
+`sshd` stops responding promptly. Avoid rebooting, killing, or starting another
+compile unless AWS console shows the instance is failed/terminated or SSH stays
+unreachable after a long backoff.
 
 Remote `py_compile` passed for:
 
