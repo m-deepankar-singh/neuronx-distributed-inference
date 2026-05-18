@@ -1052,6 +1052,21 @@ Local AWS CLI credentials are not valid for checking EC2 health from this
 machine. Do not assume the process is dead from SSH alone; this is the same
 symptom seen when `neuronx-cc` starves sshd during heavy compilation.
 
+The user later reported that the instance was terminated. Treat the in-flight
+combined compile and the `/mnt/trainium_artifacts` artifacts from that instance
+as lost unless the underlying volume was explicitly preserved and reattached.
+The durable state is the pushed `experimental` branch and this report.
+
+Next new-instance bootstrap should:
+
+```text
+1. Clone/fetch origin/experimental.
+2. Recreate /mnt/trainium_artifacts on the large scratch volume.
+3. Put TMPDIR/TMP/TEMP, NEURON_COMPILE_CACHE_URL, and --base-compile-work-dir under /mnt/trainium_artifacts.
+4. Download or mount /home/ubuntu/models/Qwen3.6-27B.
+5. Re-run the staged ctx2/tkg2 compile plan: 256-only, then 512-only, then combined 256,512 only if the first two succeed.
+```
+
 If the combined artifact succeeds, the same job immediately runs
 `batched-exactness` with `max_num_seqs=2`, `ctx_batch_size=2`,
 `tkg_batch_size=2`, host-side BF16 logits, and real-token generation. If it
