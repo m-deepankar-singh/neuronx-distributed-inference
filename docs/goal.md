@@ -1136,6 +1136,18 @@ same access-layer symptom seen when `neuronx-cc` saturates the host enough that
 compile unless AWS console shows the instance is failed/terminated or SSH stays
 unreachable after a long backoff.
 
+Follow-up check from the local machine at `2026-05-18T20:07:59+0530` still
+timed out during SSH banner exchange:
+
+```text
+Connection timed out during banner exchange
+Connection to 16.50.246.35 port 22 timed out
+```
+
+No compile or validation status could be read from the host during that check.
+The last authoritative remote evidence remains the `2026-05-18T14:00:04+00:00`
+read above.
+
 Remote `py_compile` passed for:
 
 ```text
