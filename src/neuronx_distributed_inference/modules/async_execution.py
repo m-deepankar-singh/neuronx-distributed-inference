@@ -78,6 +78,7 @@ def _single_batch_tensor(value: Any) -> bool:
 
 
 def _batch_size_from_input_dict(input_dict: Dict[str, Any]) -> int:
+    batch_size = 1
     for key in (
         "input_ids",
         "seq_ids",
@@ -89,13 +90,78 @@ def _batch_size_from_input_dict(input_dict: Dict[str, Any]) -> int:
     ):
         value = input_dict.get(key)
         if isinstance(value, torch.Tensor) and value.ndim >= 1:
-            return int(value.shape[0])
-        if isinstance(value, (list, tuple)):
-            return len(value)
-    return 1
+            batch_size = max(batch_size, int(value.reshape(value.shape[0], -1).shape[0]))
+        elif isinstance(value, (list, tuple)):
+            batch_size = max(batch_size, len(value))
+    return batch_size
 
 
-def _select_batch_item(value: Any, index: int, batch_size: int, *, key: str = ""):
+def _batch_int_list(
+    input_dict: Dict[str, Any],
+    key: str,
+    *,
+    batch_size: int,
+) -> list[int] | None:
+    value = input_dict.get(key)
+    if value is None:
+        return None
+    if isinstance(value, torch.Tensor):
+        flat = value.reshape(-1)
+        if flat.numel() < batch_size:
+            return None
+        return [int(item.item()) for item in flat[:batch_size]]
+    if isinstance(value, (list, tuple)) and len(value) >= batch_size:
+        try:
+            return [int(item) for item in value[:batch_size]]
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _vectorized_query_lengths(
+    input_dict: Dict[str, Any],
+    *,
+    batch_size: int,
+) -> list[int] | None:
+    num_queries = _batch_int_list(input_dict, "num_queries", batch_size=batch_size)
+    if num_queries is not None:
+        return num_queries
+
+    full_context_lens = _batch_int_list(
+        input_dict,
+        "full_context_lens",
+        batch_size=batch_size,
+    )
+    computed_context_lens = _batch_int_list(
+        input_dict,
+        "computed_context_lens",
+        batch_size=batch_size,
+    )
+    if full_context_lens is not None and computed_context_lens is not None:
+        return [
+            max(0, full_len - computed_len)
+            for full_len, computed_len in zip(full_context_lens, computed_context_lens)
+        ]
+
+    input_ids = input_dict.get("input_ids")
+    if (
+        isinstance(input_ids, torch.Tensor)
+        and input_ids.ndim >= 2
+        and input_ids.shape[0] == 1
+        and input_ids.shape[1] % batch_size == 0
+    ):
+        return [input_ids.shape[1] // batch_size] * batch_size
+    return None
+
+
+def _select_batch_item(
+    value: Any,
+    index: int,
+    batch_size: int,
+    *,
+    key: str = "",
+    query_lengths: list[int] | None = None,
+):
     if isinstance(value, torch.Tensor):
         if value.numel() == 0 or value.ndim == 0:
             return value
@@ -107,10 +173,41 @@ def _select_batch_item(value: Any, index: int, batch_size: int, *, key: str = ""
             return value[:, index : index + 1, ...]
         if value.shape[0] == batch_size:
             return value[index : index + 1]
+        if (
+            value.ndim >= 2
+            and value.shape[0] == 1
+            and query_lengths is not None
+            and key
+            in {
+                "input_ids",
+                "attention_mask",
+                "position_ids",
+                "slot_mapping",
+                "inputs_embeds",
+            }
+        ):
+            offset = sum(query_lengths[:index])
+            length = query_lengths[index]
+            if offset + length <= value.shape[1]:
+                return value[:, offset : offset + length, ...]
+        if (
+            key in {"seq_ids", "adapter_ids"}
+            and value.ndim == 1
+            and value.shape[0] == 1
+            and batch_size > 1
+        ):
+            fill_value = index if key == "seq_ids" else int(value.reshape(-1)[0].item())
+            return torch.tensor([fill_value], dtype=value.dtype, device=value.device)
         return value
     if key == "llava_args" and isinstance(value, (list, tuple)):
         return [
-            _select_batch_item(item, index, batch_size, key=f"{key}[{idx}]")
+            _select_batch_item(
+                item,
+                index,
+                batch_size,
+                key=f"{key}[{idx}]",
+                query_lengths=query_lengths,
+            )
             for idx, item in enumerate(value)
         ]
     if isinstance(value, tuple) and len(value) == batch_size:
@@ -219,10 +316,17 @@ def _prepare_vectorized_hybrid_apc_requests(
 ) -> Dict[str, Any]:
     row_outputs: list[Dict[str, Any]] = []
     prepared_requests = []
+    query_lengths = _vectorized_query_lengths(input_dict, batch_size=batch_size)
     try:
         for index in range(batch_size):
             row_input = {
-                key: _select_batch_item(value, index, batch_size, key=key)
+                key: _select_batch_item(
+                    value,
+                    index,
+                    batch_size,
+                    key=key,
+                    query_lengths=query_lengths,
+                )
                 for key, value in input_dict.items()
                 if not key.startswith("_hybrid_apc")
             }
