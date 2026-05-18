@@ -455,6 +455,17 @@ unlike the previous `ctx_batch_size=1` artifact that packed two requests into
 became temporarily unreachable via SSH while this compile was running; recheck
 the log/status before deciding whether to recompile or patch vLLM-Neuron.
 
+Potential prefill-only fallback note:
+
+```text
+Current vLLM SamplingParams validation requires max_tokens >= 1.
+```
+
+So a prefill-only batched proof cannot be implemented as a simple
+`LLM.generate(..., SamplingParams(max_tokens=0))` path. It would need a
+lower-level vLLM/vLLM-Neuron runner hook, a prompt-logprobs path that is proven
+not to enter TKG, or a custom model-execute validator.
+
 The base BF16 host-logits path is not the current blocker when using the per-chunk DeltaNet CTE path:
 
 - Fused CTE artifact goes NaN around 105-106 tokens.
@@ -951,3 +962,4 @@ References:
 
 - vLLM PagedAttention: https://docs.vllm.ai/en/stable/design/paged_attention/
 - vLLM prefix caching: https://docs.vllm.ai/en/stable/design/prefix_caching/
+- vLLM SamplingParams: https://docs.vllm.ai/en/latest/api/vllm/sampling_params/
