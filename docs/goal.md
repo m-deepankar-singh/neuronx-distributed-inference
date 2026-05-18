@@ -1232,6 +1232,87 @@ The compile cache is optional and only helps future compiles. Inference should
 load from `--compiled-artifacts <artifact_path>` and should not invoke
 `neuronx-cc` on the smaller instance.
 
+Concrete large-compile/small-inference runbook:
+
+```bash
+export REPO=/home/ubuntu/inferentia-gdn-experimental-test
+export MODEL=/home/ubuntu/models/Qwen3.6-27B
+export SCRATCH=/mnt/trainium_artifacts
+export ART=$SCRATCH/qwen_artifacts/qwen36_27b_2048_bf16_hybrid_apc_backed_prefix_ctx2_tkg2_largebox_$(cd "$REPO" && git rev-parse --short HEAD)
+
+mkdir -p "$SCRATCH"/{qwen_artifacts,neuron_compile_cache,tmp}
+export TMPDIR=$SCRATCH/tmp
+export TMP=$SCRATCH/tmp
+export TEMP=$SCRATCH/tmp
+export NEURON_COMPILE_CACHE_URL=$SCRATCH/neuron_compile_cache
+
+cd "$REPO"
+python3 contrib/models/Qwen3.6-27B/test/integration/qwen36_27b_compile_fp8.py \
+  --repo-root "$REPO" \
+  --model-path "$MODEL" \
+  --compiled-path "$ART" \
+  --base-compile-work-dir "$SCRATCH/qwen_artifacts/_nxd_model_workdir" \
+  --weight-dtype bf16_control \
+  --seq-len 2048 \
+  --cte-buckets 256,512 \
+  --prefix-buckets 256,512 \
+  --block-size 256 \
+  --pa-num-blocks 16 \
+  --tp-degree 4 \
+  --logical-nc-config 2 \
+  --max-num-seqs 2 \
+  --ctx-batch-size 2 \
+  --enable-prefix-caching \
+  --enable-hybrid-apc \
+  --enable-vllm-chunked-prefill \
+  --disable-on-device-sampling \
+  --disable-static-hybrid-cache \
+  --gdn-checkpoint-interval 256 \
+  --max-gdn-checkpoint-slots 8 \
+  --gdn-recurrent-cache-dtype float32 \
+  --gdn-conv-cache-dtype bfloat16 \
+  --hybrid-cache-mode all \
+  --hybrid-apc-enable-backed-prefix-reads \
+  --skip-warmup
+```
+
+Then copy the full `$ART` directory to the smaller inference instance under the
+same or another stable path. Validate there without running the compile helper:
+
+```bash
+QWEN36_HYBRID_APC_DEBUG=1 \
+python3 validation_scripts/qwen36_hybrid_apc_validation.py batched-exactness \
+  --model-path /home/ubuntu/models/Qwen3.6-27B \
+  --compiled-artifacts /mnt/trainium_artifacts/qwen_artifacts/<copied-artifact> \
+  --max-model-len 2048 \
+  --seq-len 2048 \
+  --cte-buckets 256,512 \
+  --tensor-parallel-size 4 \
+  --max-num-seqs 2 \
+  --logical-nc-config 2 \
+  --ctx-batch-size 2 \
+  --block-size 256 \
+  --gdn-checkpoint-interval 256 \
+  --max-gdn-checkpoint-slots 8 \
+  --gdn-recurrent-cache-dtype float32 \
+  --gdn-conv-cache-dtype bfloat16 \
+  --hybrid-apc-enable-backed-prefix-reads \
+  --enable-vllm-chunked-prefill \
+  --num-gpu-blocks-override 16 \
+  --max-tokens 8 \
+  --require-real-tokens \
+  --skip-fp8-env
+```
+
+If the copied artifact fails to load on the smaller box, first inspect:
+
+```text
+NEFF version mismatch -> compiler/runtime version mismatch
+unsupported hardware/operator -> wrong target family or runtime stack
+insufficient NeuronCores -> tp_degree/logical_nc_config too wide for target
+insufficient memory -> artifact shape is too large for target device memory
+```
+
 References:
 
 - vLLM PagedAttention: https://docs.vllm.ai/en/stable/design/paged_attention/
