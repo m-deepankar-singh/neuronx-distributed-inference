@@ -124,6 +124,24 @@ def _pa_num_blocks(args: argparse.Namespace) -> int:
     return requested_blocks + 1
 
 
+def _configure_base_compile_work_dir(
+    compiled_path: Path,
+    requested_work_dir: str | None,
+) -> Path:
+    if requested_work_dir:
+        work_dir = Path(requested_work_dir).expanduser().resolve()
+    else:
+        existing_work_dir = os.environ.get("BASE_COMPILE_WORK_DIR")
+        if existing_work_dir:
+            work_dir = Path(existing_work_dir).expanduser().resolve()
+        else:
+            work_dir = (compiled_path.parent / "_nxd_model_workdir").resolve()
+
+    work_dir.mkdir(parents=True, exist_ok=True)
+    os.environ["BASE_COMPILE_WORK_DIR"] = str(work_dir)
+    return work_dir
+
+
 def _mlp_only_modules_to_not_convert(num_layers: int) -> list[str]:
     """Exclude numerically sensitive or unsupported modules from FP8 conversion."""
     modules = [
@@ -359,6 +377,14 @@ def main() -> int:
     parser.add_argument("--compiled-path", required=True)
     parser.add_argument("--quantized-checkpoints-path")
     parser.add_argument(
+        "--base-compile-work-dir",
+        default=None,
+        help=(
+            "NxDI compiler work directory. Defaults next to --compiled-path "
+            "instead of /tmp so large compiles do not fill the root volume."
+        ),
+    )
+    parser.add_argument(
         "--weight-dtype",
         choices=[_WEIGHT_DTYPE_FP8_MLP_ONLY, _WEIGHT_DTYPE_BF16_CONTROL],
         default=_WEIGHT_DTYPE_FP8_MLP_ONLY,
@@ -426,6 +452,10 @@ def main() -> int:
         if args.quantized_checkpoints_path
         else None
     )
+    base_compile_work_dir = _configure_base_compile_work_dir(
+        compiled_path,
+        args.base_compile_work_dir,
+    )
 
     inf_config, modules_to_not_convert = _build_config(args)
 
@@ -436,6 +466,7 @@ def main() -> int:
         print("FP8_MODE disabled_bf16_control", flush=True)
     print("MODEL_PATH", str(model_path), flush=True)
     print("COMPILED_PATH", str(compiled_path), flush=True)
+    print("BASE_COMPILE_WORK_DIR", str(base_compile_work_dir), flush=True)
     if quantized_path is not None:
         print("QUANTIZED_CHECKPOINTS_PATH", str(quantized_path), flush=True)
     for env_name in _FP8_ENV_DEFAULTS:

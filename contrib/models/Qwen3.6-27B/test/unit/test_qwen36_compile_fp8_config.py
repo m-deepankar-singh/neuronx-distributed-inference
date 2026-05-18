@@ -224,6 +224,45 @@ class TestQwen36CompileFp8Config(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "need at least 8"):
             _COMPILE._pa_num_blocks(_args(pa_num_blocks=7))
 
+    def test_base_compile_work_dir_defaults_next_to_artifacts(self):
+        with self.subTest("default"), patch.dict(os.environ, {}, clear=True):
+            work_dir = _COMPILE._configure_base_compile_work_dir(
+                Path("/tmp/qwen_artifacts/model_a"),
+                None,
+            )
+
+            self.assertEqual(
+                work_dir,
+                Path("/tmp/qwen_artifacts/_nxd_model_workdir").resolve(),
+            )
+            self.assertEqual(os.environ["BASE_COMPILE_WORK_DIR"], str(work_dir))
+
+        with self.subTest("existing env"), patch.dict(
+            os.environ,
+            {"BASE_COMPILE_WORK_DIR": "/tmp/existing_nxd_workdir"},
+            clear=True,
+        ):
+            work_dir = _COMPILE._configure_base_compile_work_dir(
+                Path("/tmp/qwen_artifacts/model_a"),
+                None,
+            )
+
+            self.assertEqual(work_dir, Path("/tmp/existing_nxd_workdir").resolve())
+            self.assertEqual(os.environ["BASE_COMPILE_WORK_DIR"], str(work_dir))
+
+        with self.subTest("explicit override"), patch.dict(
+            os.environ,
+            {"BASE_COMPILE_WORK_DIR": "/tmp/existing_nxd_workdir"},
+            clear=True,
+        ):
+            work_dir = _COMPILE._configure_base_compile_work_dir(
+                Path("/tmp/qwen_artifacts/model_a"),
+                "/tmp/explicit_nxd_workdir",
+            )
+
+            self.assertEqual(work_dir, Path("/tmp/explicit_nxd_workdir").resolve())
+            self.assertEqual(os.environ["BASE_COMPILE_WORK_DIR"], str(work_dir))
+
     def test_backed_prefix_read_compile_flag_is_forwarded(self):
         with patch.object(
             _COMPILE,

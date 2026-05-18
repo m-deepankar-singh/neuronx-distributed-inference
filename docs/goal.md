@@ -958,8 +958,44 @@ batched/concurrent restore handling, plus a generated-token artifact with
 `ctx_batch_size >= 2` and `tkg_batch_size >= 2` or a prefill-only proof that
 avoids host-logits sampling.
 
+## 2026-05-18 Trainium Recovery Note
+
+The batch-2 ctx/tkg compile on `16.26.178.5` reached a useful intermediate
+state before SSH became unresponsive:
+
+```text
+TKG priority compile completed successfully.
+CTE batch-2 HLO compilation had started.
+Validation had not started yet.
+```
+
+The instance was later stop/started and returned as `16.50.60.182`. The new
+boot was reachable, with uptime about one minute, no active `neuronx-cc` or
+validation processes, and root still nearly full:
+
+```text
+/dev/root 484G used 472G, avail 12G, 98%
+/dev/nvme1n1 437.7G present, initially unmounted and empty
+```
+
+The previous compile script set Neuron cache and temp dirs to
+`/mnt/trainium_artifacts`, but NxDI `ModelBuilder` still defaulted
+`BASE_COMPILE_WORK_DIR` to `/tmp/nxd_model` on the nearly full root volume.
+Patch the compile script to default `BASE_COMPILE_WORK_DIR` next to
+`--compiled-path`, or pass it explicitly under `/mnt/trainium_artifacts`, before
+restarting long compiles. This should reduce root pressure and make the run less
+likely to starve SSH or wedge the guest.
+
+AWS Neuron docs note that compilation worker count can affect host CPU/memory
+pressure in supported stacks; this NxDI `ModelBuilder` version does not expose a
+worker-count constructor argument, so the immediate mitigation is to keep all
+large compiler work/cache/tmp paths off root and avoid aggressive SSH polling
+while `neuronx-cc` is active.
+
 References:
 
 - vLLM PagedAttention: https://docs.vllm.ai/en/stable/design/paged_attention/
 - vLLM prefix caching: https://docs.vllm.ai/en/stable/design/prefix_caching/
 - vLLM SamplingParams: https://docs.vllm.ai/en/latest/api/vllm/sampling_params/
+- AWS Neuron compiler: https://awsdocs-neuron.readthedocs-hosted.com/en/latest/compiler/neuronx-cc/api-reference-guide/
+- AWS Transformers NeuronX compilation worker count: https://awsdocs-neuron.readthedocs-hosted.com/en/v2.25.0/libraries/transformers-neuronx/transformers-neuronx-developer-guide.html#compilation-worker-count-support
