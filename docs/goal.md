@@ -992,6 +992,69 @@ worker-count constructor argument, so the immediate mitigation is to keep all
 large compiler work/cache/tmp paths off root and avoid aggressive SSH polling
 while `neuronx-cc` is active.
 
+## 2026-05-18 Staged Ctx2/TKG2 Compile Result
+
+The current Trainium instance is:
+
+```text
+ubuntu@16.50.122.105
+```
+
+The 2K BF16 ctx2/tkg2 compile was split by CTE bucket to reduce compiler
+pressure and warm the Neuron cache before trying the combined artifact.
+
+The 256-only stage completed successfully:
+
+```text
+/mnt/trainium_artifacts/qwen_artifacts/qwen36_27b_2048_bf16_hybrid_apc_backed_prefix_ctx2_tkg2_256only_e6493d3
+status: success
+```
+
+The 512-only stage also completed successfully:
+
+```text
+/mnt/trainium_artifacts/qwen_artifacts/qwen36_27b_2048_bf16_hybrid_apc_backed_prefix_ctx2_tkg2_512only_e6493d3
+status: success
+size: 51G
+```
+
+This confirms that both individual ctx2/tkg2 CTE shapes can compile on the
+current instance when the compile workdir/cache/temp paths are under
+`/mnt/trainium_artifacts`.
+
+The combined `256,512` artifact is now running:
+
+```text
+pid: 4495
+artifact: /mnt/trainium_artifacts/qwen_artifacts/qwen36_27b_2048_bf16_hybrid_apc_backed_prefix_ctx2_tkg2_staged_e6493d3
+log: /home/ubuntu/validation_logs/hybrid_apc_real_tokens/bf16_hybrid_apc_backed_prefix_ctx2_tkg2_staged_e6493d3_compile_validate.log
+status: /home/ubuntu/validation_logs/hybrid_apc_real_tokens/bf16_hybrid_apc_backed_prefix_ctx2_tkg2_staged_e6493d3_compile_validate.status
+```
+
+Last confirmed combined-run state before SSH timed out during compilation:
+
+```text
+CONTEXT_TRACE_SHAPE ctx_batch_size=2 tkg_batch_size=2
+context_encoding_buckets=[256,512]
+prefix_buckets=[256,512]
+Generating 6 hlos for key: context_encoding_model
+Starting compilation for the priority HLO
+```
+
+If the combined artifact succeeds, the same job immediately runs
+`batched-exactness` with `max_num_seqs=2`, `ctx_batch_size=2`,
+`tkg_batch_size=2`, host-side BF16 logits, and real-token generation. If it
+fails or wedges again, the confirmed state is:
+
+```text
+single-bucket ctx2/tkg2 compile works
+combined multi-bucket ctx2/tkg2 compile still overloads or misses cache
+```
+
+That would make the next practical path either a prefill-only batched proof
+that avoids generated-token TKG, or a larger/more isolated compile box for the
+combined artifact.
+
 References:
 
 - vLLM PagedAttention: https://docs.vllm.ai/en/stable/design/paged_attention/
