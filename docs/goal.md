@@ -1041,6 +1041,17 @@ Generating 6 hlos for key: context_encoding_model
 Starting compilation for the priority HLO
 ```
 
+Two later SSH probes timed out while the combined compile was still presumed
+active:
+
+```text
+ssh: connect to host 16.50.122.105 port 22: Operation timed out
+```
+
+Local AWS CLI credentials are not valid for checking EC2 health from this
+machine. Do not assume the process is dead from SSH alone; this is the same
+symptom seen when `neuronx-cc` starves sshd during heavy compilation.
+
 If the combined artifact succeeds, the same job immediately runs
 `batched-exactness` with `max_num_seqs=2`, `ctx_batch_size=2`,
 `tkg_batch_size=2`, host-side BF16 logits, and real-token generation. If it
