@@ -41,9 +41,9 @@ batched partial exactness: passes for both prompts
 Current blocker:
 
 ```text
-BF16 host-side logits from the compiled Neuron Qwen graph are all NaN.
-This is already true at NxDI raw output 0, before vLLM-Neuron slices logits
-and before vLLM sampling.
+BF16 host-side logits from the compiled Hybrid APC ctx2/tkg2 Neuron Qwen graph
+are all NaN. This is already true at NxDI raw output 0, before vLLM-Neuron
+slices logits and before vLLM sampling.
 
 nxdi_raw_output_debug count=1
 raw_output[0] shape=(1, 1, 248320)
@@ -56,10 +56,62 @@ runner_logits_after_prepare shape=(1, 248320)
 finite=0 nan=248320
 ```
 
-The next engineering target is not the `[2,511]` shape miss, vLLM sampling, or
-vLLM-Neuron output slicing. The request-prep and bucket-shape contract now get
-through validation. The remaining issue is inside the compiled Qwen graph or the
-artifact compile/runtime contract that produces raw logits.
+The no-Hybrid BF16 host-logits control is finite, so the remaining NaN issue is
+not the generic Qwen host-logits path, vLLM sampling, or vLLM-Neuron output
+slicing. The request-prep and bucket-shape contract now get through validation,
+including the mixed `[2,511]` vectorized CTE case padded to compiled `[2,512]`.
+The remaining issue is specific to the compiled Hybrid APC/chunked artifact
+contract that produces raw logits.
+
+### 2026-05-18 No-Hybrid BF16 Host-Logits Control
+
+A smallest useful no-Hybrid BF16 host-logits control artifact compiled on Trn2:
+
+```text
+/mnt/trainium_artifacts/qwen_artifacts/qwen36_27b_2048_bf16_hostlogits_nohybrid_cte256_tkg1_8269f27
+compile_exit:0
+artifact size: 51G
+ctx_batch_size=1
+tkg_batch_size=1
+context_encoding_buckets=[256]
+enable_hybrid_apc=false
+enable_prefix_caching=false
+enable_vllm_chunked_prefill=false
+output_logits=true
+```
+
+Compile log:
+
+```text
+/home/ubuntu/validation_logs/host_logits_controls/bf16_hostlogits_nohybrid_cte256_tkg1_8269f27_20260518T210539Z.compile.log
+```
+
+The raw-output debug inference passed and produced finite logits:
+
+```text
+SWEEP_CASE repeats=0 tokens=16
+raw_output[0] shape=(1, 1, 248320) dtype=torch.float32
+finite=248320/248320 nan=0 posinf=0 neginf=0 finite_min=-6.3125 finite_max=20.0
+logits shape=(1, 1, 248320) dtype=torch.float32
+finite=248320/248320 nan=0 posinf=0 neginf=0 finite_min=-6.3125 finite_max=20.0
+SWEEP_RESULT repeats=0 tokens=16 output_tokens=[220]
+```
+
+Inference log:
+
+```text
+/home/ubuntu/validation_logs/host_logits_controls/bf16_hostlogits_nohybrid_cte256_tkg1_8269f27_20260518T212554Z.infer.log
+```
+
+Interpretation:
+
+```text
+BF16 no-Hybrid raw logits finite:
+  generic host-logits / vLLM CPU sampler path is not the blocker.
+
+Hybrid APC ctx2/tkg2 raw logits all NaN:
+  focus on Hybrid APC/chunked compile/runtime contract, not sampler slicing.
+```
 
 ### 2026-05-18 Overnight Update
 
