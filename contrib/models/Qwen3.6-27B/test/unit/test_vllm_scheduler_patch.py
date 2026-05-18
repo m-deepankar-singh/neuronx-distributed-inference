@@ -371,7 +371,7 @@ class TestQwen36HybridAPCSchedulerPatch(unittest.TestCase):
             key,
         )
 
-    def test_backed_prefix_read_stays_disabled_for_batched_scheduler(self):
+    def test_backed_prefix_read_allows_batched_scheduler_when_configured(self):
         scheduler = _scheduler(
             block_size=2,
             enable_backed_prefix_reads=True,
@@ -407,10 +407,10 @@ class TestQwen36HybridAPCSchedulerPatch(unittest.TestCase):
             os.environ,
             {"QWEN36_HYBRID_APC_DISABLE_UNBACKED_PREFIX_READS": "1"},
         ):
-            self.assertTrue(
+            self.assertFalse(
                 self.patch.should_disable_unbacked_prefix_reads(scheduler, request)
             )
-        self.assertIsNone(
+        self.assertIsNotNone(
             self.patch.pop_hybrid_apc_authorized_prefix_key(
                 prefix_len=4,
                 cache_salt=None,
@@ -422,7 +422,7 @@ class TestQwen36HybridAPCSchedulerPatch(unittest.TestCase):
             )
         )
 
-    def test_env_backed_prefix_override_does_not_bypass_batched_guard(self):
+    def test_env_backed_prefix_override_allows_batched_scheduler(self):
         scheduler = _scheduler(
             block_size=2,
             enable_backed_prefix_reads=False,
@@ -461,9 +461,20 @@ class TestQwen36HybridAPCSchedulerPatch(unittest.TestCase):
                 "QWEN36_HYBRID_APC_ENABLE_BACKED_PREFIX_READS": "1",
             },
         ):
-            self.assertTrue(
+            self.assertFalse(
                 self.patch.should_disable_unbacked_prefix_reads(scheduler, request)
             )
+        self.assertIsNotNone(
+            self.patch.pop_hybrid_apc_authorized_prefix_key(
+                prefix_len=4,
+                cache_salt=None,
+                model_revision="rev-a",
+                layout_version=1,
+                tp_rank=0,
+                recurrent_dtype="float32",
+                conv_dtype="bfloat16",
+            )
+        )
 
     def test_additional_config_overrides_scheduler_registry_key_metadata(self):
         scheduler = _scheduler(

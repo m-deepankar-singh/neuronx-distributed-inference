@@ -425,9 +425,6 @@ def _request_id_for_scheduler_request(request: Any) -> Hashable | None:
 def _supports_backed_prefix_reads(scheduler: Any) -> bool:
     """Return whether this artifact can consume a backed Hybrid APC prefix."""
 
-    if _max_num_seqs_for_scheduler(scheduler) != 1:
-        return False
-
     if _env_flag("QWEN36_HYBRID_APC_ENABLE_BACKED_PREFIX_READS"):
         return True
 
@@ -473,6 +470,7 @@ def should_disable_unbacked_prefix_reads(scheduler: Any, request: Any = None) ->
             f"disable_requested={disable_requested} "
             f"backed_hit_len={backed_hit_len} "
             f"supports_backed={supports_backed} "
+            f"max_num_seqs={_max_num_seqs_for_scheduler(scheduler)} "
             f"prompt_len={prompt_len} "
             f"registry_size={len(_GDN_PREFIX_KEYS)}",
             flush=True,
