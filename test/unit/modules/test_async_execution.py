@@ -865,6 +865,16 @@ class TestHybridAPCAsyncBridge(unittest.TestCase):
 
     def test_vectorized_cached_decode_row_does_not_require_prefix_restore(self):
         bridge = _FakeHybridBridge()
+        original_prepare_request = bridge.prepare_request
+
+        def prepare_request_with_vector_full_context_lens(**kwargs):
+            prepared = original_prepare_request(**kwargs)
+            prepared.input_dict["full_context_lens"] = prepared.input_dict[
+                "full_context_lens"
+            ].reshape(-1)
+            return prepared
+
+        bridge.prepare_request = prepare_request_with_vector_full_context_lens
         base = SimpleNamespace(
             config=SimpleNamespace(use_hybrid_apc_manager=True),
             hybrid_apc_bridge=bridge,
@@ -914,6 +924,12 @@ class TestHybridAPCAsyncBridge(unittest.TestCase):
             torch.equal(
                 prepared["hybrid_commit_mask"],
                 torch.tensor([0, 1], dtype=torch.int32),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                prepared["full_context_lens"],
+                torch.tensor([[5], [3]], dtype=torch.int32),
             )
         )
 

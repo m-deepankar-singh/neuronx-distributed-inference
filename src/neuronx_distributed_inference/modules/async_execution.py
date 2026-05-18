@@ -360,10 +360,14 @@ def _combine_vectorized_hybrid_apc_inputs(
                 max_dim1 = max(tensor.shape[1] if tensor.ndim >= 2 else 1 for tensor in tensors)
             padded = []
             for tensor in tensors:
-                current = tensor
-                if max_dim1 is not None and tensor.ndim >= 2:
+                current = (
+                    tensor.reshape(1, -1)
+                    if max_dim1 is not None and tensor.ndim == 1
+                    else tensor
+                )
+                if max_dim1 is not None and current.ndim >= 2:
                     current = _right_pad_dim1(
-                        tensor,
+                        current,
                         max_dim1,
                         _pad_value_for_key(neuron_base_instance, key),
                     )
