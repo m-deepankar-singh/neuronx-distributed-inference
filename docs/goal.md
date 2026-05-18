@@ -897,6 +897,44 @@ The existing BF16 per-chunk artifact was generated before the full
 backed-prefix and batched proof path existed. It can prove the safety fallback
 and single-request backed path, but not generated-token `max_num_seqs=2`.
 
+## Current Limitations
+
+What is proven:
+
+- Single-request BF16 Hybrid APC backed-prefix correctness is proven on the
+  checkpoint-boundary prompt.
+- Safety fallback is proven: if vLLM has an attention KV prefix hit but Qwen
+  has no matching GDN checkpoint, the scheduler disables prefix reads and
+  cold/warm outputs match.
+- Request-scoped restore identity is proven for the single-request path.
+- Vectorized no-hit fallback is unit-covered.
+- Single-bucket ctx2/tkg2 compiles have succeeded for 256-only and 512-only.
+
+What is not proven yet:
+
+- Batched/concurrent backed-prefix serving is not proven.
+- The `max_num_seqs > 1` backed-prefix guard should not be relaxed yet.
+- A combined multi-bucket ctx2/tkg2 artifact has not completed validation.
+- Cold-prefill performance has not been measured for the final batched path.
+- FP8 is not validated for this path and should not be used to debug the
+  serving contract.
+- Fused CTE is not the current correctness path because the fused BF16 artifact
+  previously produced NaNs around token 105-106.
+
+Current practical constraints:
+
+- Generated-token batch-2 validation needs both `ctx_batch_size=2` and
+  `tkg_batch_size=2`.
+- The artifact with `tkg_batch_size=2` but `ctx_batch_size=1` failed because
+  vLLM-Neuron packed two prefills into one CTE row and host-logits sampling
+  tried to index a missing second output row.
+- The smaller Trainium instance can compile single CTE buckets, but the
+  combined `cte_buckets=256,512` ctx2/tkg2 compile made SSH unresponsive during
+  all-HLO CTE compilation after TKG priority compile passed.
+- Without a larger compile box, the best next proof is to run batch-2
+  validation against the 256-only and 512-only ctx2/tkg2 artifacts separately,
+  or build a prefill-only batched validator that avoids generated-token TKG.
+
 ## Recommended Next Work
 
 1. Produce a runnable batched/concurrent proof. The current validation harness
