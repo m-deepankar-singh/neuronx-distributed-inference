@@ -23,7 +23,7 @@ Current useful hosts and paths:
 - Current copied BF16 Hybrid APC artifact on Trn2:
   `/mnt/trainium_artifacts/qwen_artifacts/qwen36_27b_2048_bf16_hybrid_apc_backed_prefix_ctx2_tkg2_r7i_trn2_local_7306c2e`
 - Latest copied-artifact validation log:
-  `/home/ubuntu/validation_logs/hybrid_apc_real_tokens/bf16_hybrid_apc_batched_ctx2_tkg2_runnerlogits_20260518T204658Z.log`
+  `/home/ubuntu/validation_logs/hybrid_apc_real_tokens/bf16_hybrid_apc_batched_ctx2_tkg2_copied_r7i_db2ee21_20260518T205609Z.log`
 
 Current result:
 
@@ -35,13 +35,19 @@ vectorized Hybrid APC request prep: now runs past the old one-request guard
 mixed cached-decode + prefill CTE padding: now pads [2,511] to compiled [2,512]
 slot_mapping/block_table/seq_ids rank repair: passed the static Neuron checks
 batched grouped Hybrid APC validation: reaches generation but emits only token 0
+batched partial exactness: passes for both prompts
 ```
 
 Current blocker:
 
 ```text
-BF16 host-side logits from the Neuron/vLLM-Neuron output path are all NaN
-before vLLM sampling.
+BF16 host-side logits from the compiled Neuron Qwen graph are all NaN.
+This is already true at NxDI raw output 0, before vLLM-Neuron slices logits
+and before vLLM sampling.
+
+nxdi_raw_output_debug count=1
+raw_output[0] shape=(1, 1, 248320)
+finite=0/248320 nan=248320
 
 runner_hidden_states_before_prepare shape=(1, 248320)
 finite=0 nan=248320
@@ -50,11 +56,10 @@ runner_logits_after_prepare shape=(1, 248320)
 finite=0 nan=248320
 ```
 
-The next engineering target is not another compile and not the `[2,511]` shape
-miss. The request-prep and bucket-shape contract now get through validation. The
-remaining issue is to isolate whether the all-NaN logits originate inside the
-compiled Qwen model path, or at the loaded-artifact/output-alias/host-logits
-serving contract.
+The next engineering target is not the `[2,511]` shape miss, vLLM sampling, or
+vLLM-Neuron output slicing. The request-prep and bucket-shape contract now get
+through validation. The remaining issue is inside the compiled Qwen graph or the
+artifact compile/runtime contract that produces raw logits.
 
 ### 2026-05-18 Overnight Update
 
@@ -952,6 +957,9 @@ What is proven:
   slot/block/row metadata, and avoids the previous static Neuron shape failures.
 - The latest grouped validation reaches sampling and proves the output reaching
   vLLM is already all NaN before sampling.
+- The `NXDI_RAW_OUTPUT_DEBUG=1` run proves the first raw NxDI output tensor is
+  already all NaN, so the NaNs are not introduced by vLLM-Neuron's
+  `output.logits[:, -1, :]`/chunked-prefill slicing or by vLLM's CPU sampler.
 
 What is not proven yet:
 
@@ -960,8 +968,8 @@ What is not proven yet:
 - The final grouped `llm.generate([prompt_a, prompt_b])` path gets past the
   vectorized metadata and static-shape blockers, but fails the real-token gate
   because every sampled token is `0`.
-- BF16 host-logits correctness is not proven; the runner sees all-NaN logits
-  before sampling.
+- BF16 host-logits correctness is not proven; NxDI raw output and the runner
+  both see all-NaN logits.
 - Cold-prefill performance has not been measured for the final batched path.
 - FP8 is not validated for this path and should not be used to debug the
   serving contract.
@@ -979,33 +987,40 @@ Current practical constraints:
   `cte_buckets=256,512` ctx2/tkg2 compile overloaded it. Use the r7i compile
   host for large CPU/RAM/disk compile work, then copy the finished artifact to
   Trn2.
-- The current blocker is no longer request metadata preparation or artifact
-  shape. It is all-NaN BF16 host logits from the loaded model output path.
+- The current blocker is no longer request metadata preparation, artifact shape,
+  vLLM-Neuron output slicing, or sampling. It is all-NaN BF16 host logits from
+  the compiled Qwen graph/artifact contract.
 
 ## Recommended Next Work
 
-1. Prove where the NaNs first appear in the BF16 host-logits path. The runner
-   already shows all-NaN values before sampling; next isolate compiled-model
-   output vs loaded-artifact/output-alias/host-logits serving contract.
-2. Run or build the smallest non-Hybrid BF16 host-logits control available for
-   the same Qwen wrapper and artifact style. If that is finite, the remaining
-   problem is Hybrid APC/output aliasing. If it is also NaN, the issue is the
-   Qwen host-logits path or artifact contract.
-3. Preserve the current scheduler rule: vLLM prefix reads are allowed only when a
+1. Build/run the smallest BF16 host-logits control artifact that can answer whether
+   raw logits are finite without the current Hybrid APC/chunked-CTE artifact
+   contract. Prefer a single CTE bucket and `ctx_batch_size=1`/`tkg_batch_size=1`
+   first to reduce compile load. If that is finite, the remaining problem is the
+   Hybrid APC/chunked-CTE artifact path. If it is also NaN, the issue is the
+   Qwen host-logits path or artifact contract more generally.
+2. If a non-Hybrid control is too broad, build a debug Hybrid artifact that
+   returns or captures an earlier finite check: after final norm, after
+   `lm_head`, after `mask_padded_logits`, and before returning logits.
+3. Also test a compile-time DeltaNet CTE backend switch before spending time on
+   FP8: current artifacts trace the fused chunked path. A control compiled with
+   the alternate chunked backend can separate fused-CTE numerical NaNs from
+   host-logits/output-alias contract bugs.
+4. Preserve the current scheduler rule: vLLM prefix reads are allowed only when a
    matching GDN checkpoint exists and the runtime config advertises backed CTE
    prefix support.
-4. Keep the vectorized CTE bucket-padding and row-repair tests in place; they
+5. Keep the vectorized CTE bucket-padding and row-repair tests in place; they
    cover the `[2,511]` to `[2,512]` fix, short slot mapping repair, and stale
    `seq_ids` repair.
-5. Rerun the copied-artifact generated-token validation with
+6. Rerun the copied-artifact generated-token validation with
    `QWEN36_VLLM_LOGITS_DEBUG=1` after each logits/output-contract change.
-6. Only after that generated-token proof passes with finite real tokens, decide
+7. Only after that generated-token proof passes with finite real tokens, decide
    whether to relax the
    `max_num_seqs == 1` backed-prefix guard or keep fallback-only behavior for
    multi-request serving.
-7. Keep rerunning the 2K checkpoint-boundary validation without
+8. Keep rerunning the 2K checkpoint-boundary validation without
    `QWEN36_HYBRID_APC_ALLOW_UNHASHED_SINGLE_PREFIX_RESTORE`.
-8. Expected backed-prefix debug stays:
+9. Expected backed-prefix debug stays:
 
 ```text
 attention_hit_len=256
@@ -1017,19 +1032,19 @@ prefill_bucket=256
 prefix_bucket=256
 ```
 
-9. If backed BF16 exactness passes, measure cold vs warm prefill performance.
-10. If backed BF16 exactness fails, capture the first failing token/logit stage
+10. If backed BF16 exactness passes, measure cold vs warm prefill performance.
+11. If backed BF16 exactness fails, capture the first failing token/logit stage
    and inspect CTE prefix K/V selection before compiling again.
-11. If the same failure repeats more than twice, search NVIDIA/vLLM
+12. If the same failure repeats more than twice, search NVIDIA/vLLM
     implementation details and compare contracts before continuing.
-12. After BF16 backed restore exactness and perf are understood, revisit FP8 and
+13. After BF16 backed restore exactness and perf are understood, revisit FP8 and
     TKG/on-device sampling separately.
 
 The next concrete engineering target is no longer artifact production or
 vectorized request prep. The combined 2K BF16 `ctx_batch_size=2` /
 `tkg_batch_size=2` artifact exists, loads on Trn2, and reaches generation for the
-grouped two-request path. The next target is finite BF16 host logits from the
-Qwen output path.
+grouped two-request path. The next target is finite BF16 raw logits from the
+compiled Qwen graph.
 
 ## NVIDIA/vLLM Comparison
 
@@ -1049,8 +1064,9 @@ usable_prefix_hit = attention_kv_hit intersect gdn_checkpoint_hit
 The compiled CTE input contract now honors the single-request backed hit during
 suffix-only execution. The vectorized request-prep path now gets through the
 previous metadata and static-shape blockers. The remaining Neuron/vLLM gap is
-the host-logits/output contract: vLLM receives all-NaN BF16 logits before the
-sampler runs.
+the host-logits/compiled-graph contract: raw NxDI output 0 is already all NaN,
+while NVIDIA vLLM keeps model execution, logits computation, and sampling as
+separate stable stages with explicit NaN accounting before bookkeeping.
 
 ## 2026-05-18 Trainium Recovery Note
 
