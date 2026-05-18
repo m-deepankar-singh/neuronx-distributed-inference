@@ -91,6 +91,60 @@ def _validate_generation_batch_support(args) -> None:
         )
 
 
+def _parse_bucket_values(values) -> list[int]:
+    buckets = []
+    for value in values:
+        for part in str(value).split(","):
+            part = part.strip()
+            if part:
+                buckets.append(int(part))
+    return sorted(set(buckets))
+
+
+def _next_bucket(token_count: int, buckets: list[int]) -> int:
+    for bucket in buckets:
+        if token_count <= bucket:
+            return bucket
+    raise ValueError(
+        f"prompt token length {token_count} exceeds compiled CTE buckets {buckets}"
+    )
+
+
+def _padding_token_id(tokenizer) -> int:
+    for token_id in (tokenizer.pad_token_id, tokenizer.eos_token_id):
+        if token_id is not None:
+            return int(token_id)
+    raise ValueError("tokenizer must define a pad_token_id or eos_token_id")
+
+
+def _maybe_bucket_align_labeled_prompts(args, labeled_prompts):
+    if not getattr(args, "align_prompts_to_cte_buckets", False):
+        return labeled_prompts
+
+    from transformers import AutoTokenizer  # noqa: WPS433
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        str(Path(args.model_path).expanduser().resolve()),
+        trust_remote_code=True,
+    )
+    buckets = _parse_bucket_values(args.cte_buckets)
+    pad_token_id = _padding_token_id(tokenizer)
+    aligned = []
+    for label, prompt in labeled_prompts:
+        prompt_token_ids = tokenizer.encode(prompt, add_special_tokens=False)
+        bucket = _next_bucket(len(prompt_token_ids), buckets)
+        aligned.append(
+            (
+                label,
+                {
+                    "prompt_token_ids": prompt_token_ids
+                    + [pad_token_id] * (bucket - len(prompt_token_ids)),
+                },
+            )
+        )
+    return aligned
+
+
 def _runner_args(args, *, enable_hybrid_apc: bool):
     return SimpleNamespace(
         cte_bucket=args.cte_bucket,
@@ -246,13 +300,19 @@ def _generate_batch_worker(args_dict, enable_hybrid_apc: bool, labeled_prompts, 
     try:
         args = argparse.Namespace(**args_dict)
         llm, sampling = _build_llm(args, enable_hybrid_apc=enable_hybrid_apc)
+        labeled_prompts = _maybe_bucket_align_labeled_prompts(args, labeled_prompts)
         results = {}
         for label, prompt in labeled_prompts:
             if os.environ.get("QWEN36_HYBRID_APC_DEBUG") == "1":
+                prompt_len = (
+                    len(prompt.get("prompt_token_ids", []))
+                    if isinstance(prompt, dict)
+                    else len(prompt)
+                )
                 print(
                     "[hybrid_apc_debug] generate "
                     f"label={label} enable_hybrid_apc={enable_hybrid_apc} "
-                    f"prompt_chars={len(prompt)}",
+                    f"prompt_len={prompt_len}",
                     flush=True,
                 )
             results[label] = _generate(llm, sampling, prompt)
@@ -298,6 +358,7 @@ def _generate_grouped_batch_worker(
         llm, sampling = _build_llm(args, enable_hybrid_apc=enable_hybrid_apc)
         results = {}
         for group in labeled_prompt_groups:
+            group = _maybe_bucket_align_labeled_prompts(args, group)
             if os.environ.get("QWEN36_HYBRID_APC_DEBUG") == "1":
                 print(
                     "[hybrid_apc_debug] generate-group "
@@ -564,6 +625,15 @@ def parse_args():
         exact.add_argument("--seq-len", type=int, default=2048)
         exact.add_argument("--cte-bucket", type=int, default=512)
         exact.add_argument("--cte-buckets", nargs="+", default=["256,512"])
+        exact.add_argument(
+            "--align-prompts-to-cte-buckets",
+            action="store_true",
+            help=(
+                "Tokenize prompts and pad token ids to the next compiled CTE bucket "
+                "before calling vLLM. This is useful for static Neuron artifacts "
+                "that reject non-bucket prompt shapes."
+            ),
+        )
         exact.add_argument("--cte-bucket-profile", default="single")
         exact.add_argument("--tensor-parallel-size", type=int, default=4)
         exact.add_argument("--max-num-seqs", type=int, default=1)

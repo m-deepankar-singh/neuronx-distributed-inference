@@ -33,6 +33,9 @@ def _args(**overrides):
         "max_num_seqs": 2,
         "max_tokens": 8,
         "compiled_artifacts": None,
+        "model_path": "/tmp/model",
+        "cte_buckets": ["256,512"],
+        "align_prompts_to_cte_buckets": False,
         "require_real_tokens": True,
         "dummy_token_ids": [0],
         "output_json": None,
@@ -74,6 +77,40 @@ def _fake_generate_grouped_batch(tokens_by_label):
 
 
 class TestHybridAPCValidationRealTokens(unittest.TestCase):
+    def test_bucket_alignment_pads_prompt_token_ids(self):
+        class FakeTokenizer:
+            pad_token_id = 99
+            eos_token_id = None
+
+            def encode(self, prompt, add_special_tokens=False):
+                del add_special_tokens
+                return list(range(len(prompt.split())))
+
+        class FakeAutoTokenizer:
+            @staticmethod
+            def from_pretrained(_model_path, trust_remote_code):
+                del trust_remote_code
+                return FakeTokenizer()
+
+        fake_transformers = SimpleNamespace(AutoTokenizer=FakeAutoTokenizer)
+        with patch.dict(sys.modules, {"transformers": fake_transformers}):
+            aligned = _VALIDATION._maybe_bucket_align_labeled_prompts(
+                _args(
+                    cte_buckets=["4,8"],
+                    align_prompts_to_cte_buckets=True,
+                ),
+                [("prompt", "one two three")],
+            )
+
+        self.assertEqual(
+            aligned,
+            [("prompt", {"prompt_token_ids": [0, 1, 2, 99]})],
+        )
+
+    def test_bucket_alignment_rejects_too_long_prompt(self):
+        with self.assertRaisesRegex(ValueError, "exceeds compiled CTE buckets"):
+            _VALIDATION._next_bucket(9, [4, 8])
+
     def test_real_token_checks_fail_all_dummy_tokens(self):
         checks = _VALIDATION._real_token_checks(
             {
