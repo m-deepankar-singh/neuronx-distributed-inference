@@ -1167,10 +1167,66 @@ That would make the next practical path either a prefill-only batched proof
 that avoids generated-token TKG, or a larger/more isolated compile box for the
 combined artifact.
 
+## 2026-05-18 Artifact Portability Plan
+
+It is valid to compile the multi-CTE artifact on a larger or more isolated
+instance, then copy the finished artifact back to the smaller inference
+instance, as long as the artifact is compiled for the smaller instance's exact
+runtime contract. The larger instance should only be used to absorb compile
+CPU/RAM/disk pressure; it should not change the serving shape.
+
+AWS Neuron documents that the one-time `neuronx-cc` compilation can be
+performed on another EC2 instance or even outside EC2, and that NEFFs can be
+distributed to an inference fleet. Runtime loading still validates the NEFF
+version and hardware/operator compatibility, and load can fail if the NEFF
+needs more NeuronCores or memory than the target instance has.
+
+For this project, the compile box should produce the exact artifact intended
+for the smaller inference box:
+
+```text
+target: trn2
+tp_degree: 4
+logical_nc_config: 2
+max_num_seqs: 2
+ctx_batch_size: 2
+tkg_batch_size: 2
+seq_len: 2048
+cte_buckets: 256,512
+prefix_buckets: 256,512
+block_size: 256
+runtime num_gpu_blocks_override / user PA blocks: 16
+compiled physical PA blocks: include the helper's null-block adjustment if applicable
+sampling mode: host logits / disable on-device sampling
+Hybrid APC flags: backed prefix reads enabled, static hybrid cache disabled
+```
+
+Do not compile a wider artifact just because the compile instance is larger. If
+the large box compiles `tp_degree=8`, a different logical NeuronCore layout, a
+different chip family target, or a different host-logits/sampling contract, the
+smaller box should be expected to reject it or run the wrong validation path.
+
+Copy the complete compiled artifact directory back to the smaller instance, not
+just the Neuron compile cache:
+
+```text
+/mnt/trainium_artifacts/qwen_artifacts/<artifact>/
+  neuron_config.json
+  compiled NEFF directories
+  sharded weights / metadata
+```
+
+The compile cache is optional and only helps future compiles. Inference should
+load from `--compiled-artifacts <artifact_path>` and should not invoke
+`neuronx-cc` on the smaller instance.
+
 References:
 
 - vLLM PagedAttention: https://docs.vllm.ai/en/stable/design/paged_attention/
 - vLLM prefix caching: https://docs.vllm.ai/en/stable/design/prefix_caching/
 - vLLM SamplingParams: https://docs.vllm.ai/en/latest/api/vllm/sampling_params/
 - AWS Neuron compiler: https://awsdocs-neuron.readthedocs-hosted.com/en/latest/compiler/neuronx-cc/api-reference-guide/
+- AWS Neuron compiler FAQ: https://awsdocs-neuron.readthedocs-hosted.com/en/latest/compiler/neuronx-cc/faq.html
+- AWS Neuron runtime troubleshooting: https://awsdocs-neuron.readthedocs-hosted.com/en/latest/neuron-runtime/nrt-troubleshoot.html
+- AWS Neuron runtime config: https://awsdocs-neuron.readthedocs-hosted.com/en/latest/neuron-runtime/nrt-configurable-parameters.html
 - AWS Transformers NeuronX compilation worker count: https://awsdocs-neuron.readthedocs-hosted.com/en/v2.25.0/libraries/transformers-neuronx/transformers-neuronx-developer-guide.html#compilation-worker-count-support
