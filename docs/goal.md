@@ -1431,6 +1431,96 @@ Trn2 inference instance and run `batched-exactness` from
 where we will learn whether the remaining blocker is gone or whether the decode
 TKG input contract still causes `NRT_EXEC_OOB`.
 
+## 2026-05-19 Trn2 Copy And Runtime Result
+
+The r7i artifact was copied to the new Trn2 instance with a direct private-IP
+transfer:
+
+```text
+source: ubuntu@16.26.249.227:/mnt/trainium_artifacts/qwen_artifacts/qwen36_27b_2048_bf16_hybrid_apc_backed_prefix_ctx2_tkg2_r7i_trn2_local_7306c2e
+destination: ubuntu@16.26.98.193:/mnt/trainium_artifacts/qwen_artifacts/qwen36_27b_2048_bf16_hybrid_apc_backed_prefix_ctx2_tkg2_r7i_trn2_local_7306c2e
+method: rsync over private IP 172.31.46.4
+bytes transferred: 54.32G
+average transfer rate: 205.18 MB/s
+destination size: 51G
+destination free disk after copy: 316G
+```
+
+The copied artifact contains:
+
+```text
+model.pt
+neuron_config.json
+weights/tp0_sharded_checkpoint.safetensors
+weights/tp1_sharded_checkpoint.safetensors
+weights/tp2_sharded_checkpoint.safetensors
+weights/tp3_sharded_checkpoint.safetensors
+```
+
+The Trn2 checkout was updated to `experimental` commit `cccdfde`, which adds
+`--align-prompts-to-cte-buckets` to the validation harness. This was needed
+because the static Neuron trace only accepts compiled CTE sequence shapes. The
+first copied-artifact runtime run sent a 463-token prompt into a trace compiled
+for 256/512 and failed with:
+
+```text
+Input shape [[2, 463], ...] not found in input_shape_map
+```
+
+The validation harness now tokenizes prompts and pads token IDs to the next CTE
+bucket before calling vLLM. Focused tests passed locally and on Trn2:
+
+```text
+contrib/models/Qwen3.6-27B/test/unit/test_hybrid_apc_validation.py
+9 passed
+```
+
+With prompt bucket alignment enabled and the second synthetic prefix shortened
+to fit under 512 tokens, the final copied-artifact validation reached the real
+current Hybrid APC blocker:
+
+```text
+run id: bf16_hybrid_apc_batched_ctx2_tkg2_copied_r7i_db2ee21_20260518T190201Z
+status: failed:1
+artifact load: success
+cold_partial_a: prompt_len=512, completed real generation
+cold_partial_b: prompt_len=512, completed real generation
+warmup_full_a: prompt_len=512, completed real generation
+warmup_full_b: prompt_len=512, completed real generation
+final grouped warm_partial_a/warm_partial_b: failed
+```
+
+The final failure is not compile capacity, artifact portability, or the old
+non-bucket prompt shape problem. It is the intentional v0 guard in
+`prepare_hybrid_apc_request_for_execution`:
+
+```text
+ValueError: hybrid APC v0 request prep supports one request at a time;
+vectorized continuous-batching metadata is not wired yet
+```
+
+That means the project has now proven:
+
+```text
+multi-CTE ctx2/tkg2 artifact compiles on r7i
+the artifact is portable to Trn2
+Trn2 loads the copied artifact
+single-request bucket-aligned CTE + TKG generation works from the copied artifact
+batched grouped Hybrid APC still fails at vectorized request-prep metadata
+```
+
+The next implementation step is vectorizing Hybrid APC request preparation so
+`computed_context_lens`, `request_id`/sequence identity, prefix hashes/full
+input IDs, restore slots, restore masks, restore prefix lens, commit slots, and
+commit masks are prepared per scheduled request instead of assuming one active
+request. This should mirror vLLM's GPU-side separation: the scheduler maintains
+per-request logical KV block state and prefix-cache hits, then passes per-request
+block/slot metadata to the runner rather than collapsing the batch into a single
+request. vLLM's prefix caching design uses hash-addressed KV blocks, and its
+PagedAttention path maps logical request blocks to non-contiguous physical KV
+blocks; the Neuron path needs the same per-row contract for the GDN
+restore/commit metadata.
+
 References:
 
 - vLLM PagedAttention: https://docs.vllm.ai/en/stable/design/paged_attention/
