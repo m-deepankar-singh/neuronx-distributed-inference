@@ -544,6 +544,68 @@ class TestQwen36ModelAliases(unittest.TestCase):
             )
         )
 
+    def test_request_scoped_vllm_metadata_is_added_for_hybrid_apc(self):
+        request_dict = {}
+
+        self.qwen_module._qwen36_add_vllm_hybrid_apc_metadata(
+            request_dict,
+            request_ids=("req-a", "req-b"),
+            metadata_by_request_id={
+                "req-a": {
+                    "cumulative_hashes_by_prefix_len": {256: b"a"},
+                    "attention_block_refs_by_prefix_len": {256: (1,)},
+                    "request_prefix_len": 256,
+                    "vllm_attention_hit_len": 0,
+                },
+                "req-b": {
+                    "cumulative_hashes_by_prefix_len": {256: b"b"},
+                    "attention_block_refs_by_prefix_len": {256: (2,)},
+                    "request_prefix_len": 272,
+                    "vllm_attention_hit_len": 256,
+                },
+            },
+        )
+
+        self.assertEqual(
+            request_dict["cumulative_hashes_by_prefix_len"],
+            ({256: b"a"}, {256: b"b"}),
+        )
+        self.assertEqual(
+            request_dict["attention_block_refs_by_prefix_len"],
+            ({256: (1,)}, {256: (2,)}),
+        )
+        self.assertEqual(request_dict["request_prefix_len"], (256, 272))
+        self.assertEqual(request_dict["vllm_attention_hit_len"], (0, 256))
+
+    def test_vllm_metadata_request_ids_prefer_scheduler_new_request_ids(self):
+        selected = self.qwen_module._qwen36_select_vllm_hybrid_apc_request_ids(
+            {
+                "new-a": {"vllm_attention_hit_len": 256},
+                "new-b": {"vllm_attention_hit_len": 256},
+            },
+            ("new-a", "new-b"),
+            ("model-a", "model-b"),
+        )
+
+        self.assertEqual(selected, ("new-a", "new-b"))
+
+    def test_vllm_metadata_request_ids_use_model_order_for_packed_chunked_batch(self):
+        selected = (
+            self.qwen_module._qwen36_select_vllm_hybrid_apc_request_ids_for_input(
+                {
+                    "new-a": {"vllm_attention_hit_len": 0},
+                    "cached-a": {"vllm_attention_hit_len": 271},
+                },
+                all_request_ids=("new-a", "cached-a"),
+                new_request_ids=("new-a",),
+                full_context_lens=torch.tensor([271, 272], dtype=torch.int32),
+                computed_context_lens=torch.tensor([0, 271], dtype=torch.int32),
+                prefill_completion_state=torch.tensor([True, True]),
+            )
+        )
+
+        self.assertEqual(selected, ("new-a", "cached-a"))
+
     def test_flattened_slot_mapping_is_normalized_before_batch_chunking(self):
         flattened = torch.arange(256, 719, dtype=torch.int32)
 

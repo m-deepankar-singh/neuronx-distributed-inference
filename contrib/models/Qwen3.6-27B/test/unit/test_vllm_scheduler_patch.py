@@ -374,6 +374,82 @@ class TestQwen36HybridAPCSchedulerPatch(unittest.TestCase):
             key,
         )
 
+    def test_backed_prefix_hit_uses_vllm_block_hashes_when_available(self):
+        scheduler = _scheduler(block_size=2)
+        key = self.patch.HybridGDNPrefixKey(
+            cumulative_prefix_hash=b"vllm-hash-4",
+            prefix_len=4,
+            block_size=2,
+            cache_salt=None,
+            model_revision="rev-a",
+            layout_version=1,
+            tp_rank=0,
+            recurrent_dtype="float32",
+            conv_dtype="bfloat16",
+        )
+        self.patch.register_hybrid_apc_gdn_checkpoint(key)
+        request = types.SimpleNamespace(
+            prompt_token_ids=[10, 11, 12, 13, 14],
+            block_hashes=[b"vllm-hash-2", b"vllm-hash-4"],
+            num_tokens=5,
+            cache_salt=None,
+        )
+
+        self.assertEqual(self.patch.backed_gdn_prefix_hit(scheduler, request), key)
+
+    def test_scheduler_output_carries_vllm_hashes_and_block_refs(self):
+        class FakeScheduler:
+            def __init__(self):
+                base = _scheduler(block_size=2)
+                self.vllm_config = base.vllm_config
+                self.cache_config = base.cache_config
+                self.scheduler_config = base.scheduler_config
+                self.requests = {
+                    "req-a": types.SimpleNamespace(
+                        prompt_token_ids=[10, 11, 12, 13],
+                        block_hashes=[b"hash-2", b"hash-4"],
+                        num_tokens=4,
+                        cache_salt=None,
+                    )
+                }
+
+            def add_request(self, request):
+                del request
+
+            def schedule(self):
+                return types.SimpleNamespace(
+                    scheduled_new_reqs=[
+                        types.SimpleNamespace(
+                            req_id="req-a",
+                            block_ids=([11, 12],),
+                            num_computed_tokens=0,
+                        )
+                    ],
+                    scheduled_cached_reqs=types.SimpleNamespace(
+                        req_ids=[],
+                        new_block_ids=[],
+                        num_computed_tokens=[],
+                    ),
+                )
+
+        self.patch.patch_scheduler_class(FakeScheduler)
+        scheduler_output = FakeScheduler().schedule()
+        metadata = getattr(
+            scheduler_output,
+            "_qwen36_hybrid_apc_metadata_by_request_id",
+        )
+
+        self.assertEqual(
+            metadata["req-a"]["cumulative_hashes_by_prefix_len"],
+            {2: b"hash-2", 4: b"hash-4"},
+        )
+        self.assertEqual(
+            metadata["req-a"]["attention_block_refs_by_prefix_len"],
+            {2: (11,), 4: (11, 12)},
+        )
+        self.assertEqual(metadata["req-a"]["request_prefix_len"], 4)
+        self.assertEqual(metadata["req-a"]["vllm_attention_hit_len"], 0)
+
     def test_backed_prefix_read_allows_batched_scheduler_when_configured(self):
         scheduler = _scheduler(
             block_size=2,
@@ -644,6 +720,11 @@ class TestQwen36HybridAPCSchedulerPatch(unittest.TestCase):
                     "_qwen36_vllm_prefill_completion_state",
                     None,
                 )
+                self.seen_metadata = getattr(
+                    self.model.model,
+                    "_qwen36_vllm_hybrid_apc_metadata_by_request_id",
+                    None,
+                )
                 return self.seen_request_ids
 
         installed = self.patch.patch_neuron_model_runner_class(FakeRunner)
@@ -653,6 +734,9 @@ class TestQwen36HybridAPCSchedulerPatch(unittest.TestCase):
                 request_ids=["req-a"],
                 _qwen36_cached_request_ids=("req-a",),
                 prefill_completion_state="done",
+                _qwen36_hybrid_apc_metadata_by_request_id={
+                    "req-a": {"cumulative_hashes_by_prefix_len": {4: b"h4"}}
+                },
             )
         )
 
@@ -661,9 +745,71 @@ class TestQwen36HybridAPCSchedulerPatch(unittest.TestCase):
         self.assertEqual(runner.seen_request_ids, ("req-a",))
         self.assertEqual(runner.seen_cached_request_ids, ("req-a",))
         self.assertEqual(runner.seen_prefill_completion_state, "done")
+        self.assertEqual(
+            runner.seen_metadata,
+            {"req-a": {"cumulative_hashes_by_prefix_len": {4: b"h4"}}},
+        )
         self.assertFalse(hasattr(runner.model, "_qwen36_vllm_request_ids"))
         self.assertFalse(hasattr(runner.model.model, "_qwen36_vllm_request_ids"))
         self.assertFalse(hasattr(runner.model.model, "_qwen36_vllm_cached_request_ids"))
+
+    def test_runner_patch_applies_runtime_hybrid_apc_config_during_execution(self):
+        class FakeRunner:
+            def __init__(self):
+                self.vllm_config = types.SimpleNamespace(
+                    additional_config={
+                        "hybrid_apc_require_vllm_metadata": True,
+                        "hybrid_apc_enable_backed_prefix_reads": True,
+                    }
+                )
+                self.model = types.SimpleNamespace(
+                    model=types.SimpleNamespace(
+                        config=types.SimpleNamespace(
+                            hybrid_apc_require_vllm_metadata=False,
+                            hybrid_apc_allow_local_hash_fallback=True,
+                            hybrid_apc_require_attention_block_refs=False,
+                            hybrid_apc_reject_unbacked_attention_hits=False,
+                            hybrid_apc_enable_backed_prefix_reads=False,
+                        ),
+                        hybrid_apc_bridge=types.SimpleNamespace(
+                            allow_local_hash_fallback=True,
+                            require_attention_block_refs=False,
+                            reject_unbacked_attention_hits=False,
+                        ),
+                    )
+                )
+
+            def _execute_model_for_text(self, model_input, intermediate_tensors=None):
+                del model_input, intermediate_tensors
+                config = self.model.model.config
+                bridge = self.model.model.hybrid_apc_bridge
+                return (
+                    config.hybrid_apc_require_vllm_metadata,
+                    config.hybrid_apc_allow_local_hash_fallback,
+                    config.hybrid_apc_require_attention_block_refs,
+                    config.hybrid_apc_reject_unbacked_attention_hits,
+                    config.hybrid_apc_enable_backed_prefix_reads,
+                    bridge.allow_local_hash_fallback,
+                    bridge.require_attention_block_refs,
+                    bridge.reject_unbacked_attention_hits,
+                )
+
+        installed = self.patch.patch_neuron_model_runner_class(FakeRunner)
+        runner = FakeRunner()
+        result = runner._execute_model_for_text(types.SimpleNamespace())
+
+        self.assertTrue(installed)
+        self.assertEqual(result, (True, False, True, True, True, False, True, True))
+        config = runner.model.model.config
+        self.assertFalse(config.hybrid_apc_require_vllm_metadata)
+        self.assertTrue(config.hybrid_apc_allow_local_hash_fallback)
+        self.assertFalse(config.hybrid_apc_require_attention_block_refs)
+        self.assertFalse(config.hybrid_apc_reject_unbacked_attention_hits)
+        self.assertFalse(config.hybrid_apc_enable_backed_prefix_reads)
+        bridge = runner.model.model.hybrid_apc_bridge
+        self.assertTrue(bridge.allow_local_hash_fallback)
+        self.assertFalse(bridge.require_attention_block_refs)
+        self.assertFalse(bridge.reject_unbacked_attention_hits)
 
     def test_runner_patch_attaches_scheduler_request_sources_to_model_input(self):
         @dataclass(frozen=True)
@@ -687,12 +833,19 @@ class TestQwen36HybridAPCSchedulerPatch(unittest.TestCase):
         scheduler_output = types.SimpleNamespace(
             scheduled_cached_reqs=types.SimpleNamespace(req_ids=["cached-1"]),
             scheduled_new_reqs=[types.SimpleNamespace(req_id="new-1")],
+            _qwen36_hybrid_apc_metadata_by_request_id={
+                "new-1": {"attention_block_refs_by_prefix_len": {4: (3, 4)}}
+            },
         )
         model_input = runner._prepare_model_input(scheduler_output)
 
         self.assertTrue(installed)
         self.assertEqual(model_input._qwen36_cached_request_ids, ("cached-1",))
         self.assertEqual(model_input._qwen36_new_request_ids, ("new-1",))
+        self.assertEqual(
+            model_input._qwen36_hybrid_apc_metadata_by_request_id,
+            {"new-1": {"attention_block_refs_by_prefix_len": {4: (3, 4)}}},
+        )
 
     def test_runner_patch_expands_completed_only_prefill_logits(self):
         class FakeRunner:

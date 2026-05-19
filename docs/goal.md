@@ -24,9 +24,9 @@ Current useful hosts and paths:
   `/mnt/trainium_artifacts/qwen_artifacts/qwen36_27b_2048_bf16_hybrid_apc_backed_prefix_ctx2_tkg2_commitfix_025dc60_pypath`
 - Fresh compile log:
   `/home/ubuntu/validation_logs/hybrid_apc_real_tokens/bf16_hybrid_apc_backed_prefix_ctx2_tkg2_commitfix_025dc60_pypath_compile.log`
-- Latest boundary exactness logs:
-  `/home/ubuntu/validation_logs/hybrid_apc_real_tokens/bf16_hybrid_apc_batched_ctx2_tkg2_commitfix_025dc60_pypath_boundary_tkgmask_8tok.log`
-  `/home/ubuntu/validation_logs/hybrid_apc_real_tokens/bf16_hybrid_apc_batched_ctx2_tkg2_commitfix_025dc60_pypath_boundary_tkgmask_8tok.json`
+- Latest strict metadata boundary exactness logs:
+  `/home/ubuntu/validation_logs/hybrid_apc_real_tokens/bf16_hybrid_apc_batched_ctx2_tkg2_commitfix_025dc60_pypath_boundary256_strictmeta_8tok_retry8_ordinary_stableprefix.log`
+  `/home/ubuntu/validation_logs/hybrid_apc_real_tokens/bf16_hybrid_apc_batched_ctx2_tkg2_commitfix_025dc60_pypath_boundary256_strictmeta_8tok_retry8_ordinary_stableprefix.json`
 
 Current result:
 
@@ -38,28 +38,91 @@ backed prefix-slot registration at 256 tokens: passed
 grouped warm partial restore from two backed slots: passed
 packed batched one-token decode now routes to TKG: passed
 TKG packed-decode attention mask repair to batch-2 shape: passed
-batched cold/warm exactness for both partial prompts: passed
+strict vLLM metadata and attention block ref handoff: passed
+strict batched cold/warm exactness for both partial prompts: passed
 real-token generation checks for cold/warm/warmup prompts: passed
 ```
 
 Current blocker / caveat:
 
 ```text
-The latest correctness pass used the controlled artifact config that permits
-local prefix-hash fallback:
-
-hybrid_apc_require_vllm_metadata=false
-hybrid_apc_allow_local_hash_fallback=true
-hybrid_apc_require_attention_block_refs=false
-
-Strict production metadata mode is still unresolved because vLLM cumulative
-prefix hashes / attention block refs are not available in the request metadata
-being passed to the Neuron runner.
+Strict production metadata mode has passed correctness. The remaining planned
+work is cold-prefill performance measurement against the strict path.
 ```
 
-Performance measurement remains the next step after the strict metadata path is
-resolved or explicitly accepted as out of scope for the controlled fallback
-validation.
+Performance measurement remains the next step.
+
+### 2026-05-19 Strict Metadata Boundary Exactness Pass
+
+Strict metadata validation used ordinary-text tokenizer-stable 256-token
+prefixes with a 256-token common prefix after suffixing:
+
+```text
+validation_exit:0
+batched_partial_a_exact=true
+batched_partial_b_exact=true
+real_generated_tokens_passed=true
+hybrid_apc_require_vllm_metadata=true
+hybrid_apc_allow_local_hash_fallback=false
+hybrid_apc_require_attention_block_refs=true
+
+cold_partial_a tokens:
+  [271, 248068, 198, 8160, 579, 264, 7047, 1817]
+warm_partial_a tokens:
+  [271, 248068, 198, 8160, 579, 264, 7047, 1817]
+
+cold_partial_b tokens:
+  [271, 248068, 198, 8160, 579, 264, 7047, 1817]
+warm_partial_b tokens:
+  [271, 248068, 198, 8160, 579, 264, 7047, 1817]
+```
+
+Important runtime evidence:
+
+```text
+warmup_full_a:
+  prompt_len=256
+  commit_slot=0
+  scheduler-register prefix_len=256 registry_size=1
+
+warmup_full_b:
+  prompt_len=256
+  commit_slot=1
+  scheduler-register prefix_len=256 registry_size=2
+
+grouped warm partials:
+  backed_hit_len=256 for both requests
+  apply-suffix restore_slot=0 and restore_slot=1
+  prepare-vectorized batch_size=2 prepared=2
+  qwen-cte-call input_shape=(2,256)
+  slot_minmax=-1:783
+  restore_slots=[0,1]
+  restore_mask=[1,1]
+  restore_prefix=[256,256]
+```
+
+The strict run also validates the runtime hooks added after the controlled
+fallback pass:
+
+```text
+SchedulerOutput carries vLLM cumulative prefix hashes and attention block refs.
+The Neuron runner copies scheduler metadata into model_input.
+The model selects request IDs in model-input order for packed chunked prefill.
+Strict runtime config disables local hash fallback and requires block refs.
+Active-window slot mapping is repaired for suffix-only restored rows.
+```
+
+Focused test coverage after the strict patch set:
+
+```text
+local qwen36 alias tests: 24 passed
+local vLLM scheduler patch tests: 25 passed
+local async_execution tests: 36 passed
+
+remote qwen36 alias tests: 24 passed
+remote vLLM scheduler patch tests: 25 passed
+remote async_execution tests: 36 passed
+```
 
 ### 2026-05-19 Fresh Compile And Boundary Exactness Pass
 

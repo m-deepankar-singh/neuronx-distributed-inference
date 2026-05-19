@@ -52,6 +52,10 @@ def _single_batch_value(value: Any):
         if flat.numel() != 1:
             return None
         return flat[0]
+    if isinstance(value, (list, tuple)):
+        if len(value) != 1:
+            return None
+        return value[0]
     return value
 
 
@@ -383,11 +387,21 @@ def _synthesize_slots_from_block_table(
     logical_blocks = torch.div(positions, block_size, rounding_mode="floor")
     if logical_blocks.numel() == 0:
         return torch.empty((0,), dtype=dtype, device=position_row.device)
-    if int(logical_blocks.max().item()) >= int(block_table_row.shape[0]):
-        return None
+    block_table_i64 = block_table_row.to(torch.int64)
+    nonzero_block_indices = (block_table_i64 != 0).nonzero(as_tuple=False).reshape(-1)
+    if int(nonzero_block_indices.numel()) > 0:
+        block_table_i64 = block_table_i64[: int(nonzero_block_indices[-1].item()) + 1]
+    if int(logical_blocks.max().item()) >= int(block_table_i64.shape[0]):
+        # Some vLLM cached/chunked rows carry only the active suffix/decode
+        # block table, while position_ids remain absolute in the request.
+        min_logical_block = int(logical_blocks.min().item())
+        rebased_blocks = logical_blocks - min_logical_block
+        if int(rebased_blocks.max().item()) >= int(block_table_i64.shape[0]):
+            return None
+        logical_blocks = rebased_blocks
     offsets = positions.remainder(block_size)
     physical_blocks = torch.index_select(
-        block_table_row.to(torch.int64),
+        block_table_i64,
         0,
         logical_blocks,
     )
@@ -923,6 +937,8 @@ def prepare_hybrid_apc_request_for_execution(
             and input_ids.ndim >= 2
             and input_ids.shape[1] < request_prefix_len
         ):
+            if _to_python_int(attention_hit_len) <= 0:
+                return _with_zero_hybrid_apc_slots(input_dict)
             # The live prefix-caching request has already been sliced to the
             # attention suffix. Without full prompt tokens the bridge cannot
             # compute or apply an exact GDN checkpoint boundary.

@@ -31,7 +31,7 @@ import math
 import logging
 import os
 import sys
-from typing import List, NamedTuple, Optional, Tuple
+from typing import Any, Hashable, List, NamedTuple, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -3242,6 +3242,164 @@ def _qwen36_unpack_packed_decode_batch(
     return input_ids, attention_mask, position_ids, seq_ids, adapter_ids, slot_mapping
 
 
+def _qwen36_hashable_request_id(request_id: Any) -> Hashable:
+    if isinstance(request_id, list):
+        return tuple(request_id)
+    try:
+        hash(request_id)
+    except TypeError:
+        return repr(request_id)
+    return request_id
+
+
+def _qwen36_metadata_for_request(
+    metadata_by_request_id,
+    request_id,
+) -> dict[str, Any] | None:
+    if not isinstance(metadata_by_request_id, dict):
+        return None
+    normalized = _qwen36_hashable_request_id(request_id)
+    metadata = metadata_by_request_id.get(normalized)
+    if metadata is None and request_id is not None:
+        metadata = metadata_by_request_id.get(str(request_id))
+    return metadata if isinstance(metadata, dict) else None
+
+
+def _qwen36_request_metadata_values(
+    metadata_by_request_id,
+    request_ids,
+    key: str,
+):
+    if request_ids is None:
+        return None
+    if isinstance(request_ids, list):
+        request_ids = tuple(request_ids)
+    elif not isinstance(request_ids, tuple):
+        request_ids = (request_ids,)
+
+    values = []
+    found = False
+    for request_id in request_ids:
+        metadata = _qwen36_metadata_for_request(metadata_by_request_id, request_id)
+        value = metadata.get(key) if metadata is not None else None
+        values.append(value)
+        found = found or value is not None
+    if not found:
+        return None
+    return values[0] if len(values) == 1 else tuple(values)
+
+
+def _qwen36_request_ids_have_metadata(
+    metadata_by_request_id,
+    request_ids,
+) -> bool:
+    return any(
+        _qwen36_request_metadata_values(
+            metadata_by_request_id,
+            request_ids,
+            key,
+        )
+        is not None
+        for key in (
+            "cumulative_hashes_by_prefix_len",
+            "attention_block_refs_by_prefix_len",
+            "request_prefix_len",
+            "vllm_attention_hit_len",
+        )
+    )
+
+
+def _qwen36_select_vllm_hybrid_apc_request_ids(
+    metadata_by_request_id,
+    *request_id_groups,
+):
+    first_present = None
+    for request_ids in request_id_groups:
+        if request_ids is None:
+            continue
+        if first_present is None:
+            first_present = request_ids
+        if _qwen36_request_ids_have_metadata(metadata_by_request_id, request_ids):
+            return request_ids
+    return first_present
+
+
+def _qwen36_flat_item_count(value: Any) -> int:
+    if value is None:
+        return 0
+    if hasattr(value, "numel"):
+        try:
+            return int(value.reshape(-1).numel())
+        except Exception:
+            return 0
+    if isinstance(value, (list, tuple)):
+        return len(value)
+    return 1
+
+
+def _qwen36_request_ids_tuple(request_ids):
+    if request_ids is None:
+        return None
+    if isinstance(request_ids, list):
+        return tuple(request_ids)
+    if isinstance(request_ids, tuple):
+        return request_ids
+    return (request_ids,)
+
+
+def _qwen36_select_vllm_hybrid_apc_request_ids_for_input(
+    metadata_by_request_id,
+    *,
+    all_request_ids,
+    new_request_ids,
+    full_context_lens,
+    computed_context_lens,
+    prefill_completion_state,
+):
+    all_request_ids_tuple = _qwen36_request_ids_tuple(all_request_ids)
+    logical_request_count = max(
+        _qwen36_flat_item_count(full_context_lens),
+        _qwen36_flat_item_count(computed_context_lens),
+        _qwen36_flat_item_count(prefill_completion_state),
+    )
+    if (
+        logical_request_count > 1
+        and all_request_ids_tuple is not None
+        and len(all_request_ids_tuple) == logical_request_count
+        and _qwen36_request_ids_have_metadata(
+            metadata_by_request_id,
+            all_request_ids_tuple,
+        )
+    ):
+        return all_request_ids_tuple
+    return _qwen36_select_vllm_hybrid_apc_request_ids(
+        metadata_by_request_id,
+        new_request_ids,
+        all_request_ids,
+    )
+
+
+def _qwen36_add_vllm_hybrid_apc_metadata(
+    hybrid_apc_request_dict: dict[str, Any],
+    *,
+    request_ids,
+    metadata_by_request_id,
+) -> None:
+    for key in (
+        "cumulative_hashes_by_prefix_len",
+        "attention_block_refs_by_prefix_len",
+        "request_prefix_len",
+        "vllm_attention_hit_len",
+    ):
+        value = _qwen36_request_metadata_values(
+            metadata_by_request_id,
+            request_ids,
+            key,
+        )
+        if value is not None:
+            hybrid_apc_request_dict[key] = value
+
+
 def _debug_logits_stage(stage: str, tensor) -> None:
     if os.environ.get("QWEN36_LOGIT_STAGE_DEBUG") != "1":
         return
@@ -4643,7 +4801,19 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
                 "full_context_lens": full_context_lens,
                 "computed_context_lens": computed_context_lens,
             }
-            request_ids = getattr(self, "_qwen36_vllm_request_ids", None)
+            metadata_by_request_id = getattr(
+                self,
+                "_qwen36_vllm_hybrid_apc_metadata_by_request_id",
+                None,
+            )
+            request_ids = _qwen36_select_vllm_hybrid_apc_request_ids_for_input(
+                metadata_by_request_id,
+                all_request_ids=getattr(self, "_qwen36_vllm_request_ids", None),
+                new_request_ids=getattr(self, "_qwen36_vllm_new_request_ids", None),
+                full_context_lens=full_context_lens,
+                computed_context_lens=computed_context_lens,
+                prefill_completion_state=prefill_completion_state,
+            )
             if request_ids is not None:
                 if isinstance(request_ids, list):
                     request_ids = tuple(request_ids)
@@ -4664,6 +4834,11 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
                 hybrid_apc_request_dict[
                     "hybrid_prefill_completion_state"
                 ] = prefill_completion_state
+            _qwen36_add_vllm_hybrid_apc_metadata(
+                hybrid_apc_request_dict,
+                request_ids=request_ids,
+                metadata_by_request_id=metadata_by_request_id,
+            )
             prepared_inputs = prepare_hybrid_apc_request_for_execution(
                 self,
                 hybrid_apc_request_dict,

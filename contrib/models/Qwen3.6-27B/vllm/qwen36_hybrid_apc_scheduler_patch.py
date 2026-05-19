@@ -38,6 +38,42 @@ class HybridGDNPrefixKey(NamedTuple):
 _GDN_PREFIX_KEYS: set[HybridGDNPrefixKey] = set()
 _AUTHORIZED_PREFIX_READS: dict[int, list[HybridGDNPrefixKey]] = {}
 _AUTHORIZED_PREFIX_READS_BY_REQUEST: dict[Hashable, list[HybridGDNPrefixKey]] = {}
+_SCHEDULER_OUTPUT_METADATA_ATTR = "_qwen36_hybrid_apc_metadata_by_request_id"
+_HYBRID_APC_RUNTIME_CONFIG_KEYS = (
+    "use_hybrid_apc_manager",
+    "use_qwen_hybrid_chunked_prefill",
+    "use_qwen_hybrid_chunked_prefill_nki",
+    "gdn_checkpoint_interval",
+    "max_gdn_checkpoint_slots",
+    "gdn_recurrent_cache_dtype",
+    "gdn_conv_cache_dtype",
+    "hybrid_recurrent_cache_dtype",
+    "hybrid_conv_cache_dtype",
+    "hybrid_cache_mode",
+    "hybrid_cache_prefix_boundary_only",
+    "hybrid_cache_block_boundary_only",
+    "hybrid_cache_validate_exact",
+    "hybrid_apc_layout_version",
+    "hybrid_apc_allow_residual_replay",
+    "hybrid_apc_cache_salt",
+    "hybrid_apc_model_revision",
+    "hybrid_apc_require_vllm_metadata",
+    "hybrid_apc_allow_local_hash_fallback",
+    "hybrid_apc_require_attention_block_refs",
+    "hybrid_apc_reject_unbacked_attention_hits",
+    "hybrid_apc_disable_unbacked_prefix_reads",
+    "hybrid_apc_enable_backed_prefix_reads",
+)
+_HYBRID_APC_BRIDGE_CONFIG_ATTRS = {
+    "hybrid_apc_allow_local_hash_fallback": "allow_local_hash_fallback",
+    "hybrid_apc_require_attention_block_refs": "require_attention_block_refs",
+    "hybrid_apc_reject_unbacked_attention_hits": "reject_unbacked_attention_hits",
+    "hybrid_apc_cache_salt": "cache_salt",
+    "hybrid_apc_model_revision": "model_revision",
+    "hybrid_apc_layout_version": "layout_version",
+    "hybrid_recurrent_cache_dtype": "recurrent_dtype",
+    "hybrid_conv_cache_dtype": "conv_dtype",
+}
 
 
 def _env_flag(name: str) -> bool:
@@ -323,6 +359,57 @@ def _local_cumulative_prefix_hashes(
     return hashes
 
 
+def _vllm_cumulative_prefix_hashes(
+    request: Any,
+    *,
+    block_size: int,
+    max_prefix_len: int | None = None,
+) -> dict[int, Hashable]:
+    block_hashes = list(getattr(request, "block_hashes", ()) or ())
+    if not block_hashes:
+        return {}
+    if max_prefix_len is None:
+        max_prefix_len = len(block_hashes) * block_size
+    max_prefix_len = max(0, int(max_prefix_len))
+    max_prefix_len = max_prefix_len // block_size * block_size
+    hashes: dict[int, Hashable] = {}
+    for index, block_hash in enumerate(block_hashes):
+        prefix_len = (index + 1) * block_size
+        if prefix_len > max_prefix_len:
+            break
+        hashes[prefix_len] = block_hash
+    return hashes
+
+
+def _candidate_cumulative_prefix_hashes(
+    scheduler: Any,
+    request: Any,
+    *,
+    max_prefix_len: int,
+) -> list[dict[int, Hashable]]:
+    block_size = _block_size_for_scheduler(scheduler)
+    if block_size <= 0:
+        return []
+    candidates = []
+    vllm_hashes = _vllm_cumulative_prefix_hashes(
+        request,
+        block_size=block_size,
+        max_prefix_len=max_prefix_len,
+    )
+    if vllm_hashes:
+        candidates.append(vllm_hashes)
+    token_ids = getattr(request, "prompt_token_ids", None)
+    if token_ids:
+        local_hashes = _local_cumulative_prefix_hashes(
+            token_ids,
+            block_size=block_size,
+            max_prefix_len=max_prefix_len,
+        )
+        if local_hashes:
+            candidates.append(local_hashes)
+    return candidates
+
+
 def _request_registry_key(
     *,
     scheduler: Any,
@@ -379,30 +466,155 @@ def backed_gdn_prefix_hit(scheduler: Any, request: Any) -> HybridGDNPrefixKey | 
 
     if request is None:
         return None
-    token_ids = getattr(request, "prompt_token_ids", None)
-    if not token_ids:
-        return None
     block_size = _block_size_for_scheduler(scheduler)
     if block_size <= 0:
         return None
-    max_cache_hit_len = max(0, int(getattr(request, "num_tokens", len(token_ids))) - 1)
-    max_cache_hit_len = min(max_cache_hit_len, len(token_ids))
-    hashes = _local_cumulative_prefix_hashes(
-        token_ids,
-        block_size=block_size,
+    token_ids = getattr(request, "prompt_token_ids", None)
+    token_count = int(getattr(request, "num_tokens", len(token_ids or ())))
+    max_cache_hit_len = max(0, token_count - 1)
+    if token_ids:
+        max_cache_hit_len = min(max_cache_hit_len, len(token_ids))
+    for hashes in _candidate_cumulative_prefix_hashes(
+        scheduler,
+        request,
         max_prefix_len=max_cache_hit_len,
-    )
-    for prefix_len in sorted(hashes, reverse=True):
-        key = _request_registry_key(
-            scheduler=scheduler,
-            request=request,
-            cumulative_prefix_hash=hashes[prefix_len],
-            prefix_len=prefix_len,
-            block_size=block_size,
-        )
-        if key in _GDN_PREFIX_KEYS:
-            return key
+    ):
+        for prefix_len in sorted(hashes, reverse=True):
+            key = _request_registry_key(
+                scheduler=scheduler,
+                request=request,
+                cumulative_prefix_hash=hashes[prefix_len],
+                prefix_len=prefix_len,
+                block_size=block_size,
+            )
+            if key in _GDN_PREFIX_KEYS:
+                return key
     return None
+
+
+def _block_id_groups(block_ids: Any) -> list[list[int]]:
+    if block_ids is None:
+        return []
+    if isinstance(block_ids, tuple):
+        groups = block_ids
+    elif (
+        isinstance(block_ids, list)
+        and block_ids
+        and all(isinstance(item, (list, tuple)) for item in block_ids)
+    ):
+        groups = tuple(block_ids)
+    else:
+        groups = (block_ids,)
+    normalized = []
+    for group in groups:
+        try:
+            normalized.append([int(block_id) for block_id in group])
+        except TypeError:
+            continue
+    return normalized
+
+
+def _attention_block_refs_by_prefix_len(
+    block_ids: Any,
+    *,
+    block_size: int,
+) -> dict[int, tuple[int, ...]]:
+    groups = _block_id_groups(block_ids)
+    if not groups:
+        return {}
+    max_blocks = max(len(group) for group in groups)
+    refs_by_prefix_len: dict[int, tuple[int, ...]] = {}
+    for block_count in range(1, max_blocks + 1):
+        refs: list[int] = []
+        for group in groups:
+            refs.extend(group[:block_count])
+        if refs:
+            refs_by_prefix_len[block_count * block_size] = tuple(refs)
+    return refs_by_prefix_len
+
+
+def _scheduler_request_metadata(
+    scheduler: Any,
+    request: Any,
+    *,
+    block_ids: Any = None,
+    num_computed_tokens: int | None = None,
+) -> dict[str, Any]:
+    block_size = _block_size_for_scheduler(scheduler)
+    if request is None or block_size <= 0:
+        return {}
+    token_ids = getattr(request, "prompt_token_ids", None)
+    request_prefix_len = int(getattr(request, "num_tokens", len(token_ids or ())))
+    cumulative_hashes = _vllm_cumulative_prefix_hashes(
+        request,
+        block_size=block_size,
+        max_prefix_len=request_prefix_len,
+    )
+    metadata: dict[str, Any] = {}
+    if cumulative_hashes:
+        metadata["cumulative_hashes_by_prefix_len"] = cumulative_hashes
+    refs_by_prefix_len = _attention_block_refs_by_prefix_len(
+        block_ids,
+        block_size=block_size,
+    )
+    if refs_by_prefix_len:
+        metadata["attention_block_refs_by_prefix_len"] = refs_by_prefix_len
+    metadata["request_prefix_len"] = request_prefix_len
+    if num_computed_tokens is not None:
+        metadata["vllm_attention_hit_len"] = int(num_computed_tokens)
+    return metadata
+
+
+def _request_from_scheduler(scheduler: Any, req_id: Any) -> Any:
+    requests = getattr(scheduler, "requests", None)
+    if isinstance(requests, dict):
+        return requests.get(req_id)
+    return None
+
+
+def _attach_scheduler_output_metadata(scheduler: Any, scheduler_output: Any) -> None:
+    metadata_by_request_id: dict[Hashable, dict[str, Any]] = {}
+    for req_data in getattr(scheduler_output, "scheduled_new_reqs", ()) or ():
+        req_id = getattr(req_data, "req_id", None)
+        request = _request_from_scheduler(scheduler, req_id)
+        metadata = _scheduler_request_metadata(
+            scheduler,
+            request,
+            block_ids=getattr(req_data, "block_ids", None),
+            num_computed_tokens=getattr(req_data, "num_computed_tokens", None),
+        )
+        if metadata:
+            metadata_by_request_id[_normalize_request_id(req_id)] = metadata
+
+    cached_reqs = getattr(scheduler_output, "scheduled_cached_reqs", None)
+    req_ids = list(getattr(cached_reqs, "req_ids", ()) or ())
+    new_block_ids = list(getattr(cached_reqs, "new_block_ids", ()) or ())
+    num_computed_tokens = list(
+        getattr(cached_reqs, "num_computed_tokens", ()) or ()
+    )
+    for index, req_id in enumerate(req_ids):
+        request = _request_from_scheduler(scheduler, req_id)
+        block_ids = new_block_ids[index] if index < len(new_block_ids) else None
+        computed = (
+            int(num_computed_tokens[index])
+            if index < len(num_computed_tokens)
+            else None
+        )
+        metadata = _scheduler_request_metadata(
+            scheduler,
+            request,
+            block_ids=block_ids,
+            num_computed_tokens=computed,
+        )
+        if metadata:
+            metadata_by_request_id[_normalize_request_id(req_id)] = metadata
+
+    if metadata_by_request_id:
+        setattr(
+            scheduler_output,
+            _SCHEDULER_OUTPUT_METADATA_ATTR,
+            metadata_by_request_id,
+        )
 
 
 def backed_gdn_prefix_hit_len(scheduler: Any, request: Any) -> int:
@@ -494,20 +706,42 @@ def patch_scheduler_class(scheduler_cls: type) -> bool:
     original_add_request = getattr(scheduler_cls, "add_request", None)
     if original_add_request is None:
         raise AttributeError(f"{scheduler_cls!r} has no add_request method")
-    if getattr(original_add_request, "_qwen36_hybrid_apc_patched", False):
-        return False
+    installed = False
 
-    def add_request_with_hybrid_apc_fallback(self, request):
-        if should_disable_unbacked_prefix_reads(self, request):
-            request.skip_reading_prefix_cache = True
-        return original_add_request(self, request)
+    if not getattr(original_add_request, "_qwen36_hybrid_apc_patched", False):
 
-    add_request_with_hybrid_apc_fallback._qwen36_hybrid_apc_patched = True
-    add_request_with_hybrid_apc_fallback._qwen36_original_add_request = (
-        original_add_request
-    )
-    scheduler_cls.add_request = add_request_with_hybrid_apc_fallback
-    return True
+        def add_request_with_hybrid_apc_fallback(self, request):
+            if should_disable_unbacked_prefix_reads(self, request):
+                request.skip_reading_prefix_cache = True
+            return original_add_request(self, request)
+
+        add_request_with_hybrid_apc_fallback._qwen36_hybrid_apc_patched = True
+        add_request_with_hybrid_apc_fallback._qwen36_original_add_request = (
+            original_add_request
+        )
+        scheduler_cls.add_request = add_request_with_hybrid_apc_fallback
+        installed = True
+
+    original_schedule = getattr(scheduler_cls, "schedule", None)
+    if original_schedule is not None and not getattr(
+        original_schedule,
+        "_qwen36_hybrid_apc_metadata_patched",
+        False,
+    ):
+
+        def schedule_with_hybrid_apc_metadata(self, *args, **kwargs):
+            scheduler_output = original_schedule(self, *args, **kwargs)
+            _attach_scheduler_output_metadata(self, scheduler_output)
+            return scheduler_output
+
+        schedule_with_hybrid_apc_metadata._qwen36_hybrid_apc_metadata_patched = True
+        schedule_with_hybrid_apc_metadata._qwen36_original_schedule = (
+            original_schedule
+        )
+        scheduler_cls.schedule = schedule_with_hybrid_apc_metadata
+        installed = True
+
+    return installed
 
 
 def _patch_scheduler_module(module: Any) -> bool:
@@ -570,6 +804,85 @@ def _request_id_target_models(model: Any) -> list[Any]:
         targets.append(current)
         current = getattr(current, "model", None)
     return targets
+
+
+def _runner_hybrid_apc_runtime_config(runner: Any) -> dict[str, Any]:
+    additional_config = _get_additional_config(getattr(runner, "vllm_config", None))
+    runtime_config = {
+        key: additional_config[key]
+        for key in _HYBRID_APC_RUNTIME_CONFIG_KEYS
+        if key in additional_config
+    }
+    if runtime_config.get("hybrid_apc_require_vllm_metadata"):
+        runtime_config["hybrid_apc_allow_local_hash_fallback"] = False
+        runtime_config["hybrid_apc_require_attention_block_refs"] = True
+        runtime_config["hybrid_apc_reject_unbacked_attention_hits"] = True
+    return runtime_config
+
+
+def _config_targets_for_model(model: Any) -> list[Any]:
+    targets = []
+    seen = set()
+    for target in _request_id_target_models(model):
+        config = getattr(target, "config", None)
+        if config is not None:
+            config_id = id(config)
+            if config_id not in seen:
+                seen.add(config_id)
+                targets.append(config)
+        if any(hasattr(target, key) for key in _HYBRID_APC_RUNTIME_CONFIG_KEYS):
+            target_id = id(target)
+            if target_id not in seen:
+                seen.add(target_id)
+                targets.append(target)
+    return targets
+
+
+def _apply_runtime_config_values(
+    *,
+    target: Any,
+    values: dict[str, Any],
+    previous_values: list[tuple[Any, str, Any]],
+    missing: Any,
+) -> None:
+    for attr, value in values.items():
+        previous_values.append((target, attr, getattr(target, attr, missing)))
+        setattr(target, attr, value)
+
+
+def _apply_hybrid_apc_runtime_config(
+    model: Any,
+    values: dict[str, Any],
+    *,
+    previous_values: list[tuple[Any, str, Any]],
+    missing: Any,
+) -> None:
+    if not values:
+        return
+    for target in _config_targets_for_model(model):
+        _apply_runtime_config_values(
+            target=target,
+            values=values,
+            previous_values=previous_values,
+            missing=missing,
+        )
+    bridge_values = {
+        bridge_attr: values[config_attr]
+        for config_attr, bridge_attr in _HYBRID_APC_BRIDGE_CONFIG_ATTRS.items()
+        if config_attr in values
+    }
+    if not bridge_values:
+        return
+    for target in _request_id_target_models(model):
+        bridge = getattr(target, "hybrid_apc_bridge", None)
+        if bridge is None:
+            continue
+        _apply_runtime_config_values(
+            target=bridge,
+            values=bridge_values,
+            previous_values=previous_values,
+            missing=missing,
+        )
 
 
 def _debug_logits_tensor(stage: str, tensor: Any) -> None:
@@ -741,6 +1054,17 @@ def patch_neuron_model_runner_class(runner_cls: type) -> bool:
                     kind="new",
                 ),
             )
+            metadata_by_request_id = getattr(
+                scheduler_output,
+                _SCHEDULER_OUTPUT_METADATA_ATTR,
+                None,
+            )
+            if metadata_by_request_id is not None:
+                object.__setattr__(
+                    model_input,
+                    _SCHEDULER_OUTPUT_METADATA_ATTR,
+                    metadata_by_request_id,
+                )
             return model_input
 
         prepare_model_input_with_hybrid_apc_metadata._qwen36_hybrid_apc_model_input_patched = (
@@ -803,6 +1127,7 @@ def patch_neuron_model_runner_class(runner_cls: type) -> bool:
 
     def execute_model_for_text_with_request_ids(self, model_input, *args, **kwargs):
         model = getattr(self, "model", None)
+        runtime_config = _runner_hybrid_apc_runtime_config(self)
         metadata = {
             "_qwen36_vllm_request_ids": _request_ids_from_model_input(model_input),
             "_qwen36_vllm_cached_request_ids": getattr(
@@ -820,8 +1145,19 @@ def patch_neuron_model_runner_class(runner_cls: type) -> bool:
                 "prefill_completion_state",
                 None,
             ),
+            "_qwen36_vllm_hybrid_apc_metadata_by_request_id": getattr(
+                model_input,
+                _SCHEDULER_OUTPUT_METADATA_ATTR,
+                None,
+            ),
         }
         previous_values = []
+        _apply_hybrid_apc_runtime_config(
+            model,
+            runtime_config,
+            previous_values=previous_values,
+            missing=missing,
+        )
         if any(value is not None for value in metadata.values()):
             for target in _request_id_target_models(model):
                 for attr, value in metadata.items():

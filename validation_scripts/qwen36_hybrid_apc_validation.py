@@ -203,6 +203,8 @@ def _build_llm(args, *, enable_hybrid_apc: bool):
     )
     os.environ.setdefault("VLLM_NEURON_FRAMEWORK", "neuronx-distributed-inference")
     os.environ.setdefault("VLLM_PLUGINS", "neuron")
+    if enable_hybrid_apc:
+        os.environ.setdefault("QWEN36_HYBRID_APC_INSTALL_PATCH", "1")
     if args.enable_vllm_chunked_prefill:
         os.environ["DISABLE_NEURON_CUSTOM_SCHEDULER"] = "1"
     if args.hybrid_apc_disable_unbacked_prefix_reads:
