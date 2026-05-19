@@ -22,6 +22,7 @@ import time
 import traceback
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -32,6 +33,23 @@ FP8_ENV_DEFAULTS = {
     "XLA_HANDLE_SPECIAL_SCALAR": "1",
     "UNSAFE_FP8FNCAST": "1",
 }
+COMPACT_SINGLE_TOKEN_PIECES = [
+    " one",
+    " two",
+    " three",
+    " four",
+    " five",
+    " six",
+    " seven",
+    " eight",
+    " nine",
+    " ten",
+    " alpha",
+    " beta",
+    " gamma",
+    " delta",
+    " token",
+]
 
 
 def _ensure_fp8_environment() -> None:
@@ -189,6 +207,11 @@ def _runner_args(args, *, enable_hybrid_apc: bool):
             "hybrid_apc_enable_backed_prefix_reads",
             False,
         ),
+        hybrid_apc_max_backed_prefix_read_len=getattr(
+            args,
+            "hybrid_apc_max_backed_prefix_read_len",
+            0,
+        ),
         text_only_cte=True,
         compact_cte_attention_mask=True,
         cold_zero_conv_fast_path=False,
@@ -196,10 +219,12 @@ def _runner_args(args, *, enable_hybrid_apc: bool):
 
 
 def _build_llm(args, *, enable_hybrid_apc: bool):
+    sys.path.insert(0, str(REPO_ROOT / "src"))
     sys.path.insert(0, str(QWEN_ROOT / "vllm"))
     sys.path.insert(0, str(QWEN_ROOT))
     os.environ["PYTHONPATH"] = (
-        f"{QWEN_ROOT / 'vllm'}:{QWEN_ROOT}:{os.environ.get('PYTHONPATH', '')}"
+        f"{REPO_ROOT / 'src'}:{QWEN_ROOT / 'vllm'}:{QWEN_ROOT}:"
+        f"{os.environ.get('PYTHONPATH', '')}"
     )
     os.environ.setdefault("VLLM_NEURON_FRAMEWORK", "neuronx-distributed-inference")
     os.environ.setdefault("VLLM_PLUGINS", "neuron")
@@ -432,6 +457,290 @@ def _real_token_checks(results_by_label: dict[str, dict], dummy_token_ids: set[i
     }
 
 
+def _effective_dummy_token_ids(args, tokenizer=None) -> set[int]:
+    configured = {int(token_id) for token_id in args.dummy_token_ids}
+    if tokenizer is None or configured != {0}:
+        return configured
+    special_ids = {
+        int(token_id)
+        for token_id in (
+            getattr(tokenizer, "pad_token_id", None),
+            getattr(tokenizer, "eos_token_id", None),
+        )
+        if token_id is not None
+    }
+    return special_ids or configured
+
+
+def _prompt_token_count(prompt: Any) -> int:
+    if isinstance(prompt, dict):
+        return len(prompt.get("prompt_token_ids", []))
+    return len(str(prompt))
+
+
+def _token_prompt(prefix_ids: list[int], suffix_ids: list[int] | None = None) -> dict:
+    return {"prompt_token_ids": list(prefix_ids) + list(suffix_ids or [])}
+
+
+def _compact_boundary_lengths(args) -> list[int]:
+    if getattr(args, "compact_boundary_lens", None):
+        candidates = _parse_bucket_values(args.compact_boundary_lens)
+    else:
+        block_size = int(args.block_size)
+        candidates = [
+            block_size - 1,
+            block_size,
+            block_size + 1,
+            (2 * block_size) - 1,
+            2 * block_size,
+            (2 * block_size) + 1,
+        ]
+    max_suffix = max(1, int(getattr(args, "compact_suffix_tokens", 16)))
+    max_prompt_len = max(1, int(args.seq_len) - max_suffix - max(1, int(args.max_tokens)))
+    return [
+        prefix_len
+        for prefix_len in sorted(set(candidates))
+        if 0 < prefix_len <= max_prompt_len
+    ]
+
+
+def _make_prefix_ids(tokenizer, *, label: str, target_len: int) -> list[int]:
+    seed = f"System {label}: answer deterministically.\n"
+    text = seed
+    ids = tokenizer.encode(text, add_special_tokens=False)
+    while len(ids) < target_len:
+        text += seed
+        ids = tokenizer.encode(text, add_special_tokens=False)
+    return list(ids[:target_len])
+
+
+def _make_suffix_ids(tokenizer, *, label: str, target_len: int) -> list[int]:
+    seed = f"\nUser: compact gate suffix {label}. Answer with one token.\nAssistant:"
+    ids = tokenizer.encode(seed, add_special_tokens=False)
+    if len(ids) >= target_len:
+        return list(ids[:target_len])
+    pad_piece = tokenizer.encode(" detail", add_special_tokens=False)
+    if not pad_piece:
+        raise ValueError("tokenizer returned no tokens for compact suffix padding")
+    while len(ids) < target_len:
+        ids.extend(pad_piece)
+    return list(ids[:target_len])
+
+
+def _single_token_piece(tokenizer, start_index: int) -> str:
+    for offset in range(len(COMPACT_SINGLE_TOKEN_PIECES)):
+        piece = COMPACT_SINGLE_TOKEN_PIECES[
+            (int(start_index) + offset) % len(COMPACT_SINGLE_TOKEN_PIECES)
+        ]
+        if len(tokenizer.encode(piece, add_special_tokens=False)) == 1:
+            return piece
+    raise ValueError("could not find a compact-gate single-token text piece")
+
+
+def _repeat_single_token_piece(tokenizer, *, start_index: int, token_count: int) -> str:
+    piece = _single_token_piece(tokenizer, start_index)
+    text = piece * int(token_count)
+    actual = len(tokenizer.encode(text, add_special_tokens=False))
+    if actual != int(token_count):
+        raise ValueError(
+            "compact-gate tokenizer-stable text construction failed: "
+            f"wanted {token_count} tokens but built {actual}"
+        )
+    return text
+
+
+def _compact_instruction_suffix_text(
+    tokenizer,
+    *,
+    label: str,
+    start_index: int,
+    token_count: int,
+) -> str:
+    words = ("yes", "no", "red", "blue", "green", "done")
+    word = words[start_index % len(words)]
+    tails = (
+        f"\nUser: Say {word}.\nAssistant:",
+        f" Answer {word}:",
+        f" {word}",
+    )
+    tail = None
+    tail_len = 0
+    for candidate in tails:
+        candidate_len = len(tokenizer.encode(candidate, add_special_tokens=False))
+        if candidate_len <= int(token_count):
+            tail = candidate
+            tail_len = candidate_len
+            break
+    if tail is None:
+        raise ValueError(f"compact-gate suffix {label!r} cannot fit in {token_count} tokens")
+    filler_len = int(token_count) - tail_len
+    filler = (
+        _repeat_single_token_piece(
+            tokenizer,
+            start_index=start_index,
+            token_count=filler_len,
+        )
+        if filler_len > 0
+        else ""
+    )
+    text = filler + tail
+    actual = len(tokenizer.encode(text, add_special_tokens=False))
+    if actual != int(token_count):
+        raise ValueError(
+            "compact-gate instruction suffix construction failed: "
+            f"wanted {token_count} tokens but built {actual} for {label}"
+        )
+    return text
+
+
+def _stable_text_prompt(tokenizer, prefix: str, suffix: str = "") -> str:
+    prefix_ids = tokenizer.encode(prefix, add_special_tokens=False)
+    full = prefix + suffix
+    full_ids = tokenizer.encode(full, add_special_tokens=False)
+    if full_ids[: len(prefix_ids)] != prefix_ids:
+        raise ValueError(
+            "compact-gate text prompt is not tokenizer-stable at the prefix/suffix "
+            "boundary"
+        )
+    return full
+
+
+def _compact_case_plan(args, tokenizer) -> dict:
+    suffix_tokens = int(getattr(args, "compact_suffix_tokens", 16))
+    prefill_batch_budget = max(_parse_bucket_values(args.cte_buckets))
+    cases = []
+    for index, prefix_len in enumerate(_compact_boundary_lengths(args)):
+        prefix_a = _repeat_single_token_piece(
+            tokenizer,
+            start_index=index * 5,
+            token_count=prefix_len,
+        )
+        prefix_b = _repeat_single_token_piece(
+            tokenizer,
+            start_index=(index * 5) + 1,
+            token_count=prefix_len,
+        )
+        suffix_a = _compact_instruction_suffix_text(
+            tokenizer,
+            label=f"{prefix_len}-a",
+            start_index=(index * 5) + 2,
+            token_count=suffix_tokens,
+        )
+        suffix_b = _compact_instruction_suffix_text(
+            tokenizer,
+            label=f"{prefix_len}-b",
+            start_index=(index * 5) + 3,
+            token_count=suffix_tokens,
+        )
+        cold_suffix = _compact_instruction_suffix_text(
+            tokenizer,
+            label=f"{prefix_len}-cold",
+            start_index=(index * 5) + 4,
+            token_count=suffix_tokens,
+        )
+        cold_prefix = _repeat_single_token_piece(
+            tokenizer,
+            start_index=(index * 5) + 5,
+            token_count=prefix_len,
+        )
+        speedup_required = (
+            prefix_len % int(args.gdn_checkpoint_interval) == 0
+            and (
+                int(getattr(args, "hybrid_apc_max_backed_prefix_read_len", 0) or 0)
+                <= 0
+                or prefix_len <= int(args.hybrid_apc_max_backed_prefix_read_len)
+            )
+        )
+        warm_partial_active_len = suffix_tokens if speedup_required else (
+            prefix_len + suffix_tokens
+        )
+        cold_mixed_active_len = prefix_len + suffix_tokens
+        cases.append(
+            {
+                "case": f"boundary_{prefix_len}",
+                "prefix_len": prefix_len,
+                "full_token_len": prefix_len,
+                "partial_token_len": prefix_len + suffix_tokens,
+                "full_a": _stable_text_prompt(tokenizer, prefix_a),
+                "full_b": _stable_text_prompt(tokenizer, prefix_b),
+                "partial_a": _stable_text_prompt(tokenizer, prefix_a, suffix_a),
+                "partial_b": _stable_text_prompt(tokenizer, prefix_b, suffix_b),
+                "mixed_cold": _stable_text_prompt(
+                    tokenizer,
+                    cold_prefix,
+                    cold_suffix,
+                ),
+                "full_grouped": (2 * prefix_len) <= prefill_batch_budget,
+                "partial_grouped": (
+                    2 * warm_partial_active_len
+                )
+                <= prefill_batch_budget,
+                "mixed_grouped": (
+                    warm_partial_active_len + cold_mixed_active_len
+                )
+                <= prefill_batch_budget,
+                "speedup_required": speedup_required,
+            }
+        )
+    return {
+        "boundary_lengths": [case["prefix_len"] for case in cases],
+        "cases": cases,
+    }
+
+
+def _compact_exactness_check(
+    *,
+    name: str,
+    cold_label: str,
+    warm_label: str,
+    cold_results: dict[str, dict],
+    warm_results: dict[str, dict],
+) -> dict:
+    cold_tokens = list(cold_results[cold_label]["tokens"])
+    warm_tokens = list(warm_results[warm_label]["tokens"])
+    return {
+        "name": name,
+        "cold_label": cold_label,
+        "warm_label": warm_label,
+        "passed": cold_tokens == warm_tokens,
+        "cold_tokens": cold_tokens,
+        "warm_tokens": warm_tokens,
+    }
+
+
+def _compact_speedup_check(
+    *,
+    name: str,
+    cold_labels: list[str],
+    warm_label: str,
+    cold_results: dict[str, dict],
+    warm_results: dict[str, dict],
+    min_speedup: float,
+) -> dict:
+    cold_serial = sum(float(cold_results[label]["elapsed_seconds"]) for label in cold_labels)
+    warm_elapsed = float(warm_results[warm_label]["elapsed_seconds"])
+    speedup = cold_serial / warm_elapsed if warm_elapsed > 0 else float("inf")
+    return {
+        "name": name,
+        "cold_labels": list(cold_labels),
+        "warm_label": warm_label,
+        "cold_serial_seconds": cold_serial,
+        "warm_group_seconds": warm_elapsed,
+        "speedup": speedup,
+        "min_speedup": min_speedup,
+        "passed": speedup >= min_speedup,
+    }
+
+
+def _write_report(args, report: dict) -> None:
+    if args.output_json:
+        args.output_json.expanduser().write_text(
+            json.dumps(report, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+    print(json.dumps(report, indent=2, sort_keys=True))
+
+
 def run_exactness(args) -> int:
     shared = args.shared_prefix
     prompt_a = shared + args.suffix_a
@@ -478,7 +787,7 @@ def run_exactness(args) -> int:
     }
     real_token_checks = _real_token_checks(
         all_results,
-        {int(token_id) for token_id in args.dummy_token_ids},
+        _effective_dummy_token_ids(args),
     )
 
     report = {
@@ -553,7 +862,7 @@ def run_batched_exactness(args) -> int:
     }
     real_token_checks = _real_token_checks(
         all_results,
-        {int(token_id) for token_id in args.dummy_token_ids},
+        _effective_dummy_token_ids(args),
     )
     report = {
         "batched_partial_a_exact": (
@@ -583,6 +892,275 @@ def run_batched_exactness(args) -> int:
     if args.require_real_tokens:
         passed = passed and real_token_checks["passed"]
     return 0 if passed else 1
+
+
+def run_compact_gate(args) -> int:
+    if not args.hybrid_apc_require_vllm_metadata:
+        raise ValueError("compact-gate requires --hybrid-apc-require-vllm-metadata")
+    if not args.hybrid_apc_disable_unbacked_prefix_reads:
+        raise ValueError(
+            "compact-gate requires --hybrid-apc-disable-unbacked-prefix-reads"
+        )
+    if not args.hybrid_apc_enable_backed_prefix_reads:
+        raise ValueError(
+            "compact-gate requires --hybrid-apc-enable-backed-prefix-reads"
+        )
+    if args.max_num_seqs < 2:
+        raise ValueError("compact-gate requires --max-num-seqs >= 2")
+    _validate_generation_batch_support(args)
+
+    from transformers import AutoTokenizer  # noqa: WPS433
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        str(Path(args.model_path).expanduser().resolve()),
+        trust_remote_code=True,
+    )
+    plan = _compact_case_plan(args, tokenizer)
+    cases = plan["cases"]
+    if not cases:
+        raise ValueError("compact-gate produced no cases")
+
+    cold_full_prompts = []
+    cold_partial_prompts = []
+    for case in cases:
+        name = case["case"]
+        cold_full_prompts.extend(
+            [
+                (f"cold_full_a__{name}", case["full_a"]),
+                (f"cold_full_b__{name}", case["full_b"]),
+            ]
+        )
+        cold_partial_prompts.extend(
+            [
+                (f"cold_partial_a__{name}", case["partial_a"]),
+                (f"cold_partial_b__{name}", case["partial_b"]),
+                (f"cold_mixed__{name}", case["mixed_cold"]),
+            ]
+        )
+
+    cold_results = {}
+    cold_results.update(
+        _generate_batch(
+            args,
+            enable_hybrid_apc=True,
+            labeled_prompts=cold_full_prompts,
+        )
+    )
+    cold_results.update(
+        _generate_batch(
+            args,
+            enable_hybrid_apc=True,
+            labeled_prompts=cold_partial_prompts,
+        )
+    )
+
+    warm_groups = []
+    for case in cases:
+        name = case["case"]
+        warm_groups.extend(
+            [
+                [(f"warmup_full_a__{name}", case["full_a"])],
+                [(f"warmup_full_b__{name}", case["full_b"])],
+            ]
+        )
+        if case["full_grouped"]:
+            warm_groups.append(
+                [
+                    (f"warm_full_a__{name}", case["full_a"]),
+                    (f"warm_full_b__{name}", case["full_b"]),
+                ]
+            )
+        else:
+            warm_groups.extend(
+                [
+                    [(f"warm_full_a__{name}", case["full_a"])],
+                    [(f"warm_full_b__{name}", case["full_b"])],
+                ]
+            )
+        if case["partial_grouped"]:
+            warm_groups.append(
+                [
+                    (f"warm_partial_a__{name}", case["partial_a"]),
+                    (f"warm_partial_b__{name}", case["partial_b"]),
+                ]
+            )
+        else:
+            warm_groups.extend(
+                [
+                    [(f"warm_partial_a__{name}", case["partial_a"])],
+                    [(f"warm_partial_b__{name}", case["partial_b"])],
+                ]
+            )
+        if case["mixed_grouped"]:
+            warm_groups.append(
+                [
+                    (f"mixed_warm_a__{name}", case["partial_a"]),
+                    (f"mixed_cold__{name}", case["mixed_cold"]),
+                ]
+            )
+        else:
+            warm_groups.extend(
+                [
+                    [(f"mixed_warm_a__{name}", case["partial_a"])],
+                    [(f"mixed_cold__{name}", case["mixed_cold"])],
+                ]
+            )
+    first_case = cases[0]
+    warm_groups.append(
+        [
+            (
+                f"eviction_probe_partial_a__{first_case['case']}",
+                first_case["partial_a"],
+            )
+        ]
+    )
+    warm_results = _generate_grouped_batch(
+        args,
+        enable_hybrid_apc=True,
+        labeled_prompt_groups=warm_groups,
+    )
+
+    exactness_checks = []
+    speedup_checks = []
+    for case in cases:
+        name = case["case"]
+        exactness_checks.extend(
+            [
+                _compact_exactness_check(
+                    name=f"same_full_a__{name}",
+                    cold_label=f"cold_full_a__{name}",
+                    warm_label=f"warm_full_a__{name}",
+                    cold_results=cold_results,
+                    warm_results=warm_results,
+                ),
+                _compact_exactness_check(
+                    name=f"same_full_b__{name}",
+                    cold_label=f"cold_full_b__{name}",
+                    warm_label=f"warm_full_b__{name}",
+                    cold_results=cold_results,
+                    warm_results=warm_results,
+                ),
+                _compact_exactness_check(
+                    name=f"partial_a__{name}",
+                    cold_label=f"cold_partial_a__{name}",
+                    warm_label=f"warm_partial_a__{name}",
+                    cold_results=cold_results,
+                    warm_results=warm_results,
+                ),
+                _compact_exactness_check(
+                    name=f"partial_b__{name}",
+                    cold_label=f"cold_partial_b__{name}",
+                    warm_label=f"warm_partial_b__{name}",
+                    cold_results=cold_results,
+                    warm_results=warm_results,
+                ),
+                _compact_exactness_check(
+                    name=f"mixed_warm_a__{name}",
+                    cold_label=f"cold_partial_a__{name}",
+                    warm_label=f"mixed_warm_a__{name}",
+                    cold_results=cold_results,
+                    warm_results=warm_results,
+                ),
+                _compact_exactness_check(
+                    name=f"mixed_cold__{name}",
+                    cold_label=f"cold_mixed__{name}",
+                    warm_label=f"mixed_cold__{name}",
+                    cold_results=cold_results,
+                    warm_results=warm_results,
+                ),
+            ]
+        )
+        if case["speedup_required"] and case["partial_grouped"]:
+            speedup_checks.append(
+                _compact_speedup_check(
+                    name=f"grouped_warm_partials__{name}",
+                    cold_labels=[
+                        f"cold_partial_a__{name}",
+                        f"cold_partial_b__{name}",
+                    ],
+                    warm_label=f"warm_partial_a__{name}",
+                    cold_results=cold_results,
+                    warm_results=warm_results,
+                    min_speedup=float(args.compact_min_grouped_speedup),
+                )
+            )
+
+    exactness_checks.append(
+        _compact_exactness_check(
+            name=f"eviction_probe_partial_a__{first_case['case']}",
+            cold_label=f"cold_partial_a__{first_case['case']}",
+            warm_label=f"eviction_probe_partial_a__{first_case['case']}",
+            cold_results=cold_results,
+            warm_results=warm_results,
+        )
+    )
+
+    all_results = {
+        **{f"cold::{label}": result for label, result in cold_results.items()},
+        **{f"warm::{label}": result for label, result in warm_results.items()},
+    }
+    real_token_checks = _real_token_checks(
+        all_results,
+        _effective_dummy_token_ids(args, tokenizer),
+    )
+    total_requests = len(cold_results) + len(warm_results)
+    grouped_partial_case_count = sum(1 for case in cases if case["partial_grouped"])
+    grouped_mixed_case_count = sum(1 for case in cases if case["mixed_grouped"])
+    acceptance = {
+        "request_count": total_requests,
+        "min_request_count": args.compact_min_requests,
+        "request_count_passed": total_requests >= args.compact_min_requests,
+        "exactness_passed": all(check["passed"] for check in exactness_checks),
+        "real_generated_tokens_passed": real_token_checks["passed"],
+        "grouped_partial_case_count": grouped_partial_case_count,
+        "grouped_partial_coverage_passed": grouped_partial_case_count > 0,
+        "grouped_mixed_case_count": grouped_mixed_case_count,
+        "grouped_mixed_coverage_passed": grouped_mixed_case_count > 0,
+        "speedup_checks_required": len(speedup_checks),
+        "speedup_passed": bool(speedup_checks)
+        and all(check["passed"] for check in speedup_checks),
+        "runtime_exception_free": True,
+        "eviction_probe_passed": exactness_checks[-1]["passed"],
+    }
+    acceptance["passed"] = all(
+        bool(acceptance[name])
+        for name in (
+            "request_count_passed",
+            "exactness_passed",
+            "real_generated_tokens_passed",
+            "grouped_partial_coverage_passed",
+            "grouped_mixed_coverage_passed",
+            "speedup_passed",
+            "runtime_exception_free",
+            "eviction_probe_passed",
+        )
+    )
+    report = {
+        "compact_gate_passed": acceptance["passed"],
+        "acceptance": acceptance,
+        "boundary_lengths": plan["boundary_lengths"],
+        "block_size": args.block_size,
+        "gdn_checkpoint_interval": args.gdn_checkpoint_interval,
+        "max_gdn_checkpoint_slots": args.max_gdn_checkpoint_slots,
+        "max_num_seqs": args.max_num_seqs,
+        "max_tokens": args.max_tokens,
+        "compact_suffix_tokens": args.compact_suffix_tokens,
+        "hybrid_apc_require_vllm_metadata": args.hybrid_apc_require_vllm_metadata,
+        "hybrid_apc_disable_unbacked_prefix_reads": (
+            args.hybrid_apc_disable_unbacked_prefix_reads
+        ),
+        "hybrid_apc_enable_backed_prefix_reads": (
+            args.hybrid_apc_enable_backed_prefix_reads
+        ),
+        "hybrid_apc_max_backed_prefix_read_len": (
+            args.hybrid_apc_max_backed_prefix_read_len
+        ),
+        "exactness_checks": exactness_checks,
+        "speedup_checks": speedup_checks,
+        "real_generated_token_checks": real_token_checks["checks"],
+    }
+    _write_report(args, report)
+    return 0 if acceptance["passed"] else 1
 
 
 def run_hbm(args) -> int:
@@ -662,6 +1240,7 @@ def parse_args():
             action=argparse.BooleanOptionalAction,
             default=False,
         )
+        exact.add_argument("--hybrid-apc-max-backed-prefix-read-len", type=int, default=0)
         exact.add_argument("--enable-vllm-chunked-prefill", action="store_true")
         exact.add_argument("--kernel-q-tile-size", type=int, default=128)
         exact.add_argument("--kernel-kv-tile-size", type=int, default=1024)
@@ -700,6 +1279,39 @@ def parse_args():
     batched.add_argument("--suffix-c", default="")
     batched.add_argument("--suffix-d", default="\nUser: What is 23 * 31?\nAssistant:")
     batched.set_defaults(func=run_batched_exactness)
+
+    compact = subparsers.add_parser("compact-gate")
+    add_common_exact_args(compact)
+    compact.add_argument(
+        "--compact-boundary-lens",
+        nargs="+",
+        help=(
+            "Prefix token lengths to test. Defaults to block_size +/- 1 and "
+            "2*block_size +/- 1."
+        ),
+    )
+    compact.add_argument(
+        "--compact-suffix-tokens",
+        type=int,
+        default=16,
+        help="Tokenized suffix length appended to partial-prefix prompts.",
+    )
+    compact.add_argument(
+        "--compact-min-requests",
+        type=int,
+        default=50,
+        help="Minimum generated request count required for the compact gate.",
+    )
+    compact.add_argument(
+        "--compact-min-grouped-speedup",
+        type=float,
+        default=1.5,
+        help=(
+            "Minimum warm grouped throughput speedup required for checkpoint "
+            "boundary cases."
+        ),
+    )
+    compact.set_defaults(func=run_compact_gate)
 
     hbm = subparsers.add_parser("hbm")
     hbm.add_argument("--context-lens", nargs="+", type=int, default=[131072, 262144])

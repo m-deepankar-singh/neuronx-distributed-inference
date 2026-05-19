@@ -481,6 +481,17 @@ def apply_hybrid_apc_prefill_plan(
         device=device,
     ).unsqueeze(0)
     output["position_ids"] = position_ids.expand(batch_size, suffix_len).contiguous()
+    default_rotary_positions = torch.arange(
+        restore_len,
+        prompt_len,
+        dtype=torch.int32,
+        device=device,
+    )
+    output["rotary_position_ids"] = default_rotary_positions.view(
+        1,
+        1,
+        suffix_len,
+    ).expand(3, batch_size, suffix_len).contiguous()
 
     for key in ("rotary_position_id", "rotary_position_ids"):
         value = input_dict.get(key)
@@ -542,6 +553,8 @@ def apply_hybrid_apc_suffix_prefill_plan(
     *,
     plan: HybridAPCHitPlan,
     request_prefix_len: int,
+    commit_slot: int | None = None,
+    attention_block_refs: Iterable[int] | None = None,
 ) -> dict[str, torch.Tensor]:
     """Materialize Hybrid APC controls when vLLM already sliced to suffix.
 
@@ -572,6 +585,21 @@ def apply_hybrid_apc_suffix_prefill_plan(
     output = dict(input_dict)
     device = input_ids.device
     output["input_ids"] = input_ids
+    refs: tuple[int, ...] = ()
+    if attention_block_refs is not None:
+        refs = tuple(int(ref) for ref in attention_block_refs)
+        if refs:
+            block_table_template = input_dict.get("block_table")
+            block_table_dtype = (
+                block_table_template.dtype
+                if isinstance(block_table_template, torch.Tensor)
+                else torch.int32
+            )
+            output["block_table"] = torch.tensor(
+                [refs] * batch_size,
+                dtype=block_table_dtype,
+                device=device,
+            )
 
     position_template = input_dict.get("position_ids")
     position_dtype = (
@@ -586,6 +614,39 @@ def apply_hybrid_apc_suffix_prefill_plan(
         device=device,
     ).unsqueeze(0)
     output["position_ids"] = position_ids.expand(batch_size, suffix_len).contiguous()
+    default_rotary_positions = torch.arange(
+        restore_len,
+        prompt_len,
+        dtype=torch.int32,
+        device=device,
+    )
+    output["rotary_position_ids"] = default_rotary_positions.view(
+        1,
+        1,
+        suffix_len,
+    ).expand(3, batch_size, suffix_len).contiguous()
+
+    for key in ("rotary_position_id", "rotary_position_ids"):
+        value = input_dict.get(key)
+        if not isinstance(value, torch.Tensor):
+            continue
+        rotary_positions = torch.arange(
+            restore_len,
+            prompt_len,
+            dtype=value.dtype,
+            device=device,
+        )
+        if value.ndim == 2:
+            output[key] = rotary_positions.unsqueeze(0).expand(
+                batch_size,
+                suffix_len,
+            ).contiguous()
+        elif value.ndim == 3:
+            output[key] = rotary_positions.view(1, 1, suffix_len).expand(
+                value.shape[0],
+                batch_size,
+                suffix_len,
+            ).contiguous()
 
     def _batch_i32(value: int) -> torch.Tensor:
         return torch.full((batch_size,), int(value), dtype=torch.int32, device=device)
@@ -599,14 +660,16 @@ def apply_hybrid_apc_suffix_prefill_plan(
     output["hybrid_restore_slot_ids"] = _batch_i32(int(plan.checkpoint_slot))
     output["hybrid_restore_mask"] = _batch_i32(1)
     output["hybrid_restore_prefix_lens"] = _batch_i32(restore_len)
-    output["hybrid_commit_slot_ids"] = _batch_i32(0)
-    output["hybrid_commit_mask"] = _batch_i32(0)
+    output["hybrid_commit_slot_ids"] = _batch_i32(0 if commit_slot is None else commit_slot)
+    output["hybrid_commit_mask"] = _batch_i32(1 if commit_slot is not None else 0)
 
     if os.environ.get("QWEN36_HYBRID_APC_DEBUG") == "1":
         print(
             "[hybrid_apc_debug] apply-suffix "
             f"prompt_len={prompt_len} restore_len={restore_len} "
             f"suffix_len={suffix_len} restore_slot={plan.checkpoint_slot} "
+            f"commit_slot={commit_slot} "
+            f"attention_block_refs={refs} "
             f"input_shape={tuple(input_ids.shape)}",
             flush=True,
         )
@@ -861,6 +924,8 @@ class HybridAPCSchedulerBridge:
         input_dict: dict[str, torch.Tensor],
         attention_hit_len: int,
         request_prefix_len: int,
+        cumulative_hashes_by_prefix_len: dict[int, Hashable] | None = None,
+        attention_block_refs_by_prefix_len: dict[int, Iterable[int]] | None = None,
     ) -> HybridAPCPreparedRequest | None:
         """Prepare a suffix-only request using scheduler-approved restore metadata."""
 
@@ -954,28 +1019,81 @@ class HybridAPCSchedulerBridge:
             checkpoint_slot=checkpoint.gdn_checkpoint_slot,
             checkpoint_key=checkpoint.key,
         )
+        disable_commit = _env_flag("QWEN36_DISABLE_HYBRID_GDN_COMMIT")
+        commit_prefix_len = floor_to_checkpoint_boundary(
+            request_prefix_len,
+            self.store.checkpoint_interval,
+        )
+        commit_key = None
+        commit_slot = None
+        attention_block_refs: tuple[int, ...] = ()
+        can_commit_boundary = (
+            commit_prefix_len > 0
+            and commit_prefix_len == request_prefix_len
+            and not disable_commit
+        )
+        if can_commit_boundary:
+            if cumulative_hashes_by_prefix_len is None:
+                if not self.allow_local_hash_fallback:
+                    raise ValueError(
+                        "hybrid APC production mode requires vLLM cumulative prefix "
+                        f"hashes to commit suffix-only boundary {commit_prefix_len}"
+                    )
+            elif commit_prefix_len not in cumulative_hashes_by_prefix_len:
+                raise ValueError(
+                    f"missing cumulative prefix hash for commit boundary {commit_prefix_len}"
+                )
+            if cumulative_hashes_by_prefix_len is None:
+                can_commit_boundary = False
+        if can_commit_boundary:
+            commit_key = self.store.make_key(
+                cumulative_prefix_hash=cumulative_hashes_by_prefix_len[commit_prefix_len],
+                prefix_len=commit_prefix_len,
+                cache_salt=self.cache_salt,
+                model_revision=self.model_revision,
+                layout_version=self.layout_version,
+                tp_rank=self.tp_rank,
+                recurrent_dtype=self.recurrent_dtype,
+                conv_dtype=self.conv_dtype,
+            )
+            if attention_block_refs_by_prefix_len is not None:
+                attention_block_refs = tuple(
+                    int(ref)
+                    for ref in attention_block_refs_by_prefix_len.get(
+                        commit_prefix_len,
+                        (),
+                    )
+                )
+            if not attention_block_refs and not self.require_attention_block_refs:
+                attention_block_refs = tuple(
+                    range(commit_prefix_len // self.store.block_size)
+                )
+            if self.store.lookup(commit_key) is None:
+                commit_slot = self.slot_allocator.reserve()
+
         model_inputs = apply_hybrid_apc_suffix_prefill_plan(
             input_dict,
             plan=plan,
             request_prefix_len=request_prefix_len,
+            commit_slot=commit_slot,
+            attention_block_refs=checkpoint.attention_block_refs,
         )
-        self.store.on_request_restore(
+        record = self.store.on_request_restore(
             request_id=request_id,
             checkpoint_key=plan.checkpoint_key,
         )
+        if commit_slot is not None:
+            record.reserved_slots.append(commit_slot)
         self.store.on_prefill_running(request_id)
 
         return HybridAPCPreparedRequest(
             request_id=request_id,
             input_dict=model_inputs,
             plan=plan,
-            commit_prefix_len=floor_to_checkpoint_boundary(
-                request_prefix_len,
-                self.store.checkpoint_interval,
-            ),
-            commit_key=None,
-            commit_slot=None,
-            attention_block_refs=checkpoint.attention_block_refs,
+            commit_prefix_len=commit_prefix_len,
+            commit_key=commit_key,
+            commit_slot=commit_slot,
+            attention_block_refs=attention_block_refs or checkpoint.attention_block_refs,
         )
 
     def commit_prefill(

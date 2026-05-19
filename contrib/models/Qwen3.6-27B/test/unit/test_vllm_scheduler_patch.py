@@ -144,6 +144,19 @@ class TestQwen36HybridAPCSchedulerPatch(unittest.TestCase):
         )
         self.patch.register_hybrid_apc_gdn_checkpoint(
             self.patch.HybridGDNPrefixKey(
+                cumulative_prefix_hash=hashes[2],
+                prefix_len=2,
+                block_size=2,
+                cache_salt=None,
+                model_revision="rev-a",
+                layout_version=1,
+                tp_rank=0,
+                recurrent_dtype="float32",
+                conv_dtype="bfloat16",
+            )
+        )
+        self.patch.register_hybrid_apc_gdn_checkpoint(
+            self.patch.HybridGDNPrefixKey(
                 cumulative_prefix_hash=hashes[4],
                 prefix_len=4,
                 block_size=2,
@@ -187,6 +200,19 @@ class TestQwen36HybridAPCSchedulerPatch(unittest.TestCase):
         )
         self.patch.register_hybrid_apc_gdn_checkpoint(
             self.patch.HybridGDNPrefixKey(
+                cumulative_prefix_hash=hashes[2],
+                prefix_len=2,
+                block_size=2,
+                cache_salt=None,
+                model_revision="rev-a",
+                layout_version=1,
+                tp_rank=0,
+                recurrent_dtype="float32",
+                conv_dtype="bfloat16",
+            )
+        )
+        self.patch.register_hybrid_apc_gdn_checkpoint(
+            self.patch.HybridGDNPrefixKey(
                 cumulative_prefix_hash=hashes[4],
                 prefix_len=4,
                 block_size=2,
@@ -216,6 +242,118 @@ class TestQwen36HybridAPCSchedulerPatch(unittest.TestCase):
                 self.patch.should_disable_unbacked_prefix_reads(scheduler, request)
             )
 
+    def test_partial_gdn_coverage_keeps_prefix_read_disabled(self):
+        scheduler = _scheduler(
+            block_size=2,
+            enable_backed_prefix_reads=True,
+            use_qwen_hybrid_chunked_prefill=True,
+        )
+        token_ids = [10, 11, 12, 13, 14, 15, 16]
+        hashes = self.patch._local_cumulative_prefix_hashes(
+            token_ids,
+            block_size=2,
+            max_prefix_len=6,
+        )
+        self.patch.register_hybrid_apc_gdn_checkpoint(
+            self.patch.HybridGDNPrefixKey(
+                cumulative_prefix_hash=hashes[4],
+                prefix_len=4,
+                block_size=2,
+                cache_salt=None,
+                model_revision="rev-a",
+                layout_version=1,
+                tp_rank=0,
+                recurrent_dtype="float32",
+                conv_dtype="bfloat16",
+            )
+        )
+        request = types.SimpleNamespace(
+            request_id="req-partial",
+            prompt_token_ids=token_ids,
+            num_tokens=len(token_ids),
+            cache_salt=None,
+        )
+
+        with patch.dict(
+            os.environ,
+            {"QWEN36_HYBRID_APC_DISABLE_UNBACKED_PREFIX_READS": "1"},
+        ):
+            self.assertEqual(
+                self.patch.backed_gdn_prefix_hit_len(scheduler, request),
+                4,
+            )
+            self.assertTrue(
+                self.patch.should_disable_unbacked_prefix_reads(scheduler, request)
+            )
+
+        self.assertIsNone(
+            self.patch.pop_hybrid_apc_authorized_prefix_key(
+                prefix_len=4,
+                request_id="req-partial",
+                cache_salt=None,
+                model_revision="rev-a",
+                layout_version=1,
+                tp_rank=0,
+                recurrent_dtype="float32",
+                conv_dtype="bfloat16",
+            )
+        )
+
+    def test_max_backed_prefix_cap_keeps_larger_prefix_read_disabled(self):
+        scheduler = _scheduler(
+            block_size=2,
+            enable_backed_prefix_reads=True,
+            use_qwen_hybrid_chunked_prefill=True,
+            additional_config={"hybrid_apc_max_backed_prefix_read_len": 2},
+        )
+        token_ids = [10, 11, 12, 13, 14]
+        hashes = self.patch._local_cumulative_prefix_hashes(
+            token_ids,
+            block_size=2,
+            max_prefix_len=4,
+        )
+        for prefix_len in (2, 4):
+            self.patch.register_hybrid_apc_gdn_checkpoint(
+                self.patch.HybridGDNPrefixKey(
+                    cumulative_prefix_hash=hashes[prefix_len],
+                    prefix_len=prefix_len,
+                    block_size=2,
+                    cache_salt=None,
+                    model_revision="rev-a",
+                    layout_version=1,
+                    tp_rank=0,
+                    recurrent_dtype="float32",
+                    conv_dtype="bfloat16",
+                )
+            )
+        request = types.SimpleNamespace(
+            request_id="req-capped",
+            prompt_token_ids=token_ids,
+            num_tokens=len(token_ids),
+            cache_salt=None,
+        )
+
+        with patch.dict(
+            os.environ,
+            {"QWEN36_HYBRID_APC_DISABLE_UNBACKED_PREFIX_READS": "1"},
+        ):
+            self.assertTrue(
+                self.patch.should_disable_unbacked_prefix_reads(scheduler, request)
+            )
+
+        self.assertIsNone(
+            self.patch.pop_hybrid_apc_authorized_prefix_key(
+                prefix_len=4,
+                request_id="req-capped",
+                cache_salt=None,
+                model_revision="rev-a",
+                layout_version=1,
+                tp_rank=0,
+                recurrent_dtype="float32",
+                conv_dtype="bfloat16",
+            )
+        )
+
     def test_additional_config_allows_prefix_read_when_hf_config_is_stale(self):
         scheduler = _scheduler(
             block_size=2,
@@ -233,6 +371,19 @@ class TestQwen36HybridAPCSchedulerPatch(unittest.TestCase):
             token_ids,
             block_size=2,
             max_prefix_len=4,
+        )
+        self.patch.register_hybrid_apc_gdn_checkpoint(
+            self.patch.HybridGDNPrefixKey(
+                cumulative_prefix_hash=hashes[2],
+                prefix_len=2,
+                block_size=2,
+                cache_salt=None,
+                model_revision="rev-a",
+                layout_version=1,
+                tp_rank=0,
+                recurrent_dtype="float32",
+                conv_dtype="bfloat16",
+            )
         )
         self.patch.register_hybrid_apc_gdn_checkpoint(
             self.patch.HybridGDNPrefixKey(
@@ -331,6 +482,19 @@ class TestQwen36HybridAPCSchedulerPatch(unittest.TestCase):
             tp_rank=0,
             recurrent_dtype="float32",
             conv_dtype="bfloat16",
+        )
+        self.patch.register_hybrid_apc_gdn_checkpoint(
+            self.patch.HybridGDNPrefixKey(
+                cumulative_prefix_hash=hashes[2],
+                prefix_len=2,
+                block_size=2,
+                cache_salt=None,
+                model_revision="rev-a",
+                layout_version=1,
+                tp_rank=0,
+                recurrent_dtype="float32",
+                conv_dtype="bfloat16",
+            )
         )
         self.patch.register_hybrid_apc_gdn_checkpoint(key)
         request = types.SimpleNamespace(
@@ -465,6 +629,19 @@ class TestQwen36HybridAPCSchedulerPatch(unittest.TestCase):
         )
         self.patch.register_hybrid_apc_gdn_checkpoint(
             self.patch.HybridGDNPrefixKey(
+                cumulative_prefix_hash=hashes[2],
+                prefix_len=2,
+                block_size=2,
+                cache_salt=None,
+                model_revision="rev-a",
+                layout_version=1,
+                tp_rank=0,
+                recurrent_dtype="float32",
+                conv_dtype="bfloat16",
+            )
+        )
+        self.patch.register_hybrid_apc_gdn_checkpoint(
+            self.patch.HybridGDNPrefixKey(
                 cumulative_prefix_hash=hashes[4],
                 prefix_len=4,
                 block_size=2,
@@ -513,6 +690,19 @@ class TestQwen36HybridAPCSchedulerPatch(unittest.TestCase):
             token_ids,
             block_size=2,
             max_prefix_len=4,
+        )
+        self.patch.register_hybrid_apc_gdn_checkpoint(
+            self.patch.HybridGDNPrefixKey(
+                cumulative_prefix_hash=hashes[2],
+                prefix_len=2,
+                block_size=2,
+                cache_salt=None,
+                model_revision="rev-a",
+                layout_version=1,
+                tp_rank=0,
+                recurrent_dtype="float32",
+                conv_dtype="bfloat16",
+            )
         )
         self.patch.register_hybrid_apc_gdn_checkpoint(
             self.patch.HybridGDNPrefixKey(

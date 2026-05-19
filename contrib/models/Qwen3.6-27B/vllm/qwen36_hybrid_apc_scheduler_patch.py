@@ -63,6 +63,7 @@ _HYBRID_APC_RUNTIME_CONFIG_KEYS = (
     "hybrid_apc_reject_unbacked_attention_hits",
     "hybrid_apc_disable_unbacked_prefix_reads",
     "hybrid_apc_enable_backed_prefix_reads",
+    "hybrid_apc_max_backed_prefix_read_len",
 )
 _HYBRID_APC_BRIDGE_CONFIG_ATTRS = {
     "hybrid_apc_allow_local_hash_fallback": "allow_local_hash_fallback",
@@ -85,6 +86,13 @@ def _env_flag(name: str) -> bool:
         "no",
         "off",
     }
+
+
+def _env_int(name: str) -> int | None:
+    value = os.environ.get(name)
+    if value is None or value.strip() == "":
+        return None
+    return int(value)
 
 
 def _get_hf_config(vllm_config: Any) -> Any:
@@ -461,25 +469,38 @@ def _request_registry_key(
     )
 
 
-def backed_gdn_prefix_hit(scheduler: Any, request: Any) -> HybridGDNPrefixKey | None:
-    """Return the largest request prefix with a registered GDN checkpoint."""
-
+def _request_max_cache_hit_len(scheduler: Any, request: Any) -> int:
     if request is None:
-        return None
+        return 0
     block_size = _block_size_for_scheduler(scheduler)
     if block_size <= 0:
-        return None
+        return 0
     token_ids = getattr(request, "prompt_token_ids", None)
     token_count = int(getattr(request, "num_tokens", len(token_ids or ())))
     max_cache_hit_len = max(0, token_count - 1)
     if token_ids:
         max_cache_hit_len = min(max_cache_hit_len, len(token_ids))
+    return max_cache_hit_len
+
+
+def backed_gdn_prefix_hits(scheduler: Any, request: Any) -> dict[int, HybridGDNPrefixKey]:
+    """Return request prefix lengths with registered GDN checkpoints."""
+
+    if request is None:
+        return {}
+    block_size = _block_size_for_scheduler(scheduler)
+    max_cache_hit_len = _request_max_cache_hit_len(scheduler, request)
+    if block_size <= 0 or max_cache_hit_len <= 0:
+        return {}
+    hits: dict[int, HybridGDNPrefixKey] = {}
     for hashes in _candidate_cumulative_prefix_hashes(
         scheduler,
         request,
         max_prefix_len=max_cache_hit_len,
     ):
         for prefix_len in sorted(hashes, reverse=True):
+            if prefix_len in hits:
+                continue
             key = _request_registry_key(
                 scheduler=scheduler,
                 request=request,
@@ -488,8 +509,34 @@ def backed_gdn_prefix_hit(scheduler: Any, request: Any) -> HybridGDNPrefixKey | 
                 block_size=block_size,
             )
             if key in _GDN_PREFIX_KEYS:
-                return key
-    return None
+                hits[prefix_len] = key
+    return hits
+
+
+def backed_gdn_prefix_hit(scheduler: Any, request: Any) -> HybridGDNPrefixKey | None:
+    """Return the largest request prefix with a registered GDN checkpoint."""
+
+    hits = backed_gdn_prefix_hits(scheduler, request)
+    if not hits:
+        return None
+    return hits[max(hits)]
+
+
+def _required_backed_prefix_lens(scheduler: Any, request: Any) -> tuple[int, ...]:
+    if request is None:
+        return ()
+    block_size = _block_size_for_scheduler(scheduler)
+    max_cache_hit_len = _request_max_cache_hit_len(scheduler, request)
+    if block_size <= 0 or max_cache_hit_len <= 0:
+        return ()
+    required: set[int] = set()
+    for hashes in _candidate_cumulative_prefix_hashes(
+        scheduler,
+        request,
+        max_prefix_len=max_cache_hit_len,
+    ):
+        required.update(int(prefix_len) for prefix_len in hashes)
+    return tuple(sorted(required))
 
 
 def _block_id_groups(block_ids: Any) -> list[list[int]]:
@@ -649,6 +696,23 @@ def _supports_backed_prefix_reads(scheduler: Any) -> bool:
     return _scheduler_config_flag(scheduler, "use_qwen_hybrid_chunked_prefill")
 
 
+def _max_backed_prefix_read_len(scheduler: Any) -> int:
+    env_value = _env_int("QWEN36_HYBRID_APC_MAX_BACKED_PREFIX_READ_LEN")
+    if env_value is not None:
+        return max(0, env_value)
+    return max(
+        0,
+        int(
+            _scheduler_config_value(
+                scheduler,
+                "hybrid_apc_max_backed_prefix_read_len",
+                0,
+            )
+            or 0
+        ),
+    )
+
+
 def should_disable_unbacked_prefix_reads(scheduler: Any, request: Any = None) -> bool:
     """Return whether this scheduler should avoid vLLM APC reads.
 
@@ -672,9 +736,19 @@ def should_disable_unbacked_prefix_reads(scheduler: Any, request: Any = None) ->
         )
     if not disable_requested:
         return False
-    backed_hit = backed_gdn_prefix_hit(scheduler, request)
-    backed_hit_len = 0 if backed_hit is None else backed_hit.prefix_len
+    backed_hits = backed_gdn_prefix_hits(scheduler, request)
+    required_prefix_lens = _required_backed_prefix_lens(scheduler, request)
+    backed_hit_len = max(backed_hits) if backed_hits else 0
+    missing_backed_lens = [
+        prefix_len for prefix_len in required_prefix_lens if prefix_len not in backed_hits
+    ]
     supports_backed = _supports_backed_prefix_reads(scheduler)
+    max_backed_prefix_read_len = _max_backed_prefix_read_len(scheduler)
+    exceeds_backed_prefix_cap = (
+        max_backed_prefix_read_len > 0
+        and bool(required_prefix_lens)
+        and max(required_prefix_lens) > max_backed_prefix_read_len
+    )
     if _env_flag("QWEN36_HYBRID_APC_DEBUG"):
         prompt_len = len(getattr(request, "prompt_token_ids", ()) or ())
         print(
@@ -684,14 +758,25 @@ def should_disable_unbacked_prefix_reads(scheduler: Any, request: Any = None) ->
             f"supports_backed={supports_backed} "
             f"max_num_seqs={_max_num_seqs_for_scheduler(scheduler)} "
             f"prompt_len={prompt_len} "
+            f"required_backed_lens={required_prefix_lens} "
+            f"missing_backed_lens={tuple(missing_backed_lens)} "
+            f"max_backed_prefix_read_len={max_backed_prefix_read_len} "
+            f"exceeds_backed_prefix_cap={exceeds_backed_prefix_cap} "
             f"registry_size={len(_GDN_PREFIX_KEYS)}",
             flush=True,
         )
-    if backed_hit is not None and supports_backed:
-        authorize_hybrid_apc_prefix_read(
-            backed_hit,
-            request_id=_request_id_for_scheduler_request(request),
-        )
+    if (
+        required_prefix_lens
+        and not missing_backed_lens
+        and not exceeds_backed_prefix_cap
+        and supports_backed
+    ):
+        request_id = _request_id_for_scheduler_request(request)
+        for prefix_len in required_prefix_lens:
+            authorize_hybrid_apc_prefix_read(
+                backed_hits[prefix_len],
+                request_id=request_id,
+            )
         return False
     return True
 

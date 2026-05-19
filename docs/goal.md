@@ -45,14 +45,85 @@ strict vLLM metadata and attention block ref handoff: passed
 strict batched cold/warm exactness for both partial prompts: passed
 real-token generation checks for cold/warm/warmup prompts: passed
 strict one-token cold-prefill performance measurement: passed
+compact production-style 50-100 request gate: failed
 ```
 
 Current caveat:
 
 ```text
-The 2K BF16 strict Hybrid APC correctness and first cold-prefill performance
-measurement are complete. Further work is optimization and broader benchmarking,
-not a correctness blocker for the measured strict path.
+The earlier narrow 256-token strict path passed, but the compact production-style
+gate is not passing. This branch is not a production baseline until backed GDN
+restore matches cold output under the compact matrix.
+```
+
+### 2026-05-19 Compact Production-Style Gate Attempt
+
+Latest full compact gate attempt:
+
+```text
+run_id:
+  bf16_hybrid_apc_compact_gate_strictmeta_cap256_mropewire_20260519T055953Z
+
+validation_exit:1
+compact_gate_passed=false
+request_count=79
+request_count_passed=true
+runtime_exception_free=true
+eviction_probe_passed=true
+grouped_partial_coverage_passed=true
+grouped_mixed_coverage_passed=true
+speedup_checks_required=1
+speedup_passed=true
+grouped_warm_partials__boundary_256 speedup=3.3587x
+NRT_EXEC_OOB: none observed in log
+NaN/Traceback/ValueError: none observed in log
+```
+
+Failing acceptance criteria:
+
+```text
+exactness_passed=false
+real_generated_tokens_passed=false
+
+partial_a__boundary_256:
+  cold_tokens=[271]
+  warm_tokens=[248046]
+
+partial_b__boundary_256:
+  cold_tokens=[271]
+  warm_tokens=[248046]
+
+mixed_warm_a__boundary_256:
+  cold_tokens=[271]
+  warm_tokens=[41044]
+
+mixed_cold__boundary_256:
+  cold_tokens=[271]
+  warm_tokens=[26]
+```
+
+Follow-up narrowed boundary-256 run after fixing suffix-only/text-only mRoPE
+handoff still failed exactness, though it remained runtime-clean:
+
+```text
+run_id:
+  bf16_hybrid_apc_compact_gate_boundary256_mropepad_20260519T061637Z
+
+validation_exit:1
+grouped_warm_partials__boundary_256 speedup=1.8318x
+NRT_EXEC_OOB: none observed in log
+NaN/Traceback/ValueError: none observed in log
+remaining blocker:
+  cold_partial_a/cold_partial_b token [271] != warm restored token [248046]
+```
+
+Interpretation:
+
+```text
+The scheduler safety cap prevents the earlier unsafe 512-token backed restore
+path, and grouped warm throughput is still above the 1.5x target. Correctness is
+not good enough for baseline because 256-token backed GDN restore is not
+token-exact in the compact matrix.
 ```
 
 The measured one-token, 256-prefix/16-suffix strict path result is:

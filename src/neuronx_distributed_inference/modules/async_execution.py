@@ -292,6 +292,28 @@ def _right_pad_dim1(tensor: torch.Tensor, target_len: int, pad_value: int) -> to
     return torch.cat([tensor, pad], dim=1)
 
 
+def _right_pad_last_dim(
+    tensor: torch.Tensor,
+    target_len: int,
+    pad_value: int,
+) -> torch.Tensor:
+    if tensor.shape[-1] == target_len:
+        return tensor
+    if tensor.shape[-1] > target_len:
+        raise ValueError(
+            f"cannot pad tensor with last dim {tensor.shape[-1]} down to {target_len}"
+        )
+    pad_shape = list(tensor.shape)
+    pad_shape[-1] = target_len - tensor.shape[-1]
+    pad = torch.full(
+        tuple(pad_shape),
+        pad_value,
+        dtype=tensor.dtype,
+        device=tensor.device,
+    )
+    return torch.cat([tensor, pad], dim=-1)
+
+
 def _resize_dim1(tensor: torch.Tensor, target_len: int, pad_value: int) -> torch.Tensor:
     if tensor.ndim < 2 or tensor.shape[1] == target_len:
         return tensor
@@ -371,6 +393,30 @@ def _active_block_table_target_len(
     if not block_size:
         return None
     return max(1, (int(target_context_len) + block_size - 1) // block_size)
+
+
+def _restore_block_table_target_len(
+    neuron_base_instance: "NeuronBaseForCausalLM",
+    row_input_dicts: list[Dict[str, Any]],
+) -> int | None:
+    block_size = _pa_block_size(neuron_base_instance)
+    if not block_size:
+        return None
+    target_len = 0
+    for row_input in row_input_dicts:
+        restore_mask = _single_batch_value(row_input.get("hybrid_restore_mask"))
+        if restore_mask is None or _to_python_int(restore_mask) <= 0:
+            continue
+        restore_prefix_len = _single_batch_value(
+            row_input.get("hybrid_restore_prefix_lens")
+        )
+        if restore_prefix_len is None:
+            continue
+        restore_blocks = (
+            _to_python_int(restore_prefix_len) + block_size - 1
+        ) // block_size
+        target_len = max(target_len, restore_blocks)
+    return target_len or None
 
 
 def _synthesize_slots_from_block_table(
@@ -616,6 +662,10 @@ def _combine_vectorized_hybrid_apc_inputs(
         neuron_base_instance,
         target_sequence_dim1,
     )
+    restore_block_dim1 = _restore_block_table_target_len(
+        neuron_base_instance,
+        row_input_dicts,
+    )
 
     for key in keys:
         if key.startswith("_hybrid_apc"):
@@ -631,6 +681,23 @@ def _combine_vectorized_hybrid_apc_inputs(
         if all(tensor.ndim == 0 for tensor in tensors):
             combined[key] = torch.stack(tensors)
             continue
+        if (
+            key in {"rotary_position_id", "rotary_position_ids"}
+            and all(tensor.ndim == 3 and tensor.shape[1] == 1 for tensor in tensors)
+        ):
+            target_dim = max(tensor.shape[-1] for tensor in tensors)
+            combined[key] = torch.cat(
+                [
+                    _right_pad_last_dim(
+                        tensor,
+                        target_dim,
+                        _pad_value_for_key(neuron_base_instance, key),
+                    )
+                    for tensor in tensors
+                ],
+                dim=1,
+            )
+            continue
         if all(tensor.ndim >= 1 and tensor.shape[0] == 1 for tensor in tensors):
             max_dim1 = None
             if any(tensor.ndim >= 2 for tensor in tensors):
@@ -640,6 +707,8 @@ def _combine_vectorized_hybrid_apc_inputs(
                 target_dim1 = target_sequence_dim1
             elif key == "block_table" and target_block_dim1 is not None:
                 target_dim1 = target_block_dim1
+                if restore_block_dim1 is not None:
+                    target_dim1 = max(target_dim1, restore_block_dim1)
             padded = []
             for tensor in tensors:
                 current = (
@@ -902,6 +971,17 @@ def prepare_hybrid_apc_request_for_execution(
         input_dict.get("cumulative_hashes_by_prefix_len"),
         input_dict.get("hybrid_cumulative_hashes_by_prefix_len"),
     )
+    attention_block_refs_by_prefix_len = _first_present(
+        input_dict.get("attention_block_refs"),
+        input_dict.get("attention_block_refs_by_prefix_len"),
+        input_dict.get("hybrid_attention_block_refs_by_prefix_len"),
+    )
+    if (
+        requires_external_metadata
+        and not cumulative_hashes_by_prefix_len
+        and _to_python_int(attention_hit_len) <= 0
+    ):
+        return _with_zero_hybrid_apc_slots(input_dict)
     full_input_ids = _first_present(
         input_dict.get("hybrid_full_input_ids"),
         input_dict.get("full_input_ids"),
@@ -953,6 +1033,8 @@ def prepare_hybrid_apc_request_for_execution(
                     input_dict=input_dict,
                     attention_hit_len=_to_python_int(attention_hit_len),
                     request_prefix_len=request_prefix_len,
+                    cumulative_hashes_by_prefix_len=cumulative_hashes_by_prefix_len,
+                    attention_block_refs_by_prefix_len=attention_block_refs_by_prefix_len,
                 )
             if prepared is None:
                 if requires_external_metadata:
@@ -977,11 +1059,7 @@ def prepare_hybrid_apc_request_for_execution(
             attention_hit_len=_to_python_int(attention_hit_len),
             request_prefix_len=request_prefix_len,
             cumulative_hashes_by_prefix_len=cumulative_hashes_by_prefix_len,
-            attention_block_refs_by_prefix_len=_first_present(
-                input_dict.get("attention_block_refs"),
-                input_dict.get("attention_block_refs_by_prefix_len"),
-                input_dict.get("hybrid_attention_block_refs_by_prefix_len"),
-            ),
+            attention_block_refs_by_prefix_len=attention_block_refs_by_prefix_len,
         )
     input_dict["_hybrid_apc_bridge"] = bridge
     input_dict["_hybrid_apc_prepared"] = prepared

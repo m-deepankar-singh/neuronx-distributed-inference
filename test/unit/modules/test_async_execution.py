@@ -880,6 +880,14 @@ class TestHybridAPCAsyncBridge(unittest.TestCase):
                 "full_context_lens": torch.tensor([[4], [4]], dtype=torch.int32),
                 "computed_context_lens": torch.tensor([[2], [2]], dtype=torch.int32),
                 "num_queries": torch.tensor([[2], [2]], dtype=torch.int32),
+                "cumulative_hashes_by_prefix_len": (
+                    {2: "hash-a-2", 4: "hash-a-4"},
+                    {2: "hash-b-2", 4: "hash-b-4"},
+                ),
+                "attention_block_refs_by_prefix_len": (
+                    {2: (1,), 4: (1, 2)},
+                    {2: (3,), 4: (3, 4)},
+                ),
             }
         )
 
@@ -888,6 +896,14 @@ class TestHybridAPCAsyncBridge(unittest.TestCase):
         self.assertEqual(
             [call["request_id"] for call in bridge.suffix_prepare_calls],
             ["req-a", "req-b"],
+        )
+        self.assertEqual(
+            bridge.suffix_prepare_calls[0]["cumulative_hashes_by_prefix_len"],
+            {2: "hash-a-2", 4: "hash-a-4"},
+        )
+        self.assertEqual(
+            bridge.suffix_prepare_calls[1]["attention_block_refs_by_prefix_len"],
+            {2: (3,), 4: (3, 4)},
         )
         self.assertTrue(
             torch.equal(
@@ -1113,6 +1129,68 @@ class TestHybridAPCAsyncBridge(unittest.TestCase):
             )
         )
 
+    def test_vectorized_combiner_preserves_restore_prefix_block_table(self):
+        base = SimpleNamespace(
+            config=SimpleNamespace(
+                use_hybrid_apc_manager=True,
+                pad_token_id=0,
+            ),
+            neuron_config=SimpleNamespace(
+                context_encoding_buckets=[4],
+                pa_block_size=2,
+            ),
+        )
+        row_a = {
+            "input_ids": torch.tensor([[30, 31]], dtype=torch.int32),
+            "attention_mask": torch.ones((1, 2), dtype=torch.int32),
+            "position_ids": torch.tensor([[4, 5]], dtype=torch.int32),
+            "slot_mapping": torch.tensor([[20, 21]], dtype=torch.int32),
+            "block_table": torch.tensor([[7, 8]], dtype=torch.int32),
+            "computed_context_lens": torch.tensor([[4]], dtype=torch.int32),
+            "num_queries": torch.tensor([[2]], dtype=torch.int32),
+            "hybrid_restore_mask": torch.tensor([1], dtype=torch.int32),
+            "hybrid_restore_prefix_lens": torch.tensor([4], dtype=torch.int32),
+            "rotary_position_ids": torch.tensor(
+                [[[4, 5]], [[4, 5]], [[4, 5]]],
+                dtype=torch.int32,
+            ),
+        }
+        row_b = {
+            **row_a,
+            "input_ids": torch.tensor([[40, 41]], dtype=torch.int32),
+            "block_table": torch.tensor([[9, 10]], dtype=torch.int32),
+            "rotary_position_ids": torch.tensor(
+                [[[6, 7]], [[6, 7]], [[6, 7]]],
+                dtype=torch.int32,
+            ),
+        }
+
+        combined = _combine_vectorized_hybrid_apc_inputs(
+            base,
+            dict(row_a),
+            [row_a, row_b],
+        )
+
+        self.assertTrue(
+            torch.equal(
+                combined["block_table"],
+                torch.tensor([[7, 8], [9, 10]], dtype=torch.int32),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                combined["rotary_position_ids"],
+                torch.tensor(
+                    [
+                        [[4, 5], [6, 7]],
+                        [[4, 5], [6, 7]],
+                        [[4, 5], [6, 7]],
+                    ],
+                    dtype=torch.int32,
+                ),
+            )
+        )
+
     def test_vectorized_combiner_repairs_active_window_slot_mapping(self):
         base = SimpleNamespace(
             config=SimpleNamespace(
@@ -1227,6 +1305,38 @@ class TestHybridAPCAsyncBridge(unittest.TestCase):
 
         self.assertFalse(bridge.prepare_calls)
         self.assertFalse(bridge.suffix_prepare_calls)
+        self.assertTrue(torch.equal(prepared["input_ids"], input_dict["input_ids"]))
+        self.assertTrue(
+            torch.equal(
+                prepared["hybrid_restore_mask"],
+                torch.tensor([0], dtype=torch.int32),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                prepared["hybrid_commit_mask"],
+                torch.tensor([0], dtype=torch.int32),
+            )
+        )
+
+    def test_strict_hybrid_apc_allows_zero_hit_without_hash_metadata(self):
+        bridge = _FakeHybridBridge()
+        bridge.requires_external_metadata = True
+        base = SimpleNamespace(
+            config=SimpleNamespace(
+                use_hybrid_apc_manager=True,
+                hybrid_apc_require_vllm_metadata=True,
+            ),
+            hybrid_apc_bridge=bridge,
+        )
+        input_dict = _prefix_input_dict()
+        input_dict["request_id"] = "req-short-cold"
+        input_dict["request_prefix_len"] = 255
+        input_dict["vllm_attention_hit_len"] = torch.tensor([0], dtype=torch.int32)
+
+        prepared = prepare_hybrid_apc_request_for_execution(base, input_dict)
+
+        self.assertFalse(bridge.prepare_calls)
         self.assertTrue(torch.equal(prepared["input_ids"], input_dict["input_ids"]))
         self.assertTrue(
             torch.equal(

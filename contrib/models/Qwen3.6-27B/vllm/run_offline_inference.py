@@ -167,6 +167,11 @@ def _override_config(args: argparse.Namespace) -> dict:
             "hybrid_apc_enable_backed_prefix_reads",
             False,
         ),
+        "hybrid_apc_max_backed_prefix_read_len": getattr(
+            args,
+            "hybrid_apc_max_backed_prefix_read_len",
+            0,
+        ),
         "use_qwen_hybrid_chunked_prefill": args.enable_vllm_chunked_prefill,
         "use_qwen_hybrid_chunked_prefill_nki": args.enable_vllm_chunked_prefill,
         "override_neuron_config": neuron_config,
@@ -235,6 +240,15 @@ def main() -> int:
             "Allow vLLM prefix-cache reads when both attention KV and GDN "
             "checkpoint state are backed by a CTE artifact compiled for that "
             "contract."
+        ),
+    )
+    parser.add_argument(
+        "--hybrid-apc-max-backed-prefix-read-len",
+        type=int,
+        default=0,
+        help=(
+            "Optional safety cap for backed prefix reads. Prefix reads above this "
+            "token length are disabled even when a GDN checkpoint is registered."
         ),
     )
     parser.add_argument("--num-gpu-blocks-override", type=int, default=None)

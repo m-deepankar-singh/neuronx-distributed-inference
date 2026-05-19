@@ -833,6 +833,14 @@ class TestHybridAPCSchedulerBridge(unittest.TestCase):
         self.assertEqual(prepared.input_dict["num_queries"].item(), 128)
         self.assertEqual(prepared.input_dict["hybrid_restore_mask"].item(), 1)
         self.assertEqual(prepared.input_dict["hybrid_restore_slot_ids"].item(), 1)
+        self.assertTrue(
+            torch.equal(
+                prepared.input_dict["rotary_position_ids"],
+                torch.arange(128, 256, dtype=torch.int32)
+                .view(1, 1, 128)
+                .expand(3, 1, 128),
+            )
+        )
 
     def test_bridge_suffix_only_restore_uses_scheduler_authorized_key(self):
         store = _store()
@@ -863,6 +871,109 @@ class TestHybridAPCSchedulerBridge(unittest.TestCase):
         self.assertIsNotNone(prepared)
         self.assertEqual(prepared.plan.checkpoint_key, key_b)
         self.assertEqual(prepared.input_dict["hybrid_restore_slot_ids"].item(), 1)
+
+    def test_bridge_suffix_only_restore_uses_checkpoint_attention_block_refs(self):
+        store = _store()
+        key, _checkpoint = _insert(
+            store,
+            256,
+            prefix_hash="h256",
+            gdn_checkpoint_slot=1,
+            attention_block_refs=(4, 5),
+        )
+        bridge = HybridAPCSchedulerBridge(
+            store=store,
+            slot_allocator=HybridAPCSlotAllocator(num_slots=3),
+            cache_salt="tenant-a",
+            model_revision="rev-a",
+        )
+        _SCHEDULER_PATCH.authorize_hybrid_apc_prefix_read(
+            key,
+            request_id="req-suffix-blocks",
+        )
+
+        prepared = bridge.prepare_suffix_only_request(
+            request_id="req-suffix-blocks",
+            input_dict={
+                "input_ids": torch.arange(256, 272, dtype=torch.int32).unsqueeze(0),
+                "block_table": torch.tensor([[99]], dtype=torch.int32),
+                "rotary_position_id": torch.arange(
+                    16,
+                    dtype=torch.int32,
+                ).unsqueeze(0),
+                "rotary_position_ids": torch.arange(
+                    16,
+                    dtype=torch.int32,
+                ).view(1, 1, 16).expand(3, 1, 16),
+            },
+            attention_hit_len=256,
+            request_prefix_len=272,
+        )
+
+        self.assertIsNotNone(prepared)
+        self.assertTrue(
+            torch.equal(
+                prepared.input_dict["block_table"],
+                torch.tensor([[4, 5]], dtype=torch.int32),
+            )
+        )
+        expected_positions = torch.arange(256, 272, dtype=torch.int32)
+        self.assertTrue(
+            torch.equal(
+                prepared.input_dict["rotary_position_id"],
+                expected_positions.unsqueeze(0),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                prepared.input_dict["rotary_position_ids"],
+                expected_positions.view(1, 1, 16).expand(3, 1, 16),
+            )
+        )
+
+    def test_bridge_suffix_only_restore_can_commit_boundary_checkpoint(self):
+        store = _store()
+        allocator = HybridAPCSlotAllocator(num_slots=3)
+        input_ids = torch.arange(256, dtype=torch.int32).unsqueeze(0)
+        hashes = build_cumulative_prefix_hashes(input_ids, block_size=128)
+        restored_key, _checkpoint = _insert(
+            store,
+            128,
+            prefix_hash=hashes[128],
+            gdn_checkpoint_slot=2,
+        )
+        bridge = HybridAPCSchedulerBridge(
+            store=store,
+            slot_allocator=allocator,
+            cache_salt="tenant-a",
+            model_revision="rev-a",
+        )
+        _SCHEDULER_PATCH.authorize_hybrid_apc_prefix_read(
+            restored_key,
+            request_id="req-suffix-commit",
+        )
+
+        prepared = bridge.prepare_suffix_only_request(
+            request_id="req-suffix-commit",
+            input_dict={
+                "input_ids": torch.arange(128, 256, dtype=torch.int32).unsqueeze(0)
+            },
+            attention_hit_len=128,
+            request_prefix_len=256,
+            cumulative_hashes_by_prefix_len=hashes,
+            attention_block_refs_by_prefix_len={256: (8, 9)},
+        )
+
+        self.assertIsNotNone(prepared)
+        self.assertEqual(prepared.plan.checkpoint_key, restored_key)
+        self.assertEqual(prepared.commit_prefix_len, 256)
+        self.assertEqual(prepared.commit_slot, 0)
+        self.assertEqual(prepared.input_dict["hybrid_commit_mask"].item(), 1)
+        self.assertEqual(prepared.input_dict["hybrid_commit_slot_ids"].item(), 0)
+        committed = bridge.commit_prefill(prepared)
+        self.assertIsNotNone(committed)
+        self.assertEqual(committed.attention_block_refs, (8, 9))
+        self.assertIsNotNone(store.lookup(prepared.commit_key))
 
     def test_bridge_suffix_only_restore_rejects_ambiguous_prefix_len(self):
         store = _store()

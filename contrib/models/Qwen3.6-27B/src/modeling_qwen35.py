@@ -4801,6 +4801,10 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
                 "full_context_lens": full_context_lens,
                 "computed_context_lens": computed_context_lens,
             }
+            if llava_args:
+                hybrid_apc_request_dict["llava_args"] = llava_args
+                if len(llava_args) >= 3:
+                    hybrid_apc_request_dict["rotary_position_ids"] = llava_args[2]
             metadata_by_request_id = getattr(
                 self,
                 "_qwen36_vllm_hybrid_apc_metadata_by_request_id",
@@ -4863,6 +4867,20 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
             )
             hybrid_commit_slot_ids = prepared_inputs.get("hybrid_commit_slot_ids")
             hybrid_commit_mask = prepared_inputs.get("hybrid_commit_mask")
+            prepared_mrope_position_ids = prepared_inputs.get(
+                "rotary_position_ids",
+                prepared_inputs.get("rotary_position_id"),
+            )
+            if prepared_mrope_position_ids is not None and llava_args:
+                llava_args = list(llava_args)
+                if len(llava_args) >= 3:
+                    llava_args[2] = prepared_mrope_position_ids
+                elif len(llava_args) >= 2:
+                    llava_args.append(prepared_mrope_position_ids)
+            elif prepared_mrope_position_ids is not None:
+                mrope_position_ids = prepared_mrope_position_ids
+        else:
+            prepared_mrope_position_ids = None
 
         seq_len = input_ids.shape[1]
         batch_size = input_ids.shape[0]
@@ -4890,7 +4908,7 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
                     fill_value=seq_len - 1,
                     dtype=torch.int32,
                 )
-            mrope_position_ids = None
+            mrope_position_ids = prepared_mrope_position_ids
         else:
             vision_embeddings = torch.zeros((0,), dtype=torch.float32)
             vision_mask = torch.zeros((0,), dtype=torch.int32)
