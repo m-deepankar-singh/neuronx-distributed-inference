@@ -27,6 +27,9 @@ Current useful hosts and paths:
 - Latest strict metadata boundary exactness logs:
   `/home/ubuntu/validation_logs/hybrid_apc_real_tokens/bf16_hybrid_apc_batched_ctx2_tkg2_commitfix_025dc60_pypath_boundary256_strictmeta_8tok_retry8_ordinary_stableprefix.log`
   `/home/ubuntu/validation_logs/hybrid_apc_real_tokens/bf16_hybrid_apc_batched_ctx2_tkg2_commitfix_025dc60_pypath_boundary256_strictmeta_8tok_retry8_ordinary_stableprefix.json`
+- Latest strict metadata one-token prefill performance logs:
+  `/home/ubuntu/validation_logs/hybrid_apc_real_tokens/bf16_hybrid_apc_batched_ctx2_tkg2_strictmeta_prefill_perf_1tok_20260519T025644Z.log`
+  `/home/ubuntu/validation_logs/hybrid_apc_real_tokens/bf16_hybrid_apc_batched_ctx2_tkg2_strictmeta_prefill_perf_1tok_20260519T025644Z.json`
 
 Current result:
 
@@ -41,16 +44,90 @@ TKG packed-decode attention mask repair to batch-2 shape: passed
 strict vLLM metadata and attention block ref handoff: passed
 strict batched cold/warm exactness for both partial prompts: passed
 real-token generation checks for cold/warm/warmup prompts: passed
+strict one-token cold-prefill performance measurement: passed
 ```
 
-Current blocker / caveat:
+Current caveat:
 
 ```text
-Strict production metadata mode has passed correctness. The remaining planned
-work is cold-prefill performance measurement against the strict path.
+The 2K BF16 strict Hybrid APC correctness and first cold-prefill performance
+measurement are complete. Further work is optimization and broader benchmarking,
+not a correctness blocker for the measured strict path.
 ```
 
-Performance measurement remains the next step.
+The measured one-token, 256-prefix/16-suffix strict path result is:
+
+```text
+cold_partial_a wall: 2.0168s
+cold_partial_b wall: 2.0031s
+cold isolated average: 2.0100s
+warm grouped partials wall for two requests: 2.1043s
+warm grouped effective per request: 1.0522s
+grouped warm throughput speedup vs serial isolated cold: 1.91x
+```
+
+Interpretation:
+
+```text
+Warm batched restore improves grouped two-request throughput against serial
+isolated cold references. It does not yet prove lower single-request wall latency
+than an isolated cold request, because the warm measurement is a two-request
+grouped `llm.generate([...])` wall time.
+```
+
+### 2026-05-19 Strict Metadata Cold-Prefill Performance Pass
+
+Strict metadata performance validation used the same tokenizer-stable ordinary
+text 256-token prefixes as the exactness pass, but with `--max-tokens 1` to make
+the timing dominated by prefill plus the minimum sampling/decode overhead.
+
+```text
+run_id:
+  bf16_hybrid_apc_batched_ctx2_tkg2_strictmeta_prefill_perf_1tok_20260519T025644Z
+
+validation_exit:0
+batched_partial_a_exact=true
+batched_partial_b_exact=true
+real_generated_tokens_passed=true
+hybrid_apc_require_vllm_metadata=true
+hybrid_apc_allow_local_hash_fallback=false
+hybrid_apc_require_attention_block_refs=true
+hybrid_apc_disable_unbacked_prefix_reads=true
+hybrid_apc_enable_backed_prefix_reads=true
+max_tokens=1
+```
+
+Timing report:
+
+```text
+cold_partial_a elapsed_seconds=2.0168455820021336
+cold_partial_b elapsed_seconds=2.0031486849984503
+cold isolated average=2.009997133500292
+cold isolated serial sum=4.019994267000584
+
+warm_partial_a elapsed_seconds=2.104324338994047
+warm_partial_b elapsed_seconds=2.104324338994047
+warm grouped wall time=2.104324338994047
+warm grouped effective per request=1.0521621694970236
+
+grouped warm throughput speedup vs serial isolated cold=1.9103491759841096x
+single cold average vs warm grouped wall ratio=0.9551745879920548x
+```
+
+All generated one-token outputs were finite real non-dummy tokens:
+
+```text
+cold_partial_a tokens: [271]
+cold_partial_b tokens: [271]
+warm_partial_a tokens: [271]
+warm_partial_b tokens: [271]
+warmup_full_a tokens: [271]
+warmup_full_b tokens: [271]
+```
+
+This is the first strict-path performance measurement, not a complete
+performance characterization. Sensible follow-up benchmarking would sweep prompt
+lengths, block sizes, request counts, and debug/logging overhead.
 
 ### 2026-05-19 Strict Metadata Boundary Exactness Pass
 
@@ -1219,7 +1296,11 @@ The existing BF16 per-chunk artifact was generated before the full
 backed-prefix and batched proof path existed. It can prove the safety fallback
 and single-request backed path, but not generated-token `max_num_seqs=2`.
 
-## Current Limitations
+## Historical Limitations Before Strict Metadata Pass
+
+This section records the state before the 2026-05-19 strict metadata exactness
+and performance passes. The current status at the top of this document supersedes
+the limitations below.
 
 What is proven:
 
@@ -1244,7 +1325,7 @@ What is proven:
   already all NaN, so the NaNs are not introduced by vLLM-Neuron's
   `output.logits[:, -1, :]`/chunked-prefill slicing or by vLLM's CPU sampler.
 
-What is not proven yet:
+What was not proven yet at that point:
 
 - Batched/concurrent backed-prefix serving is not real-token proven.
 - The `max_num_seqs > 1` backed-prefix guard should not be relaxed yet.
@@ -1253,13 +1334,13 @@ What is not proven yet:
   because every sampled token is `0`.
 - BF16 host-logits correctness is not proven; NxDI raw output and the runner
   both see all-NaN logits.
-- Cold-prefill performance has not been measured for the final batched path.
+- Cold-prefill performance had not been measured for the final batched path.
 - FP8 is not validated for this path and should not be used to debug the
   serving contract.
 - Fused CTE is not the current correctness path because the fused BF16 artifact
   previously produced NaNs around token 105-106.
 
-Current practical constraints:
+Practical constraints at that point:
 
 - Generated-token batch-2 validation now has a copied artifact with both
   `ctx_batch_size=2` and `tkg_batch_size=2`.
@@ -1270,11 +1351,11 @@ Current practical constraints:
   `cte_buckets=256,512` ctx2/tkg2 compile overloaded it. Use the r7i compile
   host for large CPU/RAM/disk compile work, then copy the finished artifact to
   Trn2.
-- The current blocker is no longer request metadata preparation, artifact shape,
+- The blocker at that point was no longer request metadata preparation, artifact shape,
   vLLM-Neuron output slicing, or sampling. It is all-NaN BF16 host logits from
   the compiled Qwen graph/artifact contract.
 
-## Recommended Next Work
+## Historical Recommended Next Work Before Strict Metadata Pass
 
 1. Build/run the smallest BF16 host-logits control artifact that can answer whether
    raw logits are finite without the current Hybrid APC/chunked-CTE artifact
