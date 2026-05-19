@@ -9,6 +9,8 @@ import unittest
 from dataclasses import dataclass
 from unittest.mock import patch
 
+import torch
+
 
 _CONTRIB_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 _PATCH_PATH = os.path.join(
@@ -691,6 +693,61 @@ class TestQwen36HybridAPCSchedulerPatch(unittest.TestCase):
         self.assertTrue(installed)
         self.assertEqual(model_input._qwen36_cached_request_ids, ("cached-1",))
         self.assertEqual(model_input._qwen36_new_request_ids, ("new-1",))
+
+    def test_runner_patch_expands_completed_only_prefill_logits(self):
+        class FakeRunner:
+            def __init__(self):
+                self.model = types.SimpleNamespace(model=types.SimpleNamespace())
+
+            def _execute_model_for_text(self, model_input, intermediate_tensors=None):
+                del intermediate_tensors
+                return model_input
+
+            def _prepare_logits_for_sampling(self, hidden_states, model_input):
+                hidden_states = hidden_states.clone()
+                for idx, state in enumerate(model_input.prefill_completion_state):
+                    if not state.item():
+                        hidden_states[idx] = float("-inf")
+                return hidden_states
+
+        self.patch.patch_neuron_model_runner_class(FakeRunner)
+        runner = FakeRunner()
+        logits = runner._prepare_logits_for_sampling(
+            torch.tensor([[1.0, 2.0, 3.0]]),
+            types.SimpleNamespace(
+                request_ids=["req-a", "req-b"],
+                prefill_completion_state=torch.tensor([True, False]),
+            ),
+        )
+
+        self.assertEqual(tuple(logits.shape), (2, 3))
+        torch.testing.assert_close(logits[0], torch.tensor([1.0, 2.0, 3.0]))
+        self.assertTrue(torch.isneginf(logits[1]).all())
+
+    def test_runner_patch_leaves_full_prefill_logits_unchanged(self):
+        class FakeRunner:
+            def __init__(self):
+                self.model = types.SimpleNamespace(model=types.SimpleNamespace())
+
+            def _execute_model_for_text(self, model_input, intermediate_tensors=None):
+                del intermediate_tensors
+                return model_input
+
+            def _prepare_logits_for_sampling(self, hidden_states, model_input):
+                return hidden_states
+
+        self.patch.patch_neuron_model_runner_class(FakeRunner)
+        runner = FakeRunner()
+        hidden_states = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+        logits = runner._prepare_logits_for_sampling(
+            hidden_states,
+            types.SimpleNamespace(
+                request_ids=["req-a", "req-b"],
+                prefill_completion_state=torch.tensor([True, False]),
+            ),
+        )
+
+        torch.testing.assert_close(logits, hidden_states)
 
     def test_import_hook_patches_already_loaded_neuron_runner_module(self):
         class FakeRunner:

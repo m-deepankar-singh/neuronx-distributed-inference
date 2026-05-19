@@ -3091,12 +3091,155 @@ def _validate_qwen36_tkg_input_ids(input_ids, vocab_size) -> None:
         )
 
 
-def _qwen36_is_prefill_request(input_ids, position_ids) -> bool:
+def _qwen36_query_lengths(full_context_lens, computed_context_lens) -> list[int] | None:
+    if (
+        full_context_lens is None
+        or computed_context_lens is None
+        or not hasattr(full_context_lens, "numel")
+        or not hasattr(computed_context_lens, "numel")
+        or full_context_lens.numel() == 0
+        or computed_context_lens.numel() == 0
+    ):
+        return None
+    full_values = full_context_lens.reshape(-1).to(torch.int64)
+    computed_values = computed_context_lens.reshape(-1).to(torch.int64)
+    count = min(int(full_values.numel()), int(computed_values.numel()))
+    if count <= 0:
+        return None
+    return [
+        max(0, int(full_values[idx].item()) - int(computed_values[idx].item()))
+        for idx in range(count)
+    ]
+
+
+def _qwen36_prefill_has_incomplete_row(prefill_completion_state) -> bool:
+    if prefill_completion_state is None:
+        return False
+    if hasattr(prefill_completion_state, "numel"):
+        if prefill_completion_state.numel() == 0:
+            return False
+        return not bool(prefill_completion_state.reshape(-1).to(torch.bool).all().item())
+    try:
+        values = list(prefill_completion_state)
+    except TypeError:
+        return not bool(prefill_completion_state)
+    return any(not bool(value) for value in values)
+
+
+def _qwen36_is_prefill_request(
+    input_ids,
+    position_ids,
+    *,
+    full_context_lens=None,
+    computed_context_lens=None,
+    prefill_completion_state=None,
+) -> bool:
+    if _qwen36_prefill_has_incomplete_row(prefill_completion_state):
+        return True
+
+    query_lengths = _qwen36_query_lengths(full_context_lens, computed_context_lens)
+    if (
+        query_lengths is not None
+        and len(query_lengths) > 1
+        and input_ids.ndim >= 2
+        and input_ids.shape[0] == 1
+        and input_ids.shape[-1] == len(query_lengths)
+    ):
+        return any(query_len > 1 for query_len in query_lengths)
+
     # Warm prefix-cache suffixes may start at a nonzero position, but they are
     # still multi-token CTE requests. TKG must remain a one-token decode path.
     if input_ids.shape[-1] > 1:
         return True
     return position_ids.min().item() == 0
+
+
+def _qwen36_unpack_packed_decode_batch(
+    *,
+    input_ids,
+    attention_mask,
+    position_ids,
+    seq_ids,
+    adapter_ids,
+    slot_mapping,
+    full_context_lens,
+    computed_context_lens,
+):
+    query_lengths = _qwen36_query_lengths(full_context_lens, computed_context_lens)
+    if (
+        query_lengths is None
+        or len(query_lengths) <= 1
+        or any(query_len > 1 for query_len in query_lengths)
+        or input_ids.ndim < 2
+        or input_ids.shape[0] != 1
+        or input_ids.shape[-1] != len(query_lengths)
+    ):
+        return input_ids, attention_mask, position_ids, seq_ids, adapter_ids, slot_mapping
+
+    batch_size = len(query_lengths)
+
+    def _unpack_token_rows(value):
+        if (
+            value is not None
+            and hasattr(value, "ndim")
+            and value.ndim >= 2
+            and value.shape[0] == 1
+            and value.shape[1] == batch_size
+        ):
+            return value.reshape(batch_size, 1, *value.shape[2:]).contiguous()
+        return value
+
+    def _repair_batch_vector(value, *, fill_from_index: bool = False):
+        if value is None or not hasattr(value, "numel") or value.numel() == 0:
+            return value
+        flattened = value.reshape(-1)
+        if flattened.numel() == batch_size:
+            return flattened
+        if flattened.numel() == 1 and batch_size > 1:
+            if fill_from_index:
+                return torch.arange(
+                    batch_size,
+                    dtype=value.dtype,
+                    device=value.device,
+                )
+            return flattened[:1].expand(batch_size).contiguous()
+        return value
+
+    input_ids = _unpack_token_rows(input_ids)
+    position_ids = _unpack_token_rows(position_ids)
+    slot_mapping = _unpack_token_rows(slot_mapping)
+    if (
+        attention_mask is not None
+        and hasattr(attention_mask, "ndim")
+        and attention_mask.ndim >= 2
+        and attention_mask.shape[0] == 1
+        and attention_mask.shape[1] == batch_size
+        and computed_context_lens is not None
+        and hasattr(computed_context_lens, "numel")
+        and computed_context_lens.numel() >= batch_size
+    ):
+        context_lens = computed_context_lens.reshape(-1).to(torch.int64)[:batch_size]
+        max_context_len = max(1, int(context_lens.max().item()))
+        repaired_mask = torch.zeros(
+            (batch_size, max_context_len),
+            dtype=attention_mask.dtype,
+            device=attention_mask.device,
+        )
+        for row_idx, context_len in enumerate(context_lens):
+            active_len = max(0, min(int(context_len.item()), max_context_len))
+            if active_len:
+                repaired_mask[row_idx, :active_len] = 1
+        attention_mask = repaired_mask
+    if (
+        slot_mapping is not None
+        and hasattr(slot_mapping, "ndim")
+        and slot_mapping.ndim == 1
+        and int(slot_mapping.numel()) == batch_size
+    ):
+        slot_mapping = slot_mapping.reshape(batch_size, 1).contiguous()
+    seq_ids = _repair_batch_vector(seq_ids, fill_from_index=True)
+    adapter_ids = _repair_batch_vector(adapter_ids)
+    return input_ids, attention_mask, position_ids, seq_ids, adapter_ids, slot_mapping
 
 
 def _debug_logits_stage(stage: str, tensor) -> None:
@@ -4449,7 +4592,36 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
         hybrid_commit_mask=None,
     ):
         """Override to pass Qwen/vLLM positional args explicitly."""
-        is_prefill = _qwen36_is_prefill_request(input_ids, position_ids)
+        prefill_completion_state = getattr(
+            self,
+            "_qwen36_vllm_prefill_completion_state",
+            None,
+        )
+        is_prefill = _qwen36_is_prefill_request(
+            input_ids,
+            position_ids,
+            full_context_lens=full_context_lens,
+            computed_context_lens=computed_context_lens,
+            prefill_completion_state=prefill_completion_state,
+        )
+        if not is_prefill:
+            (
+                input_ids,
+                attention_mask,
+                position_ids,
+                seq_ids,
+                adapter_ids,
+                slot_mapping,
+            ) = _qwen36_unpack_packed_decode_batch(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                seq_ids=seq_ids,
+                adapter_ids=adapter_ids,
+                slot_mapping=slot_mapping,
+                full_context_lens=full_context_lens,
+                computed_context_lens=computed_context_lens,
+            )
 
         hybrid_apc_request_dict = None
         if (
@@ -4488,11 +4660,6 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
                 hybrid_apc_request_dict["hybrid_cached_request_ids"] = (
                     cached_request_ids
                 )
-            prefill_completion_state = getattr(
-                self,
-                "_qwen36_vllm_prefill_completion_state",
-                None,
-            )
             if prefill_completion_state is not None:
                 hybrid_apc_request_dict[
                     "hybrid_prefill_completion_state"

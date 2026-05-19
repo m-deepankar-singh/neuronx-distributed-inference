@@ -641,6 +641,59 @@ def _debug_logits_tensor(stage: str, tensor: Any) -> None:
         )
 
 
+def _expand_completed_prefill_logits(hidden_states: Any, model_input: Any) -> Any:
+    """Restore completed-only CTE logits to vLLM's scheduled request rows."""
+    prefill_state = getattr(model_input, "prefill_completion_state", None)
+    if prefill_state is None or not hasattr(hidden_states, "shape"):
+        return hidden_states
+    if len(getattr(hidden_states, "shape", ())) == 0:
+        return hidden_states
+
+    try:
+        import torch  # noqa: WPS433
+
+        if hasattr(prefill_state, "detach"):
+            state_values = [
+                bool(item)
+                for item in prefill_state.detach().cpu().reshape(-1).tolist()
+            ]
+        else:
+            state_values = [bool(item) for item in prefill_state]
+        scheduled_rows = len(state_values)
+        output_rows = int(hidden_states.shape[0])
+        if output_rows == scheduled_rows:
+            return hidden_states
+
+        completed_rows = [idx for idx, is_done in enumerate(state_values) if is_done]
+        if output_rows != len(completed_rows):
+            return hidden_states
+        if not torch.is_floating_point(hidden_states):
+            return hidden_states
+
+        expanded = hidden_states.new_full(
+            (scheduled_rows, *tuple(hidden_states.shape[1:])),
+            float("-inf"),
+        )
+        for src_row, dst_row in enumerate(completed_rows):
+            expanded[dst_row] = hidden_states[src_row]
+        if _env_flag("QWEN36_VLLM_LOGITS_DEBUG"):
+            print(
+                "[qwen36_vllm_logits_debug] "
+                f"expanded_completed_prefill_logits output_rows={output_rows} "
+                f"scheduled_rows={scheduled_rows} completed_rows={completed_rows}",
+                flush=True,
+            )
+        return expanded
+    except Exception as exc:  # pragma: no cover - defensive shim only
+        if _env_flag("QWEN36_VLLM_LOGITS_DEBUG"):
+            print(
+                "[qwen36_vllm_logits_debug] "
+                f"expand_completed_prefill_logits_error={type(exc).__name__}: {exc}",
+                flush=True,
+            )
+        return hidden_states
+
+
 def patch_neuron_model_runner_class(runner_cls: type) -> bool:
     """Patch vLLM-Neuron runner to expose scheduler row metadata."""
 
@@ -721,6 +774,11 @@ def patch_neuron_model_runner_class(runner_cls: type) -> bool:
                     f"request_ids={request_ids} prefill_completion_state={prefill_state}",
                     flush=True,
                 )
+            hidden_states = _expand_completed_prefill_logits(hidden_states, model_input)
+            _debug_logits_tensor(
+                "runner_hidden_states_after_prefill_expand",
+                hidden_states,
+            )
             logits = original_prepare_logits(
                 self,
                 hidden_states,

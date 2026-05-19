@@ -18,62 +18,157 @@ Current useful hosts and paths:
 - Key: `/Users/deepankarsingh1312/Downloads/trainium.pem`
 - Trn2 runtime host: `ubuntu@16.26.98.193`
 - r7i compile host: `ubuntu@16.26.249.227`
-- Remote repo on both hosts: `/home/ubuntu/inferentia-gdn-experimental-test`
-- Weights on Trn2/r7i: `/home/ubuntu/models/Qwen3.6-27B`
-- Current copied BF16 Hybrid APC artifact on Trn2:
-  `/mnt/trainium_artifacts/qwen_artifacts/qwen36_27b_2048_bf16_hybrid_apc_backed_prefix_ctx2_tkg2_r7i_trn2_local_7306c2e`
-- Latest copied-artifact validation logs:
-  `/home/ubuntu/validation_logs/hybrid_apc_real_tokens/bf16_hybrid_apc_ctx2_tkg2_bucket_pad_probe_pathfix_20260518T215320Z.log`
-  `/home/ubuntu/validation_logs/hybrid_apc_real_tokens/bf16_hybrid_apc_batched_ctx2_tkg2_bucket_pad_validation_simple_20260518T215629Z.log`
+- Current clean Trn2 worktree: `/home/ubuntu/inferentia-gdn-compile-025dc60`
+- Weights on Trn2: `/home/ubuntu/models/Qwen3.6-27B`
+- Current BF16 Hybrid APC artifact on Trn2:
+  `/mnt/trainium_artifacts/qwen_artifacts/qwen36_27b_2048_bf16_hybrid_apc_backed_prefix_ctx2_tkg2_commitfix_025dc60_pypath`
+- Fresh compile log:
+  `/home/ubuntu/validation_logs/hybrid_apc_real_tokens/bf16_hybrid_apc_backed_prefix_ctx2_tkg2_commitfix_025dc60_pypath_compile.log`
+- Latest boundary exactness logs:
+  `/home/ubuntu/validation_logs/hybrid_apc_real_tokens/bf16_hybrid_apc_batched_ctx2_tkg2_commitfix_025dc60_pypath_boundary_tkgmask_8tok.log`
+  `/home/ubuntu/validation_logs/hybrid_apc_real_tokens/bf16_hybrid_apc_batched_ctx2_tkg2_commitfix_025dc60_pypath_boundary_tkgmask_8tok.json`
 
 Current result:
 
 ```text
-multi-CTE ctx2/tkg2 compile: passed on r7i
-artifact copy to Trn2: passed
-Trn2 artifact load: passed
-vectorized Hybrid APC request prep: now runs past the old one-request guard
-mixed cached-decode + prefill CTE padding: now pads [2,511] to compiled [2,512]
-slot_mapping/block_table/seq_ids rank repair: passed the static Neuron checks
-short ctx2/tkg2 probe with commit disabled: finite raw logits and exit 0
-batched grouped Hybrid APC validation: no static CTE shape miss after padding fix
-batched grouped Hybrid APC validation with commit enabled: fails on all-NaN logits
+fresh ctx2/tkg2 BF16 Hybrid APC compile with commit fix: passed
+Trn2 artifact load with skip_warmup: passed
+host raw logits after GDN checkpoint commit/restore: finite
+backed prefix-slot registration at 256 tokens: passed
+grouped warm partial restore from two backed slots: passed
+packed batched one-token decode now routes to TKG: passed
+TKG packed-decode attention mask repair to batch-2 shape: passed
+batched cold/warm exactness for both partial prompts: passed
+real-token generation checks for cold/warm/warmup prompts: passed
 ```
 
-Current blocker:
+Current blocker / caveat:
 
 ```text
-BF16 host-side logits from the compiled Hybrid APC ctx2/tkg2 Neuron Qwen graph
-are all NaN. This is already true at NxDI raw output 0, before vLLM-Neuron
-slices logits and before vLLM sampling.
+The latest correctness pass used the controlled artifact config that permits
+local prefix-hash fallback:
 
-nxdi_raw_output_debug count=1
-raw_output[0] shape=(1, 1, 248320)
-finite=0/248320 nan=248320
+hybrid_apc_require_vllm_metadata=false
+hybrid_apc_allow_local_hash_fallback=true
+hybrid_apc_require_attention_block_refs=false
 
-runner_hidden_states_before_prepare shape=(1, 248320)
-finite=0 nan=248320
-
-runner_logits_after_prepare shape=(1, 248320)
-finite=0 nan=248320
+Strict production metadata mode is still unresolved because vLLM cumulative
+prefix hashes / attention block refs are not available in the request metadata
+being passed to the Neuron runner.
 ```
 
-The no-Hybrid BF16 host-logits control is finite, and the same Hybrid APC
-artifact produces finite raw logits when GDN checkpoint commit is disabled.
-So the remaining NaN issue is not the generic Qwen host-logits path, vLLM
-sampling, vLLM-Neuron output slicing, or the static CTE bucket selector.
+Performance measurement remains the next step after the strict metadata path is
+resolved or explicitly accepted as out of scope for the controlled fallback
+validation.
 
-The request-prep and bucket-shape contract now get through validation,
-including short batched CTE padded from `[2,16]` to `[2,256]` and grouped
-batched CTE padded to compiled `[2,512]`. The remaining issue is specific to
-the compiled Hybrid APC GDN checkpoint commit/restore contract that produces
-raw all-NaN logits and, for two scheduled requests, only one logits row.
+### 2026-05-19 Fresh Compile And Boundary Exactness Pass
 
-The most likely source is the traced GDN checkpoint commit path. The existing
-compiled artifact still contains the old checkpoint-bank scatter behavior, so
-a real commit-path fix requires patching the model code and compiling a new
-artifact; it cannot be fully fixed by runtime Python padding against the
-already-compiled NEFF.
+Fresh BF16 Hybrid APC compile:
+
+```text
+artifact:
+  /mnt/trainium_artifacts/qwen_artifacts/qwen36_27b_2048_bf16_hybrid_apc_backed_prefix_ctx2_tkg2_commitfix_025dc60_pypath
+compile_exit:0
+artifact size: 51G
+compile window:
+  2026-05-19T00:20:34Z to 2026-05-19T00:48:58Z
+settings:
+  ctx_batch_size=2
+  tkg_batch_size=2
+  context_encoding_buckets=[256,512]
+  prefix_buckets=[256,512]
+  seq_len=2048
+  output_logits=true
+  enable_prefix_caching=true
+  use_hybrid_apc_manager=true
+  enable_vllm_chunked_prefill=true
+  deltanet-cte-backend=nki_chunked
+```
+
+The fresh artifact fixes the old commit-path all-NaN raw logits. The latest
+boundary validation then exercised two exactly 256-token warm prefixes and two
+grouped warm partial prompts:
+
+```text
+validation_exit:0
+batched_partial_a_exact=true
+batched_partial_b_exact=true
+real_generated_tokens_passed=true
+
+cold_partial_a tokens:
+  [271, 248068, 198, 8160, 579, 264, 7047, 1817]
+warm_partial_a tokens:
+  [271, 248068, 198, 8160, 579, 264, 7047, 1817]
+
+cold_partial_b tokens:
+  [271, 248068, 198, 8160, 579, 264, 7047, 1817]
+warm_partial_b tokens:
+  [271, 248068, 198, 8160, 579, 264, 7047, 1817]
+```
+
+Important runtime evidence:
+
+```text
+warmup_full_a:
+  commit_slot=0
+  commit_mask=[1,0]
+  scheduler-register prefix_len=256 registry_size=1
+
+warmup_full_b:
+  commit_slot=1
+  commit_mask=[1,0]
+  scheduler-register prefix_len=256 registry_size=2
+
+grouped warm partials:
+  backed_hit_len=256 for both requests
+  restore_slot=0 and restore_slot=1
+  restore_mask=[1]
+  qwen-cte-call input_shape=(2,256)
+  restore_slots=[0,1]
+  restore_mask=[1,1]
+  runner logits shape=(2,248320)
+  finite=496640 nan=0
+```
+
+The validation also exposed and fixed a packed batched decode issue. vLLM packs
+two one-token decode rows as `input_ids.shape == (1,2)`. That used to look like
+a multi-token CTE request, which generated repeated token `271` and later hit a
+TKG static-shape miss after routing was corrected. The model wrapper now:
+
+```text
+uses full_context_lens - computed_context_lens to classify packed rows
+keeps incomplete one-token prefill rows on CTE
+routes packed one-token batched decode to TKG
+unpacks input_ids/position_ids/slot_mapping from [1,batch] to [batch,1]
+repairs singleton seq_ids/adapter_ids for batch decode
+synthesizes attention_mask from computed_context_lens for packed TKG decode
+```
+
+The passing run confirms the repaired TKG contract:
+
+```text
+qwen-tkg-call input_shape=(2,1)
+attention_shape=(2,278)
+computed_context_lens=[278,278]
+
+pad tag=token_generation_model:
+  input_ids shape=(2,1)
+  attention_mask shape=(2,2048)
+  seq_ids shape=(2,)
+  slot_mapping shape=(2,1)
+```
+
+Local and remote focused test coverage after the patch:
+
+```text
+local qwen36 alias tests: 21 passed
+local vLLM scheduler patch tests: 22 passed
+local async_execution tests: 33 passed
+
+remote qwen36 alias tests: 21 passed
+remote vLLM scheduler patch tests: 22 passed
+remote async_execution tests: 33 passed
+```
 
 ### 2026-05-18 Batched CTE Bucket Padding Fix
 

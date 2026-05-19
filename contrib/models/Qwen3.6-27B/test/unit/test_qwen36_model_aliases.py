@@ -470,6 +470,80 @@ class TestQwen36ModelAliases(unittest.TestCase):
             )
         )
 
+    def test_prefill_detection_routes_packed_batched_decode_to_tkg(self):
+        self.assertFalse(
+            self.qwen_module._qwen36_is_prefill_request(
+                torch.ones((1, 2), dtype=torch.int32),
+                torch.tensor([[272, 272]], dtype=torch.int32),
+                full_context_lens=torch.tensor([273, 273], dtype=torch.int32),
+                computed_context_lens=torch.tensor([272, 272], dtype=torch.int32),
+                prefill_completion_state=torch.tensor([True, True]),
+            )
+        )
+
+    def test_prefill_detection_keeps_packed_suffix_prefill_on_cte(self):
+        self.assertTrue(
+            self.qwen_module._qwen36_is_prefill_request(
+                torch.ones((1, 32), dtype=torch.int32),
+                torch.arange(256, 288, dtype=torch.int32).reshape(1, -1),
+                full_context_lens=torch.tensor([272, 272], dtype=torch.int32),
+                computed_context_lens=torch.tensor([256, 256], dtype=torch.int32),
+                prefill_completion_state=torch.tensor([True, True]),
+            )
+        )
+
+    def test_prefill_detection_keeps_incomplete_one_token_prefill_on_cte(self):
+        self.assertTrue(
+            self.qwen_module._qwen36_is_prefill_request(
+                torch.ones((1, 2), dtype=torch.int32),
+                torch.tensor([[272, 49]], dtype=torch.int32),
+                full_context_lens=torch.tensor([273, 50], dtype=torch.int32),
+                computed_context_lens=torch.tensor([272, 49], dtype=torch.int32),
+                prefill_completion_state=torch.tensor([True, False]),
+            )
+        )
+
+    def test_packed_decode_batch_is_unpacked_for_tkg(self):
+        input_ids, attention_mask, position_ids, seq_ids, adapter_ids, slot_mapping = (
+            self.qwen_module._qwen36_unpack_packed_decode_batch(
+                input_ids=torch.tensor([[271, 198]], dtype=torch.int32),
+                attention_mask=torch.tensor([[1, 1]], dtype=torch.int32),
+                position_ids=torch.tensor([[272, 272]], dtype=torch.int32),
+                seq_ids=torch.tensor([0], dtype=torch.int32),
+                adapter_ids=torch.tensor([0], dtype=torch.int32),
+                slot_mapping=torch.tensor([1552, 1553], dtype=torch.int32),
+                full_context_lens=torch.tensor([273, 273], dtype=torch.int32),
+                computed_context_lens=torch.tensor([272, 272], dtype=torch.int32),
+            )
+        )
+
+        self.assertTrue(
+            torch.equal(input_ids, torch.tensor([[271], [198]], dtype=torch.int32))
+        )
+        self.assertEqual(attention_mask.shape, (2, 272))
+        self.assertTrue(
+            torch.equal(
+                attention_mask[:, :272],
+                torch.ones((2, 272), dtype=torch.int32),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                position_ids,
+                torch.tensor([[272], [272]], dtype=torch.int32),
+            )
+        )
+        self.assertTrue(torch.equal(seq_ids, torch.tensor([0, 1], dtype=torch.int32)))
+        self.assertTrue(
+            torch.equal(adapter_ids, torch.tensor([0, 0], dtype=torch.int32))
+        )
+        self.assertTrue(
+            torch.equal(
+                slot_mapping,
+                torch.tensor([[1552], [1553]], dtype=torch.int32),
+            )
+        )
+
     def test_flattened_slot_mapping_is_normalized_before_batch_chunking(self):
         flattened = torch.arange(256, 719, dtype=torch.int32)
 
