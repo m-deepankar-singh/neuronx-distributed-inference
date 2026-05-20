@@ -16,7 +16,7 @@ import os
 import struct
 from collections import OrderedDict, deque
 from dataclasses import dataclass
-from typing import Hashable, Iterable, NamedTuple
+from typing import Callable, Hashable, Iterable, NamedTuple
 
 import torch
 
@@ -725,6 +725,17 @@ class HybridAPCSlotAllocator:
         if was_known and slot not in self._free:
             self._free.append(slot)
 
+    def release_committed(self, slot: int) -> bool:
+        slot = int(slot)
+        self.validate_slot_range(slot)
+        if slot in self._reserved:
+            return False
+        was_committed = slot in self._committed
+        self._committed.discard(slot)
+        if was_committed and slot not in self._free:
+            self._free.append(slot)
+        return was_committed
+
     def validate_slot_range(self, slot: int):
         slot = int(slot)
         if slot < 0 or slot >= self.num_slots:
@@ -770,6 +781,9 @@ class HybridAPCSchedulerBridge:
         self.allow_local_hash_fallback = bool(allow_local_hash_fallback)
         self.require_attention_block_refs = bool(require_attention_block_refs)
         self.reject_unbacked_attention_hits = bool(reject_unbacked_attention_hits)
+        self.store.set_checkpoint_slot_releaser(
+            self.slot_allocator.release_committed
+        )
 
     @property
     def requires_external_metadata(self) -> bool:
@@ -890,7 +904,7 @@ class HybridAPCSchedulerBridge:
                     range(commit_prefix_len // self.store.block_size)
                 )
             if self.store.lookup(commit_key) is None:
-                commit_slot = self.slot_allocator.reserve()
+                commit_slot = self._reserve_commit_slot()
 
         model_inputs = apply_hybrid_apc_prefill_plan(
             input_dict,
@@ -1069,7 +1083,7 @@ class HybridAPCSchedulerBridge:
                     range(commit_prefix_len // self.store.block_size)
                 )
             if self.store.lookup(commit_key) is None:
-                commit_slot = self.slot_allocator.reserve()
+                commit_slot = self._reserve_commit_slot()
 
         model_inputs = apply_hybrid_apc_suffix_prefill_plan(
             input_dict,
@@ -1131,6 +1145,23 @@ class HybridAPCSchedulerBridge:
             record.reserved_slots.remove(prepared.commit_slot)
         return checkpoint
 
+    def _reserve_commit_slot(self) -> int:
+        try:
+            return self.slot_allocator.reserve()
+        except RuntimeError:
+            target_checkpoints = self.slot_allocator.num_slots - 1
+            if self.store.max_checkpoints is not None:
+                target_checkpoints = min(
+                    target_checkpoints,
+                    int(self.store.max_checkpoints) - 1,
+                )
+            evicted = self.store.evict_lru(
+                target_checkpoints=max(0, target_checkpoints)
+            )
+            if evicted:
+                return self.slot_allocator.reserve()
+            raise
+
     def finish_request(self, request_id: Hashable) -> HybridAPCRequestRecord | None:
         record = self.store.on_request_finish(request_id)
         if record is not None:
@@ -1169,6 +1200,7 @@ class HybridAPCMetadataStore:
         recurrent_dtype: str | torch.dtype = "float32",
         conv_dtype: str | torch.dtype = "bfloat16",
         allow_residual_replay: bool = False,
+        checkpoint_slot_releaser: Callable[[int], object] | None = None,
     ):
         self.required_gdn_layers = tuple(sorted({int(x) for x in required_gdn_layers}))
         if not self.required_gdn_layers:
@@ -1203,6 +1235,7 @@ class HybridAPCMetadataStore:
         self.recurrent_dtype = _normalize_dtype(recurrent_dtype)
         self.conv_dtype = _normalize_dtype(conv_dtype)
         self.allow_residual_replay = bool(allow_residual_replay)
+        self._checkpoint_slot_releaser = checkpoint_slot_releaser
 
         self._by_key: OrderedDict[HybridPrefixKey, HybridPrefixCheckpoint] = (
             OrderedDict()
@@ -1211,6 +1244,12 @@ class HybridAPCMetadataStore:
         self._requests: dict[Hashable, HybridAPCRequestRecord] = {}
         self._step = 0
         self.stats = HybridAPCStats()
+
+    def set_checkpoint_slot_releaser(
+        self,
+        releaser: Callable[[int], object] | None,
+    ):
+        self._checkpoint_slot_releaser = releaser
 
     def __len__(self) -> int:
         return len(self._by_key)
@@ -1648,6 +1687,8 @@ class HybridAPCMetadataStore:
         if checkpoint is not None:
             self._slot_to_key.pop(checkpoint.gdn_checkpoint_slot, None)
             _unpublish_scheduler_gdn_checkpoint(key)
+            if self._checkpoint_slot_releaser is not None:
+                self._checkpoint_slot_releaser(checkpoint.gdn_checkpoint_slot)
 
     def _refresh_stats(self):
         self.stats.checkpoints = len(self._by_key)

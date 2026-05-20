@@ -1202,6 +1202,41 @@ class TestHybridAPCSchedulerBridge(unittest.TestCase):
         self.assertEqual(allocator.reserved_slots, ())
         self.assertEqual(allocator.free_slots, (1, 0))
 
+    def test_bridge_evicts_lru_checkpoint_before_reserving_when_slots_full(self):
+        store = _store(max_checkpoints=2)
+        allocator = HybridAPCSlotAllocator(num_slots=2)
+        bridge = HybridAPCSchedulerBridge(
+            store=store,
+            slot_allocator=allocator,
+            cache_salt="tenant-a",
+            model_revision="rev-a",
+        )
+
+        committed_keys = []
+        for request_index in range(3):
+            input_ids = (
+                torch.arange(128, dtype=torch.int32).unsqueeze(0)
+                + request_index * 1000
+            )
+            hashes = build_cumulative_prefix_hashes(input_ids, block_size=128)
+            prepared = bridge.prepare_request(
+                request_id=f"req-{request_index}",
+                input_dict={"input_ids": input_ids},
+                attention_hit_len=0,
+                cumulative_hashes_by_prefix_len=hashes,
+            )
+            self.assertIsNotNone(prepared.commit_slot)
+            bridge.commit_prefill(prepared)
+            bridge.finish_request(prepared.request_id)
+            committed_keys.append(prepared.commit_key)
+
+        self.assertIsNone(store.lookup(committed_keys[0]))
+        self.assertIsNotNone(store.lookup(committed_keys[1]))
+        self.assertIsNotNone(store.lookup(committed_keys[2]))
+        self.assertEqual(len(allocator.committed_slots), 2)
+        self.assertEqual(allocator.reserved_slots, ())
+        self.assertEqual(allocator.free_slots, ())
+
 
 if __name__ == "__main__":
     unittest.main()
