@@ -150,6 +150,7 @@ def _post_chat(
     messages: list[dict[str, str]],
     max_tokens: int,
     timeout: float,
+    enable_thinking: bool = False,
 ) -> dict[str, Any]:
     payload = {
         "model": model,
@@ -157,6 +158,7 @@ def _post_chat(
         "max_tokens": max_tokens,
         "temperature": 0,
         "stream": False,
+        "chat_template_kwargs": {"enable_thinking": enable_thinking},
     }
     body = json.dumps(payload).encode("utf-8")
     request = urllib.request.Request(
@@ -206,6 +208,7 @@ def _run_case(
     prompt_tokens: int,
     max_tokens: int,
     timeout: float,
+    enable_thinking: bool = False,
 ) -> dict[str, Any]:
     result = _post_chat(
         endpoint=endpoint,
@@ -213,6 +216,7 @@ def _run_case(
         messages=messages,
         max_tokens=max_tokens,
         timeout=timeout,
+        enable_thinking=enable_thinking,
     )
     row = {
         "label": label,

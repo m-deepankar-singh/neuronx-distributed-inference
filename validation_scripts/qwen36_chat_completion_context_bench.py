@@ -181,6 +181,7 @@ def _run_one(
         "messages": messages,
         "max_tokens": max_tokens,
         "temperature": 0,
+        "chat_template_kwargs": {"enable_thinking": False},
     }
     if stream:
         status, first_chunk_seconds, total_seconds, chunks, error_payload = _stream_chat(
