@@ -13,6 +13,7 @@ import json
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -233,6 +234,12 @@ def main() -> int:
     )
     parser.add_argument("--turns", type=int, default=8)
     parser.add_argument("--repeats", type=int, default=2)
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=1,
+        help="Number of concurrent requests per length/repeat group.",
+    )
     parser.add_argument("--max-tokens", type=int, default=1)
     parser.add_argument("--timeout", type=float, default=900.0)
     parser.add_argument("--no-stream", action="store_true")
@@ -251,33 +258,78 @@ def main() -> int:
     results = []
     for target_tokens in _parse_lengths(args.lengths):
         for repeat_idx in range(args.repeats):
-            salt = (
-                f"target={target_tokens};repeat={repeat_idx};unique=1"
-                if args.unique_per_request
-                else ""
+            requests = []
+            for concurrency_idx in range(args.concurrency):
+                salt = (
+                    f"target={target_tokens};repeat={repeat_idx};"
+                    f"concurrency={concurrency_idx};unique=1"
+                    if args.unique_per_request
+                    else ""
+                )
+                messages, prompt_tokens = _make_messages(
+                    tokenizer,
+                    target_tokens=target_tokens,
+                    turns=args.turns,
+                    salt=salt,
+                )
+                requests.append(
+                    {
+                        "messages": messages,
+                        "prompt_tokens": prompt_tokens,
+                        "concurrency_index": concurrency_idx,
+                    }
+                )
+
+            group_start = time.perf_counter()
+            if args.concurrency == 1:
+                group_results = [
+                    _run_one(
+                        url=endpoint,
+                        model=args.model,
+                        messages=requests[0]["messages"],
+                        max_tokens=args.max_tokens,
+                        timeout=args.timeout,
+                        stream=not args.no_stream,
+                    )
+                ]
+            else:
+                with ThreadPoolExecutor(max_workers=args.concurrency) as executor:
+                    futures = [
+                        executor.submit(
+                            _run_one,
+                            url=endpoint,
+                            model=args.model,
+                            messages=request["messages"],
+                            max_tokens=args.max_tokens,
+                            timeout=args.timeout,
+                            stream=not args.no_stream,
+                        )
+                        for request in requests
+                    ]
+                    group_results = [future.result() for future in futures]
+            group_wall_seconds = time.perf_counter() - group_start
+            group_prompt_tokens = sum(int(request["prompt_tokens"]) for request in requests)
+            group_effective_tps = (
+                group_prompt_tokens / group_wall_seconds
+                if group_wall_seconds > 0
+                and all(int(result["status"]) < 400 for result in group_results)
+                else None
             )
-            messages, prompt_tokens = _make_messages(
-                tokenizer,
-                target_tokens=target_tokens,
-                turns=args.turns,
-                salt=salt,
-            )
-            result = _run_one(
-                url=endpoint,
-                model=args.model,
-                messages=messages,
-                max_tokens=args.max_tokens,
-                timeout=args.timeout,
-                stream=not args.no_stream,
-            )
-            row = {
-                "target_tokens": target_tokens,
-                "prompt_tokens": prompt_tokens,
-                "repeat": repeat_idx,
-                **result,
-            }
-            print(json.dumps(row, sort_keys=True), flush=True)
-            results.append(row)
+
+            for request, result in zip(requests, group_results):
+                row = {
+                    "target_tokens": target_tokens,
+                    "prompt_tokens": request["prompt_tokens"],
+                    "repeat": repeat_idx,
+                    "concurrency": args.concurrency,
+                    "concurrency_index": request["concurrency_index"],
+                    "group_wall_seconds": group_wall_seconds,
+                    "group_prompt_tokens": group_prompt_tokens,
+                    "group_effective_prompt_tokens_per_second": group_effective_tps,
+                    **result,
+                }
+                print(json.dumps(row, sort_keys=True), flush=True)
+                results.append(row)
 
     output = {
         "base_url": args.base_url,
@@ -285,6 +337,7 @@ def main() -> int:
         "lengths": _parse_lengths(args.lengths),
         "turns": args.turns,
         "repeats": args.repeats,
+        "concurrency": args.concurrency,
         "max_tokens": args.max_tokens,
         "results": results,
     }

@@ -366,6 +366,34 @@ Raw `/v1/completions` prompts are not chat-templated and can pollute the hybrid
 state if sent directly to the backend. Keep the backend private and expose the
 proxy on the public port for production calls.
 
+4K BF16 Hybrid APC boundary/server probes:
+
+```bash
+# Boundary-aligned APC proof. Run this directly against vLLM or a proxy started
+# with --allow-completions because exact token-ID prompt lengths are required.
+python validation_scripts/qwen36_openai_boundary_apc_probe.py \
+  --base-url http://127.0.0.1:8000 \
+  --model-path /home/ubuntu/models/Qwen3.6-27B \
+  --lengths 256,512,1024,2048,4096 \
+  --repeats 3 \
+  --require-prefix-cache-query \
+  --output-jsonl /home/ubuntu/validation_logs/hybrid_apc_real_tokens/boundary_apc_probe.jsonl
+
+# Cold prefill ctx-batch utilization check. Compare --concurrency 1 and 2 with
+# --unique-per-request to avoid warm-cache reuse.
+python validation_scripts/qwen36_chat_completion_context_bench.py \
+  --base-url http://127.0.0.1:8000 \
+  --model /home/ubuntu/models/Qwen3.6-27B \
+  --model-path /home/ubuntu/models/Qwen3.6-27B \
+  --lengths 4096 \
+  --turns 8 \
+  --repeats 3 \
+  --concurrency 2 \
+  --unique-per-request \
+  --no-stream \
+  --output-json /home/ubuntu/validation_logs/hybrid_apc_real_tokens/chat_4k_concurrency2.json
+```
+
 ## Offline Smoke
 
 ```bash
