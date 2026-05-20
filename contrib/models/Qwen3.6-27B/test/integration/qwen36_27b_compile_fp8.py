@@ -111,6 +111,20 @@ def _prefix_buckets(args: argparse.Namespace, cte_buckets: list[int]) -> list[in
     return buckets
 
 
+def _max_context_length(args: argparse.Namespace, cte_buckets: list[int]) -> int:
+    max_context_length = args.max_context_length or cte_buckets[-1]
+    if max_context_length < cte_buckets[-1]:
+        raise ValueError(
+            f"--max-context-length {max_context_length} is smaller than largest "
+            f"CTE bucket {cte_buckets[-1]}"
+        )
+    if max_context_length > args.seq_len:
+        raise ValueError(
+            f"--max-context-length {max_context_length} exceeds --seq-len {args.seq_len}"
+        )
+    return max_context_length
+
+
 def _pa_num_blocks(args: argparse.Namespace) -> int:
     min_blocks = max(
         1,
@@ -310,7 +324,7 @@ def _build_config(args: argparse.Namespace):
     num_layers = int(config_dict["num_hidden_layers"])
     modules_to_not_convert = _mlp_only_modules_to_not_convert(num_layers)
     cte_buckets = _cte_buckets(args)
-    max_cte_bucket = cte_buckets[-1]
+    max_context_length = _max_context_length(args, cte_buckets)
     prefix_buckets = _prefix_buckets(args, cte_buckets)
 
     neuron_config_kwargs = {
@@ -319,7 +333,7 @@ def _build_config(args: argparse.Namespace):
         "ctx_batch_size": args.ctx_batch_size,
         "tkg_batch_size": args.max_num_seqs,
         "seq_len": args.seq_len,
-        "max_context_length": max_cte_bucket,
+        "max_context_length": max_context_length,
         "max_length": args.seq_len,
         "context_encoding_buckets": cte_buckets,
         "token_generation_buckets": [args.seq_len],
@@ -427,6 +441,16 @@ def main() -> int:
         ),
     )
     parser.add_argument("--seq-len", type=int, default=65536)
+    parser.add_argument(
+        "--max-context-length",
+        type=int,
+        default=None,
+        help=(
+            "Maximum total context length in NeuronConfig. Defaults to the "
+            "largest CTE bucket; set higher when chunked prefill serves long "
+            "contexts with smaller active chunks."
+        ),
+    )
     parser.add_argument("--cte-bucket", type=int, default=512)
     parser.add_argument("--cte-buckets", nargs="+", default=None)
     parser.add_argument("--prefix-buckets", nargs="+", default=None)
@@ -531,7 +555,7 @@ def main() -> int:
         json.dumps(
             {
                 "seq_len": args.seq_len,
-                "max_context_length": max(_cte_buckets(args)),
+                "max_context_length": _max_context_length(args, _cte_buckets(args)),
                 "context_encoding_buckets": _cte_buckets(args),
                 "prefix_buckets": _prefix_buckets(args, _cte_buckets(args)),
                 "max_num_seqs": args.max_num_seqs,

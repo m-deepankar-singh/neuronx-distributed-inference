@@ -503,6 +503,61 @@ class TestQwen36ModelAliases(unittest.TestCase):
             )
         )
 
+    def test_restored_suffix_deltanet_mask_uses_token_padding(self):
+        input_ids = torch.tensor([[11, 12, 0, 0]], dtype=torch.int64)
+        inputs_embeds = torch.ones((1, 4, 2), dtype=torch.float32)
+        attention_mask = torch.ones((1, 4), dtype=torch.int32)
+
+        mask = self.qwen_module._qwen36_deltanet_padding_mask(
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            padding_idx=0,
+            is_for_context_encoding=True,
+            hybrid_restore_mask=torch.tensor([1], dtype=torch.int32),
+        )
+
+        self.assertEqual(mask.squeeze(-1).tolist(), [[1.0, 1.0, 0.0, 0.0]])
+
+    def test_non_restored_deltanet_mask_keeps_attention_mask(self):
+        input_ids = torch.tensor([[11, 12, 0, 0]], dtype=torch.int64)
+        inputs_embeds = torch.ones((1, 4, 2), dtype=torch.float32)
+        attention_mask = torch.ones((1, 4), dtype=torch.int32)
+
+        mask = self.qwen_module._qwen36_deltanet_padding_mask(
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            padding_idx=0,
+            is_for_context_encoding=True,
+            hybrid_restore_mask=torch.tensor([0], dtype=torch.int32),
+        )
+
+        self.assertEqual(mask.squeeze(-1).tolist(), [[1.0, 1.0, 1.0, 1.0]])
+
+    def test_mixed_restore_deltanet_mask_uses_token_padding_for_all_rows(self):
+        input_ids = torch.tensor(
+            [[11, 12, 0, 0], [21, 22, 23, 0]], dtype=torch.int64
+        )
+        inputs_embeds = torch.ones((2, 4, 2), dtype=torch.float32)
+        attention_mask = torch.tensor(
+            [[1, 1, 1, 1], [0, 0, 0, 0]], dtype=torch.int32
+        )
+
+        mask = self.qwen_module._qwen36_deltanet_padding_mask(
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            padding_idx=0,
+            is_for_context_encoding=True,
+            hybrid_restore_mask=torch.tensor([1, 0], dtype=torch.int32),
+        )
+
+        self.assertEqual(
+            mask.squeeze(-1).tolist(),
+            [[1.0, 1.0, 0.0, 0.0], [1.0, 1.0, 1.0, 0.0]],
+        )
+
     def test_packed_decode_batch_is_unpacked_for_tkg(self):
         input_ids, attention_mask, position_ids, seq_ids, adapter_ids, slot_mapping = (
             self.qwen_module._qwen36_unpack_packed_decode_batch(
@@ -605,6 +660,22 @@ class TestQwen36ModelAliases(unittest.TestCase):
         )
 
         self.assertEqual(selected, ("new-a", "cached-a"))
+
+    def test_vllm_metadata_request_ids_keep_model_order_when_new_ids_are_subset(self):
+        selected = (
+            self.qwen_module._qwen36_select_vllm_hybrid_apc_request_ids_for_input(
+                {
+                    "new-a": {"vllm_attention_hit_len": 0},
+                },
+                all_request_ids=("cached-a", "new-a"),
+                new_request_ids=("new-a",),
+                full_context_lens=torch.tensor([1, 272], dtype=torch.int32),
+                computed_context_lens=torch.tensor([0, 0], dtype=torch.int32),
+                prefill_completion_state=torch.tensor([True, True]),
+            )
+        )
+
+        self.assertEqual(selected, ("cached-a", "new-a"))
 
     def test_flattened_slot_mapping_is_normalized_before_batch_chunking(self):
         flattened = torch.arange(256, 719, dtype=torch.int32)

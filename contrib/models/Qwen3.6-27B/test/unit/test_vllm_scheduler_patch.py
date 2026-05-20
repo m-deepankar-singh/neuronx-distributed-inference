@@ -614,6 +614,385 @@ class TestQwen36HybridAPCSchedulerPatch(unittest.TestCase):
         self.assertEqual(metadata["req-a"]["request_prefix_len"], 4)
         self.assertEqual(metadata["req-a"]["vllm_attention_hit_len"], 0)
 
+    def test_scheduler_preserves_backed_and_cold_prefix_read_decisions_in_mixed_batch(self):
+        class FakeScheduler:
+            def __init__(self):
+                base = _scheduler(
+                    block_size=4,
+                    disable_unbacked_prefix_reads=True,
+                    enable_backed_prefix_reads=True,
+                    use_qwen_hybrid_chunked_prefill=True,
+                    max_num_seqs=2,
+                )
+                self.vllm_config = base.vllm_config
+                self.cache_config = base.cache_config
+                self.scheduler_config = base.scheduler_config
+                self.warm = types.SimpleNamespace(
+                    request_id="warm",
+                    prompt_token_ids=[10, 11, 12, 13, 14, 15],
+                    num_tokens=6,
+                    cache_salt=None,
+                    skip_reading_prefix_cache=False,
+                )
+                self.cold = types.SimpleNamespace(
+                    request_id="cold",
+                    prompt_token_ids=[20, 21, 22, 23, 24, 25],
+                    num_tokens=6,
+                    cache_salt=None,
+                    skip_reading_prefix_cache=False,
+                )
+                self.waiting = [self.warm, self.cold]
+                self.requests = {"warm": self.warm, "cold": self.cold}
+                self.schedule_seen_skip_flags = None
+
+            def add_request(self, request):
+                del request
+
+            def schedule(self):
+                self.schedule_seen_skip_flags = [
+                    (request.request_id, request.skip_reading_prefix_cache)
+                    for request in self.waiting
+                ]
+                computed_tokens = [
+                    0 if request.skip_reading_prefix_cache else 4
+                    for request in self.waiting
+                ]
+                self.waiting = []
+                return types.SimpleNamespace(
+                    scheduled_new_reqs=[],
+                    scheduled_cached_reqs=types.SimpleNamespace(
+                        req_ids=["warm", "cold"],
+                        new_block_ids=[([1, 2],), ([3, 4],)],
+                        num_computed_tokens=computed_tokens,
+                        num_output_tokens=[0, 0],
+                    ),
+                    num_scheduled_tokens={
+                        "warm": 6 - computed_tokens[0],
+                        "cold": 6 - computed_tokens[1],
+                    },
+                    total_num_scheduled_tokens=12 - sum(computed_tokens),
+                )
+
+        warm_token_ids = [10, 11, 12, 13, 14, 15]
+        hashes = self.patch._local_cumulative_prefix_hashes(
+            warm_token_ids,
+            block_size=4,
+            max_prefix_len=4,
+        )
+        self.patch.register_hybrid_apc_gdn_checkpoint(
+            self.patch.HybridGDNPrefixKey(
+                cumulative_prefix_hash=hashes[4],
+                prefix_len=4,
+                block_size=4,
+                cache_salt=None,
+                model_revision="rev-a",
+                layout_version=1,
+                tp_rank=0,
+                recurrent_dtype="float32",
+                conv_dtype="bfloat16",
+            )
+        )
+
+        self.patch.patch_scheduler_class(FakeScheduler)
+        scheduler = FakeScheduler()
+        with patch.dict(
+            os.environ,
+            {"QWEN36_HYBRID_APC_DISABLE_UNBACKED_PREFIX_READS": "1"},
+        ):
+            self.assertFalse(
+                self.patch.should_disable_unbacked_prefix_reads(
+                    scheduler,
+                    scheduler.warm,
+                )
+            )
+            if self.patch.should_disable_unbacked_prefix_reads(
+                scheduler,
+                scheduler.cold,
+            ):
+                scheduler.cold.skip_reading_prefix_cache = True
+            scheduler_output = scheduler.schedule()
+
+        metadata = getattr(
+            scheduler_output,
+            "_qwen36_hybrid_apc_metadata_by_request_id",
+        )
+
+        self.assertEqual(
+            scheduler.schedule_seen_skip_flags,
+            [("warm", False), ("cold", True)],
+        )
+        self.assertEqual(
+            scheduler_output.scheduled_cached_reqs.num_computed_tokens,
+            [4, 0],
+        )
+        self.assertEqual(scheduler_output.num_scheduled_tokens["warm"], 2)
+        self.assertEqual(scheduler_output.num_scheduled_tokens["cold"], 6)
+        self.assertEqual(metadata["warm"]["vllm_attention_hit_len"], 4)
+        self.assertEqual(metadata["cold"]["vllm_attention_hit_len"], 0)
+        self.assertIsNotNone(
+            self.patch.pop_hybrid_apc_authorized_prefix_key(
+                prefix_len=4,
+                request_id="warm",
+                model_revision="rev-a",
+            )
+        )
+
+    def test_scheduler_preserves_all_backed_context_batch(self):
+        class FakeScheduler:
+            def __init__(self):
+                base = _scheduler(
+                    block_size=4,
+                    disable_unbacked_prefix_reads=True,
+                    enable_backed_prefix_reads=True,
+                    use_qwen_hybrid_chunked_prefill=True,
+                    max_num_seqs=2,
+                )
+                self.vllm_config = base.vllm_config
+                self.cache_config = base.cache_config
+                self.scheduler_config = base.scheduler_config
+                self.req_a = types.SimpleNamespace(
+                    request_id="req-a",
+                    prompt_token_ids=[10, 11, 12, 13, 14, 15],
+                    num_tokens=6,
+                    cache_salt=None,
+                    skip_reading_prefix_cache=False,
+                )
+                self.req_b = types.SimpleNamespace(
+                    request_id="req-b",
+                    prompt_token_ids=[30, 31, 32, 33, 34, 35],
+                    num_tokens=6,
+                    cache_salt=None,
+                    skip_reading_prefix_cache=False,
+                )
+                self.waiting = [self.req_a, self.req_b]
+                self.requests = {"req-a": self.req_a, "req-b": self.req_b}
+                self.schedule_seen_skip_flags = None
+
+            def add_request(self, request):
+                del request
+
+            def schedule(self):
+                self.schedule_seen_skip_flags = [
+                    (request.request_id, request.skip_reading_prefix_cache)
+                    for request in self.waiting
+                ]
+                self.waiting = []
+                return types.SimpleNamespace(
+                    scheduled_new_reqs=[],
+                    scheduled_cached_reqs=types.SimpleNamespace(
+                        req_ids=["req-a", "req-b"],
+                        new_block_ids=[([1, 2],), ([3, 4],)],
+                        num_computed_tokens=[4, 4],
+                        num_output_tokens=[0, 0],
+                    ),
+                    num_scheduled_tokens={"req-a": 2, "req-b": 2},
+                    total_num_scheduled_tokens=4,
+                )
+
+        for token_ids in ([10, 11, 12, 13, 14, 15], [30, 31, 32, 33, 34, 35]):
+            hashes = self.patch._local_cumulative_prefix_hashes(
+                token_ids,
+                block_size=4,
+                max_prefix_len=4,
+            )
+            self.patch.register_hybrid_apc_gdn_checkpoint(
+                self.patch.HybridGDNPrefixKey(
+                    cumulative_prefix_hash=hashes[4],
+                    prefix_len=4,
+                    block_size=4,
+                    cache_salt=None,
+                    model_revision="rev-a",
+                    layout_version=1,
+                    tp_rank=0,
+                    recurrent_dtype="float32",
+                    conv_dtype="bfloat16",
+                )
+            )
+
+        self.patch.patch_scheduler_class(FakeScheduler)
+        scheduler = FakeScheduler()
+        with patch.dict(
+            os.environ,
+            {"QWEN36_HYBRID_APC_DISABLE_UNBACKED_PREFIX_READS": "1"},
+        ):
+            self.assertFalse(
+                self.patch.should_disable_unbacked_prefix_reads(
+                    scheduler,
+                    scheduler.req_a,
+                )
+            )
+            self.assertFalse(
+                self.patch.should_disable_unbacked_prefix_reads(
+                    scheduler,
+                    scheduler.req_b,
+                )
+            )
+            scheduler_output = scheduler.schedule()
+
+        metadata = getattr(
+            scheduler_output,
+            "_qwen36_hybrid_apc_metadata_by_request_id",
+        )
+
+        self.assertEqual(
+            scheduler.schedule_seen_skip_flags,
+            [("req-a", False), ("req-b", False)],
+        )
+        self.assertEqual(
+            scheduler_output.scheduled_cached_reqs.num_computed_tokens,
+            [4, 4],
+        )
+        self.assertEqual(metadata["req-a"]["vllm_attention_hit_len"], 4)
+        self.assertEqual(metadata["req-b"]["vllm_attention_hit_len"], 4)
+
+    def test_scheduler_output_metadata_does_not_rewrite_cached_context_hit(self):
+        class FakeScheduler:
+            def __init__(self):
+                base = _scheduler(
+                    block_size=4,
+                    enable_backed_prefix_reads=True,
+                    use_qwen_hybrid_chunked_prefill=True,
+                )
+                self.vllm_config = base.vllm_config
+                self.cache_config = base.cache_config
+                self.scheduler_config = base.scheduler_config
+                self.requests = {
+                    "req-a": types.SimpleNamespace(
+                        request_id="req-a",
+                        prompt_token_ids=[10, 11, 12, 13, 14, 15],
+                        num_tokens=6,
+                        cache_salt=None,
+                    )
+                }
+
+            def add_request(self, request):
+                del request
+
+            def schedule(self):
+                return types.SimpleNamespace(
+                    scheduled_new_reqs=[],
+                    scheduled_cached_reqs=types.SimpleNamespace(
+                        req_ids=["req-a"],
+                        new_block_ids=[([11, 12],)],
+                        num_computed_tokens=[6],
+                        num_output_tokens=[0],
+                    ),
+                    num_scheduled_tokens={"req-a": 1},
+                    total_num_scheduled_tokens=1,
+                )
+
+        token_ids = [10, 11, 12, 13, 14, 15]
+        hashes = self.patch._local_cumulative_prefix_hashes(
+            token_ids,
+            block_size=4,
+            max_prefix_len=4,
+        )
+        self.patch.register_hybrid_apc_gdn_checkpoint(
+            self.patch.HybridGDNPrefixKey(
+                cumulative_prefix_hash=hashes[4],
+                prefix_len=4,
+                block_size=4,
+                cache_salt=None,
+                model_revision="rev-a",
+                layout_version=1,
+                tp_rank=0,
+                recurrent_dtype="float32",
+                conv_dtype="bfloat16",
+            )
+        )
+
+        self.patch.patch_scheduler_class(FakeScheduler)
+        with patch.dict(
+            os.environ,
+            {"QWEN36_HYBRID_APC_DISABLE_UNBACKED_PREFIX_READS": "1"},
+        ):
+            scheduler_output = FakeScheduler().schedule()
+
+        cached_reqs = scheduler_output.scheduled_cached_reqs
+        metadata = getattr(
+            scheduler_output,
+            "_qwen36_hybrid_apc_metadata_by_request_id",
+        )
+
+        self.assertEqual(cached_reqs.num_computed_tokens, [6])
+        self.assertEqual(scheduler_output.num_scheduled_tokens["req-a"], 1)
+        self.assertEqual(scheduler_output.total_num_scheduled_tokens, 1)
+        self.assertEqual(metadata["req-a"]["vllm_attention_hit_len"], 6)
+        self.assertEqual(metadata["req-a"]["request_prefix_len"], 6)
+
+    def test_scheduler_output_does_not_cap_decode_rows(self):
+        class FakeScheduler:
+            def __init__(self):
+                base = _scheduler(
+                    block_size=4,
+                    enable_backed_prefix_reads=True,
+                    use_qwen_hybrid_chunked_prefill=True,
+                )
+                self.vllm_config = base.vllm_config
+                self.cache_config = base.cache_config
+                self.scheduler_config = base.scheduler_config
+                self.requests = {
+                    "req-a": types.SimpleNamespace(
+                        request_id="req-a",
+                        prompt_token_ids=[10, 11, 12, 13, 14, 15],
+                        num_tokens=6,
+                        cache_salt=None,
+                    )
+                }
+
+            def add_request(self, request):
+                del request
+
+            def schedule(self):
+                return types.SimpleNamespace(
+                    scheduled_new_reqs=[],
+                    scheduled_cached_reqs=types.SimpleNamespace(
+                        req_ids=["req-a"],
+                        new_block_ids=[([11, 12],)],
+                        num_computed_tokens=[6],
+                        num_output_tokens=[1],
+                    ),
+                    num_scheduled_tokens={"req-a": 1},
+                    total_num_scheduled_tokens=1,
+                )
+
+        token_ids = [10, 11, 12, 13, 14, 15]
+        hashes = self.patch._local_cumulative_prefix_hashes(
+            token_ids,
+            block_size=4,
+            max_prefix_len=4,
+        )
+        self.patch.register_hybrid_apc_gdn_checkpoint(
+            self.patch.HybridGDNPrefixKey(
+                cumulative_prefix_hash=hashes[4],
+                prefix_len=4,
+                block_size=4,
+                cache_salt=None,
+                model_revision="rev-a",
+                layout_version=1,
+                tp_rank=0,
+                recurrent_dtype="float32",
+                conv_dtype="bfloat16",
+            )
+        )
+
+        self.patch.patch_scheduler_class(FakeScheduler)
+        with patch.dict(
+            os.environ,
+            {"QWEN36_HYBRID_APC_DISABLE_UNBACKED_PREFIX_READS": "1"},
+        ):
+            scheduler_output = FakeScheduler().schedule()
+
+        metadata = getattr(
+            scheduler_output,
+            "_qwen36_hybrid_apc_metadata_by_request_id",
+        )
+
+        self.assertEqual(scheduler_output.scheduled_cached_reqs.num_computed_tokens, [6])
+        self.assertEqual(scheduler_output.num_scheduled_tokens["req-a"], 1)
+        self.assertEqual(scheduler_output.total_num_scheduled_tokens, 1)
+        self.assertEqual(metadata["req-a"]["vllm_attention_hit_len"], 6)
+
     def test_backed_prefix_read_allows_batched_scheduler_when_configured(self):
         scheduler = _scheduler(
             block_size=2,
@@ -915,6 +1294,11 @@ class TestQwen36HybridAPCSchedulerPatch(unittest.TestCase):
                     "_qwen36_vllm_hybrid_apc_metadata_by_request_id",
                     None,
                 )
+                self.seen_request_records = getattr(
+                    self.model.model,
+                    "_qwen36_vllm_hybrid_apc_request_records",
+                    None,
+                )
                 return self.seen_request_ids
 
         installed = self.patch.patch_neuron_model_runner_class(FakeRunner)
@@ -927,6 +1311,12 @@ class TestQwen36HybridAPCSchedulerPatch(unittest.TestCase):
                 _qwen36_hybrid_apc_metadata_by_request_id={
                     "req-a": {"cumulative_hashes_by_prefix_len": {4: b"h4"}}
                 },
+                _qwen36_hybrid_apc_request_records=(
+                    {
+                        "request_id": "req-a",
+                        "cumulative_hashes_by_prefix_len": {4: b"h4"},
+                    },
+                ),
             )
         )
 
@@ -939,9 +1329,21 @@ class TestQwen36HybridAPCSchedulerPatch(unittest.TestCase):
             runner.seen_metadata,
             {"req-a": {"cumulative_hashes_by_prefix_len": {4: b"h4"}}},
         )
+        self.assertEqual(
+            runner.seen_request_records,
+            (
+                {
+                    "request_id": "req-a",
+                    "cumulative_hashes_by_prefix_len": {4: b"h4"},
+                },
+            ),
+        )
         self.assertFalse(hasattr(runner.model, "_qwen36_vllm_request_ids"))
         self.assertFalse(hasattr(runner.model.model, "_qwen36_vllm_request_ids"))
         self.assertFalse(hasattr(runner.model.model, "_qwen36_vllm_cached_request_ids"))
+        self.assertFalse(
+            hasattr(runner.model.model, "_qwen36_vllm_hybrid_apc_request_records")
+        )
 
     def test_runner_patch_applies_runtime_hybrid_apc_config_during_execution(self):
         class FakeRunner:
@@ -1035,6 +1437,75 @@ class TestQwen36HybridAPCSchedulerPatch(unittest.TestCase):
         self.assertEqual(
             model_input._qwen36_hybrid_apc_metadata_by_request_id,
             {"new-1": {"attention_block_refs_by_prefix_len": {4: (3, 4)}}},
+        )
+        self.assertEqual(
+            model_input._qwen36_hybrid_apc_request_records,
+            (
+                {"request_id": "cached-1"},
+                {
+                    "request_id": "new-1",
+                    "attention_block_refs_by_prefix_len": {4: (3, 4)},
+                },
+            ),
+        )
+
+    def test_runner_patch_builds_ordered_hybrid_apc_request_records(self):
+        @dataclass(frozen=True)
+        class FrozenModelInput:
+            request_ids: list[str]
+
+        class FakeRunner:
+            def __init__(self):
+                self.model = types.SimpleNamespace(model=types.SimpleNamespace())
+
+            def _prepare_model_input(self, scheduler_output):
+                del scheduler_output
+                return FrozenModelInput(request_ids=["warm", "cold"])
+
+            def _execute_model_for_text(self, model_input, intermediate_tensors=None):
+                del intermediate_tensors
+                return model_input
+
+        installed = self.patch.patch_neuron_model_runner_class(FakeRunner)
+        runner = FakeRunner()
+        scheduler_output = types.SimpleNamespace(
+            scheduled_cached_reqs=types.SimpleNamespace(req_ids=["warm"]),
+            scheduled_new_reqs=[types.SimpleNamespace(req_id="cold")],
+            num_scheduled_tokens={"warm": 2, "cold": 6},
+            _qwen36_hybrid_apc_metadata_by_request_id={
+                "warm": {
+                    "vllm_attention_hit_len": 4,
+                    "request_prefix_len": 6,
+                    "cumulative_hashes_by_prefix_len": {4: b"warm-h4"},
+                    "attention_block_refs_by_prefix_len": {4: (1, 2)},
+                },
+                "cold": {
+                    "vllm_attention_hit_len": 0,
+                    "request_prefix_len": 6,
+                },
+            },
+        )
+        model_input = runner._prepare_model_input(scheduler_output)
+
+        self.assertTrue(installed)
+        self.assertEqual(
+            model_input._qwen36_hybrid_apc_request_records,
+            (
+                {
+                    "request_id": "warm",
+                    "cumulative_hashes_by_prefix_len": {4: b"warm-h4"},
+                    "attention_block_refs_by_prefix_len": {4: (1, 2)},
+                    "request_prefix_len": 6,
+                    "vllm_attention_hit_len": 4,
+                    "active_suffix_len": 2,
+                },
+                {
+                    "request_id": "cold",
+                    "request_prefix_len": 6,
+                    "vllm_attention_hit_len": 0,
+                    "active_suffix_len": 6,
+                },
+            ),
         )
 
     def test_runner_patch_expands_completed_only_prefill_logits(self):

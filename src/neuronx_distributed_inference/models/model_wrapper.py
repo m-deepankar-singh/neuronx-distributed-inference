@@ -1054,7 +1054,8 @@ class ModelWrapper(torch.nn.Module):
                 if tensor.numel() == 0:
                     return torch.tensor(default_value, dtype=torch.int32)
                 values = tensor.reshape(-1).to(torch.int32)
-                if args[0].shape[0] > 1:
+                batch_size = args[0].shape[0] if args[0].dim() > 0 else 1
+                if batch_size > 1:
                     return torch.max(values)
                 return values[0]
 
@@ -1062,11 +1063,12 @@ class ModelWrapper(torch.nn.Module):
                 horizontal_dim = torch.tensor(0, dtype=torch.int32)
             else:
                 horizontal_dim = _cte_bucket_dim_or_default(horizontal_dim, 0)
+            default_vertical_dim = args[0].shape[-1] if args[0].dim() > 0 else 1
             if vertical_dim.numel() == 0:
-                vertical_dim = torch.tensor(args[0].shape[-1], dtype=torch.int32)
+                vertical_dim = torch.tensor(default_vertical_dim, dtype=torch.int32)
             else:
                 vertical_dim = _cte_bucket_dim_or_default(
-                    vertical_dim, args[0].shape[-1]
+                    vertical_dim, default_vertical_dim
                 )
             prefix_buckets = []
             prefill_buckets = []
@@ -1113,6 +1115,12 @@ class ModelWrapper(torch.nn.Module):
                     horizontal_dim = max(0, horizontal_dim - empty_prefill_block_slots * self.neuron_config.pa_block_size)
             elif not hybrid_apc_restore_active:
                 horizontal_dim = max(0, horizontal_dim - empty_prefill_slots)
+            else:
+                # Restored Hybrid APC CTE uses the attention-mask tensor as an
+                # active suffix validity mask, so it is padded to the prefill
+                # bucket instead of the restored-prefix bucket. Route to a
+                # traced shape whose block table width matches that mask width.
+                horizontal_dim = max(horizontal_dim, prefill_len)
             prefix_index = 0
             for b in prefix_buckets:
                 if horizontal_dim > b:
@@ -1159,6 +1167,27 @@ class ModelWrapper(torch.nn.Module):
                 return tensor.reshape(-1, 1).to(torch.int32)
             return tensor.to(torch.int32)
 
+        def _mask_block_table_to_prefix_lens(block_table, prefix_lens):
+            if (
+                block_table.numel() == 0
+                or block_table.dim() < 2
+                or prefix_lens.numel() == 0
+            ):
+                return block_table
+            masked = block_table.clone()
+            flat_prefix_lens = prefix_lens.reshape(-1).to(torch.int64)
+            row_count = min(masked.shape[0], int(flat_prefix_lens.numel()))
+            block_size = int(self.neuron_config.pa_block_size)
+            for row_idx in range(row_count):
+                prefix_len = max(0, int(flat_prefix_lens[row_idx].item()))
+                keep_blocks = min(
+                    masked.shape[1],
+                    (prefix_len + block_size - 1) // block_size,
+                )
+                if keep_blocks < masked.shape[1]:
+                    masked[row_idx, keep_blocks:] = 0
+            return masked
+
         # Calculate the buckets
         prefill_bucket, prefix_bucket = self.get_target_2d_bucket_for_prefix_caching(*args, strategy=pad_type)
 
@@ -1189,6 +1218,10 @@ class ModelWrapper(torch.nn.Module):
                     block_table = block_table.view(1, -1)
             slot_mapping = slot_mapping.to(torch.int32)
             block_table = block_table.to(torch.int32)
+            block_table = _mask_block_table_to_prefix_lens(
+                block_table,
+                computed_context_lens,
+            )
             if args[0].shape[0] > 1:
                 prefill_len = torch.max(num_queries.reshape(-1))
                 prefix_len = torch.max(computed_context_lens.reshape(-1))
@@ -1229,12 +1262,30 @@ class ModelWrapper(torch.nn.Module):
                     slot_mapping, prefill_bucket_int, -1
                 )
 
-                if prefix_bucket_int == 0:
+                if hybrid_apc_restore_active:
+                    active_attn_mask = args[1]
+                    if active_attn_mask.dim() == 1:
+                        active_attn_mask = active_attn_mask.view(1, -1)
+                    if active_attn_mask.shape[0] < batch_size:
+                        pad_rows = torch.zeros(
+                            (
+                                batch_size - active_attn_mask.shape[0],
+                                active_attn_mask.shape[1],
+                            ),
+                            dtype=active_attn_mask.dtype,
+                            device=active_attn_mask.device,
+                        )
+                        active_attn_mask = torch.cat([active_attn_mask, pad_rows], dim=0)
+                    elif active_attn_mask.shape[0] > batch_size:
+                        active_attn_mask = active_attn_mask[:batch_size]
+                    padded_attn_mask = _right_pad_or_trim_dim1(
+                        active_attn_mask.to(torch.int32),
+                        prefill_bucket_int,
+                        0,
+                    )
+                elif prefix_bucket_int == 0:
                     padded_attn_mask = torch.zeros(
                         1, dtype=torch.int32, device=args[1].device
-                    )
-                    padded_block_table = torch.zeros(
-                        1, dtype=torch.int32, device=block_table.device
                     )
                 else:
                     padded_attn_mask = torch.zeros(
@@ -1254,6 +1305,11 @@ class ModelWrapper(torch.nn.Module):
                         if row_prefix_len:
                             padded_attn_mask[row_idx, :row_prefix_len] = 1
 
+                if prefix_bucket_int == 0:
+                    padded_block_table = torch.zeros(
+                        1, dtype=torch.int32, device=block_table.device
+                    )
+                else:
                     num_blocks = prefix_bucket_int // self.neuron_config.pa_block_size
                     if block_table.shape[0] < batch_size:
                         pad_rows = torch.zeros(

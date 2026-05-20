@@ -3154,6 +3154,44 @@ def _qwen36_is_prefill_request(
     return position_ids.min().item() == 0
 
 
+def _qwen36_deltanet_padding_mask(
+    *,
+    input_ids,
+    inputs_embeds,
+    attention_mask,
+    padding_idx,
+    is_for_context_encoding,
+    hybrid_restore_mask=None,
+):
+    token_padding_mask = (input_ids != padding_idx).unsqueeze(-1).to(inputs_embeds.dtype)
+    if (
+        is_for_context_encoding
+        and attention_mask is not None
+        and attention_mask.ndim == 2
+    ):
+        attention_padding_mask = attention_mask.unsqueeze(-1).to(inputs_embeds.dtype)
+        if attention_padding_mask.shape[1] == inputs_embeds.shape[1]:
+            deltanet_padding_mask = attention_padding_mask
+        else:
+            deltanet_padding_mask = token_padding_mask
+    else:
+        deltanet_padding_mask = token_padding_mask
+
+    if (
+        is_for_context_encoding
+        and hybrid_restore_mask is not None
+        and hasattr(hybrid_restore_mask, "numel")
+        and hybrid_restore_mask.numel() > 0
+    ):
+        restore_active = hybrid_restore_mask.reshape(-1).to(torch.bool).any()
+        deltanet_padding_mask = torch.where(
+            restore_active,
+            token_padding_mask,
+            deltanet_padding_mask,
+        )
+    return deltanet_padding_mask
+
+
 def _qwen36_unpack_packed_decode_batch(
     *,
     input_ids,
@@ -3347,6 +3385,26 @@ def _qwen36_request_ids_tuple(request_ids):
     return (request_ids,)
 
 
+def _qwen36_request_ids_from_hybrid_apc_records(records):
+    if records is None:
+        return None
+    if isinstance(records, dict):
+        records = (records,)
+    elif isinstance(records, list):
+        records = tuple(records)
+    if not isinstance(records, tuple):
+        return None
+    request_ids = []
+    for record in records:
+        if not isinstance(record, dict):
+            return None
+        request_id = record.get("request_id")
+        if request_id is None:
+            return None
+        request_ids.append(request_id)
+    return tuple(request_ids) if request_ids else None
+
+
 def _qwen36_select_vllm_hybrid_apc_request_ids_for_input(
     metadata_by_request_id,
     *,
@@ -3366,11 +3424,10 @@ def _qwen36_select_vllm_hybrid_apc_request_ids_for_input(
         logical_request_count > 1
         and all_request_ids_tuple is not None
         and len(all_request_ids_tuple) == logical_request_count
-        and _qwen36_request_ids_have_metadata(
-            metadata_by_request_id,
-            all_request_ids_tuple,
-        )
     ):
+        # Keep request identity aligned with the model row order. In mixed
+        # cached/new prefill batches, scheduler "new" ids can be a strict
+        # subset, but the metadata vectors still describe every model row.
         return all_request_ids_tuple
     return _qwen36_select_vllm_hybrid_apc_request_ids(
         metadata_by_request_id,
@@ -3594,26 +3651,14 @@ class NeuronQwen35Model(NeuronBaseModel):
         # sequence positions through a linear recurrence.  Padding tokens have
         # real embedding vectors which corrupt the recurrence state.
         # The mask is [B, S, 1] float with 1.0 for real tokens, 0.0 for padding.
-        if (
-            is_for_context_encoding
-            and attention_mask is not None
-            and attention_mask.ndim == 2
-        ):
-            attention_padding_mask = attention_mask.unsqueeze(-1).to(
-                inputs_embeds.dtype
-            )
-            if attention_padding_mask.shape[1] == inputs_embeds.shape[1]:
-                deltanet_padding_mask = attention_padding_mask
-            else:
-                deltanet_padding_mask = (
-                    (input_ids != self.padding_idx)
-                    .unsqueeze(-1)
-                    .to(inputs_embeds.dtype)
-                )
-        else:
-            deltanet_padding_mask = (
-                (input_ids != self.padding_idx).unsqueeze(-1).to(inputs_embeds.dtype)
-            )
+        deltanet_padding_mask = _qwen36_deltanet_padding_mask(
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            padding_idx=self.padding_idx,
+            is_for_context_encoding=is_for_context_encoding,
+            hybrid_restore_mask=hybrid_restore_mask,
+        )
         if is_for_context_encoding:
             inputs_embeds = inputs_embeds * deltanet_padding_mask
 
@@ -3931,18 +3976,34 @@ class NeuronQwen35Model(NeuronBaseModel):
                 pass
             else:
                 if getattr(self.config, "use_qwen_hybrid_chunked_prefill", False):
+                    token_index = (
+                        (input_ids != self.padding_idx)
+                        .sum(dim=1, keepdim=True)
+                        .long()
+                        - 1
+                    ).clamp(min=0)
                     if attention_mask is not None and attention_mask.ndim == 2:
-                        index = (
+                        attention_index = (
                             attention_mask.to(torch.long).sum(dim=1, keepdim=True)
                             - 1
                         ).clamp(min=0)
+                        if (
+                            hybrid_restore_mask is not None
+                            and hasattr(hybrid_restore_mask, "numel")
+                            and hybrid_restore_mask.numel() > 0
+                        ):
+                            restore_active = (
+                                hybrid_restore_mask.reshape(-1).to(torch.bool).any()
+                            )
+                            index = torch.where(
+                                restore_active,
+                                token_index,
+                                attention_index,
+                            )
+                        else:
+                            index = attention_index
                     else:
-                        index = (
-                            (input_ids != self.padding_idx)
-                            .sum(dim=1, keepdim=True)
-                            .long()
-                            - 1
-                        ).clamp(min=0)
+                        index = token_index
                 else:
                     index = torch.max(position_ids, dim=1, keepdim=True).indices
                 index = index.unsqueeze(1).expand(batch_size, 1, self.hidden_size)
@@ -4810,14 +4871,23 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
                 "_qwen36_vllm_hybrid_apc_metadata_by_request_id",
                 None,
             )
-            request_ids = _qwen36_select_vllm_hybrid_apc_request_ids_for_input(
-                metadata_by_request_id,
-                all_request_ids=getattr(self, "_qwen36_vllm_request_ids", None),
-                new_request_ids=getattr(self, "_qwen36_vllm_new_request_ids", None),
-                full_context_lens=full_context_lens,
-                computed_context_lens=computed_context_lens,
-                prefill_completion_state=prefill_completion_state,
+            request_records = getattr(
+                self,
+                "_qwen36_vllm_hybrid_apc_request_records",
+                None,
             )
+            if request_records is not None:
+                hybrid_apc_request_dict["hybrid_request_records"] = request_records
+            request_ids = _qwen36_request_ids_from_hybrid_apc_records(request_records)
+            if request_ids is None:
+                request_ids = _qwen36_select_vllm_hybrid_apc_request_ids_for_input(
+                    metadata_by_request_id,
+                    all_request_ids=getattr(self, "_qwen36_vllm_request_ids", None),
+                    new_request_ids=getattr(self, "_qwen36_vllm_new_request_ids", None),
+                    full_context_lens=full_context_lens,
+                    computed_context_lens=computed_context_lens,
+                    prefill_completion_state=prefill_completion_state,
+                )
             if request_ids is not None:
                 if isinstance(request_ids, list):
                     request_ids = tuple(request_ids)

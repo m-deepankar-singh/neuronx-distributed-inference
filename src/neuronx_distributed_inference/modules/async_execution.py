@@ -124,6 +124,9 @@ def _batch_size_from_input_dict(input_dict: Dict[str, Any]) -> int:
         "hybrid_attention_hit_len",
         "attention_hit_len",
         "hybrid_prefill_completion_state",
+        "hybrid_active_suffix_len",
+        "active_suffix_len",
+        "hybrid_request_records",
     ):
         value = input_dict.get(key)
         if isinstance(value, torch.Tensor) and value.ndim >= 1:
@@ -163,6 +166,39 @@ def _vectorized_query_lengths(
     num_queries = _batch_int_list(input_dict, "num_queries", batch_size=batch_size)
     if num_queries is not None:
         return num_queries
+
+    active_suffix_len = _batch_int_list(
+        input_dict,
+        "hybrid_active_suffix_len",
+        batch_size=batch_size,
+    )
+    if active_suffix_len is None:
+        active_suffix_len = _batch_int_list(
+            input_dict,
+            "active_suffix_len",
+            batch_size=batch_size,
+        )
+    if active_suffix_len is not None:
+        return [max(0, int(query_len)) for query_len in active_suffix_len]
+
+    records = _hybrid_apc_request_records(input_dict, batch_size=batch_size)
+    record_active_suffix_len = _hybrid_apc_record_values(records, "active_suffix_len")
+    if (
+        isinstance(record_active_suffix_len, (list, tuple))
+        and len(record_active_suffix_len) >= batch_size
+    ):
+        try:
+            return [
+                max(0, int(query_len))
+                for query_len in record_active_suffix_len[:batch_size]
+            ]
+        except (TypeError, ValueError):
+            pass
+    if batch_size == 1 and record_active_suffix_len is not None:
+        try:
+            return [max(0, int(record_active_suffix_len))]
+        except (TypeError, ValueError):
+            pass
 
     full_context_lens = _batch_int_list(
         input_dict,
@@ -252,6 +288,61 @@ def _select_batch_item(
     if isinstance(value, list) and len(value) == batch_size:
         return value[index]
     return value
+
+
+def _hybrid_apc_request_records(
+    input_dict: Dict[str, Any],
+    *,
+    batch_size: int,
+) -> tuple[dict[str, Any], ...] | None:
+    records = input_dict.get("hybrid_request_records")
+    if records is None:
+        return None
+    if isinstance(records, dict):
+        records = (records,)
+    elif isinstance(records, list):
+        records = tuple(records)
+    if not isinstance(records, tuple):
+        return None
+    if len(records) != batch_size:
+        raise ValueError(
+            "hybrid APC request record count must match batch size: "
+            f"records={len(records)} batch_size={batch_size}"
+        )
+    if not all(isinstance(record, dict) for record in records):
+        raise ValueError("hybrid APC request records must be dictionaries")
+    return records
+
+
+def _hybrid_apc_record_values(
+    records: tuple[dict[str, Any], ...] | None,
+    key: str,
+):
+    if not records:
+        return None
+    values = [record.get(key) for record in records]
+    if not any(value is not None for value in values):
+        return None
+    return values[0] if len(values) == 1 else tuple(values)
+
+
+def _apply_hybrid_apc_request_record(
+    row_input: Dict[str, Any],
+    record: dict[str, Any] | None,
+) -> None:
+    if not isinstance(record, dict):
+        return
+    for source_key, target_key in (
+        ("request_id", "hybrid_request_id"),
+        ("vllm_attention_hit_len", "vllm_attention_hit_len"),
+        ("request_prefix_len", "request_prefix_len"),
+        ("cumulative_hashes_by_prefix_len", "cumulative_hashes_by_prefix_len"),
+        ("attention_block_refs_by_prefix_len", "attention_block_refs_by_prefix_len"),
+        ("active_suffix_len", "hybrid_active_suffix_len"),
+    ):
+        value = record.get(source_key)
+        if value is not None:
+            row_input[target_key] = value
 
 
 def _pad_value_for_key(
@@ -609,6 +700,38 @@ def _with_zero_hybrid_apc_slots(input_dict: Dict[str, Any]) -> Dict[str, Any]:
     output.setdefault("hybrid_restore_prefix_lens", torch.zeros_like(zeros))
     output.setdefault("hybrid_commit_slot_ids", torch.zeros_like(zeros))
     output.setdefault("hybrid_commit_mask", torch.zeros_like(zeros))
+    if "num_queries" not in output:
+        query_lengths = _vectorized_query_lengths(output, batch_size=batch_size)
+        if query_lengths is None:
+            input_ids = output.get("input_ids")
+            active_len = (
+                int(input_ids.shape[1])
+                if isinstance(input_ids, torch.Tensor) and input_ids.ndim >= 2
+                else 0
+            )
+            query_lengths = [active_len] * batch_size
+        query_kwargs = {"dtype": torch.int32}
+        if device is not None:
+            query_kwargs["device"] = device
+        output["num_queries"] = torch.tensor(
+            [[max(0, int(query_len))] for query_len in query_lengths[:batch_size]],
+            **query_kwargs,
+        )
+    input_ids = output.get("input_ids")
+    if isinstance(input_ids, torch.Tensor) and input_ids.ndim >= 2:
+        query_lengths = _vectorized_query_lengths(output, batch_size=batch_size)
+        if query_lengths is None:
+            query_lengths = [int(input_ids.shape[1])] * batch_size
+        attention_mask = torch.zeros(
+            input_ids.shape[:2],
+            dtype=torch.int32,
+            device=input_ids.device,
+        )
+        for row_idx, query_len in enumerate(query_lengths[:batch_size]):
+            active_len = max(0, min(int(query_len), input_ids.shape[1]))
+            if active_len:
+                attention_mask[row_idx, :active_len] = 1
+        output["attention_mask"] = attention_mask
     return output
 
 
@@ -750,6 +873,10 @@ def _prepare_vectorized_hybrid_apc_requests(
     row_outputs: list[Dict[str, Any]] = []
     prepared_requests = []
     query_lengths = _vectorized_query_lengths(input_dict, batch_size=batch_size)
+    request_records = _hybrid_apc_request_records(
+        input_dict,
+        batch_size=batch_size,
+    )
     try:
         for index in range(batch_size):
             row_input = {
@@ -763,6 +890,8 @@ def _prepare_vectorized_hybrid_apc_requests(
                 for key, value in input_dict.items()
                 if not key.startswith("_hybrid_apc")
             }
+            if request_records is not None:
+                _apply_hybrid_apc_request_record(row_input, request_records[index])
             row_input["hybrid_apc_bridge"] = bridge
             row_output = prepare_hybrid_apc_request_for_execution(
                 neuron_base_instance,
@@ -892,9 +1021,19 @@ def prepare_hybrid_apc_request_for_execution(
             )
         return input_dict
 
+    batch_size = _batch_size_from_input_dict(input_dict)
+    request_records = _hybrid_apc_request_records(
+        input_dict,
+        batch_size=batch_size,
+    )
+    if batch_size == 1 and request_records is not None:
+        input_dict = dict(input_dict)
+        _apply_hybrid_apc_request_record(input_dict, request_records[0])
+
     request_id = _first_present(
         input_dict.get("hybrid_request_id"),
         input_dict.get("request_id"),
+        _hybrid_apc_record_values(request_records, "request_id"),
     )
     if request_id is None:
         seq_id = _single_batch_value(input_dict.get("seq_ids"))
@@ -902,6 +1041,7 @@ def prepare_hybrid_apc_request_for_execution(
             request_id = ("seq_id", _to_python_int(seq_id))
 
     attention_hit_len_source = _first_present(
+        _hybrid_apc_record_values(request_records, "vllm_attention_hit_len"),
         input_dict.get("vllm_attention_hit_len"),
         input_dict.get("hybrid_attention_hit_len"),
         input_dict.get("attention_hit_len"),
@@ -910,9 +1050,19 @@ def prepare_hybrid_apc_request_for_execution(
         attention_hit_len_source = input_dict.get("computed_context_lens")
     attention_hit_len = _single_batch_value(attention_hit_len_source)
     multi_attention_hit_lens = _multi_batch_int_values(attention_hit_len_source)
-    batch_size = _batch_size_from_input_dict(input_dict)
-    if attention_hit_len is None and multi_attention_hit_lens is not None and batch_size > 1:
-        if all(hit_len == 0 for hit_len in multi_attention_hit_lens) and not requires_external_metadata:
+    if attention_hit_len is None and multi_attention_hit_lens is None:
+        multi_attention_hit_lens = _multi_batch_int_values(
+            input_dict.get("computed_context_lens")
+        )
+    if (
+        attention_hit_len is None
+        and multi_attention_hit_lens is not None
+        and batch_size > 1
+    ):
+        if (
+            all(hit_len == 0 for hit_len in multi_attention_hit_lens)
+            and not requires_external_metadata
+        ):
             return input_dict
         return _prepare_vectorized_hybrid_apc_requests(
             neuron_base_instance,

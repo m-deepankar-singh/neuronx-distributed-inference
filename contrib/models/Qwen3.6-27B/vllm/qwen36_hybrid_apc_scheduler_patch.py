@@ -39,6 +39,7 @@ _GDN_PREFIX_KEYS: set[HybridGDNPrefixKey] = set()
 _AUTHORIZED_PREFIX_READS: dict[int, list[HybridGDNPrefixKey]] = {}
 _AUTHORIZED_PREFIX_READS_BY_REQUEST: dict[Hashable, list[HybridGDNPrefixKey]] = {}
 _SCHEDULER_OUTPUT_METADATA_ATTR = "_qwen36_hybrid_apc_metadata_by_request_id"
+_SCHEDULER_OUTPUT_REQUEST_RECORDS_ATTR = "_qwen36_hybrid_apc_request_records"
 _HYBRID_APC_RUNTIME_CONFIG_KEYS = (
     "use_hybrid_apc_manager",
     "use_qwen_hybrid_chunked_prefill",
@@ -612,6 +613,60 @@ def _scheduler_request_metadata(
     return metadata
 
 
+def _unbacked_prefix_reads_disabled_requested(scheduler: Any) -> bool:
+    if _env_flag("QWEN36_HYBRID_APC_ENABLE_PREFIX_READS"):
+        return False
+
+    disable_requested = _env_flag("QWEN36_HYBRID_APC_DISABLE_UNBACKED_PREFIX_READS")
+    if disable_requested:
+        return True
+    if not _scheduler_config_flag(scheduler, "use_hybrid_apc_manager"):
+        return False
+    return _scheduler_config_flag(
+        scheduler,
+        "hybrid_apc_disable_unbacked_prefix_reads",
+    )
+
+
+def _request_prefix_len(request: Any) -> int:
+    if request is None:
+        return 0
+    token_ids = getattr(request, "prompt_token_ids", None)
+    return int(getattr(request, "num_tokens", len(token_ids or ())) or 0)
+
+
+def _backed_prefix_read_decision(scheduler: Any, request: Any) -> dict[str, Any]:
+    backed_hits = backed_gdn_prefix_hits(scheduler, request)
+    required_prefix_lens = _required_backed_prefix_lens(scheduler, request)
+    backed_hit_len = max(backed_hits) if backed_hits else 0
+    missing_backed_lens = [
+        prefix_len for prefix_len in required_prefix_lens if prefix_len not in backed_hits
+    ]
+    supports_backed = _supports_backed_prefix_reads(scheduler)
+    max_backed_prefix_read_len = _max_backed_prefix_read_len(scheduler)
+    exceeds_backed_prefix_cap = (
+        max_backed_prefix_read_len > 0
+        and bool(required_prefix_lens)
+        and max(required_prefix_lens) > max_backed_prefix_read_len
+    )
+    allowed = (
+        bool(required_prefix_lens)
+        and not missing_backed_lens
+        and not exceeds_backed_prefix_cap
+        and supports_backed
+    )
+    return {
+        "allowed": allowed,
+        "backed_hits": backed_hits,
+        "required_prefix_lens": required_prefix_lens,
+        "backed_hit_len": backed_hit_len,
+        "missing_backed_lens": tuple(missing_backed_lens),
+        "supports_backed": supports_backed,
+        "max_backed_prefix_read_len": max_backed_prefix_read_len,
+        "exceeds_backed_prefix_cap": exceeds_backed_prefix_cap,
+    }
+
+
 def _request_from_scheduler(scheduler: Any, req_id: Any) -> Any:
     requests = getattr(scheduler, "requests", None)
     if isinstance(requests, dict):
@@ -723,58 +778,31 @@ def should_disable_unbacked_prefix_reads(scheduler: Any, request: Any = None) ->
     the compiled artifact can consume the matching attention KV prefix in CTE.
     """
 
-    if _env_flag("QWEN36_HYBRID_APC_ENABLE_PREFIX_READS"):
-        return False
-
-    disable_requested = _env_flag("QWEN36_HYBRID_APC_DISABLE_UNBACKED_PREFIX_READS")
-    if not disable_requested:
-        if not _scheduler_config_flag(scheduler, "use_hybrid_apc_manager"):
-            return False
-        disable_requested = _scheduler_config_flag(
-            scheduler,
-            "hybrid_apc_disable_unbacked_prefix_reads",
-        )
+    disable_requested = _unbacked_prefix_reads_disabled_requested(scheduler)
     if not disable_requested:
         return False
-    backed_hits = backed_gdn_prefix_hits(scheduler, request)
-    required_prefix_lens = _required_backed_prefix_lens(scheduler, request)
-    backed_hit_len = max(backed_hits) if backed_hits else 0
-    missing_backed_lens = [
-        prefix_len for prefix_len in required_prefix_lens if prefix_len not in backed_hits
-    ]
-    supports_backed = _supports_backed_prefix_reads(scheduler)
-    max_backed_prefix_read_len = _max_backed_prefix_read_len(scheduler)
-    exceeds_backed_prefix_cap = (
-        max_backed_prefix_read_len > 0
-        and bool(required_prefix_lens)
-        and max(required_prefix_lens) > max_backed_prefix_read_len
-    )
+    decision = _backed_prefix_read_decision(scheduler, request)
     if _env_flag("QWEN36_HYBRID_APC_DEBUG"):
         prompt_len = len(getattr(request, "prompt_token_ids", ()) or ())
         print(
             "[hybrid_apc_debug] scheduler-decision "
             f"disable_requested={disable_requested} "
-            f"backed_hit_len={backed_hit_len} "
-            f"supports_backed={supports_backed} "
+            f"backed_hit_len={decision['backed_hit_len']} "
+            f"supports_backed={decision['supports_backed']} "
             f"max_num_seqs={_max_num_seqs_for_scheduler(scheduler)} "
             f"prompt_len={prompt_len} "
-            f"required_backed_lens={required_prefix_lens} "
-            f"missing_backed_lens={tuple(missing_backed_lens)} "
-            f"max_backed_prefix_read_len={max_backed_prefix_read_len} "
-            f"exceeds_backed_prefix_cap={exceeds_backed_prefix_cap} "
+            f"required_backed_lens={decision['required_prefix_lens']} "
+            f"missing_backed_lens={decision['missing_backed_lens']} "
+            f"max_backed_prefix_read_len={decision['max_backed_prefix_read_len']} "
+            f"exceeds_backed_prefix_cap={decision['exceeds_backed_prefix_cap']} "
             f"registry_size={len(_GDN_PREFIX_KEYS)}",
             flush=True,
         )
-    if (
-        required_prefix_lens
-        and not missing_backed_lens
-        and not exceeds_backed_prefix_cap
-        and supports_backed
-    ):
+    if decision["allowed"]:
         request_id = _request_id_for_scheduler_request(request)
-        for prefix_len in required_prefix_lens:
+        for prefix_len in decision["required_prefix_lens"]:
             authorize_hybrid_apc_prefix_read(
-                backed_hits[prefix_len],
+                decision["backed_hits"][prefix_len],
                 request_id=request_id,
             )
         return False
@@ -873,6 +901,72 @@ def _request_ids_from_scheduler_output(
             return None
         return tuple(getattr(req, "req_id") for req in new_reqs)
     raise ValueError(f"unknown scheduler request kind: {kind}")
+
+
+def _num_scheduled_tokens_by_request_id(scheduler_output: Any) -> dict[Hashable, int]:
+    values = getattr(scheduler_output, "num_scheduled_tokens", None)
+    if not isinstance(values, dict):
+        return {}
+    scheduled_tokens: dict[Hashable, int] = {}
+    for req_id, value in values.items():
+        normalized = _normalize_request_id(req_id)
+        if normalized is None:
+            continue
+        try:
+            scheduled_tokens[normalized] = int(value)
+        except (TypeError, ValueError):
+            continue
+    return scheduled_tokens
+
+
+def _scheduler_metadata_for_request_id(
+    metadata_by_request_id: Any,
+    request_id: Any,
+) -> dict[str, Any]:
+    if not isinstance(metadata_by_request_id, dict):
+        return {}
+    normalized = _normalize_request_id(request_id)
+    metadata = metadata_by_request_id.get(normalized)
+    if metadata is None and request_id is not None:
+        metadata = metadata_by_request_id.get(str(request_id))
+    return metadata if isinstance(metadata, dict) else {}
+
+
+def _hybrid_apc_request_records_from_model_input(
+    model_input: Any,
+    scheduler_output: Any,
+) -> tuple[dict[str, Any], ...] | None:
+    request_ids = _request_ids_from_model_input(model_input)
+    if not request_ids:
+        return None
+    metadata_by_request_id = getattr(
+        scheduler_output,
+        _SCHEDULER_OUTPUT_METADATA_ATTR,
+        None,
+    )
+    if not isinstance(metadata_by_request_id, dict):
+        return None
+
+    num_scheduled_tokens = _num_scheduled_tokens_by_request_id(scheduler_output)
+    records: list[dict[str, Any]] = []
+    found_metadata = False
+    for request_id in request_ids:
+        metadata = _scheduler_metadata_for_request_id(metadata_by_request_id, request_id)
+        record: dict[str, Any] = {"request_id": request_id}
+        for key in (
+            "cumulative_hashes_by_prefix_len",
+            "attention_block_refs_by_prefix_len",
+            "request_prefix_len",
+            "vllm_attention_hit_len",
+        ):
+            if key in metadata:
+                record[key] = metadata[key]
+                found_metadata = True
+        normalized = _normalize_request_id(request_id)
+        if normalized in num_scheduled_tokens:
+            record["active_suffix_len"] = num_scheduled_tokens[normalized]
+        records.append(record)
+    return tuple(records) if found_metadata else None
 
 
 def _request_id_target_models(model: Any) -> list[Any]:
@@ -1150,6 +1244,16 @@ def patch_neuron_model_runner_class(runner_cls: type) -> bool:
                     _SCHEDULER_OUTPUT_METADATA_ATTR,
                     metadata_by_request_id,
                 )
+            request_records = _hybrid_apc_request_records_from_model_input(
+                model_input,
+                scheduler_output,
+            )
+            if request_records is not None:
+                object.__setattr__(
+                    model_input,
+                    _SCHEDULER_OUTPUT_REQUEST_RECORDS_ATTR,
+                    request_records,
+                )
             return model_input
 
         prepare_model_input_with_hybrid_apc_metadata._qwen36_hybrid_apc_model_input_patched = (
@@ -1233,6 +1337,11 @@ def patch_neuron_model_runner_class(runner_cls: type) -> bool:
             "_qwen36_vllm_hybrid_apc_metadata_by_request_id": getattr(
                 model_input,
                 _SCHEDULER_OUTPUT_METADATA_ATTR,
+                None,
+            ),
+            "_qwen36_vllm_hybrid_apc_request_records": getattr(
+                model_input,
+                _SCHEDULER_OUTPUT_REQUEST_RECORDS_ATTR,
                 None,
             ),
         }

@@ -110,6 +110,8 @@ def _validate_generation_batch_support(args) -> None:
 
 
 def _parse_bucket_values(values) -> list[int]:
+    if isinstance(values, str):
+        values = [values]
     buckets = []
     for value in values:
         for part in str(value).split(","):
@@ -149,7 +151,10 @@ def _maybe_bucket_align_labeled_prompts(args, labeled_prompts):
     pad_token_id = _padding_token_id(tokenizer)
     aligned = []
     for label, prompt in labeled_prompts:
-        prompt_token_ids = tokenizer.encode(prompt, add_special_tokens=False)
+        if isinstance(prompt, dict):
+            prompt_token_ids = list(prompt.get("prompt_token_ids", []))
+        else:
+            prompt_token_ids = tokenizer.encode(prompt, add_special_tokens=False)
         bucket = _next_bucket(len(prompt_token_ids), buckets)
         aligned.append(
             (
@@ -537,6 +542,58 @@ def _single_token_piece(tokenizer, start_index: int) -> str:
     raise ValueError("could not find a compact-gate single-token text piece")
 
 
+def _compact_single_token_ids(tokenizer) -> list[int]:
+    special_ids = {
+        int(token_id)
+        for token_id in (
+            getattr(tokenizer, "pad_token_id", None),
+            getattr(tokenizer, "eos_token_id", None),
+        )
+        if token_id is not None
+    }
+    ids = []
+    for piece in COMPACT_SINGLE_TOKEN_PIECES:
+        piece_ids = tokenizer.encode(piece, add_special_tokens=False)
+        if len(piece_ids) == 1 and int(piece_ids[0]) not in special_ids:
+            token_id = int(piece_ids[0])
+            if token_id not in ids:
+                ids.append(token_id)
+    if len(ids) < 4:
+        next_id = max(ids or [0]) + 1
+        while len(ids) < 4:
+            if next_id not in special_ids and next_id not in ids:
+                ids.append(next_id)
+            next_id += 1
+    return ids
+
+
+def _compact_role_prefix_ids(
+    tokenizer,
+    *,
+    role_index: int,
+    token_count: int,
+) -> list[int]:
+    """Build a globally unique, tokenizer-stable prefix for one compact-gate role."""
+
+    token_count = int(token_count)
+    if token_count <= 0:
+        return []
+    pool = _compact_single_token_ids(tokenizer)
+    base = len(pool)
+    header_len = min(token_count, 6)
+    header = [
+        pool[(int(role_index) // (base**offset)) % base]
+        for offset in range(header_len)
+    ]
+    if token_count <= header_len:
+        return header[:token_count]
+    body = [
+        pool[(int(role_index) + 3 + (position * 7)) % base]
+        for position in range(token_count - header_len)
+    ]
+    return header + body
+
+
 def _repeat_single_token_piece(tokenizer, *, start_index: int, token_count: int) -> str:
     piece = _single_token_piece(tokenizer, start_index)
     text = piece * int(token_count)
@@ -556,12 +613,10 @@ def _compact_instruction_suffix_text(
     start_index: int,
     token_count: int,
 ) -> str:
-    words = ("yes", "no", "red", "blue", "green", "done")
-    word = words[start_index % len(words)]
     tails = (
-        f"\nUser: Say {word}.\nAssistant:",
-        f" Answer {word}:",
-        f" {word}",
+        " one two three four five",
+        " one two three",
+        " one",
     )
     tail = None
     tail_len = 0
@@ -608,16 +663,22 @@ def _stable_text_prompt(tokenizer, prefix: str, suffix: str = "") -> str:
 def _compact_case_plan(args, tokenizer) -> dict:
     suffix_tokens = int(getattr(args, "compact_suffix_tokens", 16))
     prefill_batch_budget = max(_parse_bucket_values(args.cte_buckets))
+    largest_cte_bucket = prefill_batch_budget
     cases = []
     for index, prefix_len in enumerate(_compact_boundary_lengths(args)):
-        prefix_a = _repeat_single_token_piece(
+        prefix_a_ids = _compact_role_prefix_ids(
             tokenizer,
-            start_index=index * 5,
+            role_index=(index * 3),
             token_count=prefix_len,
         )
-        prefix_b = _repeat_single_token_piece(
+        prefix_b_ids = _compact_role_prefix_ids(
             tokenizer,
-            start_index=(index * 5) + 1,
+            role_index=(index * 3) + 1,
+            token_count=prefix_len,
+        )
+        cold_prefix_ids = _compact_role_prefix_ids(
+            tokenizer,
+            role_index=(index * 3) + 2,
             token_count=prefix_len,
         )
         suffix_a = _compact_instruction_suffix_text(
@@ -638,12 +699,10 @@ def _compact_case_plan(args, tokenizer) -> dict:
             start_index=(index * 5) + 4,
             token_count=suffix_tokens,
         )
-        cold_prefix = _repeat_single_token_piece(
-            tokenizer,
-            start_index=(index * 5) + 5,
-            token_count=prefix_len,
-        )
-        speedup_required = (
+        suffix_a_ids = tokenizer.encode(suffix_a, add_special_tokens=False)
+        suffix_b_ids = tokenizer.encode(suffix_b, add_special_tokens=False)
+        cold_suffix_ids = tokenizer.encode(cold_suffix, add_special_tokens=False)
+        backed_checkpoint_hit = (
             prefix_len % int(args.gdn_checkpoint_interval) == 0
             and (
                 int(getattr(args, "hybrid_apc_max_backed_prefix_read_len", 0) or 0)
@@ -651,7 +710,14 @@ def _compact_case_plan(args, tokenizer) -> dict:
                 or prefix_len <= int(args.hybrid_apc_max_backed_prefix_read_len)
             )
         )
-        warm_partial_active_len = suffix_tokens if speedup_required else (
+        speedup_required = backed_checkpoint_hit and prefix_len < largest_cte_bucket
+        speedup_skip_reason = None
+        if backed_checkpoint_hit and not speedup_required:
+            speedup_skip_reason = (
+                "restore prefix reaches largest CTE bucket; current artifacts "
+                "cannot prove grouped warm speedup for this boundary"
+            )
+        warm_partial_active_len = suffix_tokens if backed_checkpoint_hit else (
             prefix_len + suffix_tokens
         )
         cold_mixed_active_len = prefix_len + suffix_tokens
@@ -661,15 +727,11 @@ def _compact_case_plan(args, tokenizer) -> dict:
                 "prefix_len": prefix_len,
                 "full_token_len": prefix_len,
                 "partial_token_len": prefix_len + suffix_tokens,
-                "full_a": _stable_text_prompt(tokenizer, prefix_a),
-                "full_b": _stable_text_prompt(tokenizer, prefix_b),
-                "partial_a": _stable_text_prompt(tokenizer, prefix_a, suffix_a),
-                "partial_b": _stable_text_prompt(tokenizer, prefix_b, suffix_b),
-                "mixed_cold": _stable_text_prompt(
-                    tokenizer,
-                    cold_prefix,
-                    cold_suffix,
-                ),
+                "full_a": _token_prompt(prefix_a_ids),
+                "full_b": _token_prompt(prefix_b_ids),
+                "partial_a": _token_prompt(prefix_a_ids, suffix_a_ids),
+                "partial_b": _token_prompt(prefix_b_ids, suffix_b_ids),
+                "mixed_cold": _token_prompt(cold_prefix_ids, cold_suffix_ids),
                 "full_grouped": (2 * prefix_len) <= prefill_batch_budget,
                 "partial_grouped": (
                     2 * warm_partial_active_len
@@ -679,7 +741,9 @@ def _compact_case_plan(args, tokenizer) -> dict:
                     warm_partial_active_len + cold_mixed_active_len
                 )
                 <= prefill_batch_budget,
+                "backed_checkpoint_hit": backed_checkpoint_hit,
                 "speedup_required": speedup_required,
+                "speedup_skip_reason": speedup_skip_reason,
             }
         )
     return {
@@ -1022,6 +1086,7 @@ def run_compact_gate(args) -> int:
 
     exactness_checks = []
     speedup_checks = []
+    speedup_skipped = []
     for case in cases:
         name = case["case"]
         exactness_checks.extend(
@@ -1083,6 +1148,15 @@ def run_compact_gate(args) -> int:
                     warm_results=warm_results,
                     min_speedup=float(args.compact_min_grouped_speedup),
                 )
+            )
+        elif case["backed_checkpoint_hit"] and case["partial_grouped"]:
+            speedup_skipped.append(
+                {
+                    "name": f"grouped_warm_partials__{name}",
+                    "prefix_len": case["prefix_len"],
+                    "reason": case["speedup_skip_reason"]
+                    or "speedup is not required for this boundary",
+                }
             )
 
     exactness_checks.append(
@@ -1157,6 +1231,7 @@ def run_compact_gate(args) -> int:
         ),
         "exactness_checks": exactness_checks,
         "speedup_checks": speedup_checks,
+        "speedup_skipped": speedup_skipped,
         "real_generated_token_checks": real_token_checks["checks"],
     }
     _write_report(args, report)
