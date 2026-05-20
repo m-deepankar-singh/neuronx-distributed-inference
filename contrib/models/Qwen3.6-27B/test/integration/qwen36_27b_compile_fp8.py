@@ -125,21 +125,30 @@ def _max_context_length(args: argparse.Namespace, cte_buckets: list[int]) -> int
     return max_context_length
 
 
-def _pa_num_blocks(args: argparse.Namespace) -> int:
-    min_blocks = max(
+def _pa_min_blocks(args: argparse.Namespace) -> int:
+    return max(
         1,
         ((args.seq_len + args.block_size - 1) // args.block_size)
         * args.max_num_seqs,
     )
+
+
+def _pa_requested_blocks(args: argparse.Namespace) -> int:
+    min_blocks = _pa_min_blocks(args)
     if args.pa_num_blocks is None:
-        requested_blocks = min_blocks
+        requested_blocks = min_blocks + max(0, int(args.pa_headroom_blocks))
     else:
-        requested_blocks = args.pa_num_blocks
+        requested_blocks = int(args.pa_num_blocks)
     if requested_blocks < min_blocks:
         raise ValueError(
             f"--pa-num-blocks {requested_blocks} is too small for seq_len="
             f"{args.seq_len} and block_size={args.block_size}; need at least {min_blocks}"
         )
+    return requested_blocks
+
+
+def _pa_num_blocks(args: argparse.Namespace) -> int:
+    requested_blocks = _pa_requested_blocks(args)
     # vLLM Neuron reserves one additional null block at runtime. Compile the
     # physical PA table with the same extra block so block ids stay in-bounds.
     return requested_blocks + 1
@@ -456,6 +465,16 @@ def main() -> int:
     parser.add_argument("--prefix-buckets", nargs="+", default=None)
     parser.add_argument("--block-size", type=int, default=256)
     parser.add_argument("--pa-num-blocks", type=int, default=None)
+    parser.add_argument(
+        "--pa-headroom-blocks",
+        type=int,
+        default=0,
+        help=(
+            "Extra usable PA blocks above the minimum seq_len/max_num_seqs "
+            "capacity. Ignored when --pa-num-blocks is set. The compiler still "
+            "adds one null block on top."
+        ),
+    )
     parser.add_argument("--tp-degree", type=int, default=4)
     parser.add_argument("--logical-nc-config", type=int, default=2)
     parser.add_argument("--max-num-seqs", type=int, default=1)
@@ -509,6 +528,10 @@ def main() -> int:
         parser.error("--max-num-seqs must be positive")
     if args.ctx_batch_size <= 0:
         parser.error("--ctx-batch-size must be positive")
+    if args.pa_headroom_blocks < 0:
+        parser.error("--pa-headroom-blocks must be non-negative")
+    if args.pa_num_blocks is not None and args.pa_headroom_blocks:
+        parser.error("--pa-headroom-blocks cannot be combined with --pa-num-blocks")
 
     repo = _repo_root(args.repo_root)
     contrib_model_dir = repo / "contrib" / "models" / "Qwen3.6-27B"
@@ -566,6 +589,11 @@ def main() -> int:
                 "enable_hybrid_apc": args.enable_hybrid_apc,
                 "enable_vllm_chunked_prefill": args.enable_vllm_chunked_prefill,
                 "block_size": args.block_size,
+                "pa_min_blocks": _pa_min_blocks(args),
+                "pa_requested_blocks_excluding_null": _pa_requested_blocks(args),
+                "pa_headroom_blocks": (
+                    _pa_requested_blocks(args) - _pa_min_blocks(args)
+                ),
                 "pa_num_blocks": _pa_num_blocks(args),
                 "gdn_checkpoint_interval": args.gdn_checkpoint_interval,
                 "max_gdn_checkpoint_slots": args.max_gdn_checkpoint_slots,

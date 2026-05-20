@@ -77,11 +77,13 @@ def _args(**overrides):
         quantized_checkpoints_path="/tmp/qwen36-fp8",
         weight_dtype="fp8_mlp_only",
         seq_len=2048,
+        max_context_length=None,
         cte_bucket=512,
         cte_buckets=["256,512"],
         prefix_buckets=None,
         block_size=256,
         pa_num_blocks=8,
+        pa_headroom_blocks=0,
         tp_degree=4,
         logical_nc_config=2,
         max_num_seqs=1,
@@ -224,6 +226,19 @@ class TestQwen36CompileFp8Config(unittest.TestCase):
     def test_pa_num_blocks_rejects_user_blocks_below_sequence_requirement(self):
         with self.assertRaisesRegex(ValueError, "need at least 8"):
             _COMPILE._pa_num_blocks(_args(pa_num_blocks=7))
+
+    def test_pa_headroom_blocks_extend_default_pa_capacity(self):
+        args = _args(
+            seq_len=4096,
+            block_size=32,
+            max_num_seqs=2,
+            pa_num_blocks=None,
+            pa_headroom_blocks=32,
+        )
+
+        self.assertEqual(_COMPILE._pa_min_blocks(args), 256)
+        self.assertEqual(_COMPILE._pa_requested_blocks(args), 288)
+        self.assertEqual(_COMPILE._pa_num_blocks(args), 289)
 
     def test_base_compile_work_dir_defaults_next_to_artifacts(self):
         with self.subTest("default"), patch.dict(os.environ, {}, clear=True):

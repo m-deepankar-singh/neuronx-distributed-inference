@@ -369,6 +369,12 @@ proxy on the public port for production calls.
 4K BF16 Hybrid APC boundary/server probes:
 
 ```bash
+# Artifact/config audit before spending a Trn2 run. This flags oversized PA
+# blocks, low block headroom, strict-gate boundary pressure, and nki_chunked CTE.
+python validation_scripts/qwen36_artifact_config_audit.py \
+  /mnt/trainium_artifacts/qwen_artifacts/qwen36_27b_4096_bf16_hybrid_apc_nki_chunked_prefix4096_ctx2_tkg2_r7i_20260520T082342Z \
+  --compile-log /home/ubuntu/validation_logs/hybrid_apc_real_tokens/qwen36_4k_bf16_hybrid_apc_nki_chunked_prefix4096_20260520T082342Z_compile.log
+
 # Boundary-aligned APC proof. Run this directly against vLLM or a proxy started
 # with --allow-completions because exact token-ID prompt lengths are required.
 python validation_scripts/qwen36_openai_boundary_apc_probe.py \
@@ -393,6 +399,44 @@ python validation_scripts/qwen36_chat_completion_context_bench.py \
   --no-stream \
   --output-json /home/ubuntu/validation_logs/hybrid_apc_real_tokens/chat_4k_concurrency2.json
 ```
+
+4K BF16 compile controls for the current investigation:
+
+```bash
+# Single-request cold-prefill latency control: smaller PA blocks, usable block
+# headroom, and fused DeltaNet CTE. Use a fresh compiled path and workdir.
+python contrib/models/Qwen3.6-27B/test/integration/qwen36_27b_compile_fp8.py \
+  --repo-root /home/ubuntu/inferentia-gdn-experimental \
+  --model-path /home/ubuntu/models/Qwen3.6-27B \
+  --compiled-path /mnt/trainium_artifacts/qwen_artifacts/qwen36_27b_4096_bf16_hybrid_apc_fused_block32_ctx1 \
+  --base-compile-work-dir /mnt/trainium_artifacts/qwen_artifacts/_work_qwen36_4k_fused_block32_ctx1 \
+  --weight-dtype bf16_control \
+  --seq-len 4096 \
+  --max-context-length 4096 \
+  --cte-buckets 256,512,1024,2048,4096 \
+  --prefix-buckets 4096 \
+  --block-size 32 \
+  --pa-headroom-blocks 64 \
+  --tp-degree 4 \
+  --logical-nc-config 2 \
+  --max-num-seqs 1 \
+  --ctx-batch-size 1 \
+  --skip-warmup \
+  --enable-prefix-caching \
+  --enable-hybrid-apc \
+  --enable-vllm-chunked-prefill \
+  --deltanet-cte-backend fused \
+  --gdn-checkpoint-interval 32 \
+  --max-gdn-checkpoint-slots 160 \
+  --hybrid-apc-require-vllm-metadata \
+  --hybrid-apc-enable-backed-prefix-reads
+```
+
+The `block_size=32` control follows Neuron's prefix-cache performance guidance,
+but it also increases the number of prefix boundaries the strict Hybrid APC gate
+must prove. Without boundary chunk commits, a full 4096-token prompt has 128
+possible attention-hit boundaries at block size 32, so `max_gdn_checkpoint_slots`
+must be sized accordingly or the safe gate will keep skipping APC reads.
 
 ## Offline Smoke
 
