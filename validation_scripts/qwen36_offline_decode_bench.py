@@ -26,6 +26,23 @@ def _parse_buckets(raw: str) -> list[int]:
     return [int(item) for item in raw.replace(",", " ").split() if item]
 
 
+def _validated_int_list(
+    values: list[int],
+    *,
+    name: str,
+    maximum: int | None = None,
+) -> list[int]:
+    values = sorted(set(int(item) for item in values))
+    if not values:
+        raise ValueError(f"{name} cannot be empty")
+    for value in values:
+        if value <= 0:
+            raise ValueError(f"{name} values must be positive, got {value}")
+        if maximum is not None and value > maximum:
+            raise ValueError(f"{name} value {value} exceeds {maximum}")
+    return values
+
+
 def _artifact_neuron_config(compiled_artifacts: Path) -> dict[str, Any]:
     config_path = compiled_artifacts / "neuron_config.json"
     if not config_path.exists():
@@ -53,6 +70,37 @@ def _resolve_config_defaults(args: argparse.Namespace) -> dict[str, Any]:
     )
     if not cte_buckets:
         cte_buckets = [256, 512]
+    cte_buckets = _validated_int_list(
+        cte_buckets,
+        name="context encoding buckets",
+        maximum=seq_len,
+    )
+    token_generation_buckets = (
+        _parse_buckets(args.token_generation_buckets)
+        if args.token_generation_buckets
+        else [
+            int(item)
+            for item in artifact_config.get("token_generation_buckets", [])
+        ]
+    )
+    if not token_generation_buckets:
+        token_generation_buckets = [seq_len]
+    token_generation_buckets = _validated_int_list(
+        token_generation_buckets,
+        name="token generation buckets",
+        maximum=seq_len,
+    )
+    token_generation_batches = (
+        _parse_buckets(args.token_generation_batches)
+        if args.token_generation_batches
+        else None
+    )
+    if token_generation_batches is not None:
+        token_generation_batches = _validated_int_list(
+            token_generation_batches,
+            name="token generation batches",
+            maximum=args.max_num_seqs,
+        )
     pa_num_blocks = int(
         args.pa_num_blocks
         if args.pa_num_blocks is not None
@@ -66,6 +114,8 @@ def _resolve_config_defaults(args: argparse.Namespace) -> dict[str, Any]:
         "seq_len": seq_len,
         "max_model_len": max_model_len,
         "cte_buckets": cte_buckets,
+        "token_generation_buckets": token_generation_buckets,
+        "token_generation_batches": token_generation_batches,
         "pa_num_blocks": pa_num_blocks,
     }
 
@@ -92,6 +142,39 @@ def _ensure_runtime_env(args: argparse.Namespace) -> None:
 
 
 def _additional_config(args: argparse.Namespace) -> dict[str, Any]:
+    override_neuron_config = {
+        "tp_degree": args.tensor_parallel_size,
+        "batch_size": args.max_num_seqs,
+        "ctx_batch_size": args.ctx_batch_size,
+        "tkg_batch_size": args.max_num_seqs,
+        "seq_len": args.seq_len,
+        "max_length": args.seq_len,
+        "max_context_length": args.seq_len,
+        "context_encoding_buckets": args.resolved_cte_buckets,
+        "token_generation_buckets": args.resolved_token_generation_buckets,
+        "enable_bucketing": len(args.resolved_cte_buckets) > 1
+        or len(args.resolved_token_generation_buckets) > 1,
+        "logical_nc_config": args.logical_nc_config,
+        "torch_dtype": "bfloat16",
+        "save_sharded_checkpoint": True,
+        "pa_block_size": args.block_size,
+        "pa_num_blocks": args.pa_num_blocks,
+        "is_block_kv_layout": True,
+        "is_prefix_caching": True,
+        "chunked_prefill_config": {
+            "max_num_seqs": args.max_num_seqs,
+            "tkg_model_enabled": True,
+            "kernel_q_tile_size": args.kernel_q_tile_size,
+            "kernel_kv_tile_size": args.kernel_kv_tile_size,
+        },
+    }
+    if args.async_mode:
+        override_neuron_config["async_mode"] = True
+    if args.resolved_token_generation_batches is not None:
+        override_neuron_config["token_generation_batches"] = (
+            args.resolved_token_generation_batches
+        )
+
     return {
         "max_prompt_length": args.seq_len,
         "use_hybrid_apc_manager": True,
@@ -115,31 +198,7 @@ def _additional_config(args: argparse.Namespace) -> dict[str, Any]:
         "hybrid_apc_enable_backed_prefix_reads": True,
         "use_qwen_hybrid_chunked_prefill": True,
         "use_qwen_hybrid_chunked_prefill_nki": True,
-        "override_neuron_config": {
-            "tp_degree": args.tensor_parallel_size,
-            "batch_size": args.ctx_batch_size,
-            "ctx_batch_size": args.ctx_batch_size,
-            "tkg_batch_size": args.max_num_seqs,
-            "seq_len": args.seq_len,
-            "max_length": args.seq_len,
-            "max_context_length": args.seq_len,
-            "context_encoding_buckets": args.resolved_cte_buckets,
-            "token_generation_buckets": [args.seq_len],
-            "enable_bucketing": True,
-            "logical_nc_config": args.logical_nc_config,
-            "torch_dtype": "bfloat16",
-            "save_sharded_checkpoint": True,
-            "pa_block_size": args.block_size,
-            "pa_num_blocks": args.pa_num_blocks,
-            "is_block_kv_layout": True,
-            "is_prefix_caching": True,
-            "chunked_prefill_config": {
-                "max_num_seqs": args.max_num_seqs,
-                "tkg_model_enabled": True,
-                "kernel_q_tile_size": args.kernel_q_tile_size,
-                "kernel_kv_tile_size": args.kernel_kv_tile_size,
-            },
-        },
+        "override_neuron_config": override_neuron_config,
     }
 
 
@@ -210,6 +269,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-model-len", type=int)
     parser.add_argument("--seq-len", type=int)
     parser.add_argument("--cte-buckets")
+    parser.add_argument("--token-generation-buckets")
+    parser.add_argument("--token-generation-batches")
+    parser.add_argument("--async-mode", action="store_true")
     parser.add_argument("--tensor-parallel-size", type=int, default=4)
     parser.add_argument("--max-num-seqs", type=int, default=1)
     parser.add_argument("--ctx-batch-size", type=int, default=1)
@@ -235,6 +297,8 @@ def main() -> int:
     args.seq_len = resolved["seq_len"]
     args.max_model_len = resolved["max_model_len"]
     args.resolved_cte_buckets = resolved["cte_buckets"]
+    args.resolved_token_generation_buckets = resolved["token_generation_buckets"]
+    args.resolved_token_generation_batches = resolved["token_generation_batches"]
     args.pa_num_blocks = resolved["pa_num_blocks"]
     _ensure_paths(args.repo_root)
     _ensure_runtime_env(args)
@@ -248,6 +312,9 @@ def main() -> int:
         "max_num_seqs": args.max_num_seqs,
         "pa_num_blocks": args.pa_num_blocks,
         "cte_buckets": args.resolved_cte_buckets,
+        "token_generation_buckets": args.resolved_token_generation_buckets,
+        "token_generation_batches": args.resolved_token_generation_batches,
+        "async_mode": args.async_mode,
         "max_model_len": args.max_model_len,
         "seq_len": args.seq_len,
         "artifact_neuron_config": {

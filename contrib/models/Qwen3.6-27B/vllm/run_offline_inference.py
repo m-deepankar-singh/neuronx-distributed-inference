@@ -65,6 +65,43 @@ def _cte_buckets(args: argparse.Namespace) -> list[int]:
     return buckets
 
 
+def _token_generation_buckets(args: argparse.Namespace) -> list[int]:
+    buckets = _parse_int_list(args.token_generation_buckets) or [args.seq_len]
+    buckets = sorted(set(buckets))
+    if not buckets:
+        raise ValueError("At least one token-generation bucket is required")
+    for bucket in buckets:
+        if bucket <= 0:
+            raise ValueError(
+                f"Token-generation buckets must be positive, got {bucket}"
+            )
+        if bucket > args.seq_len:
+            raise ValueError(
+                f"Token-generation bucket {bucket} exceeds --seq-len {args.seq_len}"
+            )
+    return buckets
+
+
+def _token_generation_batches(args: argparse.Namespace) -> list[int] | None:
+    batches = _parse_int_list(args.token_generation_batches)
+    if batches is None:
+        return None
+    batches = sorted(set(batches))
+    if not batches:
+        raise ValueError("Token-generation batches cannot be empty")
+    for batch in batches:
+        if batch <= 0:
+            raise ValueError(
+                f"Token-generation batches must be positive, got {batch}"
+            )
+        if batch > args.max_num_seqs:
+            raise ValueError(
+                f"Token-generation batch {batch} exceeds --max-num-seqs "
+                f"{args.max_num_seqs}"
+            )
+    return batches
+
+
 def _validate_hybrid_apc_args(args: argparse.Namespace):
     if not args.enable_hybrid_apc:
         return
@@ -123,6 +160,8 @@ def _override_config(args: argparse.Namespace) -> dict:
     _validate_hybrid_apc_args(args)
     cte_buckets = _cte_buckets(args)
     max_cte_bucket = cte_buckets[-1]
+    token_generation_buckets = _token_generation_buckets(args)
+    token_generation_batches = _token_generation_batches(args)
     recurrent_cache_dtype = (
         args.hybrid_gdn_recurrent_cache_dtype or args.gdn_recurrent_cache_dtype
     )
@@ -136,12 +175,17 @@ def _override_config(args: argparse.Namespace) -> dict:
         "max_length": args.seq_len,
         "max_context_length": max_cte_bucket,
         "context_encoding_buckets": cte_buckets,
-        "token_generation_buckets": [args.seq_len],
-        "enable_bucketing": len(cte_buckets) > 1,
+        "token_generation_buckets": token_generation_buckets,
+        "enable_bucketing": len(cte_buckets) > 1
+        or len(token_generation_buckets) > 1,
         "logical_nc_config": args.logical_nc_config,
         "torch_dtype": "bfloat16",
         "save_sharded_checkpoint": True,
     }
+    if args.async_mode:
+        neuron_config["async_mode"] = True
+    if token_generation_batches is not None:
+        neuron_config["token_generation_batches"] = token_generation_batches
     if (
         args.enable_prefix_caching
         or args.enable_hybrid_apc
@@ -300,6 +344,9 @@ def main() -> int:
     parser.add_argument("--logical-nc-config", type=int, default=2)
     parser.add_argument("--max-num-seqs", type=int, default=1)
     parser.add_argument("--ctx-batch-size", type=int, default=1)
+    parser.add_argument("--token-generation-buckets", nargs="+", default=None)
+    parser.add_argument("--token-generation-batches", nargs="+", default=None)
+    parser.add_argument("--async-mode", action="store_true")
     parser.add_argument("--max-model-len", type=int, default=512)
     parser.add_argument("--seq-len", type=int, default=512)
     parser.add_argument("--cte-bucket", type=int, default=512)

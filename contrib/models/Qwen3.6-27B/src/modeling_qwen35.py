@@ -1048,12 +1048,18 @@ class NeuronGatedDeltaNet(nn.Module):
             conv_input = torch.cat([conv_state, mixed], dim=-1)
 
             w = self._conv1d_weight().squeeze(1)
-            conv_out = torch.zeros_like(mixed)
-            for k in range(4):
+            if seq_len == 1:
                 conv_out = (
-                    conv_out
-                    + w[:, k].unsqueeze(0).unsqueeze(-1) * conv_input[:, :, k : k + 1]
-                )
+                    conv_input[:, :, : self.conv_kernel_size] * w.unsqueeze(0)
+                ).sum(dim=-1, keepdim=True)
+            else:
+                conv_out = torch.zeros_like(mixed)
+                for k in range(self.conv_kernel_size):
+                    conv_out = (
+                        conv_out
+                        + w[:, k].unsqueeze(0).unsqueeze(-1)
+                        * conv_input[:, :, k : k + 1]
+                    )
             mixed_post_conv = F.silu(conv_out)
 
             new_conv_state = torch.cat([conv_state[:, :, 1:], mixed], dim=-1)

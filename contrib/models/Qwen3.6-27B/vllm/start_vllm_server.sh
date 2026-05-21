@@ -12,6 +12,9 @@ TP_DEGREE="4"
 LNC="2"
 MAX_NUM_SEQS="1"
 CTX_BATCH_SIZE="1"
+TOKEN_GENERATION_BUCKETS=""
+TOKEN_GENERATION_BATCHES=""
+ASYNC_MODE="0"
 PORT="8000"
 HOST="0.0.0.0"
 ENABLE_CHUNKED_PREFILL="0"
@@ -54,6 +57,10 @@ while [[ $# -gt 0 ]]; do
     --logical-nc-config) LNC="$2"; shift 2 ;;
     --max-num-seqs) MAX_NUM_SEQS="$2"; shift 2 ;;
     --ctx-batch-size) CTX_BATCH_SIZE="$2"; shift 2 ;;
+    --token-generation-buckets) TOKEN_GENERATION_BUCKETS="$2"; shift 2 ;;
+    --token-generation-batches) TOKEN_GENERATION_BATCHES="$2"; shift 2 ;;
+    --async-mode) ASYNC_MODE="1"; shift ;;
+    --no-async-mode) ASYNC_MODE="0"; shift ;;
     --enable-vllm-chunked-prefill) ENABLE_CHUNKED_PREFILL="1"; shift ;;
     --enable-prefix-caching) ENABLE_PREFIX_CACHING="1"; shift ;;
     --disable-prefix-caching|--no-enable-prefix-caching) ENABLE_PREFIX_CACHING="0"; shift ;;
@@ -235,11 +242,42 @@ ADDITIONAL_CONFIG="$(
 import json
 from pathlib import Path
 
+
+def parse_int_list(name, raw):
+    raw = raw.replace(",", " ").split()
+    if not raw:
+        return None
+    values = sorted(set(int(item) for item in raw))
+    for value in values:
+        if value <= 0:
+            raise SystemExit(f"{name} values must be positive, got {value}")
+    return values
+
 enable_chunked = "${ENABLE_CHUNKED_PREFILL}" == "1"
 enable_prefix_caching = "${ENABLE_PREFIX_CACHING}" == "1"
 enable_hybrid_apc = "${ENABLE_HYBRID_APC}" == "1"
+async_mode = "${ASYNC_MODE}" == "1"
 cte_buckets = json.loads('${CTE_BUCKETS_JSON}')
 max_cte_bucket = cte_buckets[-1]
+seq_len = int("${SEQ_LEN}")
+max_num_seqs = int("${MAX_NUM_SEQS}")
+token_generation_buckets = (
+    parse_int_list("TOKEN_GENERATION_BUCKETS", "${TOKEN_GENERATION_BUCKETS}")
+    or [seq_len]
+)
+if token_generation_buckets[-1] > seq_len:
+    raise SystemExit(
+        f"TOKEN_GENERATION_BUCKETS cannot contain values greater than SEQ_LEN ({seq_len})"
+    )
+token_generation_batches = parse_int_list(
+    "TOKEN_GENERATION_BATCHES",
+    "${TOKEN_GENERATION_BATCHES}",
+)
+if token_generation_batches is not None and token_generation_batches[-1] > max_num_seqs:
+    raise SystemExit(
+        "TOKEN_GENERATION_BATCHES cannot contain values greater than "
+        f"MAX_NUM_SEQS ({max_num_seqs})"
+    )
 compiled_artifacts = "${COMPILED_ARTIFACTS}"
 compiled_max_prompt = 0
 if compiled_artifacts:
@@ -269,21 +307,25 @@ pa_num_blocks = (
 )
 neuron_config = {
     "tp_degree": int("${TP_DEGREE}"),
-    "batch_size": int("${MAX_NUM_SEQS}"),
+    "batch_size": max_num_seqs,
     "ctx_batch_size": int("${CTX_BATCH_SIZE}"),
-    "tkg_batch_size": int("${MAX_NUM_SEQS}"),
-    "seq_len": int("${SEQ_LEN}"),
-    "max_length": int("${SEQ_LEN}"),
+    "tkg_batch_size": max_num_seqs,
+    "seq_len": seq_len,
+    "max_length": seq_len,
     "max_context_length": runtime_max_prompt,
     "context_encoding_buckets": cte_buckets,
-    "token_generation_buckets": [int("${SEQ_LEN}")],
-    "enable_bucketing": len(cte_buckets) > 1,
+    "token_generation_buckets": token_generation_buckets,
+    "enable_bucketing": len(cte_buckets) > 1 or len(token_generation_buckets) > 1,
     "logical_nc_config": int("${LNC}"),
     "torch_dtype": "bfloat16",
     "save_sharded_checkpoint": True,
     "pa_block_size": int("${BLOCK_SIZE}"),
     "pa_num_blocks": pa_num_blocks,
 }
+if async_mode:
+    neuron_config["async_mode"] = True
+if token_generation_batches is not None:
+    neuron_config["token_generation_batches"] = token_generation_batches
 if enable_prefix_caching or enable_hybrid_apc or enable_chunked:
     neuron_config["is_block_kv_layout"] = True
 if enable_prefix_caching or enable_hybrid_apc:

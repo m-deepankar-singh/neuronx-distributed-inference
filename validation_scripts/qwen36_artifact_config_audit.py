@@ -84,7 +84,20 @@ def audit(
         _first_config_value(config, "max_gdn_checkpoint_slots", default=0) or 0
     )
     cte_buckets = _first_config_value(config, "context_encoding_buckets", default=[])
+    token_generation_buckets = _first_config_value(
+        config,
+        "token_generation_buckets",
+        default=[],
+    )
     prefix_buckets = _first_config_value(config, "prefix_buckets", default=[])
+    tkg_batch_size = int(_first_config_value(config, "tkg_batch_size", default=1) or 1)
+    async_mode = _bool_config(config, "async_mode")
+    output_logits = _bool_config(config, "output_logits")
+    on_device_sampling_config = _first_config_value(
+        config,
+        "on_device_sampling_config",
+        default=None,
+    )
     min_blocks = (
         max(1, math.ceil(seq_len / block_size) * max_num_seqs)
         if seq_len > 0 and block_size > 0
@@ -157,6 +170,42 @@ def audit(
             ),
             value=compile_backend,
         )
+    if (
+        seq_len >= 32768
+        and isinstance(token_generation_buckets, list)
+        and token_generation_buckets == [seq_len]
+    ):
+        _warning(
+            warnings,
+            code="single_full_length_tkg_bucket",
+            message=(
+                "Decode has only a full-length token-generation bucket. Short "
+                "generations will still use the largest TKG trace shape; compare "
+                "against an artifact compiled with smaller TKG buckets such as "
+                "8192,32768,seq_len."
+            ),
+            value=token_generation_buckets,
+        )
+    if not async_mode:
+        _warning(
+            warnings,
+            code="sync_neuron_runtime_decode",
+            message=(
+                "Neuron async_mode is disabled. The previous fast decode control "
+                "path used async runtime execution for token generation."
+            ),
+            value=False,
+        )
+    if tkg_batch_size <= 1:
+        _warning(
+            warnings,
+            code="single_sequence_tkg_batch",
+            message=(
+                "tkg_batch_size is 1, so decode cannot amortize per-token runner "
+                "overhead across concurrent sequences."
+            ),
+            value=tkg_batch_size,
+        )
 
     summary = {
         "artifact": str(artifact),
@@ -171,6 +220,11 @@ def audit(
         "max_gdn_checkpoint_slots": max_gdn_slots,
         "required_full_prompt_boundaries": required_full_prompt_boundaries,
         "context_encoding_buckets": cte_buckets,
+        "token_generation_buckets": token_generation_buckets,
+        "tkg_batch_size": tkg_batch_size,
+        "async_mode": async_mode,
+        "output_logits": output_logits,
+        "on_device_sampling": on_device_sampling_config is not None,
         "prefix_buckets": prefix_buckets,
         "is_prefix_caching": _bool_config(config, "is_prefix_caching"),
         "use_hybrid_apc_manager": _bool_config(config, "use_hybrid_apc_manager"),

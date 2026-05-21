@@ -14,6 +14,7 @@ from neuronx_distributed_inference.modules.async_execution import (
     cancel_hybrid_apc_request,
     execute_model_prefix_caching,
     finish_hybrid_apc_request,
+    prepare_disabled_hybrid_apc_model_inputs,
     prepare_hybrid_apc_model_inputs,
     prepare_hybrid_apc_request_for_execution,
 )
@@ -423,6 +424,34 @@ class TestHybridAPCAsyncBridge(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "not a reserved checkpoint slot"):
             prepare_hybrid_apc_model_inputs(base, input_dict)
 
+    def test_disabled_bridge_builds_inert_decode_args_without_validation(self):
+        base = SimpleNamespace(
+            config=SimpleNamespace(
+                use_hybrid_apc_manager=True,
+                max_gdn_checkpoint_slots=1,
+            ),
+            hybrid_apc_slot_allocator=SimpleNamespace(
+                committed_slots=(),
+                reserved_slots=(),
+            ),
+        )
+        input_dict = {
+            "seq_ids": torch.tensor([3, 4], dtype=torch.int32),
+            "computed_context_lens": torch.tensor([[128], [256]], dtype=torch.int32),
+            "hybrid_restore_slot_ids": torch.tensor([99, 100], dtype=torch.int32),
+            "hybrid_restore_mask": torch.tensor([1, 1], dtype=torch.int32),
+            "hybrid_commit_slot_ids": torch.tensor([101, 102], dtype=torch.int32),
+            "hybrid_commit_mask": torch.tensor([1, 1], dtype=torch.int32),
+        }
+
+        args = prepare_disabled_hybrid_apc_model_inputs(base, input_dict)
+
+        self.assertEqual(len(args), 14)
+        for index in (9, 10, 11, 12, 13):
+            self.assertTrue(
+                torch.equal(args[index], torch.zeros((2,), dtype=torch.int32))
+            )
+
     def test_prefix_caching_execution_prepares_and_finishes_hybrid_apc(self):
         base = SimpleNamespace(
             config=SimpleNamespace(use_hybrid_apc_manager=True),
@@ -503,7 +532,11 @@ class TestHybridAPCAsyncBridge(unittest.TestCase):
             }
         )
 
-        result, is_neuron = execute_model_prefix_caching(base, model, input_dict)
+        with patch(
+            "neuronx_distributed_inference.modules.async_execution.prepare_hybrid_apc_model_inputs",
+            side_effect=AssertionError("decode should use inert Hybrid APC args"),
+        ):
+            result, is_neuron = execute_model_prefix_caching(base, model, input_dict)
 
         self.assertEqual(result, "model-output")
         self.assertFalse(is_neuron)

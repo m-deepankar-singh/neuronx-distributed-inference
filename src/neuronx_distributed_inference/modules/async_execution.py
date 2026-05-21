@@ -1670,6 +1670,63 @@ def prepare_hybrid_apc_model_inputs(
     ]
 
 
+def prepare_disabled_hybrid_apc_model_inputs(
+    neuron_base_instance: "NeuronBaseForCausalLM",
+    input_dict: Dict[str, Any],
+) -> list[torch.Tensor]:
+    """Build inert Hybrid APC args for decode/TKG execution.
+
+    Hybrid APC restore/commit is a prefill concern. The compiled model still has
+    the fixed Hybrid APC inputs, so decode must pass the same arity, but it does
+    not need request planning, slot validation, or mask/vector normalization on
+    every generated token.
+    """
+
+    if not _is_hybrid_apc_enabled(neuron_base_instance):
+        return []
+
+    seq_ids = input_dict["seq_ids"].reshape(-1)
+    batch_size = int(seq_ids.shape[0])
+    device = seq_ids.device
+    empty = torch.empty(0, device=device)
+    zeros = torch.zeros((batch_size,), dtype=torch.int32, device=device)
+
+    llava_args = input_dict.get("llava_args") or []
+    rotary_position_id = _first_present(
+        input_dict.get("rotary_position_id"),
+        input_dict.get("rotary_position_ids"),
+        llava_args[2] if len(llava_args) >= 3 else None,
+        empty,
+    )
+    vision_embeddings = _first_present(
+        input_dict.get("vision_embeddings"),
+        llava_args[0] if len(llava_args) >= 1 else None,
+        empty,
+    )
+    vision_mask = _first_present(
+        input_dict.get("vision_mask"),
+        llava_args[1] if len(llava_args) >= 2 else None,
+        empty,
+    )
+
+    return [
+        input_dict.get("tile_q_indices", empty),
+        input_dict.get("tile_block_tables", empty),
+        input_dict.get("tile_masks", empty),
+        input_dict.get("inputs_embeds", empty),
+        input_dict.get("kv_cache", empty),
+        input_dict.get("active_mask", empty),
+        rotary_position_id,
+        vision_embeddings,
+        vision_mask,
+        zeros,
+        zeros,
+        zeros,
+        zeros,
+        zeros,
+    ]
+
+
 def _is_context_encoding_execution(
     neuron_base_instance: "NeuronBaseForCausalLM",
     model_to_execute: "ModelWrapper",
@@ -1762,11 +1819,12 @@ def execute_model_prefix_caching(
 ) -> Tuple[AsyncTensorWrapper, bool]:
     original_input_dict = input_dict
     try:
-        if _is_context_encoding_execution(
+        is_context_encoding = _is_context_encoding_execution(
             neuron_base_instance,
             model_to_execute,
             input_dict,
-        ):
+        )
+        if is_context_encoding:
             input_dict = prepare_hybrid_apc_request_for_execution(
                 neuron_base_instance,
                 input_dict,
@@ -1783,9 +1841,14 @@ def execute_model_prefix_caching(
             not neuron_base_instance.neuron_config.enable_fused_speculation
             and not neuron_base_instance.neuron_config.enable_eagle_speculation
         ):
-            hybrid_apc_args = prepare_hybrid_apc_model_inputs(
-                neuron_base_instance, input_dict
-            )
+            if is_context_encoding:
+                hybrid_apc_args = prepare_hybrid_apc_model_inputs(
+                    neuron_base_instance, input_dict
+                )
+            else:
+                hybrid_apc_args = prepare_disabled_hybrid_apc_model_inputs(
+                    neuron_base_instance, input_dict
+                )
             return model_to_execute(
                 input_dict["input_ids"],
                 input_dict["attention_mask"],
