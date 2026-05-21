@@ -910,6 +910,19 @@ def _is_unbacked_suffix_only_hybrid_apc_error(exc: Exception) -> bool:
     )
 
 
+def _active_chunk_suffix_len(
+    *,
+    suffix_len: int,
+    active_suffix_len: int | None,
+) -> int | None:
+    if active_suffix_len is None:
+        return int(suffix_len)
+    active_len = int(active_suffix_len)
+    if active_len <= 0 or active_len > int(suffix_len):
+        return None
+    return active_len
+
+
 def _is_same_request_chunked_prefill_continuation(
     input_dict: Dict[str, Any],
     *,
@@ -921,9 +934,13 @@ def _is_same_request_chunked_prefill_continuation(
 ) -> bool:
     if suffix_len <= 1 or hit_len <= 0:
         return False
-    if active_suffix_len is not None and int(active_suffix_len) != int(suffix_len):
+    active_len = _active_chunk_suffix_len(
+        suffix_len=suffix_len,
+        active_suffix_len=active_suffix_len,
+    )
+    if active_len is None:
         return False
-    if int(request_prefix_len) - int(hit_len) != int(suffix_len):
+    if int(request_prefix_len) - int(hit_len) != int(active_len):
         return True
     return (
         input_dict.get("hybrid_prefill_completion_state") is not None
@@ -1457,10 +1474,23 @@ def prepare_hybrid_apc_request_for_execution(
                         )
                     )
                     if same_request_chunk_continuation:
+                        active_chunk_suffix_len = _active_chunk_suffix_len(
+                            suffix_len=suffix_len,
+                            active_suffix_len=active_suffix_len,
+                        )
+                        if active_chunk_suffix_len is None:
+                            active_chunk_suffix_len = suffix_len
                         active_prefix_len = min(
                             request_prefix_len,
-                            hit_len + suffix_len,
+                            hit_len + active_chunk_suffix_len,
                         )
+                        if active_chunk_suffix_len != suffix_len:
+                            return _with_inert_hybrid_apc_chunk_continuation(
+                                input_dict,
+                                hit_len=hit_len,
+                                active_prefix_len=active_prefix_len,
+                                suffix_len=active_chunk_suffix_len,
+                            )
                     try:
                         prepared = prepare_suffix_only(
                             request_id=request_id,
