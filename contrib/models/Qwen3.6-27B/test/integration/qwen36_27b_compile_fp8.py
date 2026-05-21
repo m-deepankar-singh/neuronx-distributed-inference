@@ -111,6 +111,21 @@ def _prefix_buckets(args: argparse.Namespace, cte_buckets: list[int]) -> list[in
     return buckets
 
 
+def _validate_prefix_buckets_fit_context(
+    args: argparse.Namespace,
+    max_context_length: int,
+    prefix_buckets: list[int],
+) -> None:
+    if not (args.enable_prefix_caching or args.enable_hybrid_apc):
+        return
+    if prefix_buckets[-1] > max_context_length:
+        raise ValueError(
+            f"Largest prefix bucket {prefix_buckets[-1]} exceeds "
+            f"--max-context-length {max_context_length}. Long-context APC needs "
+            "--max-context-length to cover the largest reusable prefix bucket."
+        )
+
+
 def _max_context_length(args: argparse.Namespace, cte_buckets: list[int]) -> int:
     max_context_length = args.max_context_length or cte_buckets[-1]
     if max_context_length < cte_buckets[-1]:
@@ -148,10 +163,10 @@ def _pa_requested_blocks(args: argparse.Namespace) -> int:
 
 
 def _pa_num_blocks(args: argparse.Namespace) -> int:
-    requested_blocks = _pa_requested_blocks(args)
-    # vLLM Neuron reserves one additional null block at runtime. Compile the
-    # physical PA table with the same extra block so block ids stay in-bounds.
-    return requested_blocks + 1
+    # Keep this value identical to vLLM's --num-gpu-blocks-override /
+    # NeuronConfig.pa_num_blocks contract. NxDI's BlockKVCacheManager accounts
+    # for its own reserved internal block when prefix caching is enabled.
+    return _pa_requested_blocks(args)
 
 
 def _configure_base_compile_work_dir(
@@ -230,14 +245,39 @@ def _quantized_checkpoint_ready(path: Path) -> bool:
     return False
 
 
-def _is_mlp_weight(name: str) -> bool:
+def _mlp_layer_idx(name: str) -> int | None:
     parts = name.split(".")
-    return (
+    if len(parts) < 4:
+        return None
+    for idx, part in enumerate(parts[:-3]):
+        if part == "layers" and idx + 1 < len(parts):
+            try:
+                return int(parts[idx + 1])
+            except ValueError:
+                return None
+    return None
+
+
+def _is_mlp_weight(
+    name: str,
+    *,
+    num_layers: int,
+    quantize_edge_mlp_layers: bool,
+) -> bool:
+    parts = name.split(".")
+    if not (
         len(parts) >= 4
         and parts[-3] == "mlp"
         and parts[-2] in {"gate_proj", "up_proj", "down_proj"}
         and parts[-1] == "weight"
-    )
+    ):
+        return False
+    if quantize_edge_mlp_layers:
+        return True
+    layer_idx = _mlp_layer_idx(name)
+    if layer_idx is None:
+        return True
+    return layer_idx not in {0, num_layers - 1}
 
 
 def _scale_name(weight_name: str) -> str:
@@ -251,7 +291,12 @@ def _clear_quantized_checkpoint_dir(path: Path) -> None:
             child.unlink()
 
 
-def _save_mlp_only_fp8_state_dict(model_path: Path, output_path: Path) -> None:
+def _save_mlp_only_fp8_state_dict(
+    model_path: Path,
+    output_path: Path,
+    *,
+    quantize_edge_mlp_layers: bool,
+) -> None:
     """Create a sharded FP8 checkpoint directly from HF safetensors.
 
     Loading the HF architecture requires a newer Transformers than the Neuron
@@ -263,6 +308,7 @@ def _save_mlp_only_fp8_state_dict(model_path: Path, output_path: Path) -> None:
         quantize_fp8_per_channel,
     )
 
+    num_layers = int(_load_text_config(model_path)["num_hidden_layers"])
     index_path = model_path / "model.safetensors.index.json"
     if index_path.exists():
         with index_path.open() as f:
@@ -284,7 +330,11 @@ def _save_mlp_only_fp8_state_dict(model_path: Path, output_path: Path) -> None:
         shard = load_file(str(model_path / filename))
         output_shard = {}
         for name, tensor in shard.items():
-            if _is_mlp_weight(name):
+            if _is_mlp_weight(
+                name,
+                num_layers=num_layers,
+                quantize_edge_mlp_layers=quantize_edge_mlp_layers,
+            ):
                 weight, scale = quantize_fp8_per_channel(
                     tensor,
                     torch.float8_e4m3fn,
@@ -332,9 +382,17 @@ def _build_config(args: argparse.Namespace):
     config_dict = _load_text_config(model_path)
     num_layers = int(config_dict["num_hidden_layers"])
     modules_to_not_convert = _mlp_only_modules_to_not_convert(num_layers)
+    if (
+        args.weight_dtype == _WEIGHT_DTYPE_FP8_MLP_ONLY
+        and not args.quantize_edge_mlp_layers
+    ):
+        for layer_idx in (0, num_layers - 1):
+            for prefix in ("layers", "model.layers"):
+                modules_to_not_convert.append(f"{prefix}.{layer_idx}.mlp")
     cte_buckets = _cte_buckets(args)
     max_context_length = _max_context_length(args, cte_buckets)
     prefix_buckets = _prefix_buckets(args, cte_buckets)
+    _validate_prefix_buckets_fit_context(args, max_context_length, prefix_buckets)
 
     neuron_config_kwargs = {
         "tp_degree": args.tp_degree,
@@ -471,8 +529,9 @@ def main() -> int:
         default=0,
         help=(
             "Extra usable PA blocks above the minimum seq_len/max_num_seqs "
-            "capacity. Ignored when --pa-num-blocks is set. The compiler still "
-            "adds one null block on top."
+            "capacity. Ignored when --pa-num-blocks is set. The final value is "
+            "the NeuronConfig.pa_num_blocks value and should match vLLM "
+            "--num-gpu-blocks-override."
         ),
     )
     parser.add_argument("--tp-degree", type=int, default=4)
@@ -515,6 +574,15 @@ def main() -> int:
         action=argparse.BooleanOptionalAction,
         default=False,
     )
+    parser.add_argument(
+        "--quantize-edge-mlp-layers",
+        action="store_true",
+        help=(
+            "Quantize layer-0 and final-layer MLP weights too. By default they "
+            "stay BF16, matching the AWS Trn2 FP8 tutorial's conservative "
+            "edge-layer policy."
+        ),
+    )
     parser.add_argument("--force-quantize", action="store_true")
     parser.add_argument("--quantize-only", action="store_true")
     parser.add_argument("--load-after-compile", action="store_true")
@@ -532,9 +600,15 @@ def main() -> int:
         parser.error("--pa-headroom-blocks must be non-negative")
     if args.pa_num_blocks is not None and args.pa_headroom_blocks:
         parser.error("--pa-headroom-blocks cannot be combined with --pa-num-blocks")
+    if args.enable_hybrid_apc and args.gdn_checkpoint_interval != args.block_size:
+        parser.error(
+            "--enable-hybrid-apc v0 requires --gdn-checkpoint-interval to "
+            "equal --block-size"
+        )
 
     repo = _repo_root(args.repo_root)
     contrib_model_dir = repo / "contrib" / "models" / "Qwen3.6-27B"
+    sys.path.insert(0, str(repo / "src"))
     sys.path.insert(0, str(repo))
     sys.path.insert(0, str(contrib_model_dir))
     if args.weight_dtype == _WEIGHT_DTYPE_FP8_MLP_ONLY:
@@ -590,7 +664,10 @@ def main() -> int:
                 "enable_vllm_chunked_prefill": args.enable_vllm_chunked_prefill,
                 "block_size": args.block_size,
                 "pa_min_blocks": _pa_min_blocks(args),
-                "pa_requested_blocks_excluding_null": _pa_requested_blocks(args),
+                "pa_requested_blocks": _pa_requested_blocks(args),
+                "pa_usable_headroom_blocks": (
+                    _pa_requested_blocks(args) - _pa_min_blocks(args)
+                ),
                 "pa_headroom_blocks": (
                     _pa_requested_blocks(args) - _pa_min_blocks(args)
                 ),
@@ -607,7 +684,11 @@ def main() -> int:
         print("QUANTIZE_SKIP bf16_control", flush=True)
     elif args.force_quantize or not _quantized_checkpoint_ready(quantized_path):
         print("QUANTIZE_START manual_mlp_only", flush=True)
-        _save_mlp_only_fp8_state_dict(model_path, quantized_path)
+        _save_mlp_only_fp8_state_dict(
+            model_path,
+            quantized_path,
+            quantize_edge_mlp_layers=args.quantize_edge_mlp_layers,
+        )
         print("QUANTIZE_DONE", flush=True)
     else:
         print("QUANTIZE_SKIP existing checkpoint found", flush=True)

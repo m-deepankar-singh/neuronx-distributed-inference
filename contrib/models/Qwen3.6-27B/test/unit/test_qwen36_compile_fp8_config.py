@@ -104,6 +104,7 @@ def _args(**overrides):
         hybrid_cache_mode="all",
         hybrid_apc_require_vllm_metadata=False,
         hybrid_apc_enable_backed_prefix_reads=False,
+        quantize_edge_mlp_layers=False,
     )
     defaults.update(overrides)
     return argparse.Namespace(**defaults)
@@ -146,7 +147,7 @@ class TestQwen36CompileFp8Config(unittest.TestCase):
 
         self.assertTrue(config.neuron_config.output_logits)
         self.assertIsNone(config.neuron_config.on_device_sampling_config)
-        self.assertEqual(config.neuron_config.pa_num_blocks, 9)
+        self.assertEqual(config.neuron_config.pa_num_blocks, 8)
         self.assertTrue(config.neuron_config.quantized)
 
     def test_compile_can_trace_batched_token_generation(self):
@@ -176,7 +177,7 @@ class TestQwen36CompileFp8Config(unittest.TestCase):
         self.assertEqual(config.neuron_config.batch_size, 2)
         self.assertEqual(config.neuron_config.ctx_batch_size, 1)
         self.assertEqual(config.neuron_config.tkg_batch_size, 2)
-        self.assertEqual(config.neuron_config.pa_num_blocks, 17)
+        self.assertEqual(config.neuron_config.pa_num_blocks, 16)
         self.assertTrue(config.neuron_config.skip_warmup)
 
     def test_on_device_sampling_compile_uses_sampler_config(self):
@@ -196,7 +197,7 @@ class TestQwen36CompileFp8Config(unittest.TestCase):
             )
 
         self.assertIsNotNone(config.neuron_config.on_device_sampling_config)
-        self.assertEqual(config.neuron_config.pa_num_blocks, 9)
+        self.assertEqual(config.neuron_config.pa_num_blocks, 8)
 
     def test_bf16_control_compile_disables_quantization_and_keeps_host_logits(self):
         with patch.object(
@@ -223,6 +224,34 @@ class TestQwen36CompileFp8Config(unittest.TestCase):
         self.assertIsNone(config.neuron_config.on_device_sampling_config)
         self.assertGreater(len(modules), 0)
 
+    def test_fp8_mlp_only_keeps_edge_mlp_layers_in_bf16_by_default(self):
+        with patch.object(
+            _COMPILE,
+            "_load_text_config",
+            return_value={"num_hidden_layers": 4},
+        ), patch.dict(
+            sys.modules,
+            {
+                "neuronx_distributed_inference.models.config": _fake_config_module(),
+                "src.modeling_qwen35": _fake_qwen_module(),
+            },
+        ):
+            _config, modules = _COMPILE._build_config(
+                _args(disable_on_device_sampling=True),
+            )
+
+        self.assertIn("layers.0.mlp", modules)
+        self.assertIn("layers.3.mlp", modules)
+        self.assertNotIn("layers.1.mlp", modules)
+
+    def test_long_prefix_buckets_must_fit_max_context_length(self):
+        with self.assertRaisesRegex(ValueError, "Largest prefix bucket"):
+            _COMPILE._validate_prefix_buckets_fit_context(
+                _args(enable_prefix_caching=True),
+                max_context_length=512,
+                prefix_buckets=[512, 131072],
+            )
+
     def test_pa_num_blocks_rejects_user_blocks_below_sequence_requirement(self):
         with self.assertRaisesRegex(ValueError, "need at least 8"):
             _COMPILE._pa_num_blocks(_args(pa_num_blocks=7))
@@ -238,7 +267,7 @@ class TestQwen36CompileFp8Config(unittest.TestCase):
 
         self.assertEqual(_COMPILE._pa_min_blocks(args), 256)
         self.assertEqual(_COMPILE._pa_requested_blocks(args), 288)
-        self.assertEqual(_COMPILE._pa_num_blocks(args), 289)
+        self.assertEqual(_COMPILE._pa_num_blocks(args), 288)
 
     def test_base_compile_work_dir_defaults_next_to_artifacts(self):
         with self.subTest("default"), patch.dict(os.environ, {}, clear=True):

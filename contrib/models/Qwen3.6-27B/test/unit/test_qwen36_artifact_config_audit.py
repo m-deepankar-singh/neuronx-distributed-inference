@@ -52,11 +52,50 @@ class TestQwen36ArtifactConfigAudit(unittest.TestCase):
 
         warning_codes = {warning["code"] for warning in summary["warnings"]}
         self.assertEqual(summary["pa_min_blocks"], 32)
-        self.assertEqual(summary["pa_usable_headroom_blocks_excluding_null"], 0)
+        self.assertEqual(summary["pa_usable_headroom_blocks"], 1)
         self.assertIn("non_recommended_block_size", warning_codes)
         self.assertIn("low_pa_headroom", warning_codes)
         self.assertIn("strict_gate_boundary_slots_exceed_gdn_slots", warning_codes)
         self.assertIn("nki_chunked_deltanet_cte", warning_codes)
+
+    def test_audit_reads_nested_neuron_config(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            artifact = Path(tmpdir) / "qwen36_128k_fp8_artifact"
+            artifact.mkdir()
+            (artifact / "neuron_config.json").write_text(
+                json.dumps(
+                    {
+                        "ctx_batch_size": 1,
+                        "max_gdn_checkpoint_slots": 64,
+                        "use_hybrid_apc_manager": True,
+                        "neuron_config": {
+                            "seq_len": 131072,
+                            "batch_size": 1,
+                            "pa_block_size": 256,
+                            "pa_num_blocks": 512,
+                            "context_encoding_buckets": [256, 512],
+                            "prefix_buckets": [256, 512, 1024, 2048, 4096, 8192, 16384],
+                            "is_prefix_caching": True,
+                        },
+                    }
+                )
+            )
+
+            summary = _AUDIT.audit(
+                artifact=artifact,
+                compile_log=None,
+                recommended_block_size=256,
+                min_usable_headroom_blocks=0,
+                strict_hybrid_gate=False,
+            )
+
+        self.assertEqual(summary["seq_len"], 131072)
+        self.assertEqual(summary["pa_block_size"], 256)
+        self.assertEqual(summary["pa_num_blocks"], 512)
+        self.assertEqual(summary["pa_min_blocks"], 512)
+        self.assertEqual(summary["context_encoding_buckets"], [256, 512])
+        self.assertEqual(summary["prefix_buckets"][-1], 16384)
+        self.assertTrue(summary["is_prefix_caching"])
 
 
 if __name__ == "__main__":

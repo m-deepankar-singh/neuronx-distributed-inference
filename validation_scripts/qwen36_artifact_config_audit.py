@@ -27,6 +27,16 @@ def _first_config_value(config: dict[str, Any], *keys: str, default: Any = None)
         for key in keys:
             if key in override:
                 return override[key]
+    nested = config.get("neuron_config")
+    if isinstance(nested, dict):
+        for key in keys:
+            if key in nested:
+                return nested[key]
+        nested_override = nested.get("override_neuron_config")
+        if isinstance(nested_override, dict):
+            for key in keys:
+                if key in nested_override:
+                    return nested_override[key]
     return default
 
 
@@ -80,10 +90,10 @@ def audit(
         if seq_len > 0 and block_size > 0
         else 0
     )
-    physical_extra_blocks = pa_num_blocks - min_blocks if pa_num_blocks else None
+    usable_headroom_blocks = pa_num_blocks - min_blocks if pa_num_blocks else None
     usable_headroom_blocks = (
-        max(0, physical_extra_blocks - 1)
-        if physical_extra_blocks is not None
+        max(0, usable_headroom_blocks)
+        if usable_headroom_blocks is not None
         else None
     )
     required_full_prompt_boundaries = (
@@ -113,7 +123,7 @@ def audit(
             code="low_pa_headroom",
             message=(
                 "PA block capacity has little usable residency headroom after "
-                "minimum sequence capacity and the null block."
+                "minimum sequence capacity."
             ),
             value={
                 "pa_num_blocks": pa_num_blocks,
@@ -157,8 +167,7 @@ def audit(
         "pa_block_size": block_size,
         "pa_num_blocks": pa_num_blocks,
         "pa_min_blocks": min_blocks,
-        "pa_physical_extra_blocks": physical_extra_blocks,
-        "pa_usable_headroom_blocks_excluding_null": usable_headroom_blocks,
+        "pa_usable_headroom_blocks": usable_headroom_blocks,
         "max_gdn_checkpoint_slots": max_gdn_slots,
         "required_full_prompt_boundaries": required_full_prompt_boundaries,
         "context_encoding_buckets": cte_buckets,
