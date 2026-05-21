@@ -47,6 +47,7 @@ def _args(**overrides):
         hybrid_apc_reject_unbacked_attention_hits=True,
         hybrid_apc_disable_unbacked_prefix_reads=False,
         hybrid_apc_enable_backed_prefix_reads=False,
+        hybrid_apc_prefill_chunk_tokens=0,
         text_only_cte=True,
         compact_cte_attention_mask=True,
         cold_zero_conv_fast_path=False,
@@ -189,6 +190,59 @@ class TestVllmServingConfig(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(ValueError, "gdn-checkpoint-interval"):
+            self.runner._max_num_batched_tokens(
+                args,
+                self.runner._cte_buckets(args),
+            )
+
+    def test_hybrid_apc_can_use_explicit_larger_prefill_chunk(self):
+        args = _args(
+            cte_buckets=["256,512,1024,2048,4096,8192"],
+            seq_len=8192,
+            enable_hybrid_apc=True,
+            enable_vllm_chunked_prefill=True,
+            block_size=256,
+            gdn_checkpoint_interval=256,
+            hybrid_apc_prefill_chunk_tokens=8192,
+        )
+
+        self.assertEqual(
+            self.runner._max_num_batched_tokens(
+                args,
+                self.runner._cte_buckets(args),
+            ),
+            8192,
+        )
+
+    def test_hybrid_apc_larger_prefill_chunk_must_be_compiled_bucket(self):
+        args = _args(
+            cte_buckets=["256,512,1024,2048,4096"],
+            seq_len=8192,
+            enable_hybrid_apc=True,
+            enable_vllm_chunked_prefill=True,
+            block_size=256,
+            gdn_checkpoint_interval=256,
+            hybrid_apc_prefill_chunk_tokens=8192,
+        )
+
+        with self.assertRaisesRegex(ValueError, "compiled CTE bucket"):
+            self.runner._max_num_batched_tokens(
+                args,
+                self.runner._cte_buckets(args),
+            )
+
+    def test_hybrid_apc_larger_prefill_chunk_must_align_to_checkpoint(self):
+        args = _args(
+            cte_buckets=["256,384,512,1024"],
+            seq_len=1024,
+            enable_hybrid_apc=True,
+            enable_vllm_chunked_prefill=True,
+            block_size=256,
+            gdn_checkpoint_interval=256,
+            hybrid_apc_prefill_chunk_tokens=384,
+        )
+
+        with self.assertRaisesRegex(ValueError, "multiple"):
             self.runner._max_num_batched_tokens(
                 args,
                 self.runner._cte_buckets(args),

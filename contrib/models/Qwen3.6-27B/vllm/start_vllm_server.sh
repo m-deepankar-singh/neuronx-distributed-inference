@@ -33,6 +33,7 @@ HYBRID_CACHE_VALIDATE_EXACT="0"
 HYBRID_APC_REQUIRE_VLLM_METADATA="1"
 HYBRID_APC_DISABLE_UNBACKED_PREFIX_READS="0"
 HYBRID_APC_ENABLE_BACKED_PREFIX_READS="0"
+HYBRID_APC_PREFILL_CHUNK_TOKENS="0"
 NUM_GPU_BLOCKS_OVERRIDE=""
 KERNEL_Q_TILE_SIZE="128"
 KERNEL_KV_TILE_SIZE="1024"
@@ -77,6 +78,7 @@ while [[ $# -gt 0 ]]; do
     --no-hybrid-apc-disable-unbacked-prefix-reads) HYBRID_APC_DISABLE_UNBACKED_PREFIX_READS="0"; shift ;;
     --hybrid-apc-enable-backed-prefix-reads) HYBRID_APC_ENABLE_BACKED_PREFIX_READS="1"; shift ;;
     --no-hybrid-apc-enable-backed-prefix-reads) HYBRID_APC_ENABLE_BACKED_PREFIX_READS="0"; shift ;;
+    --hybrid-apc-prefill-chunk-tokens) HYBRID_APC_PREFILL_CHUNK_TOKENS="$2"; shift 2 ;;
     --num-gpu-blocks-override) NUM_GPU_BLOCKS_OVERRIDE="$2"; shift 2 ;;
     --kernel-q-tile-size) KERNEL_Q_TILE_SIZE="$2"; shift 2 ;;
     --kernel-kv-tile-size) KERNEL_KV_TILE_SIZE="$2"; shift 2 ;;
@@ -208,7 +210,21 @@ if "${ENABLE_CHUNKED_PREFILL}" == "1" and "${ENABLE_HYBRID_APC}" == "1":
             "--enable-hybrid-apc with chunked prefill requires a CTE bucket "
             f"equal to --gdn-checkpoint-interval ({checkpoint_interval})"
         )
-    print(min(max_bucket, checkpoint_interval))
+    requested_chunk = int("${HYBRID_APC_PREFILL_CHUNK_TOKENS}" or "0")
+    if requested_chunk <= 0:
+        print(min(max_bucket, checkpoint_interval))
+    else:
+        if requested_chunk % checkpoint_interval != 0:
+            raise SystemExit(
+                "--hybrid-apc-prefill-chunk-tokens must be a multiple of "
+                f"--gdn-checkpoint-interval ({checkpoint_interval}), got {requested_chunk}"
+            )
+        if requested_chunk not in buckets:
+            raise SystemExit(
+                "--hybrid-apc-prefill-chunk-tokens must match a compiled CTE bucket, "
+                f"got {requested_chunk} with buckets {buckets}"
+            )
+        print(min(max_bucket, requested_chunk))
 else:
     print(max_bucket)
 PY
@@ -335,6 +351,7 @@ echo "HYBRID_GDN_CONV_CACHE_DTYPE=${HYBRID_GDN_CONV_CACHE_DTYPE}"
 echo "HYBRID_APC_REQUIRE_VLLM_METADATA=${HYBRID_APC_REQUIRE_VLLM_METADATA}"
 echo "HYBRID_APC_DISABLE_UNBACKED_PREFIX_READS=${HYBRID_APC_DISABLE_UNBACKED_PREFIX_READS}"
 echo "HYBRID_APC_ENABLE_BACKED_PREFIX_READS=${HYBRID_APC_ENABLE_BACKED_PREFIX_READS}"
+echo "HYBRID_APC_PREFILL_CHUNK_TOKENS=${HYBRID_APC_PREFILL_CHUNK_TOKENS}"
 echo "ADDITIONAL_CONFIG=${ADDITIONAL_CONFIG}"
 
 VLLM_ARGS=(

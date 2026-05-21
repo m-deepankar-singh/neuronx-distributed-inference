@@ -92,7 +92,20 @@ def _max_num_batched_tokens(args: argparse.Namespace, cte_buckets: list[int]) ->
             f"equal to --gdn-checkpoint-interval ({checkpoint_interval}) so "
             "scheduler chunks can commit backed GDN prefix checkpoints"
         )
-    return min(max_cte_bucket, checkpoint_interval)
+    requested_chunk = int(getattr(args, "hybrid_apc_prefill_chunk_tokens", 0) or 0)
+    if requested_chunk <= 0:
+        return min(max_cte_bucket, checkpoint_interval)
+    if requested_chunk % checkpoint_interval != 0:
+        raise ValueError(
+            "--hybrid-apc-prefill-chunk-tokens must be a multiple of "
+            f"--gdn-checkpoint-interval ({checkpoint_interval}), got {requested_chunk}"
+        )
+    if requested_chunk not in cte_buckets:
+        raise ValueError(
+            "--hybrid-apc-prefill-chunk-tokens must match a compiled CTE bucket, "
+            f"got {requested_chunk} with buckets {cte_buckets}"
+        )
+    return min(max_cte_bucket, requested_chunk)
 
 
 def _pa_num_blocks(args: argparse.Namespace) -> int:
@@ -268,6 +281,17 @@ def main() -> int:
             "token length are disabled even when a GDN checkpoint is registered."
         ),
     )
+    parser.add_argument(
+        "--hybrid-apc-prefill-chunk-tokens",
+        type=int,
+        default=0,
+        help=(
+            "Opt into larger vLLM chunked-prefill chunks for Hybrid APC. The "
+            "value must be a compiled CTE bucket and a multiple of "
+            "--gdn-checkpoint-interval. Default 0 keeps conservative "
+            "checkpoint-sized chunks."
+        ),
+    )
     parser.add_argument("--num-gpu-blocks-override", type=int, default=None)
     parser.add_argument("--max-tokens", type=int, default=64)
     parser.add_argument("--temperature", type=float, default=0.0)
@@ -353,7 +377,8 @@ def main() -> int:
 
     additional_config = _override_config(args)
     print("VLLM_QWEN36_CONFIG", json.dumps(additional_config, sort_keys=True), flush=True)
-    max_cte_bucket = max(_cte_buckets(args))
+    cte_buckets = _cte_buckets(args)
+    max_cte_bucket = max(cte_buckets)
 
     llm_kwargs = {
         "model": str(Path(args.model_path).expanduser().resolve()),
