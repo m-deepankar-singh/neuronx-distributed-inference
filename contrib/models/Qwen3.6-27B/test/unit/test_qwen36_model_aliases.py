@@ -535,7 +535,7 @@ class TestQwen36ModelAliases(unittest.TestCase):
 
         self.assertEqual(mask.squeeze(-1).tolist(), [[1.0, 1.0, 1.0, 1.0]])
 
-    def test_mixed_restore_deltanet_mask_uses_token_padding_for_all_rows(self):
+    def test_mixed_restore_deltanet_mask_uses_token_padding_per_restored_row(self):
         input_ids = torch.tensor(
             [[11, 12, 0, 0], [21, 22, 23, 0]], dtype=torch.int64
         )
@@ -555,7 +555,219 @@ class TestQwen36ModelAliases(unittest.TestCase):
 
         self.assertEqual(
             mask.squeeze(-1).tolist(),
-            [[1.0, 1.0, 0.0, 0.0], [1.0, 1.0, 1.0, 0.0]],
+            [[1.0, 1.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0]],
+        )
+
+    def test_deltanet_mask_uses_num_queries_when_attention_mask_is_full_context(self):
+        input_ids = torch.tensor(
+            [[11, 12, 13, 248044, 248044], [21, 248044, 248044, 248044, 248044]],
+            dtype=torch.int64,
+        )
+        inputs_embeds = torch.ones((2, 5, 2), dtype=torch.float32)
+        attention_mask = torch.ones((2, 16), dtype=torch.int32)
+
+        mask = self.qwen_module._qwen36_deltanet_padding_mask(
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            padding_idx=None,
+            is_for_context_encoding=True,
+            hybrid_restore_mask=torch.tensor([0, 0], dtype=torch.int32),
+            num_queries=torch.tensor([[3], [1]], dtype=torch.int32),
+        )
+
+        self.assertEqual(
+            mask.squeeze(-1).tolist(),
+            [[1.0, 1.0, 1.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0, 0.0]],
+        )
+
+    def test_negative_dummy_seq_ids_mark_inactive_state_rows(self):
+        active_rows = self.qwen_module._qwen36_active_state_rows(
+            torch.ones((2, 4, 1), dtype=torch.float32),
+            torch.tensor([0, -1], dtype=torch.int32),
+        )
+
+        self.assertTrue(
+            torch.equal(
+                active_rows,
+                torch.tensor([True, False]),
+            )
+        )
+
+    def test_inactive_dummy_rows_preserve_previous_state(self):
+        previous = torch.tensor(
+            [[[1.0, 2.0]], [[3.0, 4.0]]],
+            dtype=torch.float32,
+        )
+        updated = torch.tensor(
+            [[[10.0, 20.0]], [[30.0, 40.0]]],
+            dtype=torch.float32,
+        )
+
+        preserved = self.qwen_module._qwen36_preserve_inactive_state_rows(
+            updated,
+            previous,
+            torch.tensor([True, False]),
+        )
+
+        self.assertTrue(
+            torch.equal(
+                preserved,
+                torch.tensor(
+                    [[[10.0, 20.0]], [[3.0, 4.0]]],
+                    dtype=torch.float32,
+                ),
+            )
+        )
+
+    def test_state_rows_update_by_seq_ids(self):
+        previous = torch.tensor(
+            [[[1.0]], [[2.0]], [[3.0]]],
+            dtype=torch.float32,
+        )
+        updated_rows = torch.tensor(
+            [[[10.0]], [[20.0]]],
+            dtype=torch.float32,
+        )
+
+        updated = self.qwen_module._qwen36_update_state_rows_by_seq_ids(
+            previous,
+            updated_rows,
+            torch.tensor([2, 0], dtype=torch.int32),
+        )
+
+        self.assertTrue(
+            torch.equal(
+                updated,
+                torch.tensor(
+                    [[[20.0]], [[2.0]], [[10.0]]],
+                    dtype=torch.float32,
+                ),
+            )
+        )
+
+    def test_negative_seq_id_state_row_is_noop(self):
+        previous = torch.tensor(
+            [[[1.0]], [[2.0]]],
+            dtype=torch.float32,
+        )
+        updated_rows = torch.tensor(
+            [[[10.0]], [[20.0]]],
+            dtype=torch.float32,
+        )
+
+        updated = self.qwen_module._qwen36_update_state_rows_by_seq_ids(
+            previous,
+            updated_rows,
+            torch.tensor([1, -1], dtype=torch.int32),
+        )
+
+        self.assertTrue(
+            torch.equal(
+                updated,
+                torch.tensor(
+                    [[[1.0]], [[10.0]]],
+                    dtype=torch.float32,
+                ),
+            )
+        )
+
+    def test_request_ids_keep_stable_seq_slots_when_rows_reorder(self):
+        model = SimpleNamespace(
+            context_encoding_model=SimpleNamespace(
+                neuron_config=SimpleNamespace(batch_size=2)
+            ),
+            token_generation_model=SimpleNamespace(
+                neuron_config=SimpleNamespace(batch_size=2)
+            ),
+        )
+
+        first = self.qwen_module._qwen36_stable_seq_ids_for_request_ids(
+            model,
+            torch.tensor([0], dtype=torch.int32),
+            ("req-a",),
+        )
+        mixed = self.qwen_module._qwen36_stable_seq_ids_for_request_ids(
+            model,
+            torch.tensor([0], dtype=torch.int32),
+            ("req-b", "req-a"),
+        )
+        next_mixed = self.qwen_module._qwen36_stable_seq_ids_for_request_ids(
+            model,
+            torch.tensor([0], dtype=torch.int32),
+            ("req-c", "req-b"),
+        )
+
+        self.assertTrue(torch.equal(first, torch.tensor([0], dtype=torch.int32)))
+        self.assertTrue(torch.equal(mixed, torch.tensor([1, 0], dtype=torch.int32)))
+        self.assertTrue(
+            torch.equal(next_mixed, torch.tensor([0, 1], dtype=torch.int32))
+        )
+
+    def test_single_new_request_reuses_first_stale_seq_slot(self):
+        model = SimpleNamespace(
+            context_encoding_model=SimpleNamespace(
+                neuron_config=SimpleNamespace(batch_size=2)
+            ),
+            token_generation_model=SimpleNamespace(
+                neuron_config=SimpleNamespace(batch_size=2)
+            ),
+        )
+
+        first = self.qwen_module._qwen36_stable_seq_ids_for_request_ids(
+            model,
+            torch.tensor([0], dtype=torch.int32),
+            ("req-a",),
+        )
+        second = self.qwen_module._qwen36_stable_seq_ids_for_request_ids(
+            model,
+            torch.tensor([0], dtype=torch.int32),
+            ("req-b",),
+        )
+
+        self.assertTrue(torch.equal(first, torch.tensor([0], dtype=torch.int32)))
+        self.assertTrue(torch.equal(second, torch.tensor([0], dtype=torch.int32)))
+
+    def test_checkpoint_cache_active_rows_follow_seq_slots(self):
+        state = torch.tensor(
+            [[[1.0]], [[2.0]]],
+            dtype=torch.float32,
+        )
+
+        active = self.qwen_module.HybridGDNCheckpointCache._active_rows(
+            state,
+            torch.tensor([1, -1], dtype=torch.int32),
+            2,
+        )
+
+        self.assertTrue(
+            torch.equal(
+                active,
+                torch.tensor(
+                    [[[2.0]], [[1.0]]],
+                    dtype=torch.float32,
+                ),
+            )
+        )
+
+    def test_dummy_cte_rows_zero_restore_controls(self):
+        restore_slots, restore_mask, restore_prefix = (
+            self.qwen_module._qwen36_pad_hybrid_restore_controls_for_dummy_cte_rows(
+                torch.tensor([7], dtype=torch.int32),
+                torch.tensor([1], dtype=torch.int32),
+                torch.tensor([256], dtype=torch.int32),
+                2,
+            )
+        )
+
+        self.assertTrue(
+            torch.equal(restore_slots, torch.tensor([7, 0], dtype=torch.int32))
+        )
+        self.assertTrue(
+            torch.equal(restore_mask, torch.tensor([1, 0], dtype=torch.int32))
+        )
+        self.assertTrue(
+            torch.equal(restore_prefix, torch.tensor([256, 0], dtype=torch.int32))
         )
 
     def test_packed_decode_batch_is_unpacked_for_tkg(self):

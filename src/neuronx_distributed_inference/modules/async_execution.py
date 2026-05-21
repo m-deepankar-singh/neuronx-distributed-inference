@@ -12,6 +12,20 @@ def _is_hybrid_apc_enabled(neuron_base_instance: "NeuronBaseForCausalLM") -> boo
     return bool(getattr(neuron_base_instance.config, "use_hybrid_apc_manager", False))
 
 
+def _async_request_ids_signature(neuron_base_instance: "NeuronBaseForCausalLM"):
+    request_ids = getattr(neuron_base_instance, "_qwen36_vllm_request_ids", None)
+    if request_ids is None:
+        return None
+    if isinstance(request_ids, torch.Tensor):
+        return tuple(request_ids.detach().cpu().reshape(-1).tolist())
+    if isinstance(request_ids, (str, bytes)):
+        return (request_ids,)
+    try:
+        return tuple(request_ids)
+    except TypeError:
+        return (request_ids,)
+
+
 def _batch_vector(
     input_dict: Dict[str, Any],
     key: str,
@@ -510,6 +524,74 @@ def _restore_block_table_target_len(
     return target_len or None
 
 
+def _configured_max_context_len(
+    neuron_base_instance: "NeuronBaseForCausalLM",
+) -> int | None:
+    owners = (
+        getattr(neuron_base_instance, "neuron_config", None),
+        getattr(getattr(neuron_base_instance, "config", None), "neuron_config", None),
+        getattr(
+            getattr(neuron_base_instance, "context_encoding_model", None),
+            "neuron_config",
+            None,
+        ),
+        getattr(neuron_base_instance, "config", None),
+    )
+    for owner in owners:
+        if owner is None:
+            continue
+        for attr in (
+            "seq_len",
+            "max_context_length",
+            "max_model_len",
+            "max_position_embeddings",
+        ):
+            value = getattr(owner, attr, None)
+            if value is None:
+                continue
+            try:
+                value = int(value)
+            except (TypeError, ValueError):
+                continue
+            if value > 0:
+                return value
+    return None
+
+
+def _full_block_table_target_len(
+    neuron_base_instance: "NeuronBaseForCausalLM",
+    row_input_dicts: list[Dict[str, Any]],
+) -> int | None:
+    target_len = 0
+    block_size = _pa_block_size(neuron_base_instance)
+    max_context_len = _configured_max_context_len(neuron_base_instance)
+    if block_size and max_context_len:
+        target_len = max(target_len, (max_context_len + block_size - 1) // block_size)
+    for row_input in row_input_dicts:
+        block_table = row_input.get("block_table")
+        if not isinstance(block_table, torch.Tensor) or block_table.numel() == 0:
+            continue
+        if block_table.ndim >= 2:
+            target_len = max(target_len, int(block_table.shape[1]))
+        elif block_table.ndim == 1:
+            target_len = max(target_len, int(block_table.numel()))
+    return target_len or None
+
+
+def _uses_block_backed_restore(row_input_dicts: list[Dict[str, Any]]) -> bool:
+    for row_input in row_input_dicts:
+        block_table = row_input.get("block_table")
+        if not isinstance(block_table, torch.Tensor) or block_table.numel() == 0:
+            continue
+        restore_mask = _single_batch_value(row_input.get("hybrid_restore_mask"))
+        if restore_mask is not None and _to_python_int(restore_mask) > 0:
+            return True
+        computed_len = _single_batch_value(row_input.get("computed_context_lens"))
+        if computed_len is not None and _to_python_int(computed_len) > 0:
+            return True
+    return False
+
+
 def _synthesize_slots_from_block_table(
     *,
     block_table_row: torch.Tensor,
@@ -668,6 +750,87 @@ def _repair_vectorized_batch_vectors(combined: Dict[str, Any]) -> None:
         )
 
 
+def _repair_vectorized_attention_mask_for_block_table(
+    neuron_base_instance: "NeuronBaseForCausalLM",
+    combined: Dict[str, Any],
+) -> None:
+    input_ids = combined.get("input_ids")
+    attention_mask = combined.get("attention_mask")
+    block_table = combined.get("block_table")
+    if (
+        not isinstance(input_ids, torch.Tensor)
+        or input_ids.ndim != 2
+        or not isinstance(attention_mask, torch.Tensor)
+        or attention_mask.ndim != 2
+        or not isinstance(block_table, torch.Tensor)
+        or block_table.ndim != 2
+    ):
+        return
+
+    batch_size = int(input_ids.shape[0])
+    if (
+        batch_size <= 0
+        or block_table.shape[0] != batch_size
+        or block_table.shape[1] <= 1
+    ):
+        return
+    restore_mask = _batch_int_list(
+        combined,
+        "hybrid_restore_mask",
+        batch_size=batch_size,
+    )
+    computed_context_lens = _batch_int_list(
+        combined,
+        "computed_context_lens",
+        batch_size=batch_size,
+    )
+    if not (
+        (restore_mask is not None and any(value > 0 for value in restore_mask))
+        or (
+            computed_context_lens is not None
+            and any(value > 0 for value in computed_context_lens)
+        )
+    ):
+        return
+
+    block_size = _pa_block_size(neuron_base_instance)
+    if not block_size:
+        return
+    target_len = int(block_table.shape[1]) * int(block_size)
+    max_context_len = _configured_max_context_len(neuron_base_instance)
+    if max_context_len is not None:
+        target_len = max(target_len, max_context_len)
+    if int(attention_mask.shape[1]) == target_len:
+        return
+    if int(attention_mask.shape[1]) > target_len:
+        target_len = int(attention_mask.shape[1])
+
+    context_lens = _batch_int_list(combined, "full_context_lens", batch_size=batch_size)
+    if context_lens is None:
+        num_queries = _batch_int_list(combined, "num_queries", batch_size=batch_size)
+        if computed_context_lens is not None and num_queries is not None:
+            context_lens = [
+                computed_len + query_len
+                for computed_len, query_len in zip(computed_context_lens, num_queries)
+            ]
+    if context_lens is None:
+        context_lens = [
+            int(row.to(torch.int64).sum().item())
+            for row in attention_mask[:batch_size]
+        ]
+
+    repaired = torch.zeros(
+        (batch_size, target_len),
+        dtype=attention_mask.dtype,
+        device=attention_mask.device,
+    )
+    for row_idx, context_len in enumerate(context_lens[:batch_size]):
+        active_len = max(0, min(int(context_len), target_len))
+        if active_len:
+            repaired[row_idx, :active_len] = 1
+    combined["attention_mask"] = repaired
+
+
 _VECTOR_CTE_SEQUENCE_KEYS = {
     "input_ids",
     "attention_mask",
@@ -789,6 +952,13 @@ def _combine_vectorized_hybrid_apc_inputs(
         neuron_base_instance,
         row_input_dicts,
     )
+    full_block_dim1 = (
+        _full_block_table_target_len(neuron_base_instance, row_input_dicts)
+        if _uses_block_backed_restore(row_input_dicts)
+        else None
+    )
+    if full_block_dim1 is not None:
+        target_block_dim1 = max(target_block_dim1 or 0, full_block_dim1)
 
     for key in keys:
         if key.startswith("_hybrid_apc"):
@@ -859,6 +1029,7 @@ def _combine_vectorized_hybrid_apc_inputs(
             combined[key] = tensors[0]
 
     _repair_vectorized_batch_vectors(combined)
+    _repair_vectorized_attention_mask_for_block_table(neuron_base_instance, combined)
     _repair_vectorized_slot_mapping(neuron_base_instance, combined)
     return combined
 
@@ -1021,6 +1192,7 @@ def prepare_hybrid_apc_request_for_execution(
             )
         return input_dict
 
+    lifecycle_input_dict = input_dict
     batch_size = _batch_size_from_input_dict(input_dict)
     request_records = _hybrid_apc_request_records(
         input_dict,
@@ -1213,6 +1385,9 @@ def prepare_hybrid_apc_request_for_execution(
         )
     input_dict["_hybrid_apc_bridge"] = bridge
     input_dict["_hybrid_apc_prepared"] = prepared
+    if lifecycle_input_dict is not input_dict:
+        lifecycle_input_dict["_hybrid_apc_bridge"] = bridge
+        lifecycle_input_dict["_hybrid_apc_prepared"] = prepared
     _apply_hybrid_gdn_debug_switches(prepared.input_dict)
     if os.environ.get("QWEN36_HYBRID_APC_DEBUG") == "1":
         prepared_inputs = prepared.input_dict
@@ -1681,6 +1856,7 @@ def causal_lm_async_execution(
         # clean up async state
         neuron_base_instance.prior_outputs = None
         neuron_base_instance.prior_seq_ids = None
+        neuron_base_instance.prior_request_ids = None
 
         return outputs, is_run_on_neuron
 
@@ -1699,10 +1875,20 @@ def causal_lm_async_execution(
         buckets=generation_model.neuron_config.buckets,
         max_num_tokens_generated=generation_length,
     )
+    request_ids_signature = _async_request_ids_signature(neuron_base_instance)
+    prior_request_ids = getattr(neuron_base_instance, "prior_request_ids", None)
+    request_ids_changed = (
+        request_ids_signature is not None
+        and prior_request_ids is not None
+        and request_ids_signature != prior_request_ids
+    )
+    force_sync_for_hybrid_apc = _is_hybrid_apc_enabled(neuron_base_instance)
 
     stay_in_sync_mode = (
         not torch.equal(neuron_base_instance.prior_seq_ids, inputs["seq_ids"])
         or hits_bucket_boundary
+        or request_ids_changed
+        or force_sync_for_hybrid_apc
     )
     start_async = not stay_in_sync_mode and neuron_base_instance.prior_outputs is None
     continue_async = not stay_in_sync_mode and not start_async
@@ -1711,6 +1897,7 @@ def causal_lm_async_execution(
         # reset async state
         neuron_base_instance.prior_outputs = None
         neuron_base_instance.prior_seq_ids = None
+        neuron_base_instance.prior_request_ids = None
 
     if stay_in_sync_mode or start_async:
         next_outputs, is_run_on_neuron = execute_model(
@@ -1722,6 +1909,7 @@ def causal_lm_async_execution(
         if start_async:
             neuron_base_instance.prior_outputs = next_outputs
             neuron_base_instance.prior_seq_ids = inputs["seq_ids"]
+            neuron_base_instance.prior_request_ids = request_ids_signature
 
     if start_async or continue_async:
         if within_bounds(inputs, neuron_base_instance.neuron_config.seq_len, generation_length):
@@ -1744,6 +1932,7 @@ def causal_lm_async_execution(
                 )
                 neuron_base_instance.prior_outputs = None
                 neuron_base_instance.prior_seq_ids = None
+                neuron_base_instance.prior_request_ids = None
                 neuron_base_instance.async_should_stop = True
             else:
                 raise RuntimeError(
@@ -1762,10 +1951,12 @@ def causal_lm_async_execution(
         # make sure prior outputs is not set
         neuron_base_instance.prior_outputs = None
         neuron_base_instance.prior_seq_ids = None
+        neuron_base_instance.prior_request_ids = None
         return outputs, is_run_on_neuron
 
     # next step
     neuron_base_instance.prior_outputs = next_outputs
     neuron_base_instance.prior_seq_ids = inputs["seq_ids"]
+    neuron_base_instance.prior_request_ids = request_ids_signature
 
     return outputs, is_run_on_neuron

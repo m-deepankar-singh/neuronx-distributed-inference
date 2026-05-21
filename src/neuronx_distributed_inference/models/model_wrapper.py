@@ -1252,6 +1252,36 @@ class ModelWrapper(torch.nn.Module):
                         pad_value,
                     )
 
+                def _restore_attention_mask(tensor, target_len):
+                    tensor = tensor.to(torch.int32)
+                    if (
+                        target_len > prefill_bucket_int
+                        and tensor.shape[1] <= prefill_bucket_int
+                    ):
+                        full_context_lens = (
+                            computed_context_lens.reshape(-1).to(torch.int64)
+                            + num_queries.reshape(-1).to(torch.int64)
+                        )
+                        full_mask = torch.zeros(
+                            (batch_size, target_len),
+                            dtype=torch.int32,
+                            device=tensor.device,
+                        )
+                        for row_idx in range(
+                            min(batch_size, int(full_context_lens.numel()))
+                        ):
+                            active_len = max(
+                                0,
+                                min(
+                                    int(full_context_lens[row_idx].item()),
+                                    target_len,
+                                ),
+                            )
+                            if active_len:
+                                full_mask[row_idx, :active_len] = 1
+                        return full_mask
+                    return _right_pad_or_trim_dim1(tensor, target_len, 0)
+
                 padded_inputs = _right_pad_or_trim_dim1(
                     args[0], prefill_bucket_int, self.config.pad_token_id
                 )
@@ -1278,10 +1308,14 @@ class ModelWrapper(torch.nn.Module):
                         active_attn_mask = torch.cat([active_attn_mask, pad_rows], dim=0)
                     elif active_attn_mask.shape[0] > batch_size:
                         active_attn_mask = active_attn_mask[:batch_size]
-                    padded_attn_mask = _right_pad_or_trim_dim1(
-                        active_attn_mask.to(torch.int32),
-                        prefill_bucket_int,
-                        0,
+                    attention_target_len = (
+                        prefix_bucket_int
+                        if prefix_bucket_int > 0
+                        else prefill_bucket_int
+                    )
+                    padded_attn_mask = _restore_attention_mask(
+                        active_attn_mask,
+                        attention_target_len,
                     )
                 elif prefix_bucket_int == 0:
                     padded_attn_mask = torch.zeros(

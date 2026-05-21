@@ -242,6 +242,75 @@ class TestQwen36HybridAPCSchedulerPatch(unittest.TestCase):
                 self.patch.should_disable_unbacked_prefix_reads(scheduler, request)
             )
 
+    def test_largest_backed_prefix_read_does_not_require_lower_checkpoint(self):
+        scheduler = _scheduler(
+            block_size=2,
+            enable_backed_prefix_reads=True,
+            use_qwen_hybrid_chunked_prefill=True,
+        )
+        token_ids = [10, 11, 12, 13, 14]
+        hashes = self.patch._local_cumulative_prefix_hashes(
+            token_ids,
+            block_size=2,
+            max_prefix_len=4,
+        )
+        self.patch.register_hybrid_apc_gdn_checkpoint(
+            self.patch.HybridGDNPrefixKey(
+                cumulative_prefix_hash=hashes[4],
+                prefix_len=4,
+                block_size=2,
+                cache_salt=None,
+                model_revision="rev-a",
+                layout_version=1,
+                tp_rank=0,
+                recurrent_dtype="float32",
+                conv_dtype="bfloat16",
+            )
+        )
+        request = types.SimpleNamespace(
+            request_id="req-largest-backed",
+            prompt_token_ids=token_ids,
+            num_tokens=len(token_ids),
+            cache_salt=None,
+        )
+
+        with patch.dict(
+            os.environ,
+            {"QWEN36_HYBRID_APC_DISABLE_UNBACKED_PREFIX_READS": "1"},
+        ):
+            self.assertEqual(
+                self.patch.backed_gdn_prefix_hit_len(scheduler, request),
+                4,
+            )
+            self.assertFalse(
+                self.patch.should_disable_unbacked_prefix_reads(scheduler, request)
+            )
+
+        authorized = self.patch.pop_hybrid_apc_authorized_prefix_key(
+            prefix_len=4,
+            request_id="req-largest-backed",
+            cache_salt=None,
+            model_revision="rev-a",
+            layout_version=1,
+            tp_rank=0,
+            recurrent_dtype="float32",
+            conv_dtype="bfloat16",
+        )
+        self.assertIsNotNone(authorized)
+        self.assertEqual(authorized.cumulative_prefix_hash, hashes[4])
+        self.assertIsNone(
+            self.patch.pop_hybrid_apc_authorized_prefix_key(
+                prefix_len=2,
+                request_id="req-largest-backed",
+                cache_salt=None,
+                model_revision="rev-a",
+                layout_version=1,
+                tp_rank=0,
+                recurrent_dtype="float32",
+                conv_dtype="bfloat16",
+            )
+        )
+
     def test_partial_gdn_coverage_keeps_prefix_read_disabled(self):
         scheduler = _scheduler(
             block_size=2,
@@ -844,6 +913,76 @@ class TestQwen36HybridAPCSchedulerPatch(unittest.TestCase):
         )
         self.assertEqual(metadata["req-a"]["vllm_attention_hit_len"], 4)
         self.assertEqual(metadata["req-b"]["vllm_attention_hit_len"], 4)
+
+    def test_scheduler_defers_waiting_prefills_while_decode_running(self):
+        class FakeScheduler:
+            def __init__(self):
+                base = _scheduler(
+                    use_hybrid_apc=True,
+                    use_qwen_hybrid_chunked_prefill=True,
+                    max_num_seqs=2,
+                )
+                self.vllm_config = base.vllm_config
+                self.cache_config = base.cache_config
+                self.scheduler_config = base.scheduler_config
+                self.running = [types.SimpleNamespace(request_id="decode")]
+                self.waiting = [types.SimpleNamespace(request_id="prefill")]
+                self.waiting_seen_by_schedule = None
+
+            def add_request(self, request):
+                self.waiting.append(request)
+
+            def schedule(self):
+                self.waiting_seen_by_schedule = [
+                    request.request_id for request in self.waiting
+                ]
+                return types.SimpleNamespace(
+                    scheduled_new_reqs=[],
+                    scheduled_cached_reqs=None,
+                )
+
+        self.patch.patch_scheduler_class(FakeScheduler)
+        scheduler = FakeScheduler()
+        scheduler.schedule()
+
+        self.assertEqual(scheduler.waiting_seen_by_schedule, [])
+        self.assertEqual(
+            [request.request_id for request in scheduler.waiting],
+            ["prefill"],
+        )
+
+    def test_scheduler_keeps_waiting_prefills_when_no_decode_running(self):
+        class FakeScheduler:
+            def __init__(self):
+                base = _scheduler(
+                    use_hybrid_apc=True,
+                    use_qwen_hybrid_chunked_prefill=True,
+                    max_num_seqs=2,
+                )
+                self.vllm_config = base.vllm_config
+                self.cache_config = base.cache_config
+                self.scheduler_config = base.scheduler_config
+                self.running = []
+                self.waiting = [types.SimpleNamespace(request_id="prefill")]
+                self.waiting_seen_by_schedule = None
+
+            def add_request(self, request):
+                self.waiting.append(request)
+
+            def schedule(self):
+                self.waiting_seen_by_schedule = [
+                    request.request_id for request in self.waiting
+                ]
+                return types.SimpleNamespace(
+                    scheduled_new_reqs=[],
+                    scheduled_cached_reqs=None,
+                )
+
+        self.patch.patch_scheduler_class(FakeScheduler)
+        scheduler = FakeScheduler()
+        scheduler.schedule()
+
+        self.assertEqual(scheduler.waiting_seen_by_schedule, ["prefill"])
 
     def test_scheduler_output_metadata_does_not_rewrite_cached_context_hit(self):
         class FakeScheduler:

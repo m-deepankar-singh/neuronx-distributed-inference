@@ -1069,11 +1069,10 @@ class NeuronGatedDeltaNet(nn.Module):
             if static_hybrid_cache_active:
                 new_conv_state = new_conv_state.to(self.conv_state_buffer.dtype)
             elif seq_ids is not None:
-                # BS=1 optimization: scatter to index 0 of size-1 buffer = direct replacement
-                # Add buffer dependency for input_output_alias
-                new_conv_state = (
-                    new_conv_state.to(self.conv_state_buffer.dtype)
-                    + self.conv_state_buffer * 0
+                new_conv_state = _qwen36_update_state_rows_by_seq_ids(
+                    self.conv_state_buffer,
+                    new_conv_state.to(self.conv_state_buffer.dtype),
+                    seq_ids,
                 )
             elif batch_size < alloc_bs:
                 pad_size = alloc_bs - batch_size
@@ -1164,10 +1163,10 @@ class NeuronGatedDeltaNet(nn.Module):
             if static_hybrid_cache_active:
                 new_conv_state = new_conv_state.to(self.conv_state_buffer.dtype)
             elif seq_ids is not None:
-                # BS=1 optimization: scatter to index 0 = direct replacement
-                new_conv_state = (
-                    new_conv_state.to(self.conv_state_buffer.dtype)
-                    + self.conv_state_buffer * 0
+                new_conv_state = _qwen36_update_state_rows_by_seq_ids(
+                    self.conv_state_buffer,
+                    new_conv_state.to(self.conv_state_buffer.dtype),
+                    seq_ids,
                 )
             elif batch_size < alloc_bs:
                 pad_size = alloc_bs - batch_size
@@ -1259,9 +1258,11 @@ class NeuronGatedDeltaNet(nn.Module):
             if static_hybrid_cache_active:
                 new_rec_state = new_state_bf16
             elif seq_ids is not None:
-                # BS=1 optimization: scatter to index 0 of size-1 buffer = direct replacement
-                # Add buffer dependency for input_output_alias
-                new_rec_state = new_state_bf16 + self.recurrent_state_buffer * 0
+                new_rec_state = _qwen36_update_state_rows_by_seq_ids(
+                    self.recurrent_state_buffer,
+                    new_state_bf16,
+                    seq_ids,
+                )
             elif batch_size < alloc_bs:
                 new_rec_state = torch.cat(
                     [
@@ -1355,9 +1356,11 @@ class NeuronGatedDeltaNet(nn.Module):
                 if static_hybrid_cache_active:
                     new_rec_state = final_state_bf16
                 elif seq_ids is not None:
-                    # BS=1 optimization: scatter to index 0 of size-1 buffer = direct replacement
-                    # Add buffer dependency for input_output_alias
-                    new_rec_state = final_state_bf16 + self.recurrent_state_buffer * 0
+                    new_rec_state = _qwen36_update_state_rows_by_seq_ids(
+                        self.recurrent_state_buffer,
+                        final_state_bf16,
+                        seq_ids,
+                    )
                 elif batch_size < alloc_bs:
                     new_rec_state = torch.cat(
                         [
@@ -1378,6 +1381,25 @@ class NeuronGatedDeltaNet(nn.Module):
                     new_rec_state = final_state_bf16 + self.recurrent_state_buffer * 0
             else:
                 new_rec_state = self.recurrent_state_buffer * 1
+
+        if (
+            is_for_context_encoding
+            and not static_hybrid_cache_active
+            and valid_mask_1d is not None
+            and hasattr(valid_mask_1d, "numel")
+            and valid_mask_1d.numel() > 0
+        ):
+            active_rows = _qwen36_active_state_rows(valid_mask_1d, seq_ids)
+            new_conv_state = _qwen36_preserve_inactive_state_rows(
+                new_conv_state,
+                self.conv_state_buffer,
+                active_rows,
+            )
+            new_rec_state = _qwen36_preserve_inactive_state_rows(
+                new_rec_state,
+                self.recurrent_state_buffer,
+                active_rows,
+            )
 
         # Output: norm, gate, project
         output = output.to(hidden_states.dtype)
@@ -2718,8 +2740,13 @@ class HybridGDNCheckpointCache(nn.Module):
         seq_ids: torch.Tensor | None,
         batch_size: int,
     ) -> torch.Tensor:
-        if seq_ids is not None and state.shape[0] > batch_size:
-            return torch.index_select(state, 0, seq_ids.long())
+        if seq_ids is not None and hasattr(seq_ids, "numel") and seq_ids.numel() > 0:
+            safe_seq_ids = seq_ids.reshape(-1)[:batch_size].to(
+                device=state.device,
+                dtype=torch.long,
+            )
+            safe_seq_ids = safe_seq_ids.clamp(min=0, max=int(state.shape[0]) - 1)
+            return torch.index_select(state, 0, safe_seq_ids)
         return state[:batch_size]
 
     def restore_to_active_rows(
@@ -3162,9 +3189,45 @@ def _qwen36_deltanet_padding_mask(
     padding_idx,
     is_for_context_encoding,
     hybrid_restore_mask=None,
+    num_queries=None,
 ):
-    token_padding_mask = (input_ids != padding_idx).unsqueeze(-1).to(inputs_embeds.dtype)
+    if padding_idx is None:
+        token_padding_mask = torch.ones(
+            (*input_ids.shape, 1),
+            dtype=inputs_embeds.dtype,
+            device=inputs_embeds.device,
+        )
+    else:
+        token_padding_mask = (
+            (input_ids != padding_idx).unsqueeze(-1).to(inputs_embeds.dtype)
+        )
+
+    query_padding_mask = None
     if (
+        is_for_context_encoding
+        and num_queries is not None
+        and hasattr(num_queries, "numel")
+        and num_queries.numel() >= input_ids.shape[0]
+    ):
+        query_lens = num_queries.reshape(-1)[: input_ids.shape[0]].to(
+            device=inputs_embeds.device,
+            dtype=torch.long,
+        )
+        positions = torch.arange(
+            input_ids.shape[1],
+            device=inputs_embeds.device,
+            dtype=torch.long,
+        )
+        query_padding_mask = (
+            positions.unsqueeze(0) < query_lens.unsqueeze(1)
+        ).unsqueeze(-1).to(inputs_embeds.dtype)
+
+    if (
+        is_for_context_encoding
+        and query_padding_mask is not None
+    ):
+        deltanet_padding_mask = query_padding_mask
+    elif (
         is_for_context_encoding
         and attention_mask is not None
         and attention_mask.ndim == 2
@@ -3183,7 +3246,22 @@ def _qwen36_deltanet_padding_mask(
         and hasattr(hybrid_restore_mask, "numel")
         and hybrid_restore_mask.numel() > 0
     ):
-        restore_active = hybrid_restore_mask.reshape(-1).to(torch.bool).any()
+        restore_active = hybrid_restore_mask.reshape(-1).to(torch.bool)
+        if restore_active.numel() < input_ids.shape[0]:
+            restore_active = torch.cat(
+                [
+                    restore_active,
+                    torch.zeros(
+                        input_ids.shape[0] - restore_active.numel(),
+                        dtype=torch.bool,
+                        device=restore_active.device,
+                    ),
+                ],
+                dim=0,
+            )
+        restore_active = restore_active[: input_ids.shape[0]].to(
+            device=inputs_embeds.device
+        ).view(-1, 1, 1)
         deltanet_padding_mask = torch.where(
             restore_active,
             token_padding_mask,
@@ -3375,6 +3453,138 @@ def _qwen36_flat_item_count(value: Any) -> int:
     return 1
 
 
+def _qwen36_pad_batch_repeat_first(value, target_batch):
+    if value is None or not hasattr(value, "numel") or value.numel() == 0:
+        return value
+    if value.ndim == 0 or value.shape[0] >= target_batch:
+        return value
+    pad_n = target_batch - value.shape[0]
+    return torch.cat([value, value[:1].expand(pad_n, *value.shape[1:])], dim=0)
+
+
+def _qwen36_pad_batch_with_value(value, target_batch, fill_value):
+    if value is None or not hasattr(value, "numel") or value.numel() == 0:
+        return value
+    if value.ndim == 0 or value.shape[0] >= target_batch:
+        return value
+    pad_shape = (target_batch - value.shape[0],) + tuple(value.shape[1:])
+    pad = torch.full(pad_shape, fill_value, dtype=value.dtype, device=value.device)
+    return torch.cat([value, pad], dim=0)
+
+
+def _qwen36_pad_hybrid_restore_controls_for_dummy_cte_rows(
+    restore_slot_ids,
+    restore_mask,
+    restore_prefix_lens,
+    target_batch,
+):
+    return (
+        _qwen36_pad_batch_with_value(restore_slot_ids, target_batch, 0),
+        _qwen36_pad_batch_with_value(restore_mask, target_batch, 0),
+        _qwen36_pad_batch_with_value(restore_prefix_lens, target_batch, 0),
+    )
+
+
+def _qwen36_update_state_rows_by_seq_ids(previous_state, new_rows, seq_ids):
+    if (
+        previous_state is None
+        or new_rows is None
+        or seq_ids is None
+        or not hasattr(previous_state, "shape")
+        or not hasattr(new_rows, "shape")
+        or not hasattr(seq_ids, "numel")
+        or previous_state.ndim != new_rows.ndim
+        or previous_state.shape[1:] != new_rows.shape[1:]
+        or previous_state.shape[0] <= 0
+        or new_rows.shape[0] <= 0
+        or seq_ids.numel() == 0
+    ):
+        return new_rows
+
+    row_count = min(int(new_rows.shape[0]), int(seq_ids.reshape(-1).shape[0]))
+    if row_count <= 0:
+        return previous_state * 1
+
+    output = previous_state * 1
+    seq_ids_flat = seq_ids.reshape(-1)[:row_count].to(
+        device=previous_state.device,
+        dtype=torch.long,
+    )
+    slot_axis = torch.arange(
+        int(previous_state.shape[0]),
+        dtype=torch.long,
+        device=previous_state.device,
+    )
+    broadcast_shape = (int(previous_state.shape[0]),) + (
+        1,
+    ) * (previous_state.ndim - 1)
+    typed_rows = new_rows[:row_count].to(previous_state.dtype)
+    for row_idx in range(row_count):
+        seq_id = seq_ids_flat[row_idx]
+        valid_seq = torch.logical_and(
+            seq_id >= 0,
+            seq_id < int(previous_state.shape[0]),
+        )
+        write_mask = torch.logical_and(valid_seq, slot_axis == seq_id).view(
+            broadcast_shape
+        )
+        row_value = typed_rows[row_idx : row_idx + 1].expand_as(output)
+        output = torch.where(write_mask, row_value, output)
+    return output
+
+
+def _qwen36_preserve_inactive_state_rows(new_state, previous_state, active_rows):
+    if (
+        new_state is None
+        or previous_state is None
+        or active_rows is None
+        or not hasattr(new_state, "shape")
+        or not hasattr(previous_state, "shape")
+        or not hasattr(active_rows, "numel")
+        or new_state.shape != previous_state.shape
+        or active_rows.numel() == 0
+    ):
+        return new_state
+    active_rows = active_rows.reshape(-1).to(device=new_state.device, dtype=torch.bool)
+    row_count = min(int(active_rows.numel()), int(new_state.shape[0]))
+    if row_count <= 0:
+        return new_state
+    if row_count < int(new_state.shape[0]):
+        active_rows = torch.cat(
+            [
+                active_rows[:row_count],
+                torch.ones(
+                    int(new_state.shape[0]) - row_count,
+                    dtype=torch.bool,
+                    device=new_state.device,
+                ),
+            ],
+            dim=0,
+        )
+    else:
+        active_rows = active_rows[: int(new_state.shape[0])]
+    view_shape = (int(new_state.shape[0]),) + (1,) * (new_state.ndim - 1)
+    active_rows = active_rows.view(view_shape)
+    return torch.where(active_rows, new_state, previous_state)
+
+
+def _qwen36_active_state_rows(valid_mask_1d, seq_ids):
+    if (
+        valid_mask_1d is None
+        or not hasattr(valid_mask_1d, "numel")
+        or valid_mask_1d.numel() == 0
+    ):
+        return None
+    active_rows = valid_mask_1d.squeeze(-1).to(torch.bool).any(dim=-1)
+    if seq_ids is not None and hasattr(seq_ids, "numel") and seq_ids.numel() > 0:
+        seq_active = seq_ids.reshape(-1).to(
+            device=active_rows.device,
+            dtype=torch.long,
+        )[: active_rows.numel()] >= 0
+        active_rows = active_rows & seq_active
+    return active_rows
+
+
 def _qwen36_request_ids_tuple(request_ids):
     if request_ids is None:
         return None
@@ -3403,6 +3613,91 @@ def _qwen36_request_ids_from_hybrid_apc_records(records):
             return None
         request_ids.append(request_id)
     return tuple(request_ids) if request_ids else None
+
+
+def _qwen36_max_seq_slots_for_request_ids(model, seq_ids, request_count):
+    max_slots = int(request_count or 0)
+    for owner in (
+        model,
+        getattr(model, "neuron_config", None),
+        getattr(getattr(model, "context_encoding_model", None), "neuron_config", None),
+        getattr(getattr(model, "token_generation_model", None), "neuron_config", None),
+    ):
+        for attr in ("batch_size", "max_batch_size", "max_num_seqs"):
+            value = getattr(owner, attr, None)
+            if value is None:
+                continue
+            try:
+                max_slots = max(max_slots, int(value))
+            except (TypeError, ValueError):
+                pass
+    if seq_ids is not None and hasattr(seq_ids, "numel") and seq_ids.numel() > 0:
+        flat = seq_ids.reshape(-1)
+        try:
+            non_negative = flat[flat >= 0]
+            if non_negative.numel() > 0:
+                max_slots = max(max_slots, int(non_negative.max().item()) + 1)
+        except Exception:
+            pass
+    return max(1, max_slots)
+
+
+def _qwen36_stable_seq_ids_for_request_ids(model, seq_ids, request_ids):
+    request_ids = _qwen36_request_ids_tuple(request_ids)
+    if not request_ids:
+        return seq_ids
+
+    normalized_request_ids = tuple(
+        _qwen36_hashable_request_id(request_id) for request_id in request_ids
+    )
+    if any(request_id is None for request_id in normalized_request_ids):
+        return seq_ids
+
+    slot_by_request = getattr(model, "_qwen36_hybrid_seq_slot_by_request", None)
+    request_by_slot = getattr(model, "_qwen36_hybrid_request_by_seq_slot", None)
+    if not isinstance(slot_by_request, dict) or not isinstance(request_by_slot, dict):
+        slot_by_request = {}
+        request_by_slot = {}
+        setattr(model, "_qwen36_hybrid_seq_slot_by_request", slot_by_request)
+        setattr(model, "_qwen36_hybrid_request_by_seq_slot", request_by_slot)
+
+    max_slots = _qwen36_max_seq_slots_for_request_ids(
+        model,
+        seq_ids,
+        len(normalized_request_ids),
+    )
+    active_request_ids = set(normalized_request_ids)
+    for stale_slot, stale_owner in list(request_by_slot.items()):
+        if stale_owner in active_request_ids:
+            continue
+        request_by_slot.pop(stale_slot, None)
+        slot_by_request.pop(stale_owner, None)
+
+    assigned_slots = []
+    for request_id in normalized_request_ids:
+        slot = slot_by_request.get(request_id)
+        if slot is None or slot < 0 or slot >= max_slots:
+            free_slots = [
+                candidate
+                for candidate in range(max_slots)
+                if candidate not in request_by_slot
+            ]
+            if not free_slots:
+                return seq_ids
+            slot = free_slots[0]
+            slot_by_request[request_id] = slot
+            request_by_slot[slot] = request_id
+        assigned_slots.append(slot)
+
+    dtype = seq_ids.dtype if hasattr(seq_ids, "dtype") else torch.int32
+    if seq_ids is not None and hasattr(seq_ids, "device"):
+        device = seq_ids.device
+    else:
+        device = None
+    kwargs = {"dtype": dtype}
+    if device is not None:
+        kwargs["device"] = device
+    return torch.tensor(assigned_slots, **kwargs)
 
 
 def _qwen36_select_vllm_hybrid_apc_request_ids_for_input(
@@ -3658,6 +3953,7 @@ class NeuronQwen35Model(NeuronBaseModel):
             padding_idx=self.padding_idx,
             is_for_context_encoding=is_for_context_encoding,
             hybrid_restore_mask=hybrid_restore_mask,
+            num_queries=kwargs.get("num_queries"),
         )
         if is_for_context_encoding:
             inputs_embeds = inputs_embeds * deltanet_padding_mask
@@ -3968,6 +4264,8 @@ class NeuronQwen35Model(NeuronBaseModel):
             hybrid_restore_prefix_lens=hybrid_restore_prefix_lens,
             hybrid_commit_slot_ids=hybrid_commit_slot_ids,
             hybrid_commit_mask=hybrid_commit_mask,
+            num_queries=num_queries,
+            computed_context_lens=computed_context_lens,
         )
 
         batch_size = input_ids.shape[0]
@@ -3976,13 +4274,29 @@ class NeuronQwen35Model(NeuronBaseModel):
                 pass
             else:
                 if getattr(self.config, "use_qwen_hybrid_chunked_prefill", False):
-                    token_index = (
-                        (input_ids != self.padding_idx)
-                        .sum(dim=1, keepdim=True)
-                        .long()
-                        - 1
-                    ).clamp(min=0)
-                    if attention_mask is not None and attention_mask.ndim == 2:
+                    query_index = None
+                    if (
+                        num_queries is not None
+                        and hasattr(num_queries, "numel")
+                        and num_queries.numel() >= batch_size
+                    ):
+                        query_index = (
+                            num_queries.reshape(-1)[:batch_size]
+                            .to(device=input_ids.device, dtype=torch.long)
+                            .view(batch_size, 1)
+                            - 1
+                        ).clamp(min=0)
+                    token_index = None
+                    if self.padding_idx is not None:
+                        token_index = (
+                            (input_ids != self.padding_idx)
+                            .sum(dim=1, keepdim=True)
+                            .long()
+                            - 1
+                        ).clamp(min=0)
+                    if query_index is not None:
+                        index = query_index
+                    elif attention_mask is not None and attention_mask.ndim == 2:
                         attention_index = (
                             attention_mask.to(torch.long).sum(dim=1, keepdim=True)
                             - 1
@@ -3997,13 +4311,22 @@ class NeuronQwen35Model(NeuronBaseModel):
                             )
                             index = torch.where(
                                 restore_active,
-                                token_index,
+                                token_index if token_index is not None else attention_index,
                                 attention_index,
                             )
                         else:
                             index = attention_index
                     else:
-                        index = token_index
+                        index = (
+                            token_index
+                            if token_index is not None
+                            else torch.full(
+                                (batch_size, 1),
+                                max(0, input_ids.shape[1] - 1),
+                                dtype=torch.long,
+                                device=input_ids.device,
+                            )
+                        )
                 else:
                     index = torch.max(position_ids, dim=1, keepdim=True).indices
                 index = index.unsqueeze(1).expand(batch_size, 1, self.hidden_size)
@@ -4823,6 +5146,26 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
             computed_context_lens=computed_context_lens,
             prefill_completion_state=prefill_completion_state,
         )
+        metadata_by_request_id = getattr(
+            self,
+            "_qwen36_vllm_hybrid_apc_metadata_by_request_id",
+            None,
+        )
+        request_records = getattr(
+            self,
+            "_qwen36_vllm_hybrid_apc_request_records",
+            None,
+        )
+        request_ids = _qwen36_request_ids_from_hybrid_apc_records(request_records)
+        if request_ids is None:
+            request_ids = _qwen36_select_vllm_hybrid_apc_request_ids_for_input(
+                metadata_by_request_id,
+                all_request_ids=getattr(self, "_qwen36_vllm_request_ids", None),
+                new_request_ids=getattr(self, "_qwen36_vllm_new_request_ids", None),
+                full_context_lens=full_context_lens,
+                computed_context_lens=computed_context_lens,
+                prefill_completion_state=prefill_completion_state,
+            )
         if not is_prefill:
             (
                 input_ids,
@@ -4841,6 +5184,11 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
                 full_context_lens=full_context_lens,
                 computed_context_lens=computed_context_lens,
             )
+        seq_ids = _qwen36_stable_seq_ids_for_request_ids(
+            self,
+            seq_ids,
+            request_ids,
+        )
 
         hybrid_apc_request_dict = None
         if (
@@ -4866,28 +5214,8 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
                 hybrid_apc_request_dict["llava_args"] = llava_args
                 if len(llava_args) >= 3:
                     hybrid_apc_request_dict["rotary_position_ids"] = llava_args[2]
-            metadata_by_request_id = getattr(
-                self,
-                "_qwen36_vllm_hybrid_apc_metadata_by_request_id",
-                None,
-            )
-            request_records = getattr(
-                self,
-                "_qwen36_vllm_hybrid_apc_request_records",
-                None,
-            )
             if request_records is not None:
                 hybrid_apc_request_dict["hybrid_request_records"] = request_records
-            request_ids = _qwen36_request_ids_from_hybrid_apc_records(request_records)
-            if request_ids is None:
-                request_ids = _qwen36_select_vllm_hybrid_apc_request_ids_for_input(
-                    metadata_by_request_id,
-                    all_request_ids=getattr(self, "_qwen36_vllm_request_ids", None),
-                    new_request_ids=getattr(self, "_qwen36_vllm_new_request_ids", None),
-                    full_context_lens=full_context_lens,
-                    computed_context_lens=computed_context_lens,
-                    prefill_completion_state=prefill_completion_state,
-                )
             if request_ids is not None:
                 if isinstance(request_ids, list):
                     request_ids = tuple(request_ids)
@@ -5155,8 +5483,8 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
                     chunk_pos_ids = torch.cat(
                         [chunk_pos_ids, chunk_pos_ids[:1].expand(pad_n, -1)], dim=0
                     )
-                    pad_seq = torch.arange(
-                        batch_size, batch_size + pad_n, dtype=chunk_seq_ids.dtype
+                    pad_seq = torch.full(
+                        (pad_n,), -1, dtype=chunk_seq_ids.dtype
                     )
                     chunk_seq_ids = torch.cat([chunk_seq_ids, pad_seq], dim=0)
                     chunk_sampling = torch.cat(
@@ -5169,20 +5497,24 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
                     chunk_num_queries = _pad_batch_repeat_first(
                         chunk_num_queries, ctx_bs
                     )
-                    chunk_computed_context_lens = _pad_batch_repeat_first(
-                        chunk_computed_context_lens, ctx_bs
+                    chunk_computed_context_lens = _pad_batch(
+                        chunk_computed_context_lens, ctx_bs, 0
                     )
-                    chunk_restore_slots = torch.cat(
-                        [chunk_restore_slots, torch.zeros(pad_n, dtype=chunk_restore_slots.dtype)],
-                        dim=0,
-                    )
-                    chunk_restore_mask = torch.cat(
-                        [chunk_restore_mask, torch.zeros(pad_n, dtype=chunk_restore_mask.dtype)],
-                        dim=0,
-                    )
-                    chunk_restore_prefix = torch.cat(
-                        [chunk_restore_prefix, torch.zeros(pad_n, dtype=chunk_restore_prefix.dtype)],
-                        dim=0,
+                    # Dummy CTE rows repeat active token tensors to satisfy the
+                    # compiled batch shape, but they must not advertise a
+                    # prefix-cache restore. Their seq_ids are marked negative
+                    # and the DeltaNet state update preserves negative rows, so
+                    # recurrent state cannot leak into seq_ids later reused by
+                    # real requests.
+                    (
+                        chunk_restore_slots,
+                        chunk_restore_mask,
+                        chunk_restore_prefix,
+                    ) = _qwen36_pad_hybrid_restore_controls_for_dummy_cte_rows(
+                        chunk_restore_slots,
+                        chunk_restore_mask,
+                        chunk_restore_prefix,
+                        ctx_bs,
                     )
                     chunk_commit_slots = torch.cat(
                         [chunk_commit_slots, torch.zeros(pad_n, dtype=chunk_commit_slots.dtype)],
@@ -5259,6 +5591,7 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
                         f"attention_shape={tuple(chunk_attn_mask.shape)} "
                         f"position_shape={tuple(chunk_pos_ids.shape)} "
                         f"position_minmax={_dbg_minmax(chunk_pos_ids)} "
+                        f"seq_ids={chunk_seq_ids.reshape(-1).tolist() if hasattr(chunk_seq_ids, 'numel') and chunk_seq_ids.numel() else []} "
                         f"slot_shape={tuple(chunk_slot_mapping.shape)} "
                         f"slot_minmax={_dbg_minmax(chunk_slot_mapping)} "
                         f"block_shape={tuple(chunk_block_table.shape)} "

@@ -228,13 +228,11 @@ class TestPrefixCachingBucketSelection:
         assert torch.equal(padded_args[13], torch.tensor([[suffix_len]], dtype=torch.int32))
         assert torch.equal(padded_args[14], torch.tensor([[restore_len]], dtype=torch.int32))
 
-    def test_cte_batched_hybrid_apc_restore_padding_keeps_suffix_attention_mask(self):
+    def test_cte_batched_hybrid_apc_restore_padding_uses_full_attention_mask(self):
         model_wrapper = self.setup_context_encoding()
         model_wrapper.neuron_config.buckets = [
             [256, 0],
-            [256, 256],
-            [512, 0],
-            [512, 256],
+            [256, 4096],
         ]
         model_wrapper.neuron_config.pa_block_size = 256
 
@@ -295,14 +293,21 @@ class TestPrefixCachingBucketSelection:
         padded_args = model_wrapper._pad_prefix_caching_inputs(*inp_args)
 
         assert int(prefill_bucket) == 256
-        assert int(prefix_bucket) == 256
-        assert padded_args[1].shape == (2, 256)
-        assert torch.equal(padded_args[1][:, :suffix_len], attention_mask)
+        assert int(prefix_bucket) == 4096
+        assert padded_args[1].shape == (2, 4096)
         assert torch.equal(
-            padded_args[1][:, suffix_len:],
-            torch.zeros((2, 256 - suffix_len), dtype=torch.int32),
+            padded_args[1].sum(dim=1),
+            torch.tensor([restore_len + suffix_len, restore_len + 12]),
         )
-        assert torch.equal(padded_args[1].sum(dim=1), torch.tensor([16, 12]))
+        assert torch.equal(
+            padded_args[1][0, : restore_len + suffix_len],
+            torch.ones((restore_len + suffix_len,), dtype=torch.int32),
+        )
+        assert torch.equal(
+            padded_args[1][0, restore_len + suffix_len :],
+            torch.zeros((4096 - restore_len - suffix_len,), dtype=torch.int32),
+        )
+        assert padded_args[12].shape == (2, 16)
 
     def test_cte_batched_hybrid_apc_restore_routes_mixed_warm_cold_to_compiled_shape(self):
         model_wrapper = self.setup_context_encoding()

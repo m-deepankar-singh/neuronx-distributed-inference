@@ -144,6 +144,44 @@ def _max_num_seqs_for_scheduler(scheduler: Any) -> int:
     return int(max_num_seqs or 1)
 
 
+def _should_defer_waiting_prefills_while_running(scheduler: Any) -> bool:
+    if _env_flag("QWEN36_HYBRID_APC_ALLOW_MIXED_PREFILL_DECODE"):
+        return False
+    if _env_flag("QWEN36_HYBRID_APC_DEFER_WAITING_WHILE_RUNNING"):
+        return True
+    return (
+        _scheduler_config_flag(scheduler, "use_hybrid_apc_manager")
+        and _scheduler_config_flag(scheduler, "use_qwen_hybrid_chunked_prefill")
+        and _max_num_seqs_for_scheduler(scheduler) > 1
+    )
+
+
+def _new_empty_queue_like(queue: Any):
+    try:
+        return type(queue)()
+    except Exception:
+        return None
+
+
+def _queue_add(queue: Any, request: Any) -> None:
+    add_request = getattr(queue, "add_request", None)
+    if add_request is not None:
+        add_request(request)
+    else:
+        queue.append(request)
+
+
+def _merge_waiting_queues(front: Any, back: Any):
+    merged = _new_empty_queue_like(front)
+    if merged is None:
+        return back
+    for request in front:
+        _queue_add(merged, request)
+    for request in back:
+        _queue_add(merged, request)
+    return merged
+
+
 def _normalize_dtype(value: Any, default: str) -> str:
     if value is None:
         value = default
@@ -639,19 +677,23 @@ def _backed_prefix_read_decision(scheduler: Any, request: Any) -> dict[str, Any]
     backed_hits = backed_gdn_prefix_hits(scheduler, request)
     required_prefix_lens = _required_backed_prefix_lens(scheduler, request)
     backed_hit_len = max(backed_hits) if backed_hits else 0
-    missing_backed_lens = [
-        prefix_len for prefix_len in required_prefix_lens if prefix_len not in backed_hits
+    max_readable_prefix_len = max(required_prefix_lens) if required_prefix_lens else 0
+    missing_higher_backed_lens = [
+        prefix_len
+        for prefix_len in required_prefix_lens
+        if prefix_len > backed_hit_len and prefix_len not in backed_hits
     ]
     supports_backed = _supports_backed_prefix_reads(scheduler)
     max_backed_prefix_read_len = _max_backed_prefix_read_len(scheduler)
     exceeds_backed_prefix_cap = (
         max_backed_prefix_read_len > 0
         and bool(required_prefix_lens)
-        and max(required_prefix_lens) > max_backed_prefix_read_len
+        and max_readable_prefix_len > max_backed_prefix_read_len
     )
     allowed = (
-        bool(required_prefix_lens)
-        and not missing_backed_lens
+        backed_hit_len > 0
+        and backed_hit_len == max_readable_prefix_len
+        and not missing_higher_backed_lens
         and not exceeds_backed_prefix_cap
         and supports_backed
     )
@@ -660,7 +702,7 @@ def _backed_prefix_read_decision(scheduler: Any, request: Any) -> dict[str, Any]
         "backed_hits": backed_hits,
         "required_prefix_lens": required_prefix_lens,
         "backed_hit_len": backed_hit_len,
-        "missing_backed_lens": tuple(missing_backed_lens),
+        "missing_backed_lens": tuple(missing_higher_backed_lens),
         "supports_backed": supports_backed,
         "max_backed_prefix_read_len": max_backed_prefix_read_len,
         "exceeds_backed_prefix_cap": exceeds_backed_prefix_cap,
@@ -800,11 +842,11 @@ def should_disable_unbacked_prefix_reads(scheduler: Any, request: Any = None) ->
         )
     if decision["allowed"]:
         request_id = _request_id_for_scheduler_request(request)
-        for prefix_len in decision["required_prefix_lens"]:
-            authorize_hybrid_apc_prefix_read(
-                decision["backed_hits"][prefix_len],
-                request_id=request_id,
-            )
+        prefix_len = decision["backed_hit_len"]
+        authorize_hybrid_apc_prefix_read(
+            decision["backed_hits"][prefix_len],
+            request_id=request_id,
+        )
         return False
     return True
 
@@ -843,7 +885,31 @@ def patch_scheduler_class(scheduler_cls: type) -> bool:
     ):
 
         def schedule_with_hybrid_apc_metadata(self, *args, **kwargs):
-            scheduler_output = original_schedule(self, *args, **kwargs)
+            deferred_waiting = None
+            temporary_waiting = None
+            waiting = getattr(self, "waiting", None)
+            running = getattr(self, "running", None)
+            if (
+                waiting
+                and running
+                and _should_defer_waiting_prefills_while_running(self)
+            ):
+                temporary_waiting = _new_empty_queue_like(waiting)
+                if temporary_waiting is not None:
+                    deferred_waiting = waiting
+                    self.waiting = temporary_waiting
+            try:
+                scheduler_output = original_schedule(self, *args, **kwargs)
+            finally:
+                if deferred_waiting is not None:
+                    current_waiting = getattr(self, "waiting", temporary_waiting)
+                    if current_waiting:
+                        self.waiting = _merge_waiting_queues(
+                            current_waiting,
+                            deferred_waiting,
+                        )
+                    else:
+                        self.waiting = deferred_waiting
             _attach_scheduler_output_metadata(self, scheduler_output)
             return scheduler_output
 

@@ -29,6 +29,9 @@ HybridAPCHitPlan = _HYBRID_APC.HybridAPCHitPlan
 HybridAPCSchedulerBridge = _HYBRID_APC.HybridAPCSchedulerBridge
 HybridAPCSlotAllocator = _HYBRID_APC.HybridAPCSlotAllocator
 apply_hybrid_apc_prefill_plan = _HYBRID_APC.apply_hybrid_apc_prefill_plan
+apply_hybrid_apc_suffix_prefill_plan = (
+    _HYBRID_APC.apply_hybrid_apc_suffix_prefill_plan
+)
 build_cumulative_prefix_hashes = _HYBRID_APC.build_cumulative_prefix_hashes
 estimate_qwen_gdn_checkpoint_bytes_per_rank = (
     _HYBRID_APC.estimate_qwen_gdn_checkpoint_bytes_per_rank
@@ -37,6 +40,11 @@ estimate_qwen_hybrid_cache_bytes_per_rank = (
     _HYBRID_APC.estimate_qwen_hybrid_cache_bytes_per_rank
 )
 import qwen36_hybrid_apc_scheduler_patch as _SCHEDULER_PATCH  # noqa: E402
+from neuronx_distributed_inference.modules.async_execution import (  # noqa: E402
+    _combine_vectorized_hybrid_apc_inputs,
+    finish_hybrid_apc_request,
+    prepare_hybrid_apc_request_for_execution,
+)
 
 
 def _store(**overrides):
@@ -594,6 +602,106 @@ class TestHybridAPCPrefillPlanInputs(unittest.TestCase):
             )
         )
 
+    def test_suffix_prefill_plan_preserves_active_block_table(self):
+        plan = HybridAPCHitPlan(
+            attention_hit_len=4,
+            recurrent_hit_len=4,
+            conv_hit_len=4,
+            usable_hit_len=4,
+            restore_checkpoint_prefix_len=4,
+            residual_replay_len=0,
+            suffix_len=2,
+            checkpoint_slot=1,
+            checkpoint_key=None,
+        )
+        block_table = torch.tensor([[7, 8, 9, 10]], dtype=torch.int32)
+
+        output = apply_hybrid_apc_suffix_prefill_plan(
+            {
+                "input_ids": torch.tensor([[14, 15]], dtype=torch.int32),
+                "block_table": block_table,
+            },
+            plan=plan,
+            request_prefix_len=6,
+            attention_block_refs=(7,),
+        )
+
+        self.assertTrue(torch.equal(output["block_table"], block_table))
+
+
+class TestHybridAPCVectorizedInputCombiner(unittest.TestCase):
+    def test_backed_restore_uses_full_attention_mask_with_bucketed_suffix(self):
+        neuron_config = types.SimpleNamespace(
+            context_encoding_buckets=[256, 512, 1024, 2048, 4096],
+            pa_block_size=256,
+            seq_len=4096,
+        )
+        model = types.SimpleNamespace(
+            neuron_config=neuron_config,
+            config=types.SimpleNamespace(neuron_config=neuron_config),
+        )
+        rows = []
+        for row_idx in range(2):
+            rows.append(
+                {
+                    "input_ids": torch.arange(16, dtype=torch.int32).unsqueeze(0),
+                    "attention_mask": torch.ones((1, 16), dtype=torch.int32),
+                    "position_ids": torch.arange(
+                        256,
+                        272,
+                        dtype=torch.int32,
+                    ).unsqueeze(0),
+                    "slot_mapping": torch.arange(
+                        row_idx * 100,
+                        row_idx * 100 + 16,
+                        dtype=torch.int32,
+                    ).unsqueeze(0),
+                    "block_table": torch.tensor([[17 + row_idx]], dtype=torch.int32),
+                    "full_context_lens": torch.tensor([[272]], dtype=torch.int32),
+                    "computed_context_lens": torch.tensor([[256]], dtype=torch.int32),
+                    "num_queries": torch.tensor([[16]], dtype=torch.int32),
+                    "hybrid_restore_mask": torch.tensor([1], dtype=torch.int32),
+                }
+            )
+
+        combined = _combine_vectorized_hybrid_apc_inputs(model, {}, rows)
+
+        self.assertEqual(tuple(combined["input_ids"].shape), (2, 256))
+        self.assertEqual(tuple(combined["position_ids"].shape), (2, 256))
+        self.assertEqual(tuple(combined["slot_mapping"].shape), (2, 256))
+        self.assertEqual(tuple(combined["block_table"].shape), (2, 16))
+        self.assertEqual(tuple(combined["attention_mask"].shape), (2, 4096))
+        self.assertTrue(
+            torch.equal(
+                combined["attention_mask"][:, :272],
+                torch.ones((2, 272), dtype=torch.int32),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                combined["attention_mask"][:, 272:],
+                torch.zeros((2, 3824), dtype=torch.int32),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                combined["slot_mapping"][0, :16],
+                torch.arange(16, dtype=torch.int32),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                combined["slot_mapping"][1, :16],
+                torch.arange(100, 116, dtype=torch.int32),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                combined["slot_mapping"][:, 16:],
+                torch.full((2, 240), -1, dtype=torch.int32),
+            )
+        )
+
 
 class TestHybridAPCSchedulerBridge(unittest.TestCase):
     def tearDown(self):
@@ -914,7 +1022,7 @@ class TestHybridAPCSchedulerBridge(unittest.TestCase):
         self.assertTrue(
             torch.equal(
                 prepared.input_dict["block_table"],
-                torch.tensor([[4, 5]], dtype=torch.int32),
+                torch.tensor([[4, 5, 99]], dtype=torch.int32),
             )
         )
         expected_positions = torch.arange(256, 272, dtype=torch.int32)
@@ -928,6 +1036,44 @@ class TestHybridAPCSchedulerBridge(unittest.TestCase):
             torch.equal(
                 prepared.input_dict["rotary_position_ids"],
                 expected_positions.view(1, 1, 16).expand(3, 1, 16),
+            )
+        )
+
+    def test_bridge_suffix_only_restore_replaces_prefix_block_refs(self):
+        store = _store()
+        key, _checkpoint = _insert(
+            store,
+            256,
+            prefix_hash="h256",
+            gdn_checkpoint_slot=1,
+            attention_block_refs=(4,),
+        )
+        bridge = HybridAPCSchedulerBridge(
+            store=store,
+            slot_allocator=HybridAPCSlotAllocator(num_slots=3),
+            cache_salt="tenant-a",
+            model_revision="rev-a",
+        )
+        _SCHEDULER_PATCH.authorize_hybrid_apc_prefix_read(
+            key,
+            request_id="req-suffix-blocks",
+        )
+
+        prepared = bridge.prepare_suffix_only_request(
+            request_id="req-suffix-blocks",
+            input_dict={
+                "input_ids": torch.arange(256, 272, dtype=torch.int32).unsqueeze(0),
+                "block_table": torch.tensor([[99, 8]], dtype=torch.int32),
+            },
+            attention_hit_len=256,
+            request_prefix_len=272,
+        )
+
+        self.assertIsNotNone(prepared)
+        self.assertTrue(
+            torch.equal(
+                prepared.input_dict["block_table"],
+                torch.tensor([[4, 8]], dtype=torch.int32),
             )
         )
 
@@ -1202,6 +1348,53 @@ class TestHybridAPCSchedulerBridge(unittest.TestCase):
         self.assertEqual(allocator.reserved_slots, ())
         self.assertEqual(allocator.free_slots, (1, 0))
 
+    def test_prepare_with_request_record_keeps_lifecycle_on_original_dict(self):
+        store = _store()
+        allocator = HybridAPCSlotAllocator(num_slots=2)
+        bridge = HybridAPCSchedulerBridge(
+            store=store,
+            slot_allocator=allocator,
+            cache_salt="tenant-a",
+            model_revision="rev-a",
+            require_attention_block_refs=True,
+        )
+        model = types.SimpleNamespace(
+            config=types.SimpleNamespace(
+                use_hybrid_apc_manager=True,
+                hybrid_apc_require_vllm_metadata=True,
+                pad_token_id=0,
+            ),
+            hybrid_apc_bridge=bridge,
+        )
+        input_ids = torch.arange(128, dtype=torch.int32).unsqueeze(0)
+        hashes = build_cumulative_prefix_hashes(input_ids, block_size=128)
+        original_input = {
+            "input_ids": input_ids,
+            "hybrid_request_records": (
+                {
+                    "request_id": "req-record",
+                    "vllm_attention_hit_len": 0,
+                    "request_prefix_len": 128,
+                    "cumulative_hashes_by_prefix_len": hashes,
+                    "attention_block_refs_by_prefix_len": {128: (11,)},
+                },
+            ),
+        }
+
+        prepared_inputs = prepare_hybrid_apc_request_for_execution(
+            model,
+            original_input,
+        )
+
+        self.assertIsNot(prepared_inputs, original_input)
+        self.assertIn("_hybrid_apc_prepared", original_input)
+        self.assertEqual(allocator.reserved_slots, (0,))
+
+        finish_hybrid_apc_request(original_input)
+
+        self.assertEqual(allocator.reserved_slots, ())
+        self.assertEqual(allocator.committed_slots, (0,))
+
     def test_bridge_evicts_lru_checkpoint_before_reserving_when_slots_full(self):
         store = _store(max_checkpoints=2)
         allocator = HybridAPCSlotAllocator(num_slots=2)
@@ -1236,6 +1429,53 @@ class TestHybridAPCSchedulerBridge(unittest.TestCase):
         self.assertEqual(len(allocator.committed_slots), 2)
         self.assertEqual(allocator.reserved_slots, ())
         self.assertEqual(allocator.free_slots, ())
+
+    def test_store_releases_old_slot_when_replacing_same_key(self):
+        store = _store()
+        allocator = HybridAPCSlotAllocator(num_slots=2)
+        store.set_checkpoint_slot_releaser(allocator.release_committed)
+
+        key = store.make_key(
+            cumulative_prefix_hash="same-prefix",
+            prefix_len=128,
+            cache_salt="tenant-a",
+            model_revision="rev-a",
+        )
+
+        first_slot = allocator.reserve()
+        first = store.insert(
+            key=key,
+            attention_block_refs=(1,),
+            gdn_checkpoint_slot=first_slot,
+        )
+        allocator.mark_committed(first.gdn_checkpoint_slot)
+
+        second_slot = allocator.reserve()
+        second = store.insert(
+            key=key,
+            attention_block_refs=(2,),
+            gdn_checkpoint_slot=second_slot,
+        )
+        allocator.mark_committed(second.gdn_checkpoint_slot)
+
+        self.assertEqual(store.lookup(key).gdn_checkpoint_slot, second_slot)
+        self.assertEqual(allocator.committed_slots, (second_slot,))
+        self.assertEqual(allocator.free_slots, (first_slot,))
+
+    def test_attention_block_eviction_unpublishes_scheduler_checkpoint(self):
+        store = _store()
+        key, _checkpoint = _insert(
+            store,
+            128,
+            attention_block_refs=(7,),
+            gdn_checkpoint_slot=0,
+        )
+        _SCHEDULER_PATCH.register_hybrid_apc_gdn_checkpoint(key)
+        self.assertTrue(_SCHEDULER_PATCH.unregister_hybrid_apc_gdn_checkpoint(key))
+
+        _SCHEDULER_PATCH.register_hybrid_apc_gdn_checkpoint(key)
+        self.assertEqual(store.on_attention_block_evicted(7), [key])
+        self.assertFalse(_SCHEDULER_PATCH.unregister_hybrid_apc_gdn_checkpoint(key))
 
 
 if __name__ == "__main__":

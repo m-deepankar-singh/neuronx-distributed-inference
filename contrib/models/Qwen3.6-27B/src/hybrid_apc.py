@@ -590,16 +590,29 @@ def apply_hybrid_apc_suffix_prefill_plan(
         refs = tuple(int(ref) for ref in attention_block_refs)
         if refs:
             block_table_template = input_dict.get("block_table")
-            block_table_dtype = (
-                block_table_template.dtype
-                if isinstance(block_table_template, torch.Tensor)
-                else torch.int32
-            )
-            output["block_table"] = torch.tensor(
+            refs_table = torch.tensor(
                 [refs] * batch_size,
-                dtype=block_table_dtype,
+                dtype=torch.int32,
                 device=device,
             )
+            has_block_table = (
+                isinstance(block_table_template, torch.Tensor)
+                and block_table_template.numel() > 0
+                and block_table_template.ndim >= 2
+                and block_table_template.shape[0] >= batch_size
+            )
+            if has_block_table:
+                active_table = block_table_template[:batch_size].to(
+                    dtype=torch.int32,
+                    device=device,
+                )
+                if active_table.shape[1] > len(refs):
+                    suffix_table = active_table[:, len(refs) :]
+                else:
+                    suffix_table = active_table
+                output["block_table"] = torch.cat([refs_table, suffix_table], dim=1)
+            else:
+                output["block_table"] = refs_table
 
     position_template = input_dict.get("position_ids")
     position_dtype = (
@@ -1369,6 +1382,11 @@ class HybridAPCMetadataStore:
         if key in self._by_key:
             old_checkpoint = self._by_key[key]
             self._slot_to_key.pop(old_checkpoint.gdn_checkpoint_slot, None)
+            if (
+                old_checkpoint.gdn_checkpoint_slot != checkpoint.gdn_checkpoint_slot
+                and self._checkpoint_slot_releaser is not None
+            ):
+                self._checkpoint_slot_releaser(old_checkpoint.gdn_checkpoint_slot)
         self._by_key[key] = checkpoint
         self._by_key.move_to_end(key)
         self._slot_to_key[checkpoint.gdn_checkpoint_slot] = key
@@ -1588,6 +1606,7 @@ class HybridAPCMetadataStore:
         for key, checkpoint in self._by_key.items():
             if int(block_ref) in checkpoint.attention_block_refs:
                 checkpoint.attention_valid = False
+                _unpublish_scheduler_gdn_checkpoint(key)
                 invalidated.append(key)
         return invalidated
 

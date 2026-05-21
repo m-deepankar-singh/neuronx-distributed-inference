@@ -248,7 +248,7 @@ def deltanet_chunk_step(
     # nilpotent Neumann series but avoids repeated squaring of A.
     # ============================================================
     P_acc = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.memset(dst=P_acc, value=0.0)
+    nisa.tensor_copy(dst=P_acc, src=eye)
 
     A_T_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
     nisa.nc_transpose(dst=A_T_psum, data=A_mat)
@@ -289,17 +289,6 @@ def deltanet_chunk_step(
         row_prod = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_copy(dst=row_prod, src=row_psum)
 
-        row_with_eye = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_tensor(dst=row_with_eye, data1=row_prod, data2=eye, op=nl.add)
-
-        row_col_masked = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_tensor(
-            dst=row_col_masked,
-            data1=row_with_eye,
-            data2=col_mask_left,
-            op=nl.multiply,
-        )
-
         row_mask = nl.ndarray((P_MAX, 1), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_copy(
             dst=row_mask[0:P_MAX, 0:1],
@@ -308,15 +297,13 @@ def deltanet_chunk_step(
         row_update = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_scalar(
             dst=row_update,
-            data=row_col_masked,
+            data=row_prod,
             op0=nl.multiply,
             operand0=row_mask,
             engine=nisa.vector_engine,
         )
 
-        P_next = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_tensor(dst=P_next, data1=P_acc, data2=row_update, op=nl.add)
-        nisa.tensor_copy(dst=P_acc, src=P_next)
+        nisa.tensor_tensor(dst=P_acc, data1=P_acc, data2=row_update, op=nl.add)
 
     for solve_i in nl.static_range(64):
         row_idx = 64 + solve_i
@@ -326,13 +313,10 @@ def deltanet_chunk_step(
         row_prod = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_copy(dst=row_prod, src=row_psum)
 
-        row_with_eye = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_tensor(dst=row_with_eye, data1=row_prod, data2=eye, op=nl.add)
-
         row_col_masked = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_tensor(
             dst=row_col_masked,
-            data1=row_with_eye,
+            data1=row_prod,
             data2=col_mask_right,
             op=nl.multiply,
         )
@@ -351,9 +335,7 @@ def deltanet_chunk_step(
             engine=nisa.vector_engine,
         )
 
-        P_next = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_tensor(dst=P_next, data1=P_acc, data2=row_update, op=nl.add)
-        nisa.tensor_copy(dst=P_acc, src=P_next)
+        nisa.tensor_tensor(dst=P_acc, data1=P_acc, data2=row_update, op=nl.add)
 
     N_diag_T_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
     nisa.nc_transpose(dst=N_diag_T_psum, data=P_acc)

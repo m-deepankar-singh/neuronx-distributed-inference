@@ -9,6 +9,7 @@ import torch
 
 from neuronx_distributed_inference.modules.async_execution import (
     AsyncTensorWrapper,
+    _async_request_ids_signature,
     _combine_vectorized_hybrid_apc_inputs,
     cancel_hybrid_apc_request,
     execute_model_prefix_caching,
@@ -16,6 +17,28 @@ from neuronx_distributed_inference.modules.async_execution import (
     prepare_hybrid_apc_model_inputs,
     prepare_hybrid_apc_request_for_execution,
 )
+
+
+class TestAsyncRequestIdsSignature(unittest.TestCase):
+    def test_signature_preserves_request_order(self):
+        model = SimpleNamespace(_qwen36_vllm_request_ids=["req-b", "req-a"])
+
+        self.assertEqual(
+            _async_request_ids_signature(model),
+            ("req-b", "req-a"),
+        )
+
+    def test_signature_accepts_single_request_id(self):
+        model = SimpleNamespace(_qwen36_vllm_request_ids="req-a")
+
+        self.assertEqual(_async_request_ids_signature(model), ("req-a",))
+
+    def test_signature_accepts_tensor_request_ids(self):
+        model = SimpleNamespace(
+            _qwen36_vllm_request_ids=torch.tensor([1, 0], dtype=torch.int32)
+        )
+
+        self.assertEqual(_async_request_ids_signature(model), (1, 0))
 
 
 class TestAsyncTensorWrapper(unittest.TestCase):
@@ -1205,7 +1228,10 @@ class TestHybridAPCAsyncBridge(unittest.TestCase):
         self.assertTrue(
             torch.equal(
                 prepared["attention_mask"],
-                torch.tensor([[1, 0, 0, 0], [1, 1, 1, 0]], dtype=torch.int32),
+                torch.tensor(
+                    [[1, 1, 1, 1, 1, 0], [1, 1, 1, 0, 0, 0]],
+                    dtype=torch.int32,
+                ),
             )
         )
         self.assertTrue(
@@ -1217,7 +1243,7 @@ class TestHybridAPCAsyncBridge(unittest.TestCase):
         self.assertTrue(
             torch.equal(
                 prepared["block_table"],
-                torch.tensor([[1, 2], [4, 5]], dtype=torch.int32),
+                torch.tensor([[1, 2, 3], [4, 5, 6]], dtype=torch.int32),
             )
         )
 
