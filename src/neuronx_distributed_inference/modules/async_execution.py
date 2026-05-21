@@ -923,6 +923,14 @@ def _active_chunk_suffix_len(
     return active_len
 
 
+def _is_seq_id_fallback_request_id(request_id: Any) -> bool:
+    return (
+        isinstance(request_id, tuple)
+        and len(request_id) == 2
+        and request_id[0] == "seq_id"
+    )
+
+
 def _is_same_request_chunked_prefill_continuation(
     input_dict: Dict[str, Any],
     *,
@@ -942,14 +950,18 @@ def _is_same_request_chunked_prefill_continuation(
         return False
     if int(request_prefix_len) - int(hit_len) != int(active_len):
         return True
-    return (
+    if (
         input_dict.get("hybrid_prefill_completion_state") is not None
         and not _truthy_single_value(input_dict.get("hybrid_prefill_completion_state"))
         and _request_id_in_collection(
             request_id,
             input_dict.get("hybrid_cached_request_ids"),
         )
-    )
+    ):
+        return True
+    if _is_seq_id_fallback_request_id(request_id):
+        return True
+    return False
 
 
 def _with_inert_hybrid_apc_chunk_continuation(
@@ -1484,7 +1496,10 @@ def prepare_hybrid_apc_request_for_execution(
                             request_prefix_len,
                             hit_len + active_chunk_suffix_len,
                         )
-                        if active_chunk_suffix_len != suffix_len:
+                        if (
+                            active_chunk_suffix_len != suffix_len
+                            or _is_seq_id_fallback_request_id(request_id)
+                        ):
                             return _with_inert_hybrid_apc_chunk_continuation(
                                 input_dict,
                                 hit_len=hit_len,

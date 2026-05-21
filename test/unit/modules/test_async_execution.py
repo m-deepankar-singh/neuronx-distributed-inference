@@ -1846,6 +1846,66 @@ class TestHybridAPCAsyncBridge(unittest.TestCase):
             )
         )
 
+    def test_strict_hybrid_apc_seq_id_prefill_suffix_without_checkpoint_is_inert(
+        self,
+    ):
+        bridge = _FakeHybridBridge()
+        bridge.requires_external_metadata = True
+
+        def raise_unbacked_suffix_error(**kwargs):
+            bridge.suffix_prepare_calls.append(kwargs)
+            raise ValueError(
+                "suffix-only hybrid APC received an attention prefix hit "
+                "without scheduler-authorized GDN checkpoint metadata"
+            )
+
+        bridge.prepare_suffix_only_request = raise_unbacked_suffix_error
+        base = SimpleNamespace(
+            config=SimpleNamespace(
+                use_hybrid_apc_manager=True,
+                hybrid_apc_require_vllm_metadata=True,
+            ),
+            hybrid_apc_bridge=bridge,
+        )
+        input_dict = _prefix_input_dict()
+        input_dict["input_ids"] = torch.tensor([[12, 13]], dtype=torch.int32)
+        input_dict["attention_mask"] = torch.ones((1, 2), dtype=torch.int32)
+        input_dict["position_ids"] = torch.tensor([[2, 3]], dtype=torch.int32)
+        input_dict["slot_mapping"] = torch.tensor([[2, 3]], dtype=torch.int32)
+        input_dict["computed_context_lens"] = torch.tensor([[2]], dtype=torch.int32)
+        input_dict["full_context_lens"] = torch.tensor([[4]], dtype=torch.int32)
+        input_dict["seq_ids"] = torch.tensor([0], dtype=torch.int32)
+        input_dict["vllm_attention_hit_len"] = torch.tensor([2], dtype=torch.int32)
+
+        prepared = prepare_hybrid_apc_request_for_execution(base, input_dict)
+
+        self.assertFalse(bridge.prepare_calls)
+        self.assertFalse(bridge.suffix_prepare_calls)
+        self.assertTrue(
+            torch.equal(
+                prepared["full_context_lens"],
+                torch.tensor([[4]], dtype=torch.int32),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                prepared["num_queries"],
+                torch.tensor([[2]], dtype=torch.int32),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                prepared["hybrid_restore_mask"],
+                torch.tensor([0], dtype=torch.int32),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                prepared["hybrid_commit_mask"],
+                torch.tensor([0], dtype=torch.int32),
+            )
+        )
+
     def test_strict_hybrid_apc_suffix_chunk_other_bridge_error_still_raises(self):
         bridge = _FakeHybridBridge()
         bridge.requires_external_metadata = True
