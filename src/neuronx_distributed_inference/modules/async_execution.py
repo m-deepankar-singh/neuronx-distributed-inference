@@ -911,7 +911,9 @@ def _is_unbacked_suffix_only_hybrid_apc_error(exc: Exception) -> bool:
 
 
 def _is_same_request_chunked_prefill_continuation(
+    input_dict: Dict[str, Any],
     *,
+    request_id: Any,
     request_prefix_len: int,
     hit_len: int,
     suffix_len: int,
@@ -921,7 +923,16 @@ def _is_same_request_chunked_prefill_continuation(
         return False
     if active_suffix_len is not None and int(active_suffix_len) != int(suffix_len):
         return False
-    return int(request_prefix_len) - int(hit_len) != int(suffix_len)
+    if int(request_prefix_len) - int(hit_len) != int(suffix_len):
+        return True
+    return (
+        input_dict.get("hybrid_prefill_completion_state") is not None
+        and not _truthy_single_value(input_dict.get("hybrid_prefill_completion_state"))
+        and _request_id_in_collection(
+            request_id,
+            input_dict.get("hybrid_cached_request_ids"),
+        )
+    )
 
 
 def _with_inert_hybrid_apc_chunk_continuation(
@@ -1437,6 +1448,8 @@ def prepare_hybrid_apc_request_for_execution(
                     # boundary, otherwise the suffix-only bridge rejects the row.
                     same_request_chunk_continuation = (
                         _is_same_request_chunked_prefill_continuation(
+                            input_dict,
+                            request_id=request_id,
                             request_prefix_len=request_prefix_len,
                             hit_len=hit_len,
                             suffix_len=suffix_len,
