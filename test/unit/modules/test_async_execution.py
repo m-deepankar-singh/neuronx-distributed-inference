@@ -1492,6 +1492,40 @@ class TestHybridAPCAsyncBridge(unittest.TestCase):
             )
         )
 
+    def test_strict_hybrid_apc_commits_zero_hit_chunk_boundary_with_hash(self):
+        bridge = _FakeHybridBridge()
+        bridge.requires_external_metadata = True
+        base = SimpleNamespace(
+            config=SimpleNamespace(
+                use_hybrid_apc_manager=True,
+                hybrid_apc_require_vllm_metadata=True,
+            ),
+            hybrid_apc_bridge=bridge,
+        )
+        input_dict = _prefix_input_dict()
+        input_dict["input_ids"] = torch.tensor([[12, 13]], dtype=torch.int32)
+        input_dict["attention_mask"] = torch.ones((1, 2), dtype=torch.int32)
+        input_dict["position_ids"] = torch.tensor([[0, 1]], dtype=torch.int32)
+        input_dict["slot_mapping"] = torch.tensor([[0, 1]], dtype=torch.int32)
+        input_dict["full_context_lens"] = torch.tensor([[4]], dtype=torch.int32)
+        input_dict["computed_context_lens"] = torch.tensor([[0]], dtype=torch.int32)
+        input_dict["request_id"] = "req-strict"
+        input_dict["vllm_attention_hit_len"] = torch.tensor([0], dtype=torch.int32)
+        input_dict["cumulative_hashes_by_prefix_len"] = {2: b"hash-2"}
+        input_dict["attention_block_refs_by_prefix_len"] = {2: [9]}
+
+        prepared = prepare_hybrid_apc_request_for_execution(base, input_dict)
+
+        self.assertEqual(len(bridge.prepare_calls), 1)
+        self.assertFalse(bridge.suffix_prepare_calls)
+        self.assertEqual(bridge.prepare_kwargs["request_prefix_len"], 2)
+        self.assertTrue(
+            torch.equal(
+                prepared["hybrid_commit_mask"],
+                torch.tensor([1], dtype=torch.int32),
+            )
+        )
+
     def test_strict_hybrid_apc_allows_zero_hit_without_hash_metadata(self):
         bridge = _FakeHybridBridge()
         bridge.requires_external_metadata = True

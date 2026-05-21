@@ -1340,24 +1340,42 @@ def prepare_hybrid_apc_request_for_execution(
             and input_ids.shape[1] < request_prefix_len
         ):
             if _to_python_int(attention_hit_len) <= 0:
-                return _with_zero_hybrid_apc_slots(input_dict)
+                active_prefix_len = min(
+                    request_prefix_len,
+                    int(input_ids.shape[1]),
+                )
+                if (
+                    cumulative_hashes_by_prefix_len
+                    and active_prefix_len in cumulative_hashes_by_prefix_len
+                ):
+                    prepared = bridge.prepare_request(
+                        request_id=request_id,
+                        input_dict=input_dict,
+                        attention_hit_len=0,
+                        request_prefix_len=active_prefix_len,
+                        cumulative_hashes_by_prefix_len=cumulative_hashes_by_prefix_len,
+                        attention_block_refs_by_prefix_len=attention_block_refs_by_prefix_len,
+                    )
+                else:
+                    return _with_zero_hybrid_apc_slots(input_dict)
             # The live prefix-caching request has already been sliced to the
             # attention suffix. Without full prompt tokens the bridge cannot
             # compute or apply an exact GDN checkpoint boundary.
-            prepare_suffix_only = getattr(
-                bridge,
-                "prepare_suffix_only_request",
-                None,
-            )
-            if prepare_suffix_only is not None:
-                prepared = prepare_suffix_only(
-                    request_id=request_id,
-                    input_dict=input_dict,
-                    attention_hit_len=_to_python_int(attention_hit_len),
-                    request_prefix_len=request_prefix_len,
-                    cumulative_hashes_by_prefix_len=cumulative_hashes_by_prefix_len,
-                    attention_block_refs_by_prefix_len=attention_block_refs_by_prefix_len,
+            else:
+                prepare_suffix_only = getattr(
+                    bridge,
+                    "prepare_suffix_only_request",
+                    None,
                 )
+                if prepare_suffix_only is not None:
+                    prepared = prepare_suffix_only(
+                        request_id=request_id,
+                        input_dict=input_dict,
+                        attention_hit_len=_to_python_int(attention_hit_len),
+                        request_prefix_len=request_prefix_len,
+                        cumulative_hashes_by_prefix_len=cumulative_hashes_by_prefix_len,
+                        attention_block_refs_by_prefix_len=attention_block_refs_by_prefix_len,
+                    )
             if prepared is None:
                 if requires_external_metadata:
                     raise ValueError(
