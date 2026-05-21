@@ -1298,6 +1298,29 @@ def _expand_completed_prefill_logits(hidden_states: Any, model_input: Any) -> An
         return hidden_states
 
 
+def _prefill_completion_has_incomplete_row(prefill_completion_state: Any) -> bool:
+    if prefill_completion_state is None:
+        return False
+    try:
+        if hasattr(prefill_completion_state, "numel"):
+            if prefill_completion_state.numel() == 0:
+                return False
+            return not bool(prefill_completion_state.reshape(-1).bool().all().item())
+        values = list(prefill_completion_state)
+    except Exception:
+        return False
+    if not values:
+        return False
+    for value in values:
+        try:
+            if not bool(value.item()):
+                return True
+        except AttributeError:
+            if not bool(value):
+                return True
+    return False
+
+
 def patch_neuron_model_runner_class(runner_cls: type) -> bool:
     """Patch vLLM-Neuron runner to expose scheduler row metadata."""
 
@@ -1310,6 +1333,11 @@ def patch_neuron_model_runner_class(runner_cls: type) -> bool:
     original_prepare_logits = getattr(
         runner_cls,
         "_prepare_logits_for_sampling",
+        None,
+    )
+    original_sample_on_device = getattr(
+        runner_cls,
+        "_sample_on_device",
         None,
     )
 
@@ -1421,6 +1449,41 @@ def patch_neuron_model_runner_class(runner_cls: type) -> bool:
             original_prepare_logits
         )
         runner_cls._prepare_logits_for_sampling = prepare_logits_for_sampling_with_debug
+        installed = True
+
+    if original_sample_on_device is not None and not getattr(
+        original_sample_on_device,
+        "_qwen36_clone_incomplete_prefill_tokens_patched",
+        False,
+    ):
+
+        def sample_on_device_with_incomplete_prefill_clone(
+            self,
+            hidden_states,
+            model_input,
+            *args,
+            **kwargs,
+        ):
+            prefill_state = getattr(model_input, "prefill_completion_state", None)
+            if _prefill_completion_has_incomplete_row(prefill_state):
+                clone = getattr(hidden_states, "clone", None)
+                if clone is not None:
+                    hidden_states = clone()
+            return original_sample_on_device(
+                self,
+                hidden_states,
+                model_input,
+                *args,
+                **kwargs,
+            )
+
+        sample_on_device_with_incomplete_prefill_clone._qwen36_clone_incomplete_prefill_tokens_patched = (
+            True
+        )
+        sample_on_device_with_incomplete_prefill_clone._qwen36_original_sample_on_device = (
+            original_sample_on_device
+        )
+        runner_cls._sample_on_device = sample_on_device_with_incomplete_prefill_clone
         installed = True
 
     if getattr(original_execute, "_qwen36_hybrid_apc_request_ids_patched", False):

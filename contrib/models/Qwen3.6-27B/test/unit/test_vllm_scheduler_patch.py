@@ -1776,6 +1776,36 @@ class TestQwen36HybridAPCSchedulerPatch(unittest.TestCase):
 
         torch.testing.assert_close(logits, hidden_states)
 
+    def test_runner_patch_clones_inference_tensor_before_on_device_prefill_mask(self):
+        class FakeRunner:
+            def __init__(self):
+                self.model = types.SimpleNamespace(model=types.SimpleNamespace())
+
+            def _execute_model_for_text(self, model_input, intermediate_tensors=None):
+                del intermediate_tensors
+                return model_input
+
+            def _sample_on_device(self, hidden_states, model_input):
+                for idx, state in enumerate(model_input.prefill_completion_state):
+                    if not state.item():
+                        hidden_states[idx] = -1
+                return hidden_states
+
+        self.patch.patch_neuron_model_runner_class(FakeRunner)
+        runner = FakeRunner()
+        with torch.inference_mode():
+            hidden_states = torch.tensor([11, 22], dtype=torch.int32)
+
+        sampled = runner._sample_on_device(
+            hidden_states,
+            types.SimpleNamespace(
+                prefill_completion_state=torch.tensor([True, False]),
+            ),
+        )
+
+        torch.testing.assert_close(sampled, torch.tensor([11, -1], dtype=torch.int32))
+        torch.testing.assert_close(hidden_states, torch.tensor([11, 22], dtype=torch.int32))
+
     def test_import_hook_patches_already_loaded_neuron_runner_module(self):
         class FakeRunner:
             def __init__(self):
