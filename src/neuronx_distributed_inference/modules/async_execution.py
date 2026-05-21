@@ -1734,11 +1734,38 @@ def _is_context_encoding_execution(
 ) -> bool:
     if getattr(model_to_execute, "tag", None) == "context_encoding_model":
         return True
+    input_ids = input_dict.get("input_ids")
+    if (
+        isinstance(input_ids, torch.Tensor)
+        and input_ids.ndim >= 2
+        and input_ids.shape[-1] > 1
+        and not getattr(neuron_base_instance.neuron_config, "enable_fused_speculation", False)
+        and not getattr(neuron_base_instance.neuron_config, "enable_eagle_speculation", False)
+    ):
+        return True
     is_prefill = getattr(neuron_base_instance, "_is_prefill", None)
     position_ids = input_dict.get("position_ids")
     if callable(is_prefill) and position_ids is not None:
         return bool(is_prefill(position_ids))
     return False
+
+
+def _is_chunked_prefill_execution(
+    neuron_base_instance: "NeuronBaseForCausalLM",
+    inputs: Dict[str, Any],
+    *,
+    is_fused_speculation: bool,
+) -> bool:
+    if is_fused_speculation:
+        return False
+    if getattr(neuron_base_instance.neuron_config, "enable_eagle_speculation", False):
+        return False
+    input_ids = inputs.get("input_ids")
+    return (
+        isinstance(input_ids, torch.Tensor)
+        and input_ids.ndim >= 2
+        and input_ids.shape[-1] > 1
+    )
 
 
 def _with_disabled_hybrid_apc_controls(input_dict: Dict[str, Any]) -> Dict[str, Any]:
@@ -1963,6 +1990,16 @@ def causal_lm_async_execution(
 
     # PREFILL STAGE:
     is_prefill = neuron_base_instance._is_prefill(inputs["position_ids"])
+    if (
+        is_prefix_caching
+        and not is_prefill
+        and _is_chunked_prefill_execution(
+            neuron_base_instance,
+            inputs,
+            is_fused_speculation=is_fused_speculation,
+        )
+    ):
+        is_prefill = True
     neuron_base_instance.async_should_stop = False
     prefill_outputs = None
     is_run_on_neuron = None

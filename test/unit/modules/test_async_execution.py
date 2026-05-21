@@ -11,6 +11,8 @@ from neuronx_distributed_inference.modules.async_execution import (
     AsyncTensorWrapper,
     _async_request_ids_signature,
     _combine_vectorized_hybrid_apc_inputs,
+    _is_chunked_prefill_execution,
+    _is_context_encoding_execution,
     cancel_hybrid_apc_request,
     execute_model_prefix_caching,
     finish_hybrid_apc_request,
@@ -546,6 +548,58 @@ class TestHybridAPCAsyncBridge(unittest.TestCase):
         )
         self.assertTrue(
             torch.equal(model.calls[0][-1], torch.tensor([0], dtype=torch.int32))
+        )
+
+    def test_chunked_prefill_with_nonzero_positions_still_uses_context_execution(self):
+        base = SimpleNamespace(
+            neuron_config=SimpleNamespace(
+                enable_fused_speculation=False,
+                enable_eagle_speculation=False,
+            ),
+            _is_prefill=lambda position_ids: not bool(position_ids.min().item()),
+        )
+        model = _FakePrefixModel(tag="token_generation_model")
+        input_dict = _prefix_input_dict()
+        input_dict.update(
+            {
+                "input_ids": torch.arange(256, dtype=torch.int32).reshape(1, 256),
+                "position_ids": torch.arange(256, 512, dtype=torch.int32).reshape(1, 256),
+            }
+        )
+
+        self.assertTrue(_is_context_encoding_execution(base, model, input_dict))
+        self.assertTrue(
+            _is_chunked_prefill_execution(
+                base,
+                input_dict,
+                is_fused_speculation=False,
+            )
+        )
+
+    def test_single_token_decode_remains_generation_execution(self):
+        base = SimpleNamespace(
+            neuron_config=SimpleNamespace(
+                enable_fused_speculation=False,
+                enable_eagle_speculation=False,
+            ),
+            _is_prefill=lambda position_ids: not bool(position_ids.min().item()),
+        )
+        model = _FakePrefixModel(tag="token_generation_model")
+        input_dict = _prefix_input_dict()
+        input_dict.update(
+            {
+                "input_ids": torch.tensor([[13]], dtype=torch.int32),
+                "position_ids": torch.tensor([[512]], dtype=torch.int32),
+            }
+        )
+
+        self.assertFalse(_is_context_encoding_execution(base, model, input_dict))
+        self.assertFalse(
+            _is_chunked_prefill_execution(
+                base,
+                input_dict,
+                is_fused_speculation=False,
+            )
         )
 
     def test_commit_debug_switch_cancels_instead_of_committing_metadata(self):
