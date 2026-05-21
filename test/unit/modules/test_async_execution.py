@@ -474,6 +474,47 @@ class TestHybridAPCAsyncBridge(unittest.TestCase):
         self.assertEqual(bridge.finished, ["req-1"])
         self.assertNotIn("_hybrid_apc_prepared", input_dict)
 
+    def test_prefix_caching_execution_does_not_prepare_hybrid_apc_for_generation(self):
+        base = SimpleNamespace(
+            config=SimpleNamespace(use_hybrid_apc_manager=True),
+            neuron_config=SimpleNamespace(
+                enable_fused_speculation=False,
+                enable_eagle_speculation=False,
+            ),
+        )
+        bridge = _FakeHybridBridge()
+        model = _FakePrefixModel(tag="token_generation_model")
+        input_dict = _prefix_input_dict()
+        input_dict.update(
+            {
+                "input_ids": torch.tensor([[13]], dtype=torch.int32),
+                "attention_mask": torch.ones((1, 5), dtype=torch.int32),
+                "position_ids": torch.tensor([[4]], dtype=torch.int32),
+                "slot_mapping": torch.tensor([[4]], dtype=torch.int32),
+                "full_context_lens": torch.tensor([[5]], dtype=torch.int32),
+                "computed_context_lens": torch.tensor([[4]], dtype=torch.int32),
+                "hybrid_apc_bridge": bridge,
+                "request_id": "req-1",
+                "vllm_attention_hit_len": torch.tensor([4], dtype=torch.int32),
+                "hybrid_restore_slot_ids": torch.tensor([5], dtype=torch.int32),
+                "hybrid_restore_mask": torch.tensor([1], dtype=torch.int32),
+                "hybrid_commit_slot_ids": torch.tensor([7], dtype=torch.int32),
+                "hybrid_commit_mask": torch.tensor([1], dtype=torch.int32),
+            }
+        )
+
+        result, is_neuron = execute_model_prefix_caching(base, model, input_dict)
+
+        self.assertEqual(result, "model-output")
+        self.assertFalse(is_neuron)
+        self.assertEqual(bridge.prepare_calls, [])
+        self.assertTrue(
+            torch.equal(model.calls[0][-4], torch.tensor([0], dtype=torch.int32))
+        )
+        self.assertTrue(
+            torch.equal(model.calls[0][-1], torch.tensor([0], dtype=torch.int32))
+        )
+
     def test_commit_debug_switch_cancels_instead_of_committing_metadata(self):
         base = SimpleNamespace(
             config=SimpleNamespace(use_hybrid_apc_manager=True),
@@ -1692,8 +1733,9 @@ class _FakeHybridBridge:
 
 
 class _FakePrefixModel:
-    def __init__(self, should_fail=False):
+    def __init__(self, should_fail=False, tag="context_encoding_model"):
         self.should_fail = should_fail
+        self.tag = tag
         self.calls = []
 
     def __call__(self, *args, **kwargs):

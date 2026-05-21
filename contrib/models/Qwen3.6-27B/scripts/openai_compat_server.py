@@ -58,6 +58,16 @@ def _token_scalar(tokens: Any) -> int:
     return int(tokens.reshape(-1)[0].item())
 
 
+def _normalize_stop_sequences(stop: Any) -> List[str]:
+    if stop is None:
+        return []
+    if isinstance(stop, str):
+        return [stop]
+    if isinstance(stop, list):
+        return [item for item in stop if isinstance(item, str)]
+    return []
+
+
 class QwenOpenAIServer:
     def __init__(self, args: argparse.Namespace):
         self.args = args
@@ -234,7 +244,7 @@ class QwenOpenAIServer:
             raise RuntimeError(f"model generated invalid token ids: {invalid[:8]}")
 
         text = self.tokenizer.decode(new_ids, skip_special_tokens=True)
-        for stop in body.get("stop") or []:
+        for stop in _normalize_stop_sequences(body.get("stop")):
             if isinstance(stop, str) and stop in text:
                 text = text.split(stop, 1)[0]
 

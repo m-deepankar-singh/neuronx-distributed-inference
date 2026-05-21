@@ -695,7 +695,8 @@ class ModelWrapper(torch.nn.Module):
                 for arg in eagle_empty_args:
                     padded_args.append(arg)
             else:
-                for arg in extra_prefix_args:
+                extra_prefix_arg_count = len(extra_prefix_args)
+                for extra_prefix_arg_index, arg in enumerate(extra_prefix_args):
                     if arg.numel() == 0:
                         padded_args.append(arg)
                     elif arg.dim() == 3 and arg.shape[0] == 3 and arg.shape[1] == seq_ids.shape[0]:
@@ -706,9 +707,21 @@ class ModelWrapper(torch.nn.Module):
                         padded[:, : arg.shape[1], :] = arg
                         padded_args.append(padded)
                     elif arg.shape[0] == seq_ids.shape[0]:
-                        padded_args.append(
-                            self._pad_helper(arg, pad_type="repeat_first_batchline")
-                        )
+                        if self._is_hybrid_apc_control_extra_arg(
+                            extra_prefix_arg_index,
+                            extra_prefix_arg_count,
+                        ):
+                            padded = torch.zeros(
+                                (target_batch_size,) + tuple(arg.shape[1:]),
+                                dtype=arg.dtype,
+                                device=arg.device,
+                            )
+                            padded[: arg.shape[0]] = arg
+                            padded_args.append(padded)
+                        else:
+                            padded_args.append(
+                                self._pad_helper(arg, pad_type="repeat_first_batchline")
+                            )
                     else:
                         padded_args.append(arg)
 
@@ -733,6 +746,20 @@ class ModelWrapper(torch.nn.Module):
         else:
             logits, *kv_cache = outputs
             return [torch.index_select(logits, 0, seq_ids), *kv_cache]
+
+    def _is_hybrid_apc_control_extra_arg(
+        self,
+        extra_prefix_arg_index: int,
+        extra_prefix_arg_count: int,
+    ) -> bool:
+        if not getattr(self.config, "use_hybrid_apc_manager", False):
+            return False
+        if self.tag not in (CONTEXT_ENCODING_MODEL_TAG, TOKEN_GENERATION_MODEL_TAG):
+            return False
+        return (
+            extra_prefix_arg_count >= 14
+            and extra_prefix_arg_index >= extra_prefix_arg_count - 5
+        )
 
     def _forward(self, *args):
         if self.async_mode:

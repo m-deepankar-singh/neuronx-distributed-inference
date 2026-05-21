@@ -1647,6 +1647,27 @@ def prepare_hybrid_apc_model_inputs(
     ]
 
 
+def _is_context_encoding_execution(
+    neuron_base_instance: "NeuronBaseForCausalLM",
+    model_to_execute: "ModelWrapper",
+    input_dict: Dict[str, Any],
+) -> bool:
+    if getattr(model_to_execute, "tag", None) == "context_encoding_model":
+        return True
+    is_prefill = getattr(neuron_base_instance, "_is_prefill", None)
+    position_ids = input_dict.get("position_ids")
+    if callable(is_prefill) and position_ids is not None:
+        return bool(is_prefill(position_ids))
+    return False
+
+
+def _with_disabled_hybrid_apc_controls(input_dict: Dict[str, Any]) -> Dict[str, Any]:
+    output = dict(input_dict)
+    _zero_mask_if_present(output, "hybrid_restore_mask")
+    _zero_mask_if_present(output, "hybrid_commit_mask")
+    return output
+
+
 class AsyncTensorWrapper:
     """
     Wrapper class for tensors from models executed with async runtime.
@@ -1718,10 +1739,17 @@ def execute_model_prefix_caching(
 ) -> Tuple[AsyncTensorWrapper, bool]:
     original_input_dict = input_dict
     try:
-        input_dict = prepare_hybrid_apc_request_for_execution(
+        if _is_context_encoding_execution(
             neuron_base_instance,
+            model_to_execute,
             input_dict,
-        )
+        ):
+            input_dict = prepare_hybrid_apc_request_for_execution(
+                neuron_base_instance,
+                input_dict,
+            )
+        else:
+            input_dict = _with_disabled_hybrid_apc_controls(input_dict)
         if "num_queries" not in input_dict:
             full_context_lens = input_dict["full_context_lens"]
             computed_context_lens = input_dict["computed_context_lens"]

@@ -42,6 +42,7 @@ from neuronx_distributed_inference.models.model_base import (
     NeuronBaseModel,
 )
 from neuronx_distributed_inference.modules.async_execution import (
+    cancel_hybrid_apc_request,
     finish_hybrid_apc_request,
     prepare_hybrid_apc_request_for_execution,
 )
@@ -5649,7 +5650,13 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
                     self.config,
                     cte_args,
                 )
-                chunk_out = self.context_encoding_model(*cte_args)
+                try:
+                    chunk_out = self.context_encoding_model(*cte_args)
+                except Exception:
+                    if hybrid_apc_request_dict is not None:
+                        cancel_hybrid_apc_request(hybrid_apc_request_dict)
+                        hybrid_apc_request_dict = None
+                    raise
                 if actual_chunk < ctx_bs:
                     chunk_out = chunk_out[:actual_chunk]
                 output_logits.append(chunk_out)
