@@ -303,6 +303,9 @@ def _build_llm(args, *, enable_hybrid_apc: bool):
         "enable_chunked_prefill": args.enable_vllm_chunked_prefill,
         "additional_config": additional_config,
     }
+    gpu_memory_utilization = getattr(args, "gpu_memory_utilization", None)
+    if gpu_memory_utilization is not None:
+        llm_kwargs["gpu_memory_utilization"] = float(gpu_memory_utilization)
     if enable_hybrid_apc or args.enable_vllm_chunked_prefill:
         llm_kwargs["block_size"] = args.block_size
     if enable_hybrid_apc:

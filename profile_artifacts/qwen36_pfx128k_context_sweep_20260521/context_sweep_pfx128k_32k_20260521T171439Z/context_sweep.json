@@ -1,0 +1,100 @@
+{
+  "artifact": "/mnt/trainium_artifacts/qwen_artifacts/qwen36_27b_128k_fp8_mlp_edgebf16_hybrid_apc_nki_chunked_b256_cte256_512_pfx128k_slots64_20260521T160116Z",
+  "artifact_neuron_config": {
+    "context_encoding_buckets": [
+      256,
+      512
+    ],
+    "ctx_batch_size": 1,
+    "max_context_length": 131072,
+    "on_device_sampling_config": {
+      "deterministic": false,
+      "do_sample": false,
+      "dynamic": false,
+      "global_topk": 256,
+      "on_device_sampling_config": true,
+      "sampling_dp_degree": 1,
+      "temperature": 1.0,
+      "top_k": 1,
+      "top_k_kernel_enabled": true,
+      "top_p": 1.0
+    },
+    "output_logits": false,
+    "pa_block_size": 256,
+    "pa_num_blocks": 512,
+    "prefix_buckets": [
+      256,
+      512,
+      1024,
+      2048,
+      4096,
+      8192,
+      16384,
+      32768,
+      65536,
+      131072
+    ],
+    "seq_len": 131072,
+    "tkg_batch_size": 1,
+    "token_generation_buckets": [
+      131072
+    ]
+  },
+  "lengths": [
+    16384,
+    32760
+  ],
+  "passed": true,
+  "rows": [
+    {
+      "actual_prompt_tokens": 16384,
+      "cold": {
+        "elapsed_seconds": 27.002640253998834,
+        "generated_text": " token",
+        "generated_token_count": 1,
+        "generated_tokens": [
+          3817
+        ]
+      },
+      "cold_effective_prompt_tokens_per_second": 606.75548190417,
+      "max_tokens": 1,
+      "real_tokens_passed": true,
+      "repeat_exact": true,
+      "target_prompt_tokens": 16384,
+      "warm": {
+        "elapsed_seconds": 0.4266257700001006,
+        "generated_text": " token",
+        "generated_token_count": 1,
+        "generated_tokens": [
+          3817
+        ]
+      },
+      "warm_effective_prompt_tokens_per_second": 38403.68105282561
+    },
+    {
+      "actual_prompt_tokens": 32760,
+      "cold": {
+        "elapsed_seconds": 63.22995087500021,
+        "generated_text": " four",
+        "generated_token_count": 1,
+        "generated_tokens": [
+          2943
+        ]
+      },
+      "cold_effective_prompt_tokens_per_second": 518.1088953360647,
+      "max_tokens": 1,
+      "real_tokens_passed": true,
+      "repeat_exact": true,
+      "target_prompt_tokens": 32760,
+      "warm": {
+        "elapsed_seconds": 0.5906422459993337,
+        "generated_text": " four",
+        "generated_token_count": 1,
+        "generated_tokens": [
+          2943
+        ]
+      },
+      "warm_effective_prompt_tokens_per_second": 55465.04711083087
+    }
+  ]
+}
