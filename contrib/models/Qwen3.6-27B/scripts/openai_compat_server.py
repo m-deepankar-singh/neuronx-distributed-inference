@@ -68,6 +68,83 @@ def _normalize_stop_sequences(stop: Any) -> List[str]:
     return []
 
 
+def _coerce_optional_bool(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower().replace("-", "_").replace(" ", "_")
+        if normalized in {"1", "true", "yes", "y", "on", "enable", "enabled", "thinking"}:
+            return True
+        if normalized in {
+            "0",
+            "false",
+            "no",
+            "n",
+            "off",
+            "disable",
+            "disabled",
+            "none",
+            "non_thinking",
+            "no_thinking",
+        }:
+            return False
+    return None
+
+
+def _resolve_enable_thinking(body: Dict[str, Any]) -> bool:
+    for key in ("enable_thinking", "thinking_enabled", "thinking"):
+        if key in body:
+            value = body.get(key)
+            if isinstance(value, dict):
+                for nested_key in ("enable_thinking", "enabled", "enable", "value"):
+                    if nested_key in value:
+                        coerced = _coerce_optional_bool(value.get(nested_key))
+                        if coerced is not None:
+                            return coerced
+                budget = value.get("budget_tokens")
+                if isinstance(budget, int):
+                    return budget > 0
+            coerced = _coerce_optional_bool(value)
+            if coerced is not None:
+                return coerced
+
+    template_kwargs = body.get("chat_template_kwargs")
+    if isinstance(template_kwargs, dict):
+        coerced = _coerce_optional_bool(template_kwargs.get("enable_thinking"))
+        if coerced is not None:
+            return coerced
+
+    reasoning = body.get("reasoning")
+    if isinstance(reasoning, dict):
+        for nested_key in ("enable_thinking", "enabled", "enable", "value"):
+            if nested_key in reasoning:
+                coerced = _coerce_optional_bool(reasoning.get(nested_key))
+                if coerced is not None:
+                    return coerced
+        effort = reasoning.get("effort") or reasoning.get("reasoning_effort")
+        coerced = _coerce_optional_bool(effort)
+        if coerced is not None:
+            return coerced
+        if isinstance(effort, str) and effort.strip():
+            return True
+    else:
+        coerced = _coerce_optional_bool(reasoning)
+        if coerced is not None:
+            return coerced
+
+    if "reasoning_effort" in body:
+        effort = body.get("reasoning_effort")
+        coerced = _coerce_optional_bool(effort)
+        if coerced is not None:
+            return coerced
+        if isinstance(effort, str) and effort.strip():
+            return True
+
+    return False
+
+
 class QwenOpenAIServer:
     def __init__(self, args: argparse.Namespace):
         self.args = args
@@ -330,7 +407,7 @@ def make_handler(server_state: QwenOpenAIServer):
                     result = server_state._generate(
                         server_state._chat_prompt(
                             messages,
-                            enable_thinking=bool(body.get("enable_thinking", False)),
+                            enable_thinking=_resolve_enable_thinking(body),
                         ),
                         body,
                     )

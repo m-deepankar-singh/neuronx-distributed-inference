@@ -253,8 +253,12 @@ The proxy forces `chat_template_kwargs={"enable_thinking": false}` for
 prompts bypass the Qwen chat template and can pollute the hybrid model state.
 It also hoists `system` and `developer` messages to a single leading `system`
 message because the Qwen chat template rejects system messages that appear later
-in the conversation. Use `--allow-thinking` or `--allow-completions` only for
-explicit debugging.
+in the conversation. Start the proxy with `--allow-thinking` to allow a
+request-level toggle while keeping the default non-thinking path. Supported
+toggles include `enable_thinking=true`, `thinking=true`,
+`thinking={"enabled": true}`, `reasoning_effort=low|medium|high`, and native
+`chat_template_kwargs={"enable_thinking": true}`. Use `--allow-completions` only
+for explicit debugging.
 
 Offline long-prompt smoke:
 
