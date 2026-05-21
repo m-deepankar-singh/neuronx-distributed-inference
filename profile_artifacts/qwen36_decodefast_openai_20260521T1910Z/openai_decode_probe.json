@@ -1,0 +1,78 @@
+{
+  "base_url": "http://127.0.0.1:8000/v1",
+  "model": "/home/ubuntu/models/Qwen3.6-27B",
+  "artifact": "/mnt/trainium_artifacts/qwen_artifacts/qwen36_27b_128k_fp8_mlp_edgebf16_hybrid_apc_nki_chunked_b256_cte256_512_pfx16k_slots64_tkg8192_32768_131072_async_20260521T181759Z",
+  "prompt": "Explain software benchmarking in two concise paragraphs.",
+  "warmup": {
+    "status": 200,
+    "elapsed_s": 0.8502508550009225,
+    "response": {
+      "id": "chatcmpl-99ee11959909bdba",
+      "object": "chat.completion",
+      "created": 1779390458,
+      "model": "/home/ubuntu/models/Qwen3.6-27B",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "Thinking Process",
+            "refusal": null,
+            "annotations": null,
+            "audio": null,
+            "function_call": null,
+            "tool_calls": [],
+            "reasoning": null
+          },
+          "logprobs": null,
+          "finish_reason": "length",
+          "stop_reason": null,
+          "token_ids": null
+        }
+      ],
+      "service_tier": null,
+      "system_fingerprint": null,
+      "usage": {
+        "prompt_tokens": 20,
+        "total_tokens": 22,
+        "completion_tokens": 2,
+        "prompt_tokens_details": null
+      },
+      "prompt_logprobs": null,
+      "prompt_token_ids": null,
+      "kv_transfer_params": null
+    }
+  },
+  "non_streaming": {
+    "status": 200,
+    "elapsed_s": 1.768840230000933,
+    "usage": {
+      "prompt_tokens": 20,
+      "total_tokens": 52,
+      "completion_tokens": 32,
+      "prompt_tokens_details": null
+    },
+    "completion_tokens": 32,
+    "tok_s": 18.090949910147128,
+    "finish_reason": "length",
+    "text": "Thinking Process:\n\n1.  **Deconstruct the user's request:**\n    *   Topic: Software benchmarking.\n    *   Constraint: Two",
+    "raw_response_id": "chatcmpl-89c4f31d8ba27859"
+  },
+  "streaming": {
+    "elapsed_s": 1.7717579969976214,
+    "ttft_first_event_s": 0.401338740997744,
+    "ttft_first_content_s": 0.4013857139980246,
+    "events": 34,
+    "usage": {
+      "prompt_tokens": 20,
+      "total_tokens": 52,
+      "completion_tokens": 32
+    },
+    "completion_tokens": 32,
+    "tok_s": 18.061157366991672,
+    "tpot_excluding_first_content_ms": 44.20555751611602,
+    "finish_reason": "length",
+    "text": "Thinking Process:\n\n1.  **Deconstruct the user's request:**\n    *   Topic: Software benchmarking.\n    *   Constraint: Two",
+    "status": 200
+  }
+}
