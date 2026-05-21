@@ -1723,6 +1723,53 @@ class TestQwen36HybridAPCSchedulerPatch(unittest.TestCase):
             ),
         )
 
+    def test_runner_patch_uses_scheduler_ids_when_model_input_has_no_ids(self):
+        @dataclass(frozen=True)
+        class FrozenModelInput:
+            pass
+
+        class FakeRunner:
+            def __init__(self):
+                self.model = types.SimpleNamespace(model=types.SimpleNamespace())
+
+            def _prepare_model_input(self, scheduler_output):
+                del scheduler_output
+                return FrozenModelInput()
+
+            def _execute_model_for_text(self, model_input, intermediate_tensors=None):
+                del intermediate_tensors
+                return model_input
+
+        installed = self.patch.patch_neuron_model_runner_class(FakeRunner)
+        runner = FakeRunner()
+        scheduler_output = types.SimpleNamespace(
+            scheduled_cached_reqs=types.SimpleNamespace(req_ids=["warm"]),
+            scheduled_new_reqs=[],
+            num_scheduled_tokens={"warm": 2},
+            _qwen36_hybrid_apc_metadata_by_request_id={
+                "warm": {
+                    "vllm_attention_hit_len": 2,
+                    "request_prefix_len": 4,
+                    "active_suffix_len": 2,
+                },
+            },
+        )
+        model_input = runner._prepare_model_input(scheduler_output)
+
+        self.assertTrue(installed)
+        self.assertEqual(model_input._qwen36_cached_request_ids, ("warm",))
+        self.assertEqual(
+            model_input._qwen36_hybrid_apc_request_records,
+            (
+                {
+                    "request_id": "warm",
+                    "request_prefix_len": 4,
+                    "vllm_attention_hit_len": 2,
+                    "active_suffix_len": 2,
+                },
+            ),
+        )
+
     def test_runner_patch_expands_completed_only_prefill_logits(self):
         class FakeRunner:
             def __init__(self):

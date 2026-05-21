@@ -979,6 +979,25 @@ def _as_request_id_tuple(request_ids: Any) -> tuple[Hashable, ...] | None:
         return (request_ids,)
 
 
+def _request_ids_from_model_input_or_scheduler_output(
+    model_input: Any,
+    scheduler_output: Any,
+) -> tuple[Hashable, ...] | None:
+    request_ids = _request_ids_from_model_input(model_input)
+    if request_ids:
+        return request_ids
+    cached_request_ids = _request_ids_from_scheduler_output(
+        scheduler_output,
+        kind="cached",
+    )
+    new_request_ids = _request_ids_from_scheduler_output(
+        scheduler_output,
+        kind="new",
+    )
+    combined = tuple(cached_request_ids or ()) + tuple(new_request_ids or ())
+    return combined or None
+
+
 def _request_ids_from_scheduler_output(
     scheduler_output: Any,
     *,
@@ -1054,7 +1073,10 @@ def _hybrid_apc_request_records_from_model_input(
     model_input: Any,
     scheduler_output: Any,
 ) -> tuple[dict[str, Any], ...] | None:
-    request_ids = _request_ids_from_model_input(model_input)
+    request_ids = _request_ids_from_model_input_or_scheduler_output(
+        model_input,
+        scheduler_output,
+    )
     if not request_ids:
         return None
     metadata_by_request_id = getattr(
@@ -1498,8 +1520,15 @@ def patch_neuron_model_runner_class(runner_cls: type) -> bool:
     def execute_model_for_text_with_request_ids(self, model_input, *args, **kwargs):
         model = getattr(self, "model", None)
         runtime_config = _runner_hybrid_apc_runtime_config(self)
+        request_ids = _request_ids_from_model_input(model_input)
+        if request_ids is None:
+            request_ids = tuple(
+                getattr(model_input, "_qwen36_cached_request_ids", ()) or ()
+            ) + tuple(getattr(model_input, "_qwen36_new_request_ids", ()) or ())
+            if not request_ids:
+                request_ids = None
         metadata = {
-            "_qwen36_vllm_request_ids": _request_ids_from_model_input(model_input),
+            "_qwen36_vllm_request_ids": request_ids,
             "_qwen36_vllm_cached_request_ids": getattr(
                 model_input,
                 "_qwen36_cached_request_ids",
