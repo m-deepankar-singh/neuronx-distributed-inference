@@ -26,6 +26,50 @@ def _parse_buckets(raw: str) -> list[int]:
     return [int(item) for item in raw.replace(",", " ").split() if item]
 
 
+def _artifact_neuron_config(compiled_artifacts: Path) -> dict[str, Any]:
+    config_path = compiled_artifacts / "neuron_config.json"
+    if not config_path.exists():
+        return {}
+    with config_path.open(encoding="utf-8") as handle:
+        config = json.load(handle)
+    nested = config.get("neuron_config")
+    return nested if isinstance(nested, dict) else config
+
+
+def _resolve_config_defaults(args: argparse.Namespace) -> dict[str, Any]:
+    artifact_config = _artifact_neuron_config(args.compiled_artifacts)
+    seq_len = int(
+        args.seq_len
+        or artifact_config.get("seq_len")
+        or artifact_config.get("max_context_length")
+        or artifact_config.get("max_length")
+        or 131072
+    )
+    max_model_len = int(args.max_model_len or seq_len)
+    cte_buckets = (
+        _parse_buckets(args.cte_buckets)
+        if args.cte_buckets
+        else [int(item) for item in artifact_config.get("context_encoding_buckets", [])]
+    )
+    if not cte_buckets:
+        cte_buckets = [256, 512]
+    pa_num_blocks = int(
+        args.pa_num_blocks
+        if args.pa_num_blocks is not None
+        else artifact_config.get("pa_num_blocks") or 0
+    )
+    if pa_num_blocks <= 0:
+        block_size = int(args.block_size)
+        pa_num_blocks = (max_model_len + block_size - 1) // block_size
+    return {
+        "artifact_config": artifact_config,
+        "seq_len": seq_len,
+        "max_model_len": max_model_len,
+        "cte_buckets": cte_buckets,
+        "pa_num_blocks": pa_num_blocks,
+    }
+
+
 def _ensure_paths(repo_root: Path) -> Path:
     qwen_root = repo_root / "contrib" / "models" / "Qwen3.6-27B"
     for path in (repo_root / "src", qwen_root / "vllm", qwen_root):
@@ -48,7 +92,6 @@ def _ensure_runtime_env(args: argparse.Namespace) -> None:
 
 
 def _additional_config(args: argparse.Namespace) -> dict[str, Any]:
-    cte_buckets = _parse_buckets(args.cte_buckets)
     return {
         "max_prompt_length": args.seq_len,
         "use_hybrid_apc_manager": True,
@@ -80,7 +123,7 @@ def _additional_config(args: argparse.Namespace) -> dict[str, Any]:
             "seq_len": args.seq_len,
             "max_length": args.seq_len,
             "max_context_length": args.seq_len,
-            "context_encoding_buckets": cte_buckets,
+            "context_encoding_buckets": args.resolved_cte_buckets,
             "token_generation_buckets": [args.seq_len],
             "enable_bucketing": True,
             "logical_nc_config": args.logical_nc_config,
@@ -124,7 +167,7 @@ def _build_llm(args: argparse.Namespace):
         num_gpu_blocks_override=args.pa_num_blocks,
         mamba_cache_mode="all",
         mamba_ssm_cache_dtype=args.gdn_recurrent_cache_dtype,
-        max_num_batched_tokens=max(_parse_buckets(args.cte_buckets)),
+        max_num_batched_tokens=max(args.resolved_cte_buckets),
         max_num_seqs=args.max_num_seqs,
     )
     sampling = SamplingParams(
@@ -164,15 +207,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-tokens", type=int, default=64)
     parser.add_argument("--warmup-tokens", type=int, default=8)
     parser.add_argument("--repeats", type=int, default=3)
-    parser.add_argument("--max-model-len", type=int, default=65536)
-    parser.add_argument("--seq-len", type=int, default=131072)
-    parser.add_argument("--cte-buckets", default="256,512")
+    parser.add_argument("--max-model-len", type=int)
+    parser.add_argument("--seq-len", type=int)
+    parser.add_argument("--cte-buckets")
     parser.add_argument("--tensor-parallel-size", type=int, default=4)
     parser.add_argument("--max-num-seqs", type=int, default=1)
     parser.add_argument("--ctx-batch-size", type=int, default=1)
     parser.add_argument("--logical-nc-config", type=int, default=2)
     parser.add_argument("--block-size", type=int, default=256)
-    parser.add_argument("--pa-num-blocks", type=int, default=256)
+    parser.add_argument("--pa-num-blocks", type=int)
     parser.add_argument("--gdn-checkpoint-interval", type=int, default=256)
     parser.add_argument("--max-gdn-checkpoint-slots", type=int, default=64)
     parser.add_argument("--gdn-recurrent-cache-dtype", default="float32")
@@ -187,6 +230,12 @@ def main() -> int:
     args.repo_root = args.repo_root.expanduser().resolve()
     args.model_path = args.model_path.expanduser().resolve()
     args.compiled_artifacts = args.compiled_artifacts.expanduser().resolve()
+    resolved = _resolve_config_defaults(args)
+    args.artifact_config = resolved["artifact_config"]
+    args.seq_len = resolved["seq_len"]
+    args.max_model_len = resolved["max_model_len"]
+    args.resolved_cte_buckets = resolved["cte_buckets"]
+    args.pa_num_blocks = resolved["pa_num_blocks"]
     _ensure_paths(args.repo_root)
     _ensure_runtime_env(args)
 
@@ -198,7 +247,26 @@ def main() -> int:
         "max_tokens": args.max_tokens,
         "max_num_seqs": args.max_num_seqs,
         "pa_num_blocks": args.pa_num_blocks,
-        "cte_buckets": _parse_buckets(args.cte_buckets),
+        "cte_buckets": args.resolved_cte_buckets,
+        "max_model_len": args.max_model_len,
+        "seq_len": args.seq_len,
+        "artifact_neuron_config": {
+            key: args.artifact_config.get(key)
+            for key in (
+                "seq_len",
+                "max_length",
+                "max_context_length",
+                "context_encoding_buckets",
+                "prefix_buckets",
+                "token_generation_buckets",
+                "tkg_batch_size",
+                "ctx_batch_size",
+                "pa_block_size",
+                "pa_num_blocks",
+                "output_logits",
+                "on_device_sampling_config",
+            )
+        },
     }
     try:
         llm, sampling, warmup_sampling = _build_llm(args)
