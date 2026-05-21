@@ -660,6 +660,14 @@ def _unbacked_prefix_reads_disabled_requested(scheduler: Any) -> bool:
         return True
     if not _scheduler_config_flag(scheduler, "use_hybrid_apc_manager"):
         return False
+    if _scheduler_config_flag(
+        scheduler,
+        "hybrid_apc_reject_unbacked_attention_hits",
+    ) or _scheduler_config_flag(
+        scheduler,
+        "hybrid_apc_require_vllm_metadata",
+    ):
+        return True
     return _scheduler_config_flag(
         scheduler,
         "hybrid_apc_disable_unbacked_prefix_reads",

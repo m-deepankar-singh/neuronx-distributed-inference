@@ -1495,6 +1495,45 @@ class TestHybridAPCAsyncBridge(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "suffix-only input"):
             prepare_hybrid_apc_request_for_execution(base, input_dict)
 
+    def test_strict_hybrid_apc_suffix_chunk_uses_active_prefix_boundary(self):
+        bridge = _FakeHybridBridge()
+        bridge.requires_external_metadata = True
+        base = SimpleNamespace(
+            config=SimpleNamespace(
+                use_hybrid_apc_manager=True,
+                hybrid_apc_require_vllm_metadata=True,
+            ),
+            hybrid_apc_bridge=bridge,
+        )
+        input_dict = _prefix_input_dict()
+        input_dict["input_ids"] = torch.tensor([[12, 13]], dtype=torch.int32)
+        input_dict["attention_mask"] = torch.ones((1, 2), dtype=torch.int32)
+        input_dict["position_ids"] = torch.tensor([[2, 3]], dtype=torch.int32)
+        input_dict["slot_mapping"] = torch.tensor([[2, 3]], dtype=torch.int32)
+        input_dict["computed_context_lens"] = torch.tensor([[2]], dtype=torch.int32)
+        input_dict["request_id"] = "req-strict"
+        input_dict["request_prefix_len"] = 6
+        input_dict["vllm_attention_hit_len"] = torch.tensor([2], dtype=torch.int32)
+        input_dict["hybrid_active_suffix_len"] = torch.tensor([2], dtype=torch.int32)
+
+        prepared = prepare_hybrid_apc_request_for_execution(base, input_dict)
+
+        self.assertFalse(bridge.prepare_calls)
+        self.assertEqual(len(bridge.suffix_prepare_calls), 1)
+        self.assertEqual(bridge.suffix_prepare_calls[0]["request_prefix_len"], 4)
+        self.assertTrue(
+            torch.equal(
+                prepared["full_context_lens"],
+                torch.tensor([[4]], dtype=torch.int32),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                prepared["num_queries"],
+                torch.tensor([[2]], dtype=torch.int32),
+            )
+        )
+
     def test_strict_hybrid_apc_allows_zero_hit_partial_chunk(self):
         bridge = _FakeHybridBridge()
         bridge.requires_external_metadata = True

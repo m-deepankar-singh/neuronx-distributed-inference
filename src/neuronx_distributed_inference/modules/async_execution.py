@@ -1271,8 +1271,19 @@ def prepare_hybrid_apc_request_for_execution(
     if request_prefix_len is not None:
         request_prefix_len = _to_python_int(request_prefix_len)
 
+    active_suffix_len = _first_present(
+        input_dict.get("hybrid_active_suffix_len"),
+        input_dict.get("active_suffix_len"),
+        _hybrid_apc_record_values(request_records, "active_suffix_len"),
+    )
+    active_suffix_len = _single_batch_value(active_suffix_len)
+    if active_suffix_len is not None:
+        active_suffix_len = max(0, _to_python_int(active_suffix_len))
+
     query_len = _single_batch_value(input_dict.get("num_queries"))
-    if (
+    if query_len is None and active_suffix_len is not None:
+        query_len = active_suffix_len
+    elif (
         query_len is None
         and request_prefix_len is not None
         and attention_hit_len is not None
@@ -1368,11 +1379,23 @@ def prepare_hybrid_apc_request_for_execution(
                     None,
                 )
                 if prepare_suffix_only is not None:
+                    suffix_len = int(input_ids.shape[1])
+                    active_prefix_len = request_prefix_len
+                    hit_len = _to_python_int(attention_hit_len)
+                    # vLLM chunked prefill may report the final prompt length in
+                    # request_prefix_len while scheduling only the next suffix
+                    # chunk. Hybrid APC restore/commit must use the active chunk
+                    # boundary, otherwise the suffix-only bridge rejects the row.
+                    if request_prefix_len - hit_len != suffix_len:
+                        active_prefix_len = min(
+                            request_prefix_len,
+                            hit_len + suffix_len,
+                        )
                     prepared = prepare_suffix_only(
                         request_id=request_id,
                         input_dict=input_dict,
-                        attention_hit_len=_to_python_int(attention_hit_len),
-                        request_prefix_len=request_prefix_len,
+                        attention_hit_len=hit_len,
+                        request_prefix_len=active_prefix_len,
                         cumulative_hashes_by_prefix_len=cumulative_hashes_by_prefix_len,
                         attention_block_refs_by_prefix_len=attention_block_refs_by_prefix_len,
                     )

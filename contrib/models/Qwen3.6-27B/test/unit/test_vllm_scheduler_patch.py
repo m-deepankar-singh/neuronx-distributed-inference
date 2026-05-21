@@ -105,6 +105,20 @@ class TestQwen36HybridAPCSchedulerPatch(unittest.TestCase):
         ):
             self.assertTrue(self.patch.should_disable_unbacked_prefix_reads(scheduler))
 
+    def test_reject_unbacked_mode_disables_unbacked_prefix_reads(self):
+        scheduler = _scheduler(
+            additional_config={"hybrid_apc_reject_unbacked_attention_hits": True},
+        )
+
+        self.assertTrue(self.patch.should_disable_unbacked_prefix_reads(scheduler))
+
+    def test_require_metadata_mode_disables_unbacked_prefix_reads(self):
+        scheduler = _scheduler(
+            additional_config={"hybrid_apc_require_vllm_metadata": True},
+        )
+
+        self.assertTrue(self.patch.should_disable_unbacked_prefix_reads(scheduler))
+
     def test_non_hybrid_apc_model_is_not_changed(self):
         scheduler = _scheduler(
             use_hybrid_apc=False,
