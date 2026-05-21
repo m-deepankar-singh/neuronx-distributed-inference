@@ -156,6 +156,7 @@ def _fake_modules():
         ),
         "neuronx_distributed_inference.modules.async_execution": _module(
             "neuronx_distributed_inference.modules.async_execution",
+            cancel_hybrid_apc_request=lambda *args, **kwargs: None,
             finish_hybrid_apc_request=lambda *args, **kwargs: None,
             prepare_hybrid_apc_request_for_execution=lambda *args, **kwargs: None,
         ),
@@ -823,12 +824,14 @@ class TestQwen36ModelAliases(unittest.TestCase):
                     "attention_block_refs_by_prefix_len": {256: (1,)},
                     "request_prefix_len": 256,
                     "vllm_attention_hit_len": 0,
+                    "active_suffix_len": 256,
                 },
                 "req-b": {
                     "cumulative_hashes_by_prefix_len": {256: b"b"},
                     "attention_block_refs_by_prefix_len": {256: (2,)},
                     "request_prefix_len": 272,
                     "vllm_attention_hit_len": 256,
+                    "active_suffix_len": 16,
                 },
             },
         )
@@ -843,6 +846,7 @@ class TestQwen36ModelAliases(unittest.TestCase):
         )
         self.assertEqual(request_dict["request_prefix_len"], (256, 272))
         self.assertEqual(request_dict["vllm_attention_hit_len"], (0, 256))
+        self.assertEqual(request_dict["active_suffix_len"], (256, 16))
 
     def test_vllm_metadata_request_ids_prefer_scheduler_new_request_ids(self):
         selected = self.qwen_module._qwen36_select_vllm_hybrid_apc_request_ids(

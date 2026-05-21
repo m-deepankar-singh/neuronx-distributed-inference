@@ -625,6 +625,7 @@ def _scheduler_request_metadata(
     *,
     block_ids: Any = None,
     num_computed_tokens: int | None = None,
+    active_suffix_len: int | None = None,
 ) -> dict[str, Any]:
     block_size = _block_size_for_scheduler(scheduler)
     if request is None or block_size <= 0:
@@ -648,6 +649,8 @@ def _scheduler_request_metadata(
     metadata["request_prefix_len"] = request_prefix_len
     if num_computed_tokens is not None:
         metadata["vllm_attention_hit_len"] = int(num_computed_tokens)
+    if active_suffix_len is not None:
+        metadata["active_suffix_len"] = int(active_suffix_len)
     return metadata
 
 
@@ -726,6 +729,7 @@ def _request_from_scheduler(scheduler: Any, req_id: Any) -> Any:
 
 def _attach_scheduler_output_metadata(scheduler: Any, scheduler_output: Any) -> None:
     metadata_by_request_id: dict[Hashable, dict[str, Any]] = {}
+    active_suffix_lens = _num_scheduled_tokens_by_request_id(scheduler_output)
     for req_data in getattr(scheduler_output, "scheduled_new_reqs", ()) or ():
         req_id = getattr(req_data, "req_id", None)
         request = _request_from_scheduler(scheduler, req_id)
@@ -734,6 +738,7 @@ def _attach_scheduler_output_metadata(scheduler: Any, scheduler_output: Any) -> 
             request,
             block_ids=getattr(req_data, "block_ids", None),
             num_computed_tokens=getattr(req_data, "num_computed_tokens", None),
+            active_suffix_len=active_suffix_lens.get(_normalize_request_id(req_id)),
         )
         if metadata:
             metadata_by_request_id[_normalize_request_id(req_id)] = metadata
@@ -763,6 +768,7 @@ def _attach_scheduler_output_metadata(scheduler: Any, scheduler_output: Any) -> 
             request,
             block_ids=block_ids,
             num_computed_tokens=computed,
+            active_suffix_len=active_suffix_lens.get(_normalize_request_id(req_id)),
         )
         if metadata:
             metadata_by_request_id[_normalize_request_id(req_id)] = metadata

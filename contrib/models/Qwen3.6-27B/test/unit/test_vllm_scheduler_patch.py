@@ -677,6 +677,7 @@ class TestQwen36HybridAPCSchedulerPatch(unittest.TestCase):
                         new_block_ids=[],
                         num_computed_tokens=[],
                     ),
+                    num_scheduled_tokens={"req-a": 4},
                 )
 
         self.patch.patch_scheduler_class(FakeScheduler)
@@ -696,6 +697,7 @@ class TestQwen36HybridAPCSchedulerPatch(unittest.TestCase):
         )
         self.assertEqual(metadata["req-a"]["request_prefix_len"], 4)
         self.assertEqual(metadata["req-a"]["vllm_attention_hit_len"], 0)
+        self.assertEqual(metadata["req-a"]["active_suffix_len"], 4)
 
     def test_scheduler_output_authorizes_backed_cached_continuation(self):
         class FakeScheduler:

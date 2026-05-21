@@ -3749,6 +3749,7 @@ def _qwen36_add_vllm_hybrid_apc_metadata(
         "attention_block_refs_by_prefix_len",
         "request_prefix_len",
         "vllm_attention_hit_len",
+        "active_suffix_len",
     ):
         value = _qwen36_request_metadata_values(
             metadata_by_request_id,
