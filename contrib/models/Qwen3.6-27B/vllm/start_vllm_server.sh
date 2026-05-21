@@ -195,6 +195,24 @@ import json
 print(json.loads('${CTE_BUCKETS_JSON}')[-1])
 PY
 )"
+MAX_BATCHED_TOKENS="$(
+  python3 - <<PY
+import json
+
+buckets = json.loads('${CTE_BUCKETS_JSON}')
+max_bucket = buckets[-1]
+checkpoint_interval = int("${GDN_CHECKPOINT_INTERVAL}")
+if "${ENABLE_CHUNKED_PREFILL}" == "1" and "${ENABLE_HYBRID_APC}" == "1":
+    if checkpoint_interval not in buckets:
+        raise SystemExit(
+            "--enable-hybrid-apc with chunked prefill requires a CTE bucket "
+            f"equal to --gdn-checkpoint-interval ({checkpoint_interval})"
+        )
+    print(min(max_bucket, checkpoint_interval))
+else:
+    print(max_bucket)
+PY
+)"
 
 ADDITIONAL_CONFIG="$(
   python3 - <<PY
@@ -335,7 +353,7 @@ fi
 if [[ "${ENABLE_CHUNKED_PREFILL}" == "1" ]]; then
   VLLM_ARGS+=(
     --enable-chunked-prefill
-    --max-num-batched-tokens "${MAX_CTE_BUCKET}"
+    --max-num-batched-tokens "${MAX_BATCHED_TOKENS}"
   )
 else
   VLLM_ARGS+=(--no-enable-chunked-prefill)

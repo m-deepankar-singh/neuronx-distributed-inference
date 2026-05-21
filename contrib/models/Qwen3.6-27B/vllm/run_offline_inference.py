@@ -78,6 +78,23 @@ def _validate_hybrid_apc_args(args: argparse.Namespace):
     args.enable_prefix_caching = True
 
 
+def _max_num_batched_tokens(args: argparse.Namespace, cte_buckets: list[int]) -> int:
+    max_cte_bucket = cte_buckets[-1]
+    if not args.enable_vllm_chunked_prefill:
+        return max_cte_bucket
+    if not args.enable_hybrid_apc:
+        return max_cte_bucket
+
+    checkpoint_interval = int(args.gdn_checkpoint_interval)
+    if checkpoint_interval not in cte_buckets:
+        raise ValueError(
+            "--enable-hybrid-apc with vLLM chunked prefill requires a CTE bucket "
+            f"equal to --gdn-checkpoint-interval ({checkpoint_interval}) so "
+            "scheduler chunks can commit backed GDN prefix checkpoints"
+        )
+    return min(max_cte_bucket, checkpoint_interval)
+
+
 def _pa_num_blocks(args: argparse.Namespace) -> int:
     num_gpu_blocks_override = getattr(args, "num_gpu_blocks_override", None)
     if num_gpu_blocks_override is not None:
@@ -380,7 +397,10 @@ def main() -> int:
     ):
         llm_kwargs["block_size"] = args.block_size
     if args.enable_vllm_chunked_prefill:
-        llm_kwargs["max_num_batched_tokens"] = max_cte_bucket
+        llm_kwargs["max_num_batched_tokens"] = _max_num_batched_tokens(
+            args,
+            cte_buckets,
+        )
     llm = LLM(**llm_kwargs)
 
     sampling = SamplingParams(

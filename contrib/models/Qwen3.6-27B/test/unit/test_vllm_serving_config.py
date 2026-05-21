@@ -162,6 +162,38 @@ class TestVllmServingConfig(unittest.TestCase):
         self.assertTrue(config["use_qwen_hybrid_chunked_prefill"])
         self.assertTrue(config["use_qwen_hybrid_chunked_prefill_nki"])
 
+    def test_hybrid_apc_chunked_prefill_uses_checkpoint_interval_batch_tokens(self):
+        args = _args(
+            cte_buckets=["256,512"],
+            enable_hybrid_apc=True,
+            enable_vllm_chunked_prefill=True,
+            block_size=256,
+            gdn_checkpoint_interval=256,
+        )
+
+        self.assertEqual(
+            self.runner._max_num_batched_tokens(
+                args,
+                self.runner._cte_buckets(args),
+            ),
+            256,
+        )
+
+    def test_hybrid_apc_chunked_prefill_requires_checkpoint_cte_bucket(self):
+        args = _args(
+            cte_buckets=["512"],
+            enable_hybrid_apc=True,
+            enable_vllm_chunked_prefill=True,
+            block_size=256,
+            gdn_checkpoint_interval=256,
+        )
+
+        with self.assertRaisesRegex(ValueError, "gdn-checkpoint-interval"):
+            self.runner._max_num_batched_tokens(
+                args,
+                self.runner._cte_buckets(args),
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

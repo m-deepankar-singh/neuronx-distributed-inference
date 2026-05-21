@@ -309,7 +309,10 @@ def _build_llm(args, *, enable_hybrid_apc: bool):
         llm_kwargs["mamba_cache_mode"] = "all"
         llm_kwargs["mamba_ssm_cache_dtype"] = args.gdn_recurrent_cache_dtype
     if args.enable_vllm_chunked_prefill:
-        llm_kwargs["max_num_batched_tokens"] = max(runner._cte_buckets(runner_args))
+        llm_kwargs["max_num_batched_tokens"] = runner._max_num_batched_tokens(
+            runner_args,
+            runner._cte_buckets(runner_args),
+        )
     if (
         runner_args.enable_prefix_caching
         or runner_args.enable_hybrid_apc
