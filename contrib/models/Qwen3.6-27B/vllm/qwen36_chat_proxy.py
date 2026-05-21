@@ -18,6 +18,7 @@ import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
+from urllib.parse import urlsplit
 
 _HOP_BY_HOP_HEADERS = {
     "connection",
@@ -104,6 +105,11 @@ def _normalize_messages_for_qwen(messages: Any) -> Any:
         "content": "\n\n".join(part for part in system_parts if part),
     }
     return [system_message, *normal_messages]
+
+
+def _request_path(path: str) -> str:
+    normalized = urlsplit(path).path.rstrip("/")
+    return normalized or "/"
 
 
 def _coerce_optional_bool(value: Any) -> bool | None:
@@ -255,7 +261,9 @@ class Qwen36ProxyHandler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", "0") or "0")
         raw_body = self.rfile.read(length) if length else b""
 
-        if self.path == "/v1/completions" and not self.allow_completions:
+        request_path = _request_path(self.path)
+
+        if request_path == "/v1/completions" and not self.allow_completions:
             _json_response(
                 self,
                 400,
@@ -273,7 +281,7 @@ class Qwen36ProxyHandler(BaseHTTPRequestHandler):
             )
             return
 
-        if self.path == "/v1/chat/completions" and raw_body:
+        if request_path == "/v1/chat/completions" and raw_body:
             try:
                 payload = json.loads(raw_body)
             except json.JSONDecodeError:

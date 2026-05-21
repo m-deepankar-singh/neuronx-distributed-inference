@@ -99,6 +99,14 @@ class TestQwen36ChatProxy(unittest.TestCase):
         self.assertEqual(normalized[0], {"role": "system", "content": "sys\n\ndev"})
         self.assertEqual([message["role"] for message in normalized], ["system", "user", "assistant"])
 
+    def test_chat_path_allows_trailing_slash_and_query(self):
+        self.assertEqual(_PROXY._request_path("/v1/chat/completions"), "/v1/chat/completions")
+        self.assertEqual(_PROXY._request_path("/v1/chat/completions/"), "/v1/chat/completions")
+        self.assertEqual(
+            _PROXY._request_path("/v1/chat/completions?api-version=1"),
+            "/v1/chat/completions",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
