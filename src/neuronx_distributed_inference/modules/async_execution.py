@@ -898,6 +898,55 @@ def _with_zero_hybrid_apc_slots(input_dict: Dict[str, Any]) -> Dict[str, Any]:
     return output
 
 
+_UNBACKED_SUFFIX_ONLY_HYBRID_APC_ERROR = (
+    "suffix-only hybrid APC received an attention prefix hit "
+    "without scheduler-authorized GDN checkpoint metadata"
+)
+
+
+def _is_unbacked_suffix_only_hybrid_apc_error(exc: Exception) -> bool:
+    return isinstance(exc, ValueError) and _UNBACKED_SUFFIX_ONLY_HYBRID_APC_ERROR in str(
+        exc
+    )
+
+
+def _is_same_request_chunked_prefill_continuation(
+    *,
+    request_prefix_len: int,
+    hit_len: int,
+    suffix_len: int,
+    active_suffix_len: int | None,
+) -> bool:
+    if suffix_len <= 1 or hit_len <= 0:
+        return False
+    if active_suffix_len is not None and int(active_suffix_len) != int(suffix_len):
+        return False
+    return int(request_prefix_len) - int(hit_len) != int(suffix_len)
+
+
+def _with_inert_hybrid_apc_chunk_continuation(
+    input_dict: Dict[str, Any],
+    *,
+    hit_len: int,
+    active_prefix_len: int,
+    suffix_len: int,
+) -> Dict[str, Any]:
+    input_ids = input_dict.get("input_ids")
+    device = input_ids.device if isinstance(input_ids, torch.Tensor) else None
+    kwargs = {"dtype": torch.int32}
+    if device is not None:
+        kwargs["device"] = device
+
+    output = dict(input_dict)
+    output["computed_context_lens"] = torch.tensor([[max(0, int(hit_len))]], **kwargs)
+    output["full_context_lens"] = torch.tensor(
+        [[max(0, int(active_prefix_len))]],
+        **kwargs,
+    )
+    output["num_queries"] = torch.tensor([[max(0, int(suffix_len))]], **kwargs)
+    return _with_zero_hybrid_apc_slots(output)
+
+
 def _is_completed_cached_decode_row(
     input_dict: Dict[str, Any],
     *,
@@ -1386,19 +1435,40 @@ def prepare_hybrid_apc_request_for_execution(
                     # request_prefix_len while scheduling only the next suffix
                     # chunk. Hybrid APC restore/commit must use the active chunk
                     # boundary, otherwise the suffix-only bridge rejects the row.
-                    if request_prefix_len - hit_len != suffix_len:
+                    same_request_chunk_continuation = (
+                        _is_same_request_chunked_prefill_continuation(
+                            request_prefix_len=request_prefix_len,
+                            hit_len=hit_len,
+                            suffix_len=suffix_len,
+                            active_suffix_len=active_suffix_len,
+                        )
+                    )
+                    if same_request_chunk_continuation:
                         active_prefix_len = min(
                             request_prefix_len,
                             hit_len + suffix_len,
                         )
-                    prepared = prepare_suffix_only(
-                        request_id=request_id,
-                        input_dict=input_dict,
-                        attention_hit_len=hit_len,
-                        request_prefix_len=active_prefix_len,
-                        cumulative_hashes_by_prefix_len=cumulative_hashes_by_prefix_len,
-                        attention_block_refs_by_prefix_len=attention_block_refs_by_prefix_len,
-                    )
+                    try:
+                        prepared = prepare_suffix_only(
+                            request_id=request_id,
+                            input_dict=input_dict,
+                            attention_hit_len=hit_len,
+                            request_prefix_len=active_prefix_len,
+                            cumulative_hashes_by_prefix_len=cumulative_hashes_by_prefix_len,
+                            attention_block_refs_by_prefix_len=attention_block_refs_by_prefix_len,
+                        )
+                    except ValueError as exc:
+                        if (
+                            same_request_chunk_continuation
+                            and _is_unbacked_suffix_only_hybrid_apc_error(exc)
+                        ):
+                            return _with_inert_hybrid_apc_chunk_continuation(
+                                input_dict,
+                                hit_len=hit_len,
+                                active_prefix_len=active_prefix_len,
+                                suffix_len=suffix_len,
+                            )
+                        raise
             if prepared is None:
                 if requires_external_metadata:
                     raise ValueError(
