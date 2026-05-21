@@ -1,0 +1,74 @@
+{
+  "artifact": "/mnt/trainium_artifacts/qwen_artifacts/qwen36_27b_128k_fp8_mlp_edgebf16_hybrid_apc_nki_chunked_b256_cte256_512_pfx16k_slots64_20260521T092332Z",
+  "artifact_neuron_config": {
+    "context_encoding_buckets": [
+      256,
+      512
+    ],
+    "ctx_batch_size": 1,
+    "max_context_length": 131072,
+    "max_length": 131072,
+    "on_device_sampling_config": {
+      "deterministic": false,
+      "do_sample": false,
+      "dynamic": false,
+      "global_topk": 256,
+      "on_device_sampling_config": true,
+      "sampling_dp_degree": 1,
+      "temperature": 1.0,
+      "top_k": 1,
+      "top_k_kernel_enabled": true,
+      "top_p": 1.0
+    },
+    "output_logits": false,
+    "pa_block_size": 256,
+    "pa_num_blocks": 512,
+    "prefix_buckets": [
+      256,
+      512,
+      1024,
+      2048,
+      4096,
+      8192,
+      16384
+    ],
+    "seq_len": 131072,
+    "tkg_batch_size": 1,
+    "token_generation_buckets": [
+      131072
+    ]
+  },
+  "async_mode": false,
+  "avg_elapsed_s": 1.4952593359994353,
+  "avg_tok_s": 5.350242467907936,
+  "cte_buckets": [
+    256,
+    512
+  ],
+  "max_model_len": 65536,
+  "max_num_seqs": 1,
+  "max_tokens": 8,
+  "model_path": "/home/ubuntu/models/Qwen3.6-27B",
+  "pa_num_blocks": 256,
+  "prompt": "Explain software benchmarking in two concise paragraphs.",
+  "runs": [
+    {
+      "completion_tokens": 8,
+      "elapsed_s": 1.4952593359994353,
+      "run": 1,
+      "text": "\n\n<think>\nThinking Process:\n\n1",
+      "tok_s": 5.350242467907936
+    }
+  ],
+  "seq_len": 131072,
+  "token_generation_batches": null,
+  "token_generation_buckets": [
+    131072
+  ],
+  "warmup": {
+    "completion_tokens": 2,
+    "elapsed_s": 7.495288832000369,
+    "text": "\n\n<think>",
+    "tok_s": 0.26683428014957933
+  }
+}
