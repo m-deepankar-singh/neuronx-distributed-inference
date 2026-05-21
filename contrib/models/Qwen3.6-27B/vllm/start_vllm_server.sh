@@ -217,11 +217,30 @@ PY
 ADDITIONAL_CONFIG="$(
   python3 - <<PY
 import json
+from pathlib import Path
+
 enable_chunked = "${ENABLE_CHUNKED_PREFILL}" == "1"
 enable_prefix_caching = "${ENABLE_PREFIX_CACHING}" == "1"
 enable_hybrid_apc = "${ENABLE_HYBRID_APC}" == "1"
 cte_buckets = json.loads('${CTE_BUCKETS_JSON}')
 max_cte_bucket = cte_buckets[-1]
+compiled_artifacts = "${COMPILED_ARTIFACTS}"
+compiled_max_prompt = 0
+if compiled_artifacts:
+    config_path = Path(compiled_artifacts).expanduser() / "neuron_config.json"
+    if config_path.exists():
+        with config_path.open(encoding="utf-8") as handle:
+            compiled_config = json.load(handle)
+        nested_config = compiled_config.get("neuron_config")
+        if isinstance(nested_config, dict):
+            compiled_config = nested_config
+        compiled_max_prompt = int(
+            compiled_config.get("max_context_length")
+            or compiled_config.get("max_length")
+            or compiled_config.get("seq_len")
+            or 0
+        )
+runtime_max_prompt = compiled_max_prompt or max_cte_bucket
 num_gpu_blocks_override = "${NUM_GPU_BLOCKS_OVERRIDE}"
 pa_num_blocks = (
     int(num_gpu_blocks_override)
@@ -239,7 +258,7 @@ neuron_config = {
     "tkg_batch_size": int("${MAX_NUM_SEQS}"),
     "seq_len": int("${SEQ_LEN}"),
     "max_length": int("${SEQ_LEN}"),
-    "max_context_length": max_cte_bucket,
+    "max_context_length": runtime_max_prompt,
     "context_encoding_buckets": cte_buckets,
     "token_generation_buckets": [int("${SEQ_LEN}")],
     "enable_bucketing": len(cte_buckets) > 1,
@@ -263,7 +282,7 @@ if enable_chunked:
         },
     })
 print(json.dumps({
-    "max_prompt_length": max_cte_bucket,
+    "max_prompt_length": runtime_max_prompt,
     "use_hybrid_apc_manager": enable_hybrid_apc,
     "use_text_only_cte_inputs": "${TEXT_ONLY_CTE}" == "1",
     "use_compact_cte_attention_mask": "${COMPACT_CTE_ATTENTION_MASK}" == "1",
