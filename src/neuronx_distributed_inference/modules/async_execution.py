@@ -1501,6 +1501,18 @@ def prepare_hybrid_apc_request_for_execution(
                             attention_block_refs_by_prefix_len=attention_block_refs_by_prefix_len,
                         )
                     except ValueError as exc:
+                        if os.environ.get("QWEN36_HYBRID_APC_DEBUG") == "1":
+                            print(
+                                "[hybrid_apc_debug] suffix-unbacked-check "
+                                f"request_id={request_id!r} "
+                                f"same_request_chunk_continuation={same_request_chunk_continuation} "
+                                f"request_prefix_len={request_prefix_len} "
+                                f"hit_len={hit_len} suffix_len={suffix_len} "
+                                f"active_suffix_len={active_suffix_len} "
+                                f"query_len={query_len} "
+                                f"error={exc}",
+                                flush=True,
+                            )
                         if (
                             same_request_chunk_continuation
                             and _is_unbacked_suffix_only_hybrid_apc_error(exc)
