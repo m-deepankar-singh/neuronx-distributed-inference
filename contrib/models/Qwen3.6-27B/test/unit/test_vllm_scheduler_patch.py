@@ -683,6 +683,66 @@ class TestQwen36HybridAPCSchedulerPatch(unittest.TestCase):
         self.assertEqual(metadata["req-a"]["request_prefix_len"], 4)
         self.assertEqual(metadata["req-a"]["vllm_attention_hit_len"], 0)
 
+    def test_scheduler_output_authorizes_backed_cached_continuation(self):
+        class FakeScheduler:
+            def __init__(self):
+                base = _scheduler(
+                    block_size=2,
+                    enable_backed_prefix_reads=True,
+                    use_qwen_hybrid_chunked_prefill=True,
+                )
+                self.vllm_config = base.vllm_config
+                self.cache_config = base.cache_config
+                self.scheduler_config = base.scheduler_config
+                self.requests = {
+                    "req-a": types.SimpleNamespace(
+                        request_id="req-a",
+                        prompt_token_ids=[10, 11, 12, 13],
+                        block_hashes=[b"hash-2", b"hash-4"],
+                        num_tokens=4,
+                        cache_salt=None,
+                    )
+                }
+
+            def add_request(self, request):
+                del request
+
+            def schedule(self):
+                return types.SimpleNamespace(
+                    scheduled_new_reqs=[],
+                    scheduled_cached_reqs=types.SimpleNamespace(
+                        req_ids=["req-a"],
+                        new_block_ids=[([12],)],
+                        num_computed_tokens=[2],
+                        num_output_tokens=[0],
+                    ),
+                )
+
+        key = self.patch.HybridGDNPrefixKey(
+            cumulative_prefix_hash=b"hash-2",
+            prefix_len=2,
+            block_size=2,
+            cache_salt=None,
+            model_revision="rev-a",
+            layout_version=1,
+            tp_rank=0,
+            recurrent_dtype="float32",
+            conv_dtype="bfloat16",
+        )
+        self.patch.register_hybrid_apc_gdn_checkpoint(key)
+        self.patch.patch_scheduler_class(FakeScheduler)
+
+        FakeScheduler().schedule()
+
+        self.assertEqual(
+            self.patch.pop_hybrid_apc_authorized_prefix_key(
+                prefix_len=2,
+                request_id="req-a",
+                model_revision="rev-a",
+            ),
+            key,
+        )
+
     def test_scheduler_preserves_backed_and_cold_prefix_read_decisions_in_mixed_batch(self):
         class FakeScheduler:
             def __init__(self):

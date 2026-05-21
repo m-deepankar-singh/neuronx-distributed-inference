@@ -729,6 +729,12 @@ def _attach_scheduler_output_metadata(scheduler: Any, scheduler_output: Any) -> 
         )
         if metadata:
             metadata_by_request_id[_normalize_request_id(req_id)] = metadata
+            _authorize_scheduled_prefix_read(
+                scheduler,
+                request,
+                request_id=req_id,
+                prefix_len=metadata.get("vllm_attention_hit_len"),
+            )
 
     cached_reqs = getattr(scheduler_output, "scheduled_cached_reqs", None)
     req_ids = list(getattr(cached_reqs, "req_ids", ()) or ())
@@ -752,6 +758,12 @@ def _attach_scheduler_output_metadata(scheduler: Any, scheduler_output: Any) -> 
         )
         if metadata:
             metadata_by_request_id[_normalize_request_id(req_id)] = metadata
+            _authorize_scheduled_prefix_read(
+                scheduler,
+                request,
+                request_id=req_id,
+                prefix_len=metadata.get("vllm_attention_hit_len"),
+            )
 
     if metadata_by_request_id:
         setattr(
@@ -996,6 +1008,32 @@ def _scheduler_metadata_for_request_id(
     if metadata is None and request_id is not None:
         metadata = metadata_by_request_id.get(str(request_id))
     return metadata if isinstance(metadata, dict) else {}
+
+
+def _authorize_scheduled_prefix_read(
+    scheduler: Any,
+    request: Any,
+    *,
+    request_id: Any,
+    prefix_len: int | None,
+) -> None:
+    """Authorize a vLLM prefix hit that is backed by a committed GDN checkpoint."""
+
+    if request is None or prefix_len is None:
+        return
+    prefix_len = int(prefix_len)
+    if prefix_len <= 0 or not _supports_backed_prefix_reads(scheduler):
+        return
+    max_backed_prefix_read_len = _max_backed_prefix_read_len(scheduler)
+    if max_backed_prefix_read_len > 0 and prefix_len > max_backed_prefix_read_len:
+        return
+    key = backed_gdn_prefix_hits(scheduler, request).get(prefix_len)
+    if key is None:
+        return
+    authorize_hybrid_apc_prefix_read(
+        key,
+        request_id=_request_id_for_scheduler_request(request) or request_id,
+    )
 
 
 def _hybrid_apc_request_records_from_model_input(
