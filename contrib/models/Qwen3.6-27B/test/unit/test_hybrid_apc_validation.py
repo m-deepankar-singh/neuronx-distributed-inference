@@ -300,6 +300,44 @@ class TestHybridAPCValidationRealTokens(unittest.TestCase):
                     _args(compiled_artifacts=tmpdir, max_num_seqs=2)
                 )
 
+    def test_runtime_additional_config_uses_compiled_max_prompt_length(self):
+        additional_config = {
+            "max_prompt_length": 512,
+            "override_neuron_config": {
+                "max_context_length": 512,
+                "context_encoding_buckets": [256, 512],
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "neuron_config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "neuron_config": {
+                            "max_context_length": 131072,
+                            "context_encoding_buckets": [256, 512],
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            aligned = _VALIDATION._align_additional_config_to_compiled_artifact(
+                _args(compiled_artifacts=tmpdir),
+                additional_config,
+            )
+
+        self.assertEqual(aligned["max_prompt_length"], 131072)
+        self.assertEqual(
+            aligned["override_neuron_config"]["max_context_length"],
+            131072,
+        )
+        self.assertEqual(
+            aligned["override_neuron_config"]["context_encoding_buckets"],
+            [256, 512],
+        )
+        self.assertEqual(additional_config["max_prompt_length"], 512)
+
     def test_compact_boundary_lengths_cover_checkpoint_edges(self):
         self.assertEqual(
             _VALIDATION._compact_boundary_lengths(

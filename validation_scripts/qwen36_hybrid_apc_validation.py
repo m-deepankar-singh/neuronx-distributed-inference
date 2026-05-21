@@ -77,6 +77,37 @@ def _compiled_neuron_config(args) -> dict:
     return nested if isinstance(nested, dict) else config
 
 
+def _align_additional_config_to_compiled_artifact(
+    args,
+    additional_config: dict,
+) -> dict:
+    """Keep runtime additional_config compatible with precompiled artifacts.
+
+    The Qwen chunked-prefill runner uses CTE buckets for active prefill chunk
+    shapes, but vLLM-Neuron validates the top-level max_prompt_length against
+    the artifact's compiled max_context_length when loading precompiled NEFFs.
+    """
+
+    compiled_config = _compiled_neuron_config(args)
+    if not compiled_config:
+        return additional_config
+    compiled_max_prompt = int(
+        compiled_config.get("max_context_length")
+        or compiled_config.get("max_length")
+        or compiled_config.get("seq_len")
+        or 0
+    )
+    if compiled_max_prompt <= 0:
+        return additional_config
+
+    aligned = dict(additional_config)
+    aligned["max_prompt_length"] = compiled_max_prompt
+    override = dict(aligned.get("override_neuron_config") or {})
+    override["max_context_length"] = compiled_max_prompt
+    aligned["override_neuron_config"] = override
+    return aligned
+
+
 def _validate_generation_batch_support(args) -> None:
     if args.max_tokens <= 0 or args.max_num_seqs <= 1:
         return
@@ -257,7 +288,10 @@ def _build_llm(args, *, enable_hybrid_apc: bool):
     from vllm import LLM, SamplingParams  # noqa: WPS433
 
     runner_args = _runner_args(args, enable_hybrid_apc=enable_hybrid_apc)
-    additional_config = runner._override_config(runner_args)
+    additional_config = _align_additional_config_to_compiled_artifact(
+        args,
+        runner._override_config(runner_args),
+    )
     llm_kwargs = {
         "model": str(Path(args.model_path).expanduser().resolve()),
         "trust_remote_code": True,
