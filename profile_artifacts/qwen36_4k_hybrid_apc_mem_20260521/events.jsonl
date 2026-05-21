@@ -1,0 +1,7 @@
+{"event":"run_start","ts":"2026-05-21T08:48:33Z","artifact":"/mnt/trainium_artifacts/qwen_artifacts/qwen36_27b_4096_bf16_hybrid_apc_nki_chunked_seqid_stale_evict_prefix4096_ctx2_tkg2_r7i_20260521T052205Z"}
+{"event":"server_start","ts":"2026-05-21T08:48:33Z","pid":102184}
+{"event":"server_ready","ts":"2026-05-21T08:49:37Z"}
+{"event":"cold_ttft_done","ts":"2026-05-21T08:50:49Z"}
+{"event":"concurrency2_done","ts":"2026-05-21T08:51:30Z"}
+{"event":"boundary_tpot_done","ts":"2026-05-21T08:53:00Z"}
+{"event":"run_done","ts":"2026-05-21T08:53:05Z"}
