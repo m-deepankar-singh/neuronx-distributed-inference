@@ -49,7 +49,7 @@ Qwen3.6 weights.
 
 - **Hybrid DeltaNet + GQA:** 48 of 64 layers use Gated DeltaNet (linear recurrent attention), 16 layers use standard GQA with KV cache. The pattern repeats every 4 layers: 3 DeltaNet + 1 GQA.
 - **DeltaNet Linear Attention:** Uses the delta rule for recurrent state updates with gated decay. Per-step: `state *= exp(g); delta = (v - state^T @ k) * beta; state += outer(k, delta); output = state^T @ q`. Runs as a chunked algorithm for context encoding, per-token recurrence for token generation.
-- **Custom NKI Kernels:** Three NKI kernels implement the DeltaNet forward pass on Neuron: a per-token recurrent kernel (TKG), a per-chunk kernel (legacy), and a fused single-kernel chunked forward (CTE). The fused kernel uses a Neumann series for intra-chunk correction with state persistence in SBUF across chunks.
+- **Custom NKI Kernels:** Three NKI kernels implement the DeltaNet forward pass on Neuron: a per-token recurrent kernel (TKG), a per-chunk kernel (legacy), and a fused single-kernel chunked forward (CTE). The fused CTE kernel uses the same direct lower-triangular intra-chunk solve strategy as the stable chunked path, with state persistence in SBUF across chunks. Earlier Neumann power-doubling experiments were not stable enough for Qwen3.6 gate scales.
 - **GQA Output Gate:** Attention layers use a sigmoid output gate. `q_proj` is 2x sized and interleaved: `[head0_query | head0_gate | head1_query | ...]`. The gate is split during weight conversion and applied after attention.
 - **Partial RoPE:** Only 25% of head_dim (64 of 256 dimensions) receives rotary embeddings. The remaining 192 dimensions are identity (no rotation).
 - **+1 RMSNorm Convention:** HF weights use `output = norm(x) * (1 + weight)` where weight is initialized to zeros. Converted to standard `output = norm(x) * weight` during loading by adding 1.0 to all RMSNorm weights (except DeltaNet internal norms, which use standard convention).
@@ -151,6 +151,27 @@ matches:
 | Offline partial-prefix reuse | 25.52s | 1.70s | 15.0x | exact token-ID match |
 | Server cross-prefix reuse | 25.17s | 1.36s | 18.5x | exact text match |
 
+### Fused Direct-Solve Validation
+
+The fused DeltaNet CTE kernel was revalidated with a direct triangular solve
+instead of the earlier Neumann power-doubling correction. Detailed results and
+raw result-file references are recorded in
+[`docs/fused_directsolve_validation_20260522.md`](docs/fused_directsolve_validation_20260522.md).
+
+| Metric | Result | Notes |
+|--------|--------|-------|
+| Coherence | PASS | Fact, code, and prefix-cache prompts produced real non-repetitive text with `enable_thinking=false` |
+| Decode throughput | 21.63 tok/s | Offline vLLM/NxDI path, on-device greedy sampling, 128-token decode |
+| Decode TPOT | 46.2 ms/token | Same run as decode throughput |
+| Cold 512-token TTFT | 1.31s | 390 tok/s cold prefill |
+| Cold 16K-token TTFT | 27.84s | 589 tok/s cold prefill |
+| Warm 16K-token TTFT | 0.45s | 36.3K tok/s effective warm prefill |
+| Peak Neuron HBM | 60.1 GiB | Sum across logical cores on trn2.3xlarge |
+
+The validated direct-solve artifact used prefix buckets through 16K. A 32K
+prompt exceeded that artifact's largest prefix bucket, so longer-context fused
+validation requires recompiling the same code with larger prefix buckets.
+
 ### Hybrid APC Follow-up Status
 
 Follow-up work on the `experimental` branch extended the baseline vLLM/APC
@@ -198,10 +219,11 @@ proof is available:
 - This is the path expected to turn the current exact single-request APC proof
   into a measured cold-prefill performance win for batched serving.
 
-The fused CTE kernel and FP8 path are not the current correctness blockers.
-The BF16 per-chunk CTE path is the reference path for Hybrid APC validation:
-the fused BF16 CTE artifact has shown NaNs around token 105-106, and FP8 should
-be revisited after the BF16 batch-2 serving contract is proven.
+The fused CTE kernel is no longer blocked on the earlier Neumann-series NaN
+failure: the direct-solve fused path passed the coherence and performance
+validation summarized above. The remaining Hybrid APC follow-up is serving
+contract coverage, especially generated-token batch-2 validation with matching
+`ctx_batch_size=2` and `tkg_batch_size=2` artifacts.
 
 ### Key Observations
 
@@ -323,7 +345,7 @@ The DeltaNet forward path can be controlled via environment variables:
 
 6. **+1 RMSNorm convention:** Qwen3.5/3.6 uses `output = norm(x) * (1 + weight)` for most RMSNorm layers, but DeltaNet internal norms use standard `output = norm(x) * weight`. The weight conversion handles this automatically, but custom weight loading must be aware of both conventions.
 
-7. **DeltaNet numerical stability:** DeltaNet kernels rely on normalized Q/K inputs and bounded decay handling. The chunked path includes regression coverage for decay handling; changes to the fused kernel should be validated against the CPU reference and long-context stress prompts.
+7. **DeltaNet numerical stability:** DeltaNet kernels rely on normalized Q/K inputs and bounded decay handling. The chunked and fused CTE paths now use direct triangular solves for intra-chunk correction; changes to either path should be validated against the CPU reference, the fused NKI validator, and long-context stress prompts.
 
 8. **Shared codebase with Qwen3.5-27B:** This contrib uses the same `Qwen35*` class names and `modeling_qwen35*.py` filenames as the [Qwen3.5-27B contrib](../Qwen3.5-27B/). This is intentional -- both models share the `qwen3_5` model_type. The code is identical; only the HuggingFace model ID and weights differ.
 
@@ -340,6 +362,11 @@ The DeltaNet forward path can be controlled via environment variables:
 For production long-context serving on trn2.3xlarge, use the FP8/vLLM artifact
 and 512-token context encoding bucket. Larger instances are recommended for
 larger batches or additional serving headroom.
+
+The fused direct-solve artifact summarized in this README was compiled with
+prefix buckets through 16K. It is suitable for fused-kernel correctness and
+short-to-mid-context performance validation, but not for proving 64K/128K warm
+APC behavior without recompilation.
 
 ## Compatibility Matrix
 
@@ -394,4 +421,4 @@ Note: The env var is `QWEN35_MODEL_PATH` (not `QWEN36`) because the code uses th
 
 AWS Neuron
 
-**Last Updated:** 2026-04-23
+**Last Updated:** 2026-05-22
