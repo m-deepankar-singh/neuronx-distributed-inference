@@ -8,6 +8,7 @@ device avoids compiling extra NEFFs that obscure the NKI kernel profile.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import math
 import os
@@ -67,6 +68,23 @@ def add_qwen_to_path() -> None:
     script_path = Path(__file__).resolve()
     qwen_root = script_path.parents[1]
     sys.path.insert(0, str(qwen_root))
+
+
+def load_chunked_kernel():
+    kernel_path = (
+        Path(__file__).resolve().parents[1]
+        / "src"
+        / "nki_kernels"
+        / "nki_deltanet_chunked.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "qwen36_nki_deltanet_chunked_under_test",
+        kernel_path,
+    )
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module.deltanet_chunk_step
 
 
 def make_inputs(torch: Any, args: argparse.Namespace) -> dict[str, Any]:
@@ -235,7 +253,7 @@ def main() -> int:
     import torch
     import torch_xla.core.xla_model as xm
 
-    from src.nki_kernels.nki_deltanet_chunked import deltanet_chunk_step
+    deltanet_chunk_step = load_chunked_kernel()
 
     inputs = make_inputs(torch, args)
     math_out, math_state, math_n = reference_math(torch, inputs)
