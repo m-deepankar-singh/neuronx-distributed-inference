@@ -73,7 +73,7 @@ Qwen3.6 weights.
 
 Unit tests are architecture-level and do not depend on weights. Coverage includes config parsing, weight conversion, hybrid cache allocation/update behavior, and DeltaNet decay handling.
 
-### Quality Validation (Qwen3.6-27B, trn2.3xlarge, TP=4, SDK 2.29)
+### Quality Validation (Qwen3.6-27B, trn2.3xlarge, TP=4)
 
 7/7 text-only quality tests passed with `enable_thinking=False`:
 
@@ -89,7 +89,7 @@ Unit tests are architecture-level and do not depend on weights. Coverage include
 
 ## Performance Benchmarks
 
-### Qwen3.6-27B on trn2.3xlarge (TP=4, LNC=2, SDK 2.29, BF16)
+### Qwen3.6-27B on trn2.3xlarge (TP=4, LNC=2, BF16)
 
 **TTFT (Time To First Token)**
 
@@ -111,7 +111,7 @@ Unit tests are architecture-level and do not depend on weights. Coverage include
 
 ### Long-Context vLLM Baseline
 
-A 128K FP8-MLP artifact was validated on trn2.3xlarge (TP=4, LNC=2, SDK 2.29)
+A 128K FP8-MLP artifact was validated on trn2.3xlarge (TP=4, LNC=2)
 with the vLLM Neuron plugin, Qwen chunked prefill, and native vLLM APC enabled.
 
 | Metric | Result |
@@ -319,7 +319,7 @@ The DeltaNet forward path can be controlled via environment variables:
 
 | Env Var | Forward Path | Use Case |
 |---------|-------------|----------|
-| `USE_NKI_FUSED=1` | Fused chunked NKI kernel | Best CTE performance (default for SDK 2.29) |
+| `USE_NKI_FUSED=1` | Fused chunked NKI kernel | Best CTE performance in the validated build |
 | `USE_NKI_CHUNKED=1` | Per-chunk NKI kernel | Legacy, superseded by fused |
 | `USE_NKI=1` | Per-token NKI kernel | TKG (always used for token generation) |
 | `DELTANET_SEQUENTIAL=1` | Sequential PyTorch | Debugging/reference |
@@ -329,7 +329,7 @@ The DeltaNet forward path can be controlled via environment variables:
 
 1. **BF16 HBM pressure at TP=4:** The pure BF16 model consumes nearly all HBM on trn2.3xlarge. Use the FP8/vLLM path for the validated 128K artifact, or a larger instance for additional batching/headroom.
 
-2. **SDK 2.29+ required:** The NKI DeltaNet kernels require NKI 0.3.0 (SDK 2.29). No library modifications needed -- runs on stock SDK 2.29 DLAMI (`/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/`).
+2. **NKI 0.3.0+ required:** The NKI DeltaNet kernels were validated with the `nki` package version shown in the package table below. No library modifications were needed in the validated NxDI venv (`/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/`).
 
 3. **No mini model test:** Unlike DeepSeek-V3, a mini model cannot be provided because DeltaNet layers require NKI kernels that only execute on Neuron devices. Integration tests require a trn2 instance with the full 27B weights.
 
@@ -370,15 +370,24 @@ APC behavior without recompilation.
 | trn2.48xlarge | 4 | 2 | Expected PASS | Untested for this contrib; use the same TP=4 artifact shape when compiling for trn2.3xlarge deployment |
 | trn2u.48xlarge | 4 | 2 | Expected PASS | Untested for this contrib; same portability caveat as trn2.48xlarge |
 
-### SDK Configuration
+### Validation Host Package Versions
+
+These versions were checked on a running trn2.3xlarge validation host on
+2026-05-22. Treat them as the observed validation environment, not as a generic
+SDK release label.
 
 | Component | Version |
 |-----------|---------|
-| NxDI | 0.9.17334 |
-| neuronx-cc | 2.24.5133 |
+| neuronx-distributed-inference | 0.9.17334+ced6ae4e |
+| neuronx-distributed | 0.18.27753+1cafd54f |
+| neuronx-cc | 2.24.8799.0+6f62ff7c |
+| nki | 0.3.0+23928721754.g18aa1271 |
 | torch | 2.9.1 |
+| torch-neuronx | 2.9.0.2.13.26312+8e870898 |
+| torch-xla | 2.9.0 |
 | transformers | 4.57.6 |
-| NKI | 0.3.0 |
+| aws-neuronx-runtime-lib | 2.31.24.0-0b044f4ce |
+| aws-neuronx-tools | 2.29.22.0-b486b0ade |
 | NXDI venv | `/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/` |
 
 ## Testing

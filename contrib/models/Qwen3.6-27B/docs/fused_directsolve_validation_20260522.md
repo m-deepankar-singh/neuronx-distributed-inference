@@ -15,6 +15,10 @@ direct-solve branch. The raw JSON captures are kept in
 | Runtime | trn2.3xlarge, TP=4, LNC=2 |
 | Serving path | Offline vLLM/NxDI, on-device greedy sampling |
 
+The Trn2 validation host was rechecked on 2026-05-22 before publishing these
+notes: it was reachable, reported instance type `trn2.3xlarge`, logical Neuron
+core config `2`, and contained the artifact directory at 36G.
+
 The clean PR branch is based on PR 164 and extracts the fused DeltaNet
 direct-solve change. The measured artifact was compiled from the full
 experimental runtime lineage:
@@ -102,6 +106,25 @@ Raw file:
 | Neuron HBM peak sum | 60.1 GiB |
 | Host process RSS peak | 46.3 GiB |
 | Main logical-core peaks | ~14.57 GiB on cores 0, 2, 4, and 6 |
+
+## Observed Package Versions
+
+These versions were read from the running validation host and the active NxDI
+venv on 2026-05-22.
+
+| Component | Version |
+|-----------|---------|
+| neuronx-distributed-inference | 0.9.17334+ced6ae4e |
+| neuronx-distributed | 0.18.27753+1cafd54f |
+| neuronx-cc | 2.24.8799.0+6f62ff7c |
+| nki | 0.3.0+23928721754.g18aa1271 |
+| torch | 2.9.1 |
+| torch-neuronx | 2.9.0.2.13.26312+8e870898 |
+| torch-xla | 2.9.0 |
+| transformers | 4.57.6 |
+| aws-neuronx-runtime-lib | 2.31.24.0-0b044f4ce |
+| aws-neuronx-tools | 2.29.22.0-b486b0ade |
+| NXDI venv | `/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/` |
 
 ## Validation Commands
 
