@@ -11,6 +11,21 @@ Validation target:
 
 The fused DeltaNet CTE path now uses a direct triangular RHS solve instead of Neumann power-doubling. This fixes the fused-kernel instability observed with realistic Qwen gates while keeping the fused CTE path available for validation.
 
+## Delta From PR 164
+
+This branch is intentionally based on the current vLLM APC PR head, `contrib/qwen36-27b-vllm-apc-pr` at `ac7df71`. It does not include the full experimental branch history.
+
+The clean branch adds only the fused DeltaNet follow-up work on top of PR 164:
+
+- Stabilizes the Qwen fused DeltaNet CTE kernel implementation in `nki_deltanet_fused.py`.
+- Adds an isolated fused NKI validator for realistic Qwen-style gate/decay coverage.
+- Loads the fused kernel directly in the validator so it can run outside package import edge cases.
+- Replaces the fused kernel's Neumann power-doubling solve with the same direct triangular RHS solve strategy used by the stable chunked path.
+- Updates the CPU DeltaNet decay regression test to cover realistic gate scales and direct-solve behavior.
+- Records the direct-solve artifact validation results in this directory.
+
+The already-open vLLM APC PR remains the base contribution for the Qwen3.6 model, vLLM APC integration, docs, and baseline benchmark material. This branch is the proposed add-on that makes the fused DeltaNet path coherent and measurable.
+
 ## Coherence
 
 `qwen36_directsolve_chat_coherence_20260522T1332Z.json`
