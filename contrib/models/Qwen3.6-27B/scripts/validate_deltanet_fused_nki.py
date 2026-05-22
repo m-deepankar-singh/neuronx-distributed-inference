@@ -8,6 +8,7 @@ NKI kernel under test, not from reference PyTorch ops.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import math
 import os
@@ -70,6 +71,23 @@ def add_qwen_to_path() -> None:
     script_path = Path(__file__).resolve()
     qwen_root = script_path.parents[1]
     sys.path.insert(0, str(qwen_root))
+
+
+def load_fused_kernel():
+    kernel_path = (
+        Path(__file__).resolve().parents[1]
+        / "src"
+        / "nki_kernels"
+        / "nki_deltanet_fused.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "qwen36_nki_deltanet_fused_under_test",
+        kernel_path,
+    )
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module.deltanet_fused_chunked_fwd
 
 
 def make_inputs(torch: Any, args: argparse.Namespace) -> dict[str, Any]:
@@ -188,7 +206,7 @@ def main() -> int:
     import torch
     import torch_xla.core.xla_model as xm
 
-    from src.nki_kernels.nki_deltanet_fused import deltanet_fused_chunked_fwd
+    deltanet_fused_chunked_fwd = load_fused_kernel()
 
     inputs = make_inputs(torch, args)
     ref_out, ref_state = reference_math(torch, inputs)
