@@ -185,28 +185,11 @@ def reference_kernel_mirror(torch: Any, inputs: dict[str, Any]) -> tuple[Any, An
     qk = k_beta @ k.T
     a_mat = -(qk * decay * lower) * lower
 
-    p_acc = eye.clone()
-    col_mask_left = torch.zeros_like(a_mat)
-    col_mask_left[:, :64] = 1.0
-    col_mask_right = torch.zeros_like(a_mat)
-    col_mask_right[:, 64:] = 1.0
-
-    for solve_i in range(64):
-        row_prod = a_mat @ p_acc
-        row_update = row_prod * eye[:, solve_i : solve_i + 1]
-        p_acc = p_acc + row_update
-
-    for solve_i in range(64):
-        row_idx = 64 + solve_i
-        row_prod = a_mat @ p_acc
-        row_col_masked = row_prod * col_mask_right
-        row_update = row_col_masked * eye[:, row_idx : row_idx + 1]
-        p_acc = p_acc + row_update
-
-    block_row_mask_bottom = lower_diag[:, 64:65]
-    n21 = (p_acc @ a_mat) @ p_acc
-    n21_block = (n21 * col_mask_left) * block_row_mask_bottom
-    p_acc = p_acc + n21_block
+    p_acc = eye + a_mat
+    a_pow = a_mat.clone()
+    for _ in range(6):
+        a_pow = (a_pow @ a_pow) * lower
+        p_acc = ((eye + a_pow) @ p_acc) * lower_diag
 
     exp_gc = torch.exp(gc)
     value_corr = p_acc @ v_beta
