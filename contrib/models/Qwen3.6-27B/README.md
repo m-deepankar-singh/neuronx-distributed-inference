@@ -166,6 +166,15 @@ The validated direct-solve artifact used prefix buckets through 16K. A 32K
 prompt exceeded that artifact's largest prefix bucket, so longer-context fused
 validation requires recompiling the same code with larger prefix buckets.
 
+Memory note: the `60.1 GiB` direct-solve number is a Neuron high-water peak
+from the Hybrid APC artifact, not a prompt-length-only 16K allocation. The
+artifact was compiled with `pa_num_blocks=512`, `max_gdn_checkpoint_slots=64`,
+and token-generation buckets `[8192, 32768, 131072]`. The PR 164 vLLM/APC
+baseline README reports `~53.25 GB` decimal during a 64K eval, but this branch
+does not include that run's raw memory log or artifact config. Treat the higher
+direct-solve HBM as a real observation that needs like-for-like A/B validation,
+not as proof that the direct triangular solve itself increases memory.
+
 ### Hybrid APC Follow-up Status
 
 Follow-up work on the `experimental` branch extended the baseline vLLM/APC

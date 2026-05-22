@@ -229,6 +229,14 @@ Result:
 - Host process RSS peak: `46.3 GiB`
 - Main logical cores peaked around `14.57 GiB` each on cores `0`, `2`, `4`, and `6`
 
+Memory caveat: this is a Neuron high-water peak from the Hybrid APC artifact,
+not a prompt-length-only 16K allocation. The artifact was compiled with
+`pa_num_blocks=512`, `max_gdn_checkpoint_slots=64`, and TKG buckets
+`[8192, 32768, 131072]`. PR 164 reports `~53.25 GB` decimal during a 64K
+vLLM/APC eval, but this clean branch does not include that run's raw memory log
+or artifact config. A strict memory regression claim needs like-for-like A/B
+measurement with the same capture script and comparable cache/bucket settings.
+
 ## Known Limitations
 
 The compiled artifact used for this validation has `prefix_buckets` only through `16384`. The 32K row failed with:

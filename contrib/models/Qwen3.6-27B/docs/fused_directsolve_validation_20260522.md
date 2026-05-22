@@ -108,6 +108,19 @@ Raw file:
 | Host process RSS peak | 46.3 GiB |
 | Main logical-core peaks | ~14.57 GiB on cores 0, 2, 4, and 6 |
 
+The HBM number above is a high-water peak from the Hybrid APC artifact. It was
+identical for the context-sweep and decode-benchmark phases in the raw capture,
+so it should be read primarily as artifact/runtime static allocation rather than
+as memory consumed by a 16K prompt alone. The artifact config includes
+`pa_num_blocks=512`, `max_gdn_checkpoint_slots=64`, and token-generation buckets
+`[8192, 32768, 131072]`.
+
+PR 164 reports `~53.25 GB` decimal during a 64K vLLM/APC eval, but this clean
+branch does not include that run's raw memory log or artifact config. A strict
+memory regression claim needs a like-for-like rerun of the PR 164 artifact and
+the direct-solve artifact with the same memory capture script and comparable
+cache/bucket settings.
+
 ## Observed Package Versions
 
 These versions were read from the running validation host and the active NxDI

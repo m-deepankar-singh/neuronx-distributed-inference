@@ -111,6 +111,18 @@ That is an artifact bucket coverage limitation, not a direct-solve correctness f
 - Host process RSS peak: `46.3 GiB`
 - Main logical cores peaked around `14.57 GiB` each on cores `0`, `2`, `4`, and `6`
 
+Memory comparison caveat:
+
+- The `60.1 GiB` value is a Neuron high-water peak and appears in both the
+  context-sweep and decode-benchmark captures.
+- The direct-solve artifact was compiled with `pa_num_blocks=512`,
+  `max_gdn_checkpoint_slots=64`, and TKG buckets `[8192, 32768, 131072]`.
+- PR 164 reports `~53.25 GB` decimal during a 64K vLLM/APC eval, but this
+  directory does not include that run's raw memory log or artifact config.
+- Treat the higher direct-solve HBM as a real observation requiring like-for-like
+  A/B validation, not as proof that the direct triangular solve itself increases
+  memory.
+
 ## Follow-Up
 
 For long-context validation, recompile the same branch with prefix buckets beyond `16384`, ideally through the intended 64K/128K validation range.
