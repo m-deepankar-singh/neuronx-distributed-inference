@@ -169,6 +169,7 @@ def main() -> int:
     tokenizer = AutoTokenizer.from_pretrained(str(args.model_path), trust_remote_code=True)
     sampling = SamplingParams(temperature=0.0, top_k=1, max_tokens=args.max_tokens)
     dummy_ids = hybrid_validation._effective_dummy_token_ids(runtime_args, tokenizer)
+    vocab_size = int(getattr(tokenizer, "vocab_size", None) or len(tokenizer))
     llm = None
     rows: list[dict[str, Any]] = []
     try:
@@ -196,6 +197,12 @@ def main() -> int:
                 for token in result["generated_tokens"]
                 if token not in dummy_ids
             ]
+            invalid_token_ids = [
+                token
+                for result in (cold, warm)
+                for token in result["generated_tokens"]
+                if token < 0 or token >= vocab_size
+            ]
             row = {
                 "target_prompt_tokens": target_tokens,
                 "actual_prompt_tokens": len(prompt["prompt_token_ids"]),
@@ -204,6 +211,9 @@ def main() -> int:
                 "warm": warm,
                 "repeat_exact": cold["generated_tokens"] == warm["generated_tokens"],
                 "real_tokens_passed": bool(non_dummy),
+                "token_range_passed": not invalid_token_ids,
+                "invalid_token_ids": sorted(set(invalid_token_ids)),
+                "vocab_size": vocab_size,
                 "cold_effective_prompt_tokens_per_second": target_tokens
                 / cold["elapsed_seconds"]
                 if cold["elapsed_seconds"] > 0
@@ -239,7 +249,12 @@ def main() -> int:
         },
         "lengths": _parse_lengths(args.lengths),
         "rows": rows,
-        "passed": all(row["repeat_exact"] and row["real_tokens_passed"] for row in rows),
+        "passed": all(
+            row["repeat_exact"]
+            and row["real_tokens_passed"]
+            and row["token_range_passed"]
+            for row in rows
+        ),
     }
     args.output_json.expanduser().parent.mkdir(parents=True, exist_ok=True)
     args.output_json.expanduser().write_text(
