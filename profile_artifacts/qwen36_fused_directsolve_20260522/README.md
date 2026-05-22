@@ -16,12 +16,14 @@ The fused DeltaNet CTE path now uses a direct triangular RHS solve instead of Ne
 The development lineage was:
 
 ```text
-PR 164 / vLLM APC baseline
+PR 164 / vLLM APC baseline, building on PR #140
   -> experimental
       -> qwen-fused-neumann-stable-decay
 ```
 
-The `experimental` branch accumulated the runtime and validation work needed to make Qwen3.6 Hybrid APC usable beyond the original PR 164 baseline:
+PR 164 itself builds on Jim Burtoft's Qwen3.6-27B contrib work in PR #140. The
+`experimental` branch accumulated the runtime and validation work needed to make
+Qwen3.6 Hybrid APC usable beyond the original PR 164 baseline:
 
 - Hybrid APC checkpoint cache, lifecycle, restore/commit masks, and strict metadata contracts.
 - vLLM/NxDI scheduler bridge changes for cached chunked prefill, backed prefix reads, request-id propagation, and suffix continuation handling.

@@ -24,11 +24,12 @@ direct-solve change. The measured artifact was compiled from the full
 experimental runtime lineage:
 
 ```text
-PR 164 / vLLM APC baseline
+PR 164 / vLLM APC baseline, building on PR #140
   -> experimental
       -> qwen-fused-neumann-stable-decay
 ```
 
+PR 164 itself builds on Jim Burtoft's Qwen3.6-27B contrib work in PR #140.
 That lineage matters because the artifact also uses the Hybrid APC runtime,
 FP8 128K compile settings, and vLLM/NxDI serving fixes developed after the
 original PR 164 baseline.

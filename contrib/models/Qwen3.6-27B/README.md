@@ -2,9 +2,9 @@
 
 NeuronX Distributed Inference implementation of Qwen3.6-27B, a 27B parameter dense model from Alibaba Cloud with a hybrid DeltaNet + GQA attention architecture.
 
-## Relationship to Qwen3.5-27B
+## Relationship to PR #140 and Qwen3.5-27B
 
-Qwen3.6-27B is a **post-training update** of Qwen3.5-27B with improved agentic coding and thinking preservation. The models share **identical architecture** (`qwen3_5` model_type, `Qwen3_5ForConditionalGeneration`) -- only weights differ. This contrib reuses the same NxDI implementation as [Qwen3.5-27B](../Qwen3.5-27B/) (PR #128). Any code updates to Qwen3.5-27B should be propagated to this contrib and vice versa.
+Qwen3.6-27B is a **post-training update** of Qwen3.5-27B with improved agentic coding and thinking preservation. The models share **identical architecture** (`qwen3_5` model_type, `Qwen3_5ForConditionalGeneration`) -- only weights differ. This contrib builds on Jim Burtoft's Qwen3.6-27B contrib work in PR #140 and the shared Qwen3.5/Qwen3.6 hybrid architecture pattern.
 
 This README reports Qwen3.6-27B validation only. Qwen3.5-27B is referenced for
 architecture and code lineage; it was not re-benchmarked as part of this

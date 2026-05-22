@@ -11,12 +11,17 @@ The important result is that the fused DeltaNet CTE path is now coherent with re
 The actual development history was:
 
 ```text
-PR 164 / vLLM APC baseline
+PR 164 / vLLM APC baseline, building on PR #140
   -> experimental
       -> qwen-fused-neumann-stable-decay
 ```
 
-PR 164 is the original Qwen3.6 vLLM APC baseline. After that, the `experimental` branch accumulated the runtime and validation work needed to make Hybrid APC usable and measurable. The final `qwen-fused-neumann-stable-decay` branch was created from `experimental` and added the fused DeltaNet stability work.
+PR 164 is the original Qwen3.6 vLLM APC baseline for this branch, and PR 164
+itself builds on Jim Burtoft's Qwen3.6-27B contrib work in PR #140. After that,
+the `experimental` branch accumulated the runtime and validation work needed to
+make Hybrid APC usable and measurable. The final
+`qwen-fused-neumann-stable-decay` branch was created from `experimental` and
+added the fused DeltaNet stability work.
 
 This clean branch extracts the direct-solve fused DeltaNet work and its result artifacts onto PR 164 for review. It does not include the entire `experimental` branch history.
 
