@@ -214,6 +214,9 @@ def _runner_args(args, *, enable_hybrid_apc: bool):
         enable_prefix_caching=enable_hybrid_apc,
         enable_hybrid_apc=enable_hybrid_apc,
         enable_vllm_chunked_prefill=args.enable_vllm_chunked_prefill,
+        token_generation_buckets=args.token_generation_buckets,
+        token_generation_batches=args.token_generation_batches,
+        async_mode=args.async_mode,
         kernel_q_tile_size=args.kernel_q_tile_size,
         kernel_kv_tile_size=args.kernel_kv_tile_size,
         hybrid_gdn_recurrent_cache_dtype=None,
@@ -1334,6 +1337,9 @@ def parse_args():
         exact.add_argument("--max-num-seqs", type=int, default=1)
         exact.add_argument("--logical-nc-config", type=int, default=2)
         exact.add_argument("--ctx-batch-size", type=int, default=1)
+        exact.add_argument("--token-generation-buckets", nargs="+", default=None)
+        exact.add_argument("--token-generation-batches", nargs="+", default=None)
+        exact.add_argument("--async-mode", action="store_true")
         exact.add_argument("--block-size", type=int, default=256)
         exact.add_argument("--gdn-checkpoint-interval", type=int, default=256)
         exact.add_argument("--max-gdn-checkpoint-slots", type=int, default=8)
