@@ -166,14 +166,17 @@ The validated direct-solve artifact used prefix buckets through 16K. A 32K
 prompt exceeded that artifact's largest prefix bucket, so longer-context fused
 validation requires recompiling the same code with larger prefix buckets.
 
-Memory note: the `60.1 GiB` direct-solve number is a Neuron high-water peak
-from the Hybrid APC artifact, not a prompt-length-only 16K allocation. The
-artifact was compiled with `pa_num_blocks=512`, `max_gdn_checkpoint_slots=64`,
-and token-generation buckets `[8192, 32768, 131072]`. The PR 164 vLLM/APC
-baseline README reports `~53.25 GB` decimal during a 64K eval, but this branch
-does not include that run's raw memory log or artifact config. Treat the higher
-direct-solve HBM as a real observation that needs like-for-like A/B validation,
-not as proof that the direct triangular solve itself increases memory.
+Memory note: the `60.1 GiB` direct-solve number is `64.54 GB` decimal and is a
+Neuron high-water peak from the Hybrid APC artifact, not a prompt-length-only
+16K allocation. The artifact was compiled with `pa_num_blocks=512`,
+`max_gdn_checkpoint_slots=64`, and token-generation buckets
+`[8192, 32768, 131072]`. The 64-slot GDN checkpoint bank alone is expected to
+reserve about `9.85 GB` decimal across TP=4 ranks
+(`38.49 MB/checkpoint/rank * 64 * 4`), which explains most of the gap from the
+PR 164 vLLM/APC README's `~53.25 GB` decimal 64K eval number. Treat the higher
+direct-solve HBM as a Hybrid APC artifact/config observation requiring
+like-for-like A/B validation, not as proof that the direct triangular solve
+itself increases memory.
 
 ### Hybrid APC Follow-up Status
 
@@ -428,9 +431,5 @@ Note: The env var is `QWEN35_MODEL_PATH` (not `QWEN36`) because the code uses th
 ## Example Checkpoints
 
 - [`Qwen/Qwen3.6-27B`](https://huggingface.co/Qwen/Qwen3.6-27B) (BF16, ~52 GB)
-
-## Maintainer
-
-AWS Neuron
 
 **Last Updated:** 2026-05-22

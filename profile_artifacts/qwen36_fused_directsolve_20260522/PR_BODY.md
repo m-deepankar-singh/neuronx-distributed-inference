@@ -230,12 +230,14 @@ Result:
 - Main logical cores peaked around `14.57 GiB` each on cores `0`, `2`, `4`, and `6`
 
 Memory caveat: this is a Neuron high-water peak from the Hybrid APC artifact,
-not a prompt-length-only 16K allocation. The artifact was compiled with
-`pa_num_blocks=512`, `max_gdn_checkpoint_slots=64`, and TKG buckets
-`[8192, 32768, 131072]`. PR 164 reports `~53.25 GB` decimal during a 64K
-vLLM/APC eval, but this clean branch does not include that run's raw memory log
-or artifact config. A strict memory regression claim needs like-for-like A/B
-measurement with the same capture script and comparable cache/bucket settings.
+not a prompt-length-only 16K allocation. In decimal units the direct-solve peak
+is `64.54 GB`, versus the PR 164 vLLM/APC README's `~53.25 GB` decimal 64K
+eval number. The artifact was compiled with `pa_num_blocks=512`,
+`max_gdn_checkpoint_slots=64`, and TKG buckets `[8192, 32768, 131072]`. The
+64-slot GDN checkpoint bank is expected to reserve about `9.85 GB` decimal
+across TP=4, explaining most of the delta. A strict memory regression claim
+still needs like-for-like A/B measurement with the same capture script and
+comparable cache/bucket settings.
 
 ## Known Limitations
 

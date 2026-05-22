@@ -114,14 +114,17 @@ That is an artifact bucket coverage limitation, not a direct-solve correctness f
 Memory comparison caveat:
 
 - The `60.1 GiB` value is a Neuron high-water peak and appears in both the
-  context-sweep and decode-benchmark captures.
+  context-sweep and decode-benchmark captures. In decimal units it is
+  `64.54 GB`.
 - The direct-solve artifact was compiled with `pa_num_blocks=512`,
   `max_gdn_checkpoint_slots=64`, and TKG buckets `[8192, 32768, 131072]`.
-- PR 164 reports `~53.25 GB` decimal during a 64K vLLM/APC eval, but this
-  directory does not include that run's raw memory log or artifact config.
+- The 64-slot GDN checkpoint bank is expected to reserve about `38.49 MB` per
+  checkpoint per TP rank, or `9.85 GB` decimal across TP=4, which explains most
+  of the gap to the PR 164 vLLM/APC README's `~53.25 GB` decimal 64K eval
+  number.
 - Treat the higher direct-solve HBM as a real observation requiring like-for-like
-  A/B validation, not as proof that the direct triangular solve itself increases
-  memory.
+  A/B validation of the artifact/cache configuration, not as proof that the
+  direct triangular solve itself increases memory.
 
 ## Follow-Up
 
