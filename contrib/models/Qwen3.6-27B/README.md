@@ -6,6 +6,10 @@ NeuronX Distributed Inference implementation of Qwen3.6-27B, a 27B parameter den
 
 Qwen3.6-27B is a **post-training update** of Qwen3.5-27B with improved agentic coding and thinking preservation. The models share **identical architecture** (`qwen3_5` model_type, `Qwen3_5ForConditionalGeneration`) -- only weights differ. This contrib reuses the same NxDI implementation as [Qwen3.5-27B](../Qwen3.5-27B/) (PR #128). Any code updates to Qwen3.5-27B should be propagated to this contrib and vice versa.
 
+This README reports Qwen3.6-27B validation only. Qwen3.5-27B is referenced for
+architecture and code lineage; it was not re-benchmarked as part of this
+Qwen3.6 contrib validation.
+
 ### Config differences from Qwen3.5-27B
 
 | Field | Value | Impact |
@@ -104,16 +108,6 @@ Unit tests are architecture-level and do not depend on weights. Coverage include
 | 32 | 54.4 | 18.4 | 1,993 |
 | 64 | 54.2 | 18.5 | 3,720 |
 | 128 | 54.2 | 18.5 | 4,912 |
-
-### Comparison with Qwen3.5-27B
-
-| Metric | Qwen3.5-27B | Qwen3.6-27B | Delta |
-|--------|------------|------------|-------|
-| TPOT P50 | 53 ms | 54.2 ms | +2.3% |
-| Throughput | 18.9 tok/s | 18.5 tok/s | -2.1% |
-| TTFT (128 tok) | 576 ms | 306.6 ms | -47% * |
-
-\* TTFT improvement is due to compilation config differences (256-token bucket vs 128-token bucket), not model differences. Architectural performance is equivalent.
 
 ### Long-Context vLLM Baseline
 
@@ -230,7 +224,7 @@ contract coverage, especially generated-token batch-2 validation with matching
 - **BF16 TP=4 is HBM-limited:** The pure BF16 path is limited to short contexts on trn2.3xlarge. The validated 128K baseline uses MLP-only FP8 weights plus the hybrid cache manager.
 - **DeltaNet enables efficient TKG:** Token generation uses O(1) per-token recurrence instead of O(n) KV cache attention for 48/64 layers.
 - **vLLM APC is high leverage:** Repeated-prefix requests avoid replaying long chunked prefill and are the largest observed latency win for chat/RAG-style workloads.
-- **Performance equivalent to Qwen3.5-27B:** The BF16 TPOT difference is within measurement noise. Expected since architectures are identical.
+- **Qwen3.6-only measurements:** The benchmark tables above are Qwen3.6 results. Qwen3.5 is referenced only because the two contrib models share the same architecture and implementation lineage.
 
 ## Usage
 
