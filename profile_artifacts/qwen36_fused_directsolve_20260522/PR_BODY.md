@@ -1,8 +1,31 @@
 # Qwen3.6 Fused DeltaNet Direct-Solve Follow-Up
 
-This is a clean branch on top of PR 164, `contrib/qwen36-27b-vllm-apc-pr` at `ac7df71`. It is meant to extend the existing vLLM APC PR without bringing in the full experimental branch stack.
+This is a clean extraction on top of PR 164, `contrib/qwen36-27b-vllm-apc-pr` at `ac7df71`. It is meant to show the fused DeltaNet direct-solve follow-up without bringing in the full experimental branch stack.
+
+## Branch Lineage
+
+The actual development history was:
+
+```text
+PR 164 / vLLM APC baseline
+  -> experimental
+      -> qwen-fused-neumann-stable-decay
+```
+
+The `experimental` branch added substantial runtime and validation work after PR 164:
+
+- Hybrid APC checkpoint cache, lifecycle, restore/commit masks, and strict metadata contracts.
+- vLLM/NxDI scheduler bridge changes for cached chunked prefill, backed prefix reads, request-id propagation, and suffix continuation handling.
+- Qwen chunked prefill fixes for CTE bucket alignment, prefix-cache slot mapping, GDN checkpoint commits, and chunk-boundary handling.
+- FP8 128K artifact configuration guards, validation max-prompt alignment, and artifact audit checks.
+- OpenAI/vLLM validation harnesses for exactness, context sweeps, TTFT/TPOT, decode benchmarking, memory capture, and API compatibility.
+- Decode-path and sampling fixes, including on-device sampling/logits-path validation and chat-template thinking controls.
+
+The final fused branch added the direct-solve fused DeltaNet fix on top of that experimental runtime stack.
 
 ## What Changed On Top Of PR 164
+
+This clean branch extracts only the fused DeltaNet follow-up commits:
 
 - Stabilized the Qwen fused DeltaNet CTE kernel.
 - Added an isolated fused NKI validation script.
@@ -10,6 +33,8 @@ This is a clean branch on top of PR 164, `contrib/qwen36-27b-vllm-apc-pr` at `ac
 - Replaced the fused kernel's Neumann power-doubling solve with a direct triangular RHS solve.
 - Updated CPU DeltaNet decay regression coverage for realistic gate scales.
 - Added compact validation artifacts for coherence, decode, prefill, and memory.
+
+The artifact results below were produced from `qwen-fused-neumann-stable-decay`, so they validate the direct-solve fused kernel inside the full `experimental` lineage. They should not be read as proof that PR 164 plus only these extracted commits reproduces every Hybrid APC runtime fix from `experimental`.
 
 ## Why
 

@@ -11,11 +11,32 @@ Validation target:
 
 The fused DeltaNet CTE path now uses a direct triangular RHS solve instead of Neumann power-doubling. This fixes the fused-kernel instability observed with realistic Qwen gates while keeping the fused CTE path available for validation.
 
-## Delta From PR 164
+## Lineage From PR 164
 
-This branch is intentionally based on the current vLLM APC PR head, `contrib/qwen36-27b-vllm-apc-pr` at `ac7df71`. It does not include the full experimental branch history.
+The development lineage was:
 
-The clean branch adds only the fused DeltaNet follow-up work on top of PR 164:
+```text
+PR 164 / vLLM APC baseline
+  -> experimental
+      -> qwen-fused-neumann-stable-decay
+```
+
+The `experimental` branch accumulated the runtime and validation work needed to make Qwen3.6 Hybrid APC usable beyond the original PR 164 baseline:
+
+- Hybrid APC checkpoint cache, lifecycle, restore/commit masks, and strict metadata contracts.
+- vLLM/NxDI scheduler bridge changes for cached chunked prefill, backed prefix reads, request-id propagation, and suffix continuation handling.
+- Qwen chunked prefill fixes for CTE bucket alignment, prefix-cache slot mapping, GDN checkpoint commits, and chunk-boundary handling.
+- FP8 128K artifact configuration guards, validation max-prompt alignment, and artifact audit checks.
+- OpenAI/vLLM validation harnesses for exactness, context sweeps, TTFT/TPOT, decode benchmarking, memory capture, and API compatibility.
+- Decode-path and sampling fixes, including on-device sampling/logits-path validation and chat-template thinking controls.
+
+The final fused branch then adds the direct-solve fused DeltaNet follow-up on top of `experimental`.
+
+## Clean PR Extraction
+
+This clean branch is based on the current PR 164 head, `contrib/qwen36-27b-vllm-apc-pr` at `ac7df71`, and intentionally does not include the full experimental branch history.
+
+It extracts only the fused DeltaNet follow-up work:
 
 - Stabilizes the Qwen fused DeltaNet CTE kernel implementation in `nki_deltanet_fused.py`.
 - Adds an isolated fused NKI validator for realistic Qwen-style gate/decay coverage.
@@ -24,7 +45,7 @@ The clean branch adds only the fused DeltaNet follow-up work on top of PR 164:
 - Updates the CPU DeltaNet decay regression test to cover realistic gate scales and direct-solve behavior.
 - Records the direct-solve artifact validation results in this directory.
 
-The already-open vLLM APC PR remains the base contribution for the Qwen3.6 model, vLLM APC integration, docs, and baseline benchmark material. This branch is the proposed add-on that makes the fused DeltaNet path coherent and measurable.
+The validation artifact referenced below was compiled from `qwen-fused-neumann-stable-decay`, so these results reflect the final fused branch running on top of the `experimental` runtime stack. If this clean extraction is used to extend PR 164 directly, reviewers should treat the artifact results as validation of the fused direct-solve change in the full experimental lineage, not proof that PR 164 plus these extracted commits alone reproduces every Hybrid APC runtime behavior.
 
 ## Coherence
 
