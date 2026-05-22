@@ -254,7 +254,3 @@ The artifact results were produced from `qwen-fused-neumann-stable-decay`, which
 ## What Is Intentionally Not Included
 
 This clean branch does not include the full 80+ commit `experimental` stack. It also does not include large raw logs, obsolete investigation branches, or temporary scripts. Those were useful during development but would make this review branch hard to inspect.
-
-## Recommended Next Step
-
-Use this branch as the reviewer-facing result branch for the fused direct-solve change. If reviewers require source-level reproducibility for the full artifact behavior, stack or merge a curated `experimental` runtime-stabilization branch beneath this direct-solve work.
