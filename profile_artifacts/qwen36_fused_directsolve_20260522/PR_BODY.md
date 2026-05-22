@@ -23,6 +23,20 @@ The `experimental` branch added substantial runtime and validation work after PR
 
 The final fused branch added the direct-solve fused DeltaNet fix on top of that experimental runtime stack.
 
+## Major Changes From PR 164 To The Tested Branch
+
+The full tested branch differs from PR 164 by roughly 105 source/result files. The important changes are:
+
+- **Hybrid APC runtime:** checkpoint cache, restore/commit masks, backed prefix reads, checkpoint-slot lifecycle, and metadata validation.
+- **vLLM scheduler bridge:** request-id propagation, cached chunked-prefill continuations, active suffix accounting, no-prefix fallback handling, and backed-prefix authorization.
+- **Qwen model execution:** Hybrid APC chunked prefill, GDN checkpoint commit/restore, text-only CTE inputs, compact CTE masks, prefix/suffix boundary handling, and decode-path safety.
+- **NxDI prefix-cache plumbing:** vectorized APC args, prefix-cache bucket selection, padded-row safety, cached decode rows, and async checkpoint lifecycle.
+- **DeltaNet NKI kernels:** chunked/fused validation paths, DeltaNet backend compile controls, masked Neumann experiments, and the final fused direct triangular RHS solve.
+- **FP8/artifact compile path:** Qwen FP8 compile config coverage, artifact config audits, 128K validation alignment, `pa_num_blocks` checks, and larger TKG bucket support.
+- **Serving/API compatibility:** OpenAI-compatible proxy/server behavior, chat-template `enable_thinking=false`, stop-sequence handling, and startup/offline helpers.
+- **Validation harnesses:** exactness validation, OpenAI chat APC validation, boundary APC probes, context sweeps, offline decode benchmark, BF16 sweep, artifact audit, and memory/perf capture.
+- **Tests and results:** added Hybrid APC, scheduler, model-alias, compile-config, artifact-audit, sampling, async, prefix-cache, and DeltaNet tests plus recorded performance/memory artifacts.
+
 ## What Changed On Top Of PR 164
 
 This clean branch extracts only the fused DeltaNet follow-up commits:

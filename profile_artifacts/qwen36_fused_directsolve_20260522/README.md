@@ -32,6 +32,23 @@ The `experimental` branch accumulated the runtime and validation work needed to 
 
 The final fused branch then adds the direct-solve fused DeltaNet follow-up on top of `experimental`.
 
+## Major Changes From PR 164 To The Tested Branch
+
+The tested branch differs from the vLLM APC PR by roughly 105 source/result files. The important changes are:
+
+- **Hybrid APC runtime:** added `hybrid_apc.py`, Hybrid APC request records, backed prefix reads, restore/commit masks, checkpoint-slot lifecycle handling, and stricter metadata validation.
+- **vLLM scheduler bridge:** added `qwen36_hybrid_apc_scheduler_patch.py` and patched request-id propagation, cached chunked-prefill continuations, active suffix accounting, no-prefix fallback handling, and backed-prefix authorization.
+- **Qwen model execution:** extended `modeling_qwen35.py` for Hybrid APC chunked prefill, GDN checkpoint commit/restore, text-only CTE inputs, compact CTE masks, prefix/suffix boundary handling, and decode-path safety.
+- **NxDI prefix-cache plumbing:** updated `model_base.py`, `model_wrapper.py`, `async_execution.py`, and KV-cache helpers for vectorized APC args, prefix-cache bucket selection, padded-row safety, cached decode rows, and async checkpoint lifecycle.
+- **DeltaNet NKI kernels:** added chunked and fused validation paths, DeltaNet backend compile controls, masked Neumann experiments, and the final fused direct triangular RHS solve.
+- **FP8/artifact compile path:** expanded Qwen FP8 compile config coverage, artifact config audits, 128K/FP8 validation alignment, `pa_num_blocks` checks, and larger TKG bucket support.
+- **Serving/API compatibility:** updated the OpenAI-compatible proxy/server behavior, chat-template `enable_thinking=false` handling, stop-sequence handling, and offline/server startup helpers.
+- **Validation harnesses:** added exactness validation, OpenAI chat APC validation, boundary APC probes, context sweeps, offline decode benchmark, BF16 length sweep, artifact config audit, and memory/perf capture flows.
+- **Tests:** added focused unit coverage for Hybrid APC manager/cache behavior, scheduler patching, model aliases, compile config, artifact config audit, sampling, async execution, prefix-cache bucket selection, and fused DeltaNet decay.
+- **Result artifacts:** recorded 4K Hybrid APC TTFT/TPOT/memory results, 128K FP8 exactness/HBM estimates, decode fast-path probes, pfx128k context sweeps, and the fused direct-solve results in this directory.
+
+This is why the clean branch separates the **result presentation** from the full experimental runtime stack: reviewers can inspect the fused direct-solve result directly, while the large runtime lineage remains explicit.
+
 ## Clean PR Extraction
 
 This clean branch is based on the current PR 164 head, `contrib/qwen36-27b-vllm-apc-pr` at `ac7df71`, and intentionally does not include the full experimental branch history.
