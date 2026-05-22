@@ -126,6 +126,13 @@ def make_inputs(torch: Any, args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+def stable_causal_decay(torch: Any, gc: Any, mask: Any) -> Any:
+    """Compute exp(gc[i] - gc[j]) only where the causal mask is active."""
+    diff = gc - gc.T
+    masked_diff = torch.where(mask.bool(), diff, torch.zeros_like(diff))
+    return torch.exp(masked_diff) * mask
+
+
 def reference_math(torch: Any, inputs: dict[str, Any]) -> tuple[Any, Any]:
     lower = inputs["lower_mask"]
     lower_diag = inputs["lower_mask_diag"]
@@ -146,26 +153,19 @@ def reference_math(torch: Any, inputs: dict[str, Any]) -> tuple[Any, Any]:
         k_beta = k * beta
         v_beta = v * beta
 
-        decay = torch.exp(gc - gc.T)
-        decay_strict = decay * lower
-        decay_diag = decay * lower_diag
+        decay_strict = stable_causal_decay(torch, gc, lower)
+        decay_diag = stable_causal_decay(torch, gc, lower_diag)
 
         qk_beta = k_beta @ k.T
         a_mat = -(qk_beta * decay_strict) * lower
 
-        # Mirror the fused kernel: Neumann power-doubling, not triangular solve.
-        p_acc = eye + a_mat
-        a_pow = a_mat.clone()
-        for _ in range(6):
-            a_pow = (a_pow @ a_pow) * lower
-            p_acc = ((eye + a_pow) @ p_acc) * lower_diag
+        lhs = eye - a_mat
 
         exp_gc = torch.exp(gc)
-        value_corr = p_acc @ v_beta
-        k_cumdecay = p_acc @ (k_beta * exp_gc)
+        solve_rhs = v_beta - ((k_beta * exp_gc) @ state)
+        v_new = torch.linalg.solve_triangular(lhs, solve_rhs, upper=False)
         attn_intra = (q @ k.T) * decay_diag
 
-        v_new = value_corr - (k_cumdecay @ state)
         chunk_out = ((q * exp_gc) @ state) + (attn_intra @ v_new)
         outputs.append(chunk_out)
 
