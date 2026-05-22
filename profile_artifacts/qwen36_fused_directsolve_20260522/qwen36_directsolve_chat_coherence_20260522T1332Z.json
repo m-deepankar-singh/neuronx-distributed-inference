@@ -1,0 +1,56 @@
+{
+  "artifact": "/mnt/trainium_artifacts/qwen_artifacts/qwen36_27b_128k_fp8_mlp_edgebf16_hybrid_apc_nki_fusedstable_directsolve_retry_b256_cte256_512_pfx16k_slots64_tkg8192_32768_131072_async_20260522T130050Z",
+  "branch": "qwen-fused-neumann-stable-decay",
+  "commit": "ae2613d",
+  "pass": true,
+  "rows": [
+    {
+      "checks": {
+        "code_has_def_or_loop": true,
+        "fact_mentions_paris": true,
+        "has_text": true,
+        "not_all_bang": true,
+        "not_repetitive": true,
+        "prefix_mentions_cache": true
+      },
+      "completion_tokens": 64,
+      "elapsed_s": 3.126171286000499,
+      "label": "fact",
+      "pass": true,
+      "text": " Paris. \ud83c\uddeb\ud83c\uddf7\ud83d\uddfc\ud83c\udf77\ud83e\udd56\ud83c\udfa8\ud83c\udfdb\ufe0f\ud83c\udf0d\ud83d\udc51\ud83d\udcdc\ud83c\udfad\ud83c\udf7d\ufe0f\ud83d\udeb2\ud83c\udf33\ud83c\udff0\ud83c\udfb6\ud83d\udcda\ud83c\udfaa\ud83c\udfa8\ud83c\udfad",
+      "tok_s": 20.47232673609484
+    },
+    {
+      "checks": {
+        "code_has_def_or_loop": true,
+        "fact_mentions_paris": true,
+        "has_text": true,
+        "not_all_bang": true,
+        "not_repetitive": true,
+        "prefix_mentions_cache": true
+      },
+      "completion_tokens": 64,
+      "elapsed_s": 3.1215076250000493,
+      "label": "code",
+      "pass": true,
+      "text": "def fib(n):\n    if n <= 0:\n        return 0\n    elif n == 1:\n        return 1\n    \n    a, b = 0, 1\n    for _ in range(2, n + 1):\n        a, b = b, a",
+      "tok_s": 20.502913235715383
+    },
+    {
+      "checks": {
+        "code_has_def_or_loop": true,
+        "fact_mentions_paris": true,
+        "has_text": true,
+        "not_all_bang": true,
+        "not_repetitive": true,
+        "prefix_mentions_cache": true
+      },
+      "completion_tokens": 64,
+      "elapsed_s": 3.123161378000077,
+      "label": "prefix_cache",
+      "pass": true,
+      "text": "*   **Avoids Redundant Computation: Prefix caching stores the hidden states (activations) of previously processed tokens, allowing the model to skip re-computing the attention and feed-forward layers for identical prompt prefixes.\n*   **Reduces Memory and Latency: By reusing cached results, the",
+      "tok_s": 20.492056686799366
+    }
+  ]
+}

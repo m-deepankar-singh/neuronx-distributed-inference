@@ -1,0 +1,71 @@
+{
+  "artifact": "/mnt/trainium_artifacts/qwen_artifacts/qwen36_27b_128k_fp8_mlp_edgebf16_hybrid_apc_nki_fusedstable_directsolve_retry_b256_cte256_512_pfx16k_slots64_tkg8192_32768_131072_async_20260522T130050Z",
+  "context_json": "/home/ubuntu/validation_logs/fp8_128k/qwen36_directsolve_context_sweep_20260522T1348Z.json",
+  "decode_json": "/home/ubuntu/validation_logs/fp8_128k/qwen36_directsolve_decode_bench_20260522T1348Z.json",
+  "phases": [
+    {
+      "log_path": "/home/ubuntu/validation_logs/fp8_128k/qwen36_directsolve_context_sweep_20260522T1348Z.log",
+      "memory": {
+        "max_device_mem_peak_sum_bytes": 64543326208,
+        "max_device_mem_present_sum_bytes": 1302872064,
+        "max_host_process_rss_kb": 48594600,
+        "max_peak_per_core_bytes": {
+          "neuron_core0": 15642320896,
+          "neuron_core1": 493510656,
+          "neuron_core2": 15642320896,
+          "neuron_core3": 493510656,
+          "neuron_core4": 15642320896,
+          "neuron_core5": 493510656,
+          "neuron_core6": 15642320896,
+          "neuron_core7": 493510656
+        },
+        "max_present_per_core_bytes": {
+          "neuron_core0": 67239936,
+          "neuron_core1": 32448512,
+          "neuron_core2": 57049088,
+          "neuron_core3": 56238080,
+          "neuron_core4": 635699200,
+          "neuron_core5": 8896512,
+          "neuron_core6": 635699200,
+          "neuron_core7": 8896512
+        },
+        "samples": 256
+      },
+      "memory_log_path": "/home/ubuntu/validation_logs/fp8_128k/qwen36_directsolve_context_sweep_memory_20260522T1348Z.jsonl",
+      "name": "context_sweep",
+      "returncode": 1
+    },
+    {
+      "log_path": "/home/ubuntu/validation_logs/fp8_128k/qwen36_directsolve_decode_bench_20260522T1348Z.log",
+      "memory": {
+        "max_device_mem_peak_sum_bytes": 64543326208,
+        "max_device_mem_present_sum_bytes": 1360543744,
+        "max_host_process_rss_kb": 48343516,
+        "max_peak_per_core_bytes": {
+          "neuron_core0": 15642320896,
+          "neuron_core1": 493510656,
+          "neuron_core2": 15642320896,
+          "neuron_core3": 493510656,
+          "neuron_core4": 15642320896,
+          "neuron_core5": 493510656,
+          "neuron_core6": 15642320896,
+          "neuron_core7": 493510656
+        },
+        "max_present_per_core_bytes": {
+          "neuron_core0": 67239936,
+          "neuron_core1": 25825280,
+          "neuron_core2": 44564480,
+          "neuron_core3": 32448512,
+          "neuron_core4": 635699200,
+          "neuron_core5": 32448512,
+          "neuron_core6": 635699200,
+          "neuron_core7": 8896512
+        },
+        "samples": 119
+      },
+      "memory_log_path": "/home/ubuntu/validation_logs/fp8_128k/qwen36_directsolve_decode_bench_memory_20260522T1348Z.jsonl",
+      "name": "decode_bench",
+      "returncode": 0
+    }
+  ]
+}

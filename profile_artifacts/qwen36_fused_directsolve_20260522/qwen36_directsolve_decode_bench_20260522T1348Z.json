@@ -1,0 +1,85 @@
+{
+  "artifact": "/mnt/trainium_artifacts/qwen_artifacts/qwen36_27b_128k_fp8_mlp_edgebf16_hybrid_apc_nki_fusedstable_directsolve_retry_b256_cte256_512_pfx16k_slots64_tkg8192_32768_131072_async_20260522T130050Z",
+  "artifact_neuron_config": {
+    "context_encoding_buckets": [
+      256,
+      512
+    ],
+    "ctx_batch_size": 1,
+    "max_context_length": 131072,
+    "max_length": 131072,
+    "on_device_sampling_config": {
+      "deterministic": false,
+      "do_sample": false,
+      "dynamic": false,
+      "global_topk": 256,
+      "on_device_sampling_config": true,
+      "sampling_dp_degree": 1,
+      "temperature": 1.0,
+      "top_k": 1,
+      "top_k_kernel_enabled": true,
+      "top_p": 1.0
+    },
+    "output_logits": false,
+    "pa_block_size": 256,
+    "pa_num_blocks": 512,
+    "prefix_buckets": [
+      256,
+      512,
+      1024,
+      2048,
+      4096,
+      8192,
+      16384
+    ],
+    "seq_len": 131072,
+    "tkg_batch_size": 1,
+    "token_generation_buckets": [
+      8192,
+      32768,
+      131072
+    ]
+  },
+  "async_mode": true,
+  "avg_elapsed_s": 5.918099790499582,
+  "avg_tok_s": 21.628582366108347,
+  "cte_buckets": [
+    256,
+    512
+  ],
+  "max_model_len": 8192,
+  "max_num_seqs": 1,
+  "max_tokens": 128,
+  "model_path": "/home/ubuntu/models/Qwen3.6-27B",
+  "pa_num_blocks": 512,
+  "prompt": "Explain prefix caching in two concise paragraphs.",
+  "runs": [
+    {
+      "completion_tokens": 128,
+      "elapsed_s": 5.923555245999523,
+      "run": 1,
+      "text": "\n\nPrefix caching is an optimization technique used in large language model inference that significantly reduces computational overhead by reusing previously computed key-value (K/V) states. When a user's prompt shares a common prefix with a previous request\u2014such as a standard system instruction or a shared codebase\u2014the model can bypass the redundant attention calculations for those identical tokens. Instead of recomputing the K/V pairs for the shared context, the system simply loads the cached results from memory, allowing the model to focus its processing power exclusively on the new, unique tokens.\n\nThis approach dramatically accelerates response times and improves throughput, particularly in scenarios involving repetitive prompts or",
+      "tok_s": 21.608644586617956
+    },
+    {
+      "completion_tokens": 128,
+      "elapsed_s": 5.912644334999641,
+      "run": 2,
+      "text": "\n\nPrefix caching is an optimization technique used in large language model inference that significantly reduces computational overhead by reusing previously computed key-value (K/V) states. When a user's prompt shares a common prefix with a previous request\u2014such as a standard system instruction or a shared codebase\u2014the model can bypass the redundant attention calculations for those identical tokens. Instead of recomputing the K/V pairs for the shared context, the system simply loads the cached results from memory, allowing the model to focus its processing power exclusively on the new, unique tokens.\n\nThis approach dramatically accelerates response times and improves throughput, particularly in scenarios involving repetitive prompts or",
+      "tok_s": 21.64852014559874
+    }
+  ],
+  "seq_len": 131072,
+  "token_generation_batches": null,
+  "token_generation_buckets": [
+    8192,
+    32768,
+    131072
+  ],
+  "warmup": {
+    "completion_tokens": 8,
+    "elapsed_s": 1.13700048300052,
+    "text": "\n\nPrefix caching is an optimization technique used",
+    "tok_s": 7.036056817573349
+  }
+}

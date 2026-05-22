@@ -1,0 +1,69 @@
+{
+  "artifact": "/mnt/trainium_artifacts/qwen_artifacts/qwen36_27b_128k_fp8_mlp_edgebf16_hybrid_apc_nki_fusedstable_directsolve_retry_b256_cte256_512_pfx16k_slots64_tkg8192_32768_131072_async_20260522T130050Z",
+  "artifact_config": {
+    "context_encoding_buckets": [
+      256,
+      512
+    ],
+    "pa_num_blocks": 512,
+    "prefix_buckets": [
+      256,
+      512,
+      1024,
+      2048,
+      4096,
+      8192,
+      16384
+    ],
+    "seq_len": 131072,
+    "tkg_batch_size": 1,
+    "token_generation_buckets": [
+      8192,
+      32768,
+      131072
+    ]
+  },
+  "failed_at": {
+    "error": "Prefix len 16640 exceeds largest bucket 16384 for context_encoding_model",
+    "target_prompt_tokens": 32768
+  },
+  "max_tokens": 1,
+  "rows": [
+    {
+      "cold_effective_prompt_tokens_per_second": 390.3766293031504,
+      "cold_ttft_seconds": 1.311553923998872,
+      "repeat_exact": true,
+      "target_prompt_tokens": 512,
+      "token_range_passed": true,
+      "warm_effective_prompt_tokens_per_second": 1214.4647409237177,
+      "warm_ttft_seconds": 0.4215849030006211
+    },
+    {
+      "cold_effective_prompt_tokens_per_second": 582.2723653461799,
+      "cold_ttft_seconds": 7.034508665999965,
+      "repeat_exact": true,
+      "target_prompt_tokens": 4096,
+      "token_range_passed": true,
+      "warm_effective_prompt_tokens_per_second": 9832.557853165847,
+      "warm_ttft_seconds": 0.4165752249991783
+    },
+    {
+      "cold_effective_prompt_tokens_per_second": 602.0664367066421,
+      "cold_ttft_seconds": 13.606471811999654,
+      "repeat_exact": true,
+      "target_prompt_tokens": 8192,
+      "token_range_passed": true,
+      "warm_effective_prompt_tokens_per_second": 18907.071820446214,
+      "warm_ttft_seconds": 0.4332770340006391
+    },
+    {
+      "cold_effective_prompt_tokens_per_second": 588.6039525245649,
+      "cold_ttft_seconds": 27.835355045999677,
+      "repeat_exact": true,
+      "target_prompt_tokens": 16384,
+      "token_range_passed": true,
+      "warm_effective_prompt_tokens_per_second": 36293.66416713788,
+      "warm_ttft_seconds": 0.4514286550001998
+    }
+  ]
+}
