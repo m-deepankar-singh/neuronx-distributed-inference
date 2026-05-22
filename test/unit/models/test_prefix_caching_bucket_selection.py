@@ -228,6 +228,135 @@ class TestPrefixCachingBucketSelection:
         assert torch.equal(padded_args[13], torch.tensor([[suffix_len]], dtype=torch.int32))
         assert torch.equal(padded_args[14], torch.tensor([[restore_len]], dtype=torch.int32))
 
+    def test_cte_suffix_only_continuation_keeps_prefix_bucket(self):
+        model_wrapper = self.setup_context_encoding()
+        model_wrapper.neuron_config.buckets = [
+            [256, 0],
+            [256, 256],
+            [512, 0],
+            [512, 256],
+        ]
+        model_wrapper.neuron_config.pa_block_size = 256
+
+        suffix_len = 256
+        prefix_len = 256
+        inp_args = [
+            torch.arange(suffix_len, dtype=torch.int32).reshape(1, suffix_len),
+            torch.ones((1, suffix_len), dtype=torch.int32),
+            torch.arange(
+                prefix_len,
+                prefix_len + suffix_len,
+                dtype=torch.int32,
+            ).reshape(1, suffix_len),
+            torch.zeros((1,), dtype=torch.int32),
+            torch.ones((1, 3), dtype=torch.float32),
+            torch.empty(0),
+            torch.zeros((1,), dtype=torch.int32),
+            torch.empty(0),
+            torch.empty(0),
+            torch.empty(0),
+            torch.empty(0),
+            torch.arange(512, 512 + suffix_len, dtype=torch.int32).reshape(
+                1,
+                suffix_len,
+            ),
+            torch.tensor([[0]], dtype=torch.int32),
+            torch.tensor([[suffix_len]], dtype=torch.int32),
+            torch.tensor([[prefix_len]], dtype=torch.int32),
+        ]
+
+        prefill_bucket, prefix_bucket = (
+            model_wrapper.get_target_2d_bucket_for_prefix_caching(*inp_args)
+        )
+        padded_args = model_wrapper._pad_prefix_caching_inputs(*inp_args)
+
+        assert int(prefill_bucket) == 256
+        assert int(prefix_bucket) == 256
+        assert padded_args[0].shape == (1, 256)
+        assert padded_args[1].shape == (1, 256)
+        assert padded_args[2].shape == (1, 256)
+        assert torch.equal(padded_args[0], inp_args[0])
+        assert torch.equal(padded_args[1], torch.ones((1, 256), dtype=torch.int32))
+        assert torch.equal(padded_args[2], inp_args[2])
+        assert torch.equal(padded_args[11], inp_args[11])
+        assert torch.equal(padded_args[12], torch.tensor([[0]], dtype=torch.int32))
+        assert torch.equal(
+            padded_args[13], torch.tensor([[suffix_len]], dtype=torch.int32)
+        )
+        assert torch.equal(
+            padded_args[14], torch.tensor([[prefix_len]], dtype=torch.int32)
+        )
+
+    def test_cte_suffix_only_partial_continuation_does_not_left_pad_slots(self):
+        model_wrapper = self.setup_context_encoding()
+        model_wrapper.neuron_config.buckets = [
+            [256, 0],
+            [256, 256],
+            [256, 512],
+            [256, 1024],
+        ]
+        model_wrapper.neuron_config.pa_block_size = 256
+
+        suffix_len = 48
+        prefix_len = 768
+        inp_args = [
+            torch.arange(suffix_len, dtype=torch.int32).reshape(1, suffix_len),
+            torch.ones((1, suffix_len), dtype=torch.int32),
+            torch.arange(
+                prefix_len,
+                prefix_len + suffix_len,
+                dtype=torch.int32,
+            ).reshape(1, suffix_len),
+            torch.zeros((1,), dtype=torch.int32),
+            torch.ones((1, 3), dtype=torch.float32),
+            torch.empty(0),
+            torch.zeros((1,), dtype=torch.int32),
+            torch.empty(0),
+            torch.empty(0),
+            torch.empty(0),
+            torch.empty(0),
+            torch.arange(1024, 1024 + suffix_len, dtype=torch.int32).reshape(
+                1,
+                suffix_len,
+            ),
+            torch.tensor([[0, 1, 2]], dtype=torch.int32),
+            torch.tensor([[suffix_len]], dtype=torch.int32),
+            torch.tensor([[prefix_len]], dtype=torch.int32),
+        ]
+
+        prefill_bucket, prefix_bucket = (
+            model_wrapper.get_target_2d_bucket_for_prefix_caching(*inp_args)
+        )
+        padded_args = model_wrapper._pad_prefix_caching_inputs(*inp_args)
+
+        assert int(prefill_bucket) == 256
+        assert int(prefix_bucket) == 1024
+        assert torch.equal(padded_args[0][:, :suffix_len], inp_args[0])
+        assert torch.equal(padded_args[2][:, :suffix_len], inp_args[2])
+        assert torch.equal(padded_args[11][:, :suffix_len], inp_args[11])
+        assert torch.equal(
+            padded_args[11][:, suffix_len:],
+            torch.full((1, 256 - suffix_len), -1, dtype=torch.int32),
+        )
+        assert padded_args[1].shape == (1, 1024)
+        assert torch.equal(
+            padded_args[1][:, :prefix_len],
+            torch.ones((1, prefix_len), dtype=torch.int32),
+        )
+        assert torch.equal(
+            padded_args[1][:, prefix_len:],
+            torch.zeros((1, 1024 - prefix_len), dtype=torch.int32),
+        )
+        assert torch.equal(
+            padded_args[12], torch.tensor([[0, 1, 2, 0]], dtype=torch.int32)
+        )
+        assert torch.equal(
+            padded_args[13], torch.tensor([[suffix_len]], dtype=torch.int32)
+        )
+        assert torch.equal(
+            padded_args[14], torch.tensor([[prefix_len]], dtype=torch.int32)
+        )
+
     def test_cte_batched_hybrid_apc_restore_padding_uses_full_attention_mask(self):
         model_wrapper = self.setup_context_encoding()
         model_wrapper.neuron_config.buckets = [

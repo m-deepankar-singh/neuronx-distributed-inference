@@ -1106,8 +1106,17 @@ class ModelWrapper(torch.nn.Module):
                     prefix_buckets.append(b[1])
             # Corner case
             total_context = vertical_dim + horizontal_dim
+            vertical_dim_int = int(vertical_dim.item())
+            horizontal_dim_int = int(horizontal_dim.item())
+            input_token_len = args[0].shape[-1] if args[0].dim() > 1 else 1
+            suffix_only_cte_continuation = (
+                horizontal_dim_int > 0
+                and input_token_len <= vertical_dim_int
+                and input_token_len < vertical_dim_int + horizontal_dim_int
+            )
             if (
                 not hybrid_apc_restore_active
+                and not suffix_only_cte_continuation
                 and total_context <= 512
                 and total_context > 256
             ):
@@ -1474,6 +1483,11 @@ class ModelWrapper(torch.nn.Module):
                 return tuple(args)
             else:
                 extra_prefill_slots = max(0, prefill_bucket - prefill_len)
+                suffix_only_cte_continuation = (
+                    _debug_int(prefix_len) > 0
+                    and args[0].shape[-1] <= _debug_int(prefill_len)
+                    and args[0].shape[-1] < _debug_int(prefill_len) + _debug_int(prefix_len)
+                )
                 if hybrid_apc_restore_active:
                     # Hybrid APC request prep has already sliced input_ids,
                     # attention_mask, position_ids, and slot_mapping to the
@@ -1483,6 +1497,28 @@ class ModelWrapper(torch.nn.Module):
                     sliced_inputs = args[0]
                     sliced_attn_mask = args[1]
                     sliced_position_id = args[2]
+                elif suffix_only_cte_continuation:
+                    # Qwen chunked-prefill continuations are already suffix-only
+                    # but still need the prefix bucket/mask for block-KV attention.
+                    adjusted_prefix_len = prefix_len
+                    sliced_inputs = args[0]
+                    sliced_position_id = args[2]
+                    prefix_bucket_int = _debug_int(prefix_bucket)
+                    sliced_attn_mask = torch.zeros(
+                        (args[0].shape[0], prefix_bucket_int),
+                        dtype=args[1].dtype,
+                        device=args[1].device,
+                    )
+                    prefix_lengths = computed_context_lens.reshape(-1).to(torch.int64)
+                    for row_idx in range(
+                        min(args[0].shape[0], int(prefix_lengths.numel()))
+                    ):
+                        row_prefix_len = max(
+                            0,
+                            min(int(prefix_lengths[row_idx].item()), prefix_bucket_int),
+                        )
+                        if row_prefix_len:
+                            sliced_attn_mask[row_idx, :row_prefix_len] = 1
                 else:
                     adjusted_prefix_len = max(0, prefix_len - extra_prefill_slots)
                     sliced_inputs = args[0][:, adjusted_prefix_len:]
@@ -1495,7 +1531,11 @@ class ModelWrapper(torch.nn.Module):
                 else:
                     padded_attn_mask = F.pad(sliced_attn_mask, (0, prefix_bucket - sliced_attn_mask.shape[1]), "constant", 0)
                 padded_position_id = F.pad(sliced_position_id, (0, prefill_bucket - sliced_position_id.shape[1]), "constant", 1)
-                left_slot_pad = 0 if hybrid_apc_restore_active else prefix_len - adjusted_prefix_len
+                left_slot_pad = (
+                    0
+                    if hybrid_apc_restore_active or suffix_only_cte_continuation
+                    else prefix_len - adjusted_prefix_len
+                )
                 padded_slot_mapping = F.pad(slot_mapping, (left_slot_pad, 0), "constant", -1)
                 padded_slot_mapping = F.pad(padded_slot_mapping, (0, prefill_bucket - padded_slot_mapping.shape[1]), "constant", -1)
 
