@@ -37,7 +37,14 @@ from neuronx_distributed_inference.models.model_wrapper import (  # noqa: E402
     TOKEN_GENERATION_MODEL_TAG,
     ModelWrapper,
 )
-from neuronx_distributed_inference.modules.async_execution import causal_lm_async_execution
+from neuronx_distributed_inference.modules.async_execution import (
+    cancel_hybrid_apc_request,
+    causal_lm_async_execution,
+    finish_hybrid_apc_request,
+    prepare_disabled_hybrid_apc_model_inputs,
+    prepare_hybrid_apc_model_inputs,
+    prepare_hybrid_apc_request_for_execution,
+)
 from neuronx_distributed_inference.modules.eagle.hidden_state import HiddenStateRollingBuffer
 from neuronx_distributed_inference.modules.eagle.token_tree import TokenTree
 from neuronx_distributed_inference.modules.flashdecode.utils import (
@@ -3571,60 +3578,173 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
             self.base_model = (
                 self.context_encoding_model if is_context_encoding else generation_model
             )
-            if self.neuron_config.enable_eagle_speculation:
-                outputs = self.base_model(
-                    input_ids,
-                    attention_mask,
-                    position_ids,
-                    seq_ids,
-                    sampling_params,
-                    torch.empty(0),
-                    adapter_ids,
-                    slot_mapping,
-                    block_table,
-                    num_queries,
-                    computed_context_lens,
-                    torch.empty(0),
-                    torch.empty(0),
-                    torch.empty(0),
-                    torch.empty(0),
-                    torch.empty(0),
-                    *llava_args,
+            hybrid_apc_request_dict = None
+            llava_args = tuple(llava_args or ())
+
+            def _replace_hybrid_apc_args(extra_args, hybrid_args):
+                hybrid_args = tuple(hybrid_args or ())
+                if not hybrid_args:
+                    return tuple(extra_args or ())
+                extra_args = tuple(extra_args or ())
+                if len(extra_args) >= len(hybrid_args):
+                    return (*extra_args[: -len(hybrid_args)], *hybrid_args)
+                return (*extra_args, *hybrid_args)
+
+            try:
+                use_hybrid_apc_manager = bool(
+                    getattr(self.config, "use_hybrid_apc_manager", False)
+                    or getattr(self.neuron_config, "use_hybrid_apc_manager", False)
+                    or getattr(
+                        getattr(self.config, "neuron_config", None),
+                        "use_hybrid_apc_manager",
+                        False,
+                    )
                 )
-            elif self.neuron_config.enable_fused_speculation:
-                outputs = self.base_model(
-                    input_ids,
-                    attention_mask,
-                    position_ids,
-                    seq_ids,
-                    sampling_params,
-                    torch.empty(0),
-                    adapter_ids,
-                    slot_mapping,
-                    block_table,
-                    num_queries,
-                    computed_context_lens,
-                    *llava_args,
-                )
-            else:
-                outputs = self.base_model(
-                    input_ids,
-                    attention_mask,
-                    position_ids,
-                    seq_ids,
-                    sampling_params,
-                    torch.empty(0),
-                    adapter_ids,
-                    torch.empty(0),
-                    torch.empty(0),
-                    torch.empty(0),
-                    torch.empty(0),
-                    slot_mapping,
-                    block_table,
-                    num_queries,
-                    computed_context_lens,
-                    *llava_args,
-                )
+                if is_context_encoding and use_hybrid_apc_manager:
+                    hybrid_apc_request_dict = {
+                        "input_ids": input_ids,
+                        "attention_mask": attention_mask,
+                        "position_ids": position_ids,
+                        "seq_ids": seq_ids,
+                        "sampling_params": sampling_params,
+                        "adapter_ids": adapter_ids,
+                        "slot_mapping": slot_mapping,
+                        "block_table": block_table,
+                        "full_context_lens": full_context_lens,
+                        "computed_context_lens": computed_context_lens,
+                        "num_queries": num_queries,
+                    }
+                    request_records = getattr(
+                        self,
+                        "_qwen36_vllm_hybrid_apc_request_records",
+                        None,
+                    )
+                    if request_records is not None:
+                        hybrid_apc_request_dict["hybrid_request_records"] = request_records
+                    request_ids = getattr(self, "_qwen36_vllm_request_ids", None)
+                    if request_ids is not None:
+                        if isinstance(request_ids, list):
+                            request_ids = tuple(request_ids)
+                        if isinstance(request_ids, tuple) and len(request_ids) == 1:
+                            hybrid_apc_request_dict["hybrid_request_id"] = request_ids[0]
+                        else:
+                            hybrid_apc_request_dict["hybrid_request_id"] = request_ids
+                    cached_request_ids = getattr(
+                        self,
+                        "_qwen36_vllm_cached_request_ids",
+                        None,
+                    )
+                    if cached_request_ids is not None:
+                        hybrid_apc_request_dict[
+                            "hybrid_cached_request_ids"
+                        ] = cached_request_ids
+                    prefill_completion_state = getattr(
+                        self,
+                        "_qwen36_vllm_prefill_completion_state",
+                        None,
+                    )
+                    if prefill_completion_state is not None:
+                        hybrid_apc_request_dict[
+                            "hybrid_prefill_completion_state"
+                        ] = prefill_completion_state
+
+                    prepared_inputs = prepare_hybrid_apc_request_for_execution(
+                        self,
+                        hybrid_apc_request_dict,
+                    )
+                    input_ids = prepared_inputs.get("input_ids", input_ids)
+                    attention_mask = prepared_inputs.get("attention_mask", attention_mask)
+                    position_ids = prepared_inputs.get("position_ids", position_ids)
+                    seq_ids = prepared_inputs.get("seq_ids", seq_ids)
+                    sampling_params = prepared_inputs.get("sampling_params", sampling_params)
+                    adapter_ids = prepared_inputs.get("adapter_ids", adapter_ids)
+                    slot_mapping = prepared_inputs.get("slot_mapping", slot_mapping)
+                    block_table = prepared_inputs.get("block_table", block_table)
+                    full_context_lens = prepared_inputs.get(
+                        "full_context_lens",
+                        full_context_lens,
+                    )
+                    computed_context_lens = prepared_inputs.get(
+                        "computed_context_lens",
+                        computed_context_lens,
+                    )
+                    num_queries = prepared_inputs.get(
+                        "num_queries",
+                        full_context_lens - computed_context_lens,
+                    )
+                    llava_args = _replace_hybrid_apc_args(
+                        llava_args,
+                        prepare_hybrid_apc_model_inputs(self, prepared_inputs),
+                    )
+                elif use_hybrid_apc_manager:
+                    llava_args = _replace_hybrid_apc_args(
+                        llava_args,
+                        prepare_disabled_hybrid_apc_model_inputs(
+                            self,
+                            {"seq_ids": seq_ids},
+                        ),
+                    )
+
+                if self.neuron_config.enable_eagle_speculation:
+                    outputs = self.base_model(
+                        input_ids,
+                        attention_mask,
+                        position_ids,
+                        seq_ids,
+                        sampling_params,
+                        torch.empty(0),
+                        adapter_ids,
+                        slot_mapping,
+                        block_table,
+                        num_queries,
+                        computed_context_lens,
+                        torch.empty(0),
+                        torch.empty(0),
+                        torch.empty(0),
+                        torch.empty(0),
+                        torch.empty(0),
+                        *llava_args,
+                    )
+                elif self.neuron_config.enable_fused_speculation:
+                    outputs = self.base_model(
+                        input_ids,
+                        attention_mask,
+                        position_ids,
+                        seq_ids,
+                        sampling_params,
+                        torch.empty(0),
+                        adapter_ids,
+                        slot_mapping,
+                        block_table,
+                        num_queries,
+                        computed_context_lens,
+                        *llava_args,
+                    )
+                else:
+                    outputs = self.base_model(
+                        input_ids,
+                        attention_mask,
+                        position_ids,
+                        seq_ids,
+                        sampling_params,
+                        torch.empty(0),
+                        adapter_ids,
+                        torch.empty(0),
+                        torch.empty(0),
+                        torch.empty(0),
+                        torch.empty(0),
+                        slot_mapping,
+                        block_table,
+                        num_queries,
+                        computed_context_lens,
+                        *llava_args,
+                    )
+            except Exception:
+                if hybrid_apc_request_dict is not None:
+                    cancel_hybrid_apc_request(hybrid_apc_request_dict)
+                raise
+            if hybrid_apc_request_dict is not None:
+                finish_hybrid_apc_request(hybrid_apc_request_dict)
             is_run_on_neuron = self.base_model.is_neuron()
         elif self._is_prefill(position_ids):
             if self.neuron_config.is_medusa:

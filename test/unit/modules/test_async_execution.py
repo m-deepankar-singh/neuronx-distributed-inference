@@ -505,6 +505,105 @@ class TestHybridAPCAsyncBridge(unittest.TestCase):
         self.assertEqual(bridge.finished, ["req-1"])
         self.assertNotIn("_hybrid_apc_prepared", input_dict)
 
+    def test_prefix_caching_execution_uses_wrapper_hybrid_apc_owner(self):
+        base = SimpleNamespace(
+            config=SimpleNamespace(use_hybrid_apc_manager=True),
+            neuron_config=SimpleNamespace(
+                enable_fused_speculation=False,
+                enable_eagle_speculation=False,
+            ),
+        )
+        bridge = _FakeHybridBridge()
+        model = _FakePrefixModel()
+        model.config = SimpleNamespace(use_hybrid_apc_manager=True)
+        model.hybrid_apc_bridge = bridge
+        input_dict = _prefix_input_dict()
+        input_dict.update(
+            {
+                "request_id": "req-wrapper-owner",
+                "vllm_attention_hit_len": torch.tensor([2], dtype=torch.int32),
+                "actual_refs": (31, 32),
+            }
+        )
+
+        result, is_neuron = execute_model_prefix_caching(base, model, input_dict)
+
+        self.assertEqual(result, "model-output")
+        self.assertFalse(is_neuron)
+        self.assertEqual(bridge.prepare_kwargs["request_id"], "req-wrapper-owner")
+        self.assertIn("_hybrid_apc_prepared", input_dict)
+        self.assertTrue(
+            torch.equal(model.calls[0][-1], torch.tensor([1], dtype=torch.int32))
+        )
+
+        finish_hybrid_apc_request(input_dict)
+
+        self.assertEqual(bridge.committed[0][0].request_id, "req-wrapper-owner")
+        self.assertEqual(bridge.committed[0][1], (31, 32))
+        self.assertEqual(bridge.finished, ["req-wrapper-owner"])
+
+    def test_prefix_caching_execution_uses_wrapper_direct_runtime_flag(self):
+        base = SimpleNamespace(
+            config=SimpleNamespace(use_hybrid_apc_manager=False),
+            neuron_config=SimpleNamespace(
+                enable_fused_speculation=False,
+                enable_eagle_speculation=False,
+            ),
+        )
+        bridge = _FakeHybridBridge()
+        model = _FakePrefixModel()
+        model.use_hybrid_apc_manager = True
+        model.hybrid_apc_bridge = bridge
+        input_dict = _prefix_input_dict()
+        input_dict.update(
+            {
+                "request_id": "req-wrapper-direct",
+                "vllm_attention_hit_len": torch.tensor([2], dtype=torch.int32),
+            }
+        )
+
+        result, is_neuron = execute_model_prefix_caching(base, model, input_dict)
+
+        self.assertEqual(result, "model-output")
+        self.assertFalse(is_neuron)
+        self.assertEqual(bridge.prepare_kwargs["request_id"], "req-wrapper-direct")
+        self.assertIn("_hybrid_apc_prepared", input_dict)
+
+    def test_prefix_caching_execution_uses_wrapper_scheduler_records(self):
+        base = SimpleNamespace(
+            config=SimpleNamespace(use_hybrid_apc_manager=True),
+            neuron_config=SimpleNamespace(
+                enable_fused_speculation=False,
+                enable_eagle_speculation=False,
+            ),
+        )
+        bridge = _FakeHybridBridge()
+        model = _FakePrefixModel()
+        model.config = SimpleNamespace(use_hybrid_apc_manager=True)
+        model.hybrid_apc_bridge = bridge
+        model._qwen36_vllm_request_ids = ("req-from-record",)
+        model._qwen36_vllm_hybrid_apc_request_records = (
+            {
+                "request_id": "req-from-record",
+                "vllm_attention_hit_len": 2,
+                "request_prefix_len": 4,
+                "cumulative_hashes_by_prefix_len": {2: "h2", 4: "h4"},
+            },
+        )
+        input_dict = _prefix_input_dict()
+
+        result, is_neuron = execute_model_prefix_caching(base, model, input_dict)
+
+        self.assertEqual(result, "model-output")
+        self.assertFalse(is_neuron)
+        self.assertEqual(bridge.prepare_kwargs["request_id"], "req-from-record")
+        self.assertEqual(bridge.prepare_kwargs["attention_hit_len"], 2)
+        self.assertEqual(
+            bridge.prepare_kwargs["cumulative_hashes_by_prefix_len"],
+            {2: "h2", 4: "h4"},
+        )
+        self.assertIn("_hybrid_apc_prepared", input_dict)
+
     def test_prefix_caching_execution_does_not_prepare_hybrid_apc_for_generation(self):
         base = SimpleNamespace(
             config=SimpleNamespace(use_hybrid_apc_manager=True),

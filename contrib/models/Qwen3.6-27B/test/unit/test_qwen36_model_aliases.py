@@ -158,6 +158,7 @@ def _fake_modules():
             "neuronx_distributed_inference.modules.async_execution",
             cancel_hybrid_apc_request=lambda *args, **kwargs: None,
             finish_hybrid_apc_request=lambda *args, **kwargs: None,
+            prepare_hybrid_apc_model_inputs=lambda *args, **kwargs: (),
             prepare_hybrid_apc_request_for_execution=lambda *args, **kwargs: None,
         ),
         "neuronx_distributed_inference.modules.custom_calls": _module(
@@ -503,6 +504,99 @@ class TestQwen36ModelAliases(unittest.TestCase):
                 prefill_completion_state=torch.tensor([True, False]),
             )
         )
+
+    def test_hybrid_apc_controls_need_prepare_for_missing_or_inert_masks(self):
+        self.assertTrue(
+            self.qwen_module._qwen36_hybrid_apc_controls_need_prepare(None, None)
+        )
+        self.assertTrue(
+            self.qwen_module._qwen36_hybrid_apc_controls_need_prepare(
+                torch.tensor([0], dtype=torch.int32),
+                torch.tensor([0], dtype=torch.int32),
+            )
+        )
+
+    def test_hybrid_apc_controls_skip_prepare_for_active_masks(self):
+        self.assertFalse(
+            self.qwen_module._qwen36_hybrid_apc_controls_need_prepare(
+                torch.tensor([1], dtype=torch.int32),
+                torch.tensor([0], dtype=torch.int32),
+            )
+        )
+        self.assertFalse(
+            self.qwen_module._qwen36_hybrid_apc_controls_need_prepare(
+                torch.tensor([0], dtype=torch.int32),
+                torch.tensor([1], dtype=torch.int32),
+            )
+        )
+
+    def test_hybrid_apc_pad_prepare_preserves_full_prefix_tail_contract(self):
+        wrapper = _make_wrapper(
+            self.qwen_module,
+            tag=self.qwen_module.CONTEXT_ENCODING_MODEL_TAG,
+        )
+        wrapper.neuron_config = SimpleNamespace(
+            enable_fused_speculation=False,
+            enable_eagle_speculation=False,
+        )
+        wrapper.is_prefix_caching = True
+
+        empty = torch.empty(0)
+        base_args = list(wrapper._base_inputs[0])
+        original_tail = [
+            empty,  # tile_q_indices
+            empty,  # tile_block_tables
+            empty,  # tile_masks
+            empty,  # inputs_embeds
+            empty,  # kv_cache
+            empty,  # active_mask
+            torch.empty(0, dtype=torch.int32),  # rotary_position_id
+            torch.empty(0, dtype=torch.bfloat16),  # vision_embeddings
+            torch.empty(0, dtype=torch.int32),  # vision_mask
+            torch.zeros((1,), dtype=torch.int32),  # restore slot
+            torch.zeros((1,), dtype=torch.int32),  # restore mask
+            torch.zeros((1,), dtype=torch.int32),  # restore prefix len
+            torch.zeros((1,), dtype=torch.int32),  # commit slot
+            torch.zeros((1,), dtype=torch.int32),  # commit mask
+        ]
+        prepared_tail = [
+            empty,
+            empty,
+            empty,
+            empty,
+            empty,
+            empty,
+            torch.empty(0, dtype=torch.int32),
+            torch.empty(0, dtype=torch.bfloat16),
+            torch.empty(0, dtype=torch.int32),
+            torch.tensor([3], dtype=torch.int32),
+            torch.tensor([0], dtype=torch.int32),
+            torch.tensor([0], dtype=torch.int32),
+            torch.tensor([7], dtype=torch.int32),
+            torch.tensor([1], dtype=torch.int32),
+        ]
+
+        def _prepare_request(_wrapper, input_dict):
+            return input_dict
+
+        with (
+            patch.object(
+                self.qwen_module,
+                "prepare_hybrid_apc_request_for_execution",
+                side_effect=_prepare_request,
+            ),
+            patch.object(
+                self.qwen_module,
+                "prepare_hybrid_apc_model_inputs",
+                return_value=prepared_tail,
+            ),
+        ):
+            padded = wrapper.pad_inputs(*(base_args + original_tail))
+
+        self.assertEqual(len(padded), 29)
+        self.assertEqual(int(padded[24].item()), 3)
+        self.assertEqual(int(padded[27].item()), 7)
+        self.assertEqual(int(padded[28].item()), 1)
 
     def test_restored_suffix_deltanet_mask_uses_token_padding(self):
         input_ids = torch.tensor([[11, 12, 0, 0]], dtype=torch.int64)

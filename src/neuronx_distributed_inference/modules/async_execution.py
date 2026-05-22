@@ -9,7 +9,15 @@ if TYPE_CHECKING:
 
 
 def _is_hybrid_apc_enabled(neuron_base_instance: "NeuronBaseForCausalLM") -> bool:
-    return bool(getattr(neuron_base_instance.config, "use_hybrid_apc_manager", False))
+    for owner in (
+        neuron_base_instance,
+        getattr(neuron_base_instance, "config", None),
+        getattr(neuron_base_instance, "neuron_config", None),
+        getattr(getattr(neuron_base_instance, "config", None), "neuron_config", None),
+    ):
+        if bool(getattr(owner, "use_hybrid_apc_manager", False)):
+            return True
+    return False
 
 
 def _async_request_ids_signature(neuron_base_instance: "NeuronBaseForCausalLM"):
@@ -125,6 +133,86 @@ def _request_id_in_collection(request_id: Any, values: Any) -> bool:
     except TypeError:
         return _request_id_matches(values, request_id)
     return any(_request_id_matches(value, request_id) for value in iterator)
+
+
+def _as_hybrid_apc_request_id_tuple(value: Any) -> tuple[Any, ...] | None:
+    if value is None:
+        return None
+    if isinstance(value, torch.Tensor):
+        return tuple(value.detach().cpu().reshape(-1).tolist())
+    if isinstance(value, (str, bytes)):
+        return (value,)
+    try:
+        return tuple(value)
+    except TypeError:
+        return (value,)
+
+
+def _lookup_hybrid_apc_metadata_for_request(metadata_by_request_id: Any, request_id: Any):
+    if not isinstance(metadata_by_request_id, dict):
+        return None
+    for key in (request_id, str(request_id)):
+        metadata = metadata_by_request_id.get(key)
+        if isinstance(metadata, dict):
+            return metadata
+    for key, metadata in metadata_by_request_id.items():
+        if _request_id_matches(key, request_id) and isinstance(metadata, dict):
+            return metadata
+    return None
+
+
+def _with_hybrid_apc_owner_metadata(
+    input_dict: Dict[str, Any],
+    owner: Any,
+) -> Dict[str, Any]:
+    output = input_dict
+    request_records = getattr(owner, "_qwen36_vllm_hybrid_apc_request_records", None)
+    if request_records is not None and "hybrid_request_records" not in output:
+        output = dict(output)
+        output["hybrid_request_records"] = request_records
+
+    request_ids = _as_hybrid_apc_request_id_tuple(
+        getattr(owner, "_qwen36_vllm_request_ids", None)
+    )
+    metadata_by_request_id = getattr(
+        owner,
+        "_qwen36_vllm_hybrid_apc_metadata_by_request_id",
+        None,
+    )
+    if (
+        request_records is None
+        and request_ids
+        and isinstance(metadata_by_request_id, dict)
+        and "hybrid_request_records" not in output
+    ):
+        records = []
+        for request_id in request_ids:
+            metadata = _lookup_hybrid_apc_metadata_for_request(
+                metadata_by_request_id,
+                request_id,
+            )
+            if metadata is None:
+                continue
+            record = {"request_id": request_id}
+            record.update(metadata)
+            records.append(record)
+        if records:
+            output = dict(output)
+            output["hybrid_request_records"] = tuple(records)
+
+    if request_ids and "hybrid_request_id" not in output:
+        output = dict(output)
+        output["hybrid_request_id"] = request_ids[0] if len(request_ids) == 1 else request_ids
+
+    for attr, key in (
+        ("_qwen36_vllm_cached_request_ids", "hybrid_cached_request_ids"),
+        ("_qwen36_vllm_prefill_completion_state", "hybrid_prefill_completion_state"),
+    ):
+        value = getattr(owner, attr, None)
+        if value is not None and key not in output:
+            output = dict(output)
+            output[key] = value
+    return output
 
 
 def _batch_size_from_input_dict(input_dict: Dict[str, Any]) -> int:
@@ -1243,13 +1331,15 @@ def _requires_external_hybrid_apc_metadata(
     neuron_base_instance: "NeuronBaseForCausalLM",
     bridge: Any,
 ) -> bool:
+    for owner in (
+        getattr(neuron_base_instance, "config", None),
+        getattr(neuron_base_instance, "neuron_config", None),
+        getattr(getattr(neuron_base_instance, "config", None), "neuron_config", None),
+    ):
+        if bool(getattr(owner, "hybrid_apc_require_vllm_metadata", False)):
+            return True
     return bool(
-        getattr(
-            neuron_base_instance.config,
-            "hybrid_apc_require_vllm_metadata",
-            False,
-        )
-        or getattr(bridge, "requires_external_metadata", False)
+        getattr(bridge, "requires_external_metadata", False)
     )
 
 
@@ -1566,6 +1656,8 @@ def prepare_hybrid_apc_request_for_execution(
         )
     input_dict["_hybrid_apc_bridge"] = bridge
     input_dict["_hybrid_apc_prepared"] = prepared
+    prepared.input_dict["_hybrid_apc_bridge"] = bridge
+    prepared.input_dict["_hybrid_apc_prepared"] = prepared
     if lifecycle_input_dict is not input_dict:
         lifecycle_input_dict["_hybrid_apc_bridge"] = bridge
         lifecycle_input_dict["_hybrid_apc_prepared"] = prepared
@@ -1591,6 +1683,12 @@ def prepare_hybrid_apc_request_for_execution(
 def finish_hybrid_apc_request(input_dict: Dict[str, Any]):
     bridge = input_dict.pop("_hybrid_apc_bridge", None)
     prepared = input_dict.pop("_hybrid_apc_prepared", None)
+    if os.environ.get("QWEN36_HYBRID_APC_DEBUG") == "1":
+        print(
+            "[hybrid_apc_debug] finish "
+            f"has_bridge={bridge is not None} has_prepared={prepared is not None}",
+            flush=True,
+        )
     if bridge is None or prepared is None:
         return
 
@@ -1606,6 +1704,15 @@ def finish_hybrid_apc_request(input_dict: Dict[str, Any]):
             input_dict.get("hybrid_actual_attention_block_refs"),
             getattr(prepared_request, "attention_block_refs", None),
         )
+        if os.environ.get("QWEN36_HYBRID_APC_DEBUG") == "1":
+            print(
+                "[hybrid_apc_debug] finish-commit "
+                f"request_id={prepared_request.request_id!r} "
+                f"commit_prefix_len={getattr(prepared_request, 'commit_prefix_len', None)} "
+                f"commit_slot={getattr(prepared_request, 'commit_slot', None)} "
+                f"actual_refs={actual_refs}",
+                flush=True,
+            )
         try:
             bridge.commit_prefill(prepared_request, attention_block_refs=actual_refs)
         except Exception:
@@ -1660,7 +1767,11 @@ def _validate_hybrid_apc_slot_inputs(
     if not active_restore_slots and not active_commit_slots:
         return
 
-    max_slots = getattr(neuron_base_instance.config, "max_gdn_checkpoint_slots", None)
+    max_slots = getattr(
+        getattr(neuron_base_instance, "config", None),
+        "max_gdn_checkpoint_slots",
+        None,
+    )
     if max_slots is not None:
         max_slots = int(max_slots)
         for kind, slots in (
@@ -1985,6 +2096,25 @@ def execute_model_prefix_caching(
     pad_type: str = "first_fit",
 ) -> Tuple[AsyncTensorWrapper, bool]:
     original_input_dict = input_dict
+    hybrid_apc_owner = neuron_base_instance
+    if (
+        getattr(hybrid_apc_owner, "hybrid_apc_bridge", None) is None
+        and getattr(model_to_execute, "hybrid_apc_bridge", None) is not None
+    ):
+        hybrid_apc_owner = model_to_execute
+    if not _is_hybrid_apc_enabled(hybrid_apc_owner) and _is_hybrid_apc_enabled(
+        model_to_execute
+    ):
+        hybrid_apc_owner = model_to_execute
+    if os.environ.get("QWEN36_HYBRID_APC_DEBUG") == "1":
+        print(
+            "[hybrid_apc_debug] async-owner "
+            f"base_enabled={_is_hybrid_apc_enabled(neuron_base_instance)} "
+            f"wrapper_enabled={_is_hybrid_apc_enabled(model_to_execute)} "
+            f"owner_type={type(hybrid_apc_owner).__name__} "
+            f"tag={getattr(model_to_execute, 'tag', None)}",
+            flush=True,
+        )
     try:
         is_context_encoding = _is_context_encoding_execution(
             neuron_base_instance,
@@ -1992,10 +2122,30 @@ def execute_model_prefix_caching(
             input_dict,
         )
         if is_context_encoding:
+            input_dict = _with_hybrid_apc_owner_metadata(
+                input_dict,
+                hybrid_apc_owner,
+            )
             input_dict = prepare_hybrid_apc_request_for_execution(
-                neuron_base_instance,
+                hybrid_apc_owner,
                 input_dict,
             )
+            if os.environ.get("QWEN36_HYBRID_APC_DEBUG") == "1":
+                print(
+                    "[hybrid_apc_debug] async-prepared-return "
+                    f"has_bridge={'_hybrid_apc_bridge' in input_dict} "
+                    f"has_prepared={'_hybrid_apc_prepared' in input_dict}",
+                    flush=True,
+                )
+            for lifecycle_key in ("_hybrid_apc_bridge", "_hybrid_apc_prepared"):
+                if lifecycle_key in input_dict:
+                    original_input_dict[lifecycle_key] = input_dict[lifecycle_key]
+            if "_hybrid_apc_prepared" in input_dict:
+                setattr(
+                    neuron_base_instance,
+                    "_hybrid_apc_pending_input_dict",
+                    input_dict,
+                )
         else:
             input_dict = _with_disabled_hybrid_apc_controls(input_dict)
         if "num_queries" not in input_dict:
@@ -2010,11 +2160,11 @@ def execute_model_prefix_caching(
         ):
             if is_context_encoding:
                 hybrid_apc_args = prepare_hybrid_apc_model_inputs(
-                    neuron_base_instance, input_dict
+                    hybrid_apc_owner, input_dict
                 )
             else:
                 hybrid_apc_args = prepare_disabled_hybrid_apc_model_inputs(
-                    neuron_base_instance, input_dict
+                    hybrid_apc_owner, input_dict
                 )
             return model_to_execute(
                 input_dict["input_ids"],
@@ -2157,9 +2307,25 @@ def causal_lm_async_execution(
             outputs = prefill_outputs.sync_async_result_to_cpu(
                 _seq_ids, is_fused_speculation=is_fused_speculation, is_prefix_caching=is_prefix_caching
             )
-            finish_hybrid_apc_request(inputs)
+            pending_hybrid_apc = getattr(
+                neuron_base_instance,
+                "_hybrid_apc_pending_input_dict",
+                None,
+            )
+            neuron_base_instance._hybrid_apc_pending_input_dict = None
+            finish_hybrid_apc_request(
+                pending_hybrid_apc if pending_hybrid_apc is not None else inputs
+            )
         except Exception:
-            cancel_hybrid_apc_request(inputs)
+            pending_hybrid_apc = getattr(
+                neuron_base_instance,
+                "_hybrid_apc_pending_input_dict",
+                None,
+            )
+            neuron_base_instance._hybrid_apc_pending_input_dict = None
+            cancel_hybrid_apc_request(
+                pending_hybrid_apc if pending_hybrid_apc is not None else inputs
+            )
             raise
 
         # clean up async state

@@ -44,6 +44,7 @@ from neuronx_distributed_inference.models.model_base import (
 from neuronx_distributed_inference.modules.async_execution import (
     cancel_hybrid_apc_request,
     finish_hybrid_apc_request,
+    prepare_hybrid_apc_model_inputs,
     prepare_hybrid_apc_request_for_execution,
 )
 from neuronx_distributed_inference.modules.custom_calls import CustomRMSNorm
@@ -2916,8 +2917,16 @@ def _use_legacy_tkg_args() -> bool:
     return os.environ.get("QWEN36_TKG_LEGACY_ARGS") == "1"
 
 
+def _qwen36_config_flag(config, neuron_config, name: str, default: bool = False) -> bool:
+    for owner in (config, neuron_config, getattr(config, "neuron_config", None)):
+        value = getattr(owner, name, None)
+        if value is not None:
+            return bool(value)
+    return bool(default)
+
+
 def _use_expanded_hybrid_args_for_tag(config, tag: str) -> bool:
-    if not getattr(config, "use_hybrid_apc_manager", False):
+    if not _qwen36_config_flag(config, None, "use_hybrid_apc_manager"):
         return False
     # The legacy ABI experiment intentionally keeps both traced stages on the
     # older prefix-cache contract. Neuron prunes the extra CTE hybrid metadata
@@ -3158,6 +3167,35 @@ def _qwen36_prefill_has_incomplete_row(prefill_completion_state) -> bool:
     except TypeError:
         return not bool(prefill_completion_state)
     return any(not bool(value) for value in values)
+
+
+def _qwen36_hybrid_apc_mask_has_active_row(mask) -> bool:
+    if mask is None:
+        return False
+    if hasattr(mask, "numel"):
+        if mask.numel() == 0:
+            return False
+        try:
+            return bool(mask.reshape(-1).to(torch.bool).any().item())
+        except (RuntimeError, TypeError, ValueError):
+            # If a non-empty control tensor cannot be inspected on the host, keep
+            # the existing controls and avoid preparing the request twice.
+            return True
+    try:
+        values = list(mask)
+    except TypeError:
+        return bool(mask)
+    return any(bool(value) for value in values)
+
+
+def _qwen36_hybrid_apc_controls_need_prepare(
+    hybrid_restore_mask,
+    hybrid_commit_mask,
+) -> bool:
+    return not (
+        _qwen36_hybrid_apc_mask_has_active_row(hybrid_restore_mask)
+        or _qwen36_hybrid_apc_mask_has_active_row(hybrid_commit_mask)
+    )
 
 
 def _qwen36_is_prefill_request(
@@ -4682,6 +4720,86 @@ class Qwen35DecoderModelInstance(DecoderModelInstance):
 class Qwen35ModelWrapper(ModelWrapper):
     """Custom ModelWrapper for VL support with mRoPE and vision inputs."""
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._qwen36_hybrid_apc_pending_input_dict = None
+        self.hybrid_apc_store = None
+        self.hybrid_apc_slot_allocator = None
+        self.hybrid_apc_bridge = None
+        self._init_hybrid_apc_scheduler_bridge()
+
+    def _init_hybrid_apc_scheduler_bridge(self):
+        if not _qwen36_config_flag(
+            self.config,
+            self.neuron_config,
+            "use_hybrid_apc_manager",
+        ):
+            return
+
+        required_gdn_layers = tuple(
+            idx
+            for idx, layer_type in enumerate(self.config.layer_types)
+            if layer_type == "linear_attention"
+        )
+        if not required_gdn_layers:
+            raise ValueError("hybrid APC requires at least one GDN layer")
+
+        tp_rank = 0
+        try:
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                tp_rank = int(parallel_state.get_tensor_model_parallel_rank())
+        except Exception:
+            tp_rank = 0
+
+        block_size = int(
+            getattr(
+                self.neuron_config,
+                "pa_block_size",
+                self.config.gdn_checkpoint_interval,
+            )
+        )
+        self.hybrid_apc_store = HybridAPCMetadataStore(
+            required_gdn_layers=required_gdn_layers,
+            block_size=block_size,
+            checkpoint_interval=self.config.gdn_checkpoint_interval,
+            max_checkpoints=self.config.max_gdn_checkpoint_slots,
+            layout_version=self.config.hybrid_apc_layout_version,
+            model_revision=self.config.hybrid_apc_model_revision,
+            tp_rank=tp_rank,
+            recurrent_dtype=self.config.hybrid_recurrent_cache_dtype,
+            conv_dtype=self.config.hybrid_conv_cache_dtype,
+            allow_residual_replay=self.config.hybrid_apc_allow_residual_replay,
+        )
+        self.hybrid_apc_slot_allocator = HybridAPCSlotAllocator(
+            self.config.max_gdn_checkpoint_slots
+        )
+        self.hybrid_apc_bridge = HybridAPCSchedulerBridge(
+            store=self.hybrid_apc_store,
+            slot_allocator=self.hybrid_apc_slot_allocator,
+            cache_salt=self.config.hybrid_apc_cache_salt,
+            model_revision=self.config.hybrid_apc_model_revision,
+            layout_version=self.config.hybrid_apc_layout_version,
+            tp_rank=tp_rank,
+            recurrent_dtype=self.config.hybrid_recurrent_cache_dtype,
+            conv_dtype=self.config.hybrid_conv_cache_dtype,
+            allow_local_hash_fallback=self.config.hybrid_apc_allow_local_hash_fallback,
+            require_attention_block_refs=self.config.hybrid_apc_require_attention_block_refs,
+            reject_unbacked_attention_hits=(
+                self.config.hybrid_apc_reject_unbacked_attention_hits
+            ),
+        )
+
+    def ensure_hybrid_apc_scheduler_bridge(self):
+        if not _qwen36_config_flag(
+            self.config,
+            self.neuron_config,
+            "use_hybrid_apc_manager",
+        ):
+            return None
+        if getattr(self, "hybrid_apc_bridge", None) is None:
+            self._init_hybrid_apc_scheduler_bridge()
+        return self.hybrid_apc_bridge
+
     def get_model_instance(self):
         return Qwen35DecoderModelInstance(
             model_cls=self.model_cls,
@@ -4770,16 +4888,156 @@ class Qwen35ModelWrapper(ModelWrapper):
 
         return extended_inputs
 
+    def _prepare_hybrid_apc_pad_inputs(self, args):
+        if (
+            self.tag != CONTEXT_ENCODING_MODEL_TAG
+            or len(args) < 29
+            or not _qwen36_config_flag(
+                self.config,
+                self.neuron_config,
+                "use_hybrid_apc_manager",
+            )
+            or not _qwen36_hybrid_apc_controls_need_prepare(args[25], args[28])
+        ):
+            return args
+
+        computed_context_lens = args[14]
+        num_queries = args[13]
+        full_context_lens = (
+            computed_context_lens + num_queries
+            if hasattr(computed_context_lens, "shape") and hasattr(num_queries, "shape")
+            else None
+        )
+        hybrid_apc_request_dict = {
+            "input_ids": args[0],
+            "attention_mask": args[1],
+            "position_ids": args[2],
+            "seq_ids": args[3],
+            "sampling_params": args[4],
+            "adapter_ids": args[6],
+            "slot_mapping": args[11],
+            "block_table": args[12],
+            "num_queries": num_queries,
+            "computed_context_lens": computed_context_lens,
+        }
+        if full_context_lens is not None:
+            hybrid_apc_request_dict["full_context_lens"] = full_context_lens
+
+        request_records = getattr(
+            self,
+            "_qwen36_vllm_hybrid_apc_request_records",
+            None,
+        )
+        request_ids = _qwen36_request_ids_from_hybrid_apc_records(request_records)
+        if request_records is not None:
+            hybrid_apc_request_dict["hybrid_request_records"] = request_records
+        if request_ids is None:
+            request_ids = getattr(self, "_qwen36_vllm_request_ids", None)
+        if request_ids is not None:
+            if isinstance(request_ids, list):
+                request_ids = tuple(request_ids)
+            if isinstance(request_ids, tuple) and len(request_ids) == 1:
+                hybrid_apc_request_dict["hybrid_request_id"] = request_ids[0]
+            else:
+                hybrid_apc_request_dict["hybrid_request_id"] = request_ids
+        cached_request_ids = getattr(self, "_qwen36_vllm_cached_request_ids", None)
+        if cached_request_ids is not None:
+            hybrid_apc_request_dict["hybrid_cached_request_ids"] = cached_request_ids
+        prefill_completion_state = getattr(
+            self,
+            "_qwen36_vllm_prefill_completion_state",
+            None,
+        )
+        if prefill_completion_state is not None:
+            hybrid_apc_request_dict[
+                "hybrid_prefill_completion_state"
+            ] = prefill_completion_state
+        _qwen36_add_vllm_hybrid_apc_metadata(
+            hybrid_apc_request_dict,
+            request_ids=request_ids,
+            metadata_by_request_id=getattr(
+                self,
+                "_qwen36_vllm_hybrid_apc_metadata_by_request_id",
+                None,
+            ),
+        )
+
+        prepared_inputs = prepare_hybrid_apc_request_for_execution(
+            self,
+            hybrid_apc_request_dict,
+        )
+        hybrid_args = prepare_hybrid_apc_model_inputs(self, prepared_inputs)
+        if not hybrid_args:
+            return args
+
+        updated_args = list(args)
+        for index, key in (
+            (0, "input_ids"),
+            (1, "attention_mask"),
+            (2, "position_ids"),
+            (3, "seq_ids"),
+            (4, "sampling_params"),
+            (6, "adapter_ids"),
+            (11, "slot_mapping"),
+            (12, "block_table"),
+            (13, "num_queries"),
+            (14, "computed_context_lens"),
+        ):
+            if key in prepared_inputs:
+                updated_args[index] = prepared_inputs[key]
+        if len(hybrid_args) == 14 and len(updated_args) >= 29:
+            updated_args[15:29] = hybrid_args
+        else:
+            updated_args[24:29] = hybrid_args
+        self._qwen36_hybrid_apc_pending_input_dict = hybrid_apc_request_dict
+        return tuple(updated_args)
+
+    def _forward_with_pad(self, *args):
+        self._qwen36_hybrid_apc_pending_input_dict = None
+        try:
+            outputs = super()._forward_with_pad(*args)
+        except Exception:
+            pending = self._qwen36_hybrid_apc_pending_input_dict
+            self._qwen36_hybrid_apc_pending_input_dict = None
+            if pending is not None:
+                cancel_hybrid_apc_request(pending)
+            raise
+        pending = self._qwen36_hybrid_apc_pending_input_dict
+        self._qwen36_hybrid_apc_pending_input_dict = None
+        if pending is not None:
+            finish_hybrid_apc_request(pending)
+        return outputs
+
     def pad_inputs(self, *args, pad_type="first_fit"):
         """Override to pad mrope_position_ids and vision inputs to bucket size."""
+        args = self._prepare_hybrid_apc_pad_inputs(args)
         orig_mrope = args[21] if len(args) >= 22 else None
         orig_vis_emb = args[22] if len(args) >= 23 else None
         orig_vis_mask = args[23] if len(args) >= 24 else None
-        orig_restore_slots = args[24] if len(args) >= 25 else None
-        orig_restore_mask = args[25] if len(args) >= 26 else None
-        orig_restore_prefix = args[26] if len(args) >= 27 else None
-        orig_commit_slots = args[27] if len(args) >= 28 else None
-        orig_commit_mask = args[28] if len(args) >= 29 else None
+        if len(args) >= 29:
+            orig_restore_slots = args[24]
+            orig_restore_mask = args[25]
+            orig_restore_prefix = args[26]
+            orig_commit_slots = args[27]
+            orig_commit_mask = args[28]
+        elif (
+            len(args) >= 20
+            and _use_expanded_hybrid_args_for_tag(self.config, self.tag)
+            and self.is_prefix_caching
+            and not self.neuron_config.enable_fused_speculation
+            and not self.neuron_config.enable_eagle_speculation
+        ):
+            orig_restore_slots = args[15]
+            orig_restore_mask = args[16]
+            orig_restore_prefix = args[17]
+            orig_commit_slots = args[18]
+            orig_commit_mask = args[19]
+        else:
+            orig_restore_slots = None
+            orig_restore_mask = None
+            orig_restore_prefix = None
+            orig_commit_slots = None
+            orig_commit_mask = None
 
         padded_args = super().pad_inputs(*args, pad_type=pad_type)
 
@@ -4936,7 +5194,11 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
         self.hybrid_apc_store = None
         self.hybrid_apc_slot_allocator = None
         self.hybrid_apc_bridge = None
-        if not getattr(self.config, "use_hybrid_apc_manager", False):
+        if not _qwen36_config_flag(
+            self.config,
+            self.neuron_config,
+            "use_hybrid_apc_manager",
+        ):
             return
 
         required_gdn_layers = tuple(
@@ -4993,7 +5255,11 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
         )
 
     def ensure_hybrid_apc_scheduler_bridge(self):
-        if not getattr(self.config, "use_hybrid_apc_manager", False):
+        if not _qwen36_config_flag(
+            self.config,
+            self.neuron_config,
+            "use_hybrid_apc_manager",
+        ):
             return None
         if getattr(self, "hybrid_apc_bridge", None) is None:
             self._init_hybrid_apc_scheduler_bridge()
@@ -5201,10 +5467,16 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
         hybrid_apc_request_dict = None
         if (
             is_prefill
-            and getattr(self.config, "use_hybrid_apc_manager", False)
+            and _qwen36_config_flag(
+                self.config,
+                self.neuron_config,
+                "use_hybrid_apc_manager",
+            )
             and getattr(self.neuron_config, "is_prefix_caching", False)
-            and hybrid_restore_mask is None
-            and hybrid_commit_mask is None
+            and _qwen36_hybrid_apc_controls_need_prepare(
+                hybrid_restore_mask,
+                hybrid_commit_mask,
+            )
         ):
             hybrid_apc_request_dict = {
                 "input_ids": input_ids,

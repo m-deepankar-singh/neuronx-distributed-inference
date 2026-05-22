@@ -1121,6 +1121,19 @@ def _request_id_target_models(model: Any) -> list[Any]:
             break
         seen.add(current_id)
         targets.append(current)
+        for attr in (
+            "context_encoding_model",
+            "token_generation_model",
+            "fused_spec_model",
+        ):
+            wrapper = getattr(current, attr, None)
+            if wrapper is None:
+                continue
+            wrapper_id = id(wrapper)
+            if wrapper_id in seen:
+                continue
+            seen.add(wrapper_id)
+            targets.append(wrapper)
         current = getattr(current, "model", None)
     return targets
 
