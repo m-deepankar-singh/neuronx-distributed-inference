@@ -370,22 +370,30 @@ class Sampler(torch.nn.Module):
         return counts
 
     def _argmax_sample(self, token_logits, return_values, dim):
-        if self.neuron_config.on_cpu:
-            return torch.argmax(token_logits, dim=dim)
-        else:
-            # distributed argmax
-            tokens = nxd_argmax(
-                tensor=token_logits,
-                dim=dim,
-                gather_dim=dim,
-                keepdim=False,
-                process_group=self.process_group,
-                disable_argmax_kernel=self.neuron_config.disable_argmax_kernel
-            )
-            values = torch.ones(tokens.shape, dtype=token_logits.dtype, device=tokens.device)
+        if self.neuron_config.on_cpu or not getattr(
+            self.neuron_config, "vocab_parallel", False
+        ):
+            tokens = torch.argmax(token_logits, dim=dim).to(torch.int32)
             if return_values:
+                values = torch.ones(
+                    tokens.shape, dtype=token_logits.dtype, device=tokens.device
+                )
                 return tokens, values
             return tokens
+
+        # Distributed argmax is only needed when the vocab dimension is sharded.
+        tokens = nxd_argmax(
+            tensor=token_logits,
+            dim=dim,
+            gather_dim=dim,
+            keepdim=False,
+            process_group=self.process_group,
+            disable_argmax_kernel=self.neuron_config.disable_argmax_kernel,
+        )
+        values = torch.ones(tokens.shape, dtype=token_logits.dtype, device=tokens.device)
+        if return_values:
+            return tokens, values
+        return tokens
 
     def _multinomial_sample(self, token_logits, sampling_params, return_values, dim, rank_id):
         batch_size = token_logits.shape[0]

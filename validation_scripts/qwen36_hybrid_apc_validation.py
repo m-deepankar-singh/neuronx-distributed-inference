@@ -305,6 +305,10 @@ def _build_llm(args, *, enable_hybrid_apc: bool):
         "enable_prefix_caching": enable_hybrid_apc,
         "enable_chunked_prefill": args.enable_vllm_chunked_prefill,
         "additional_config": additional_config,
+        # vLLM multiplies its default CPU swap space by tensor_parallel_size.
+        # Neuron validation runs with large TP counts and no CUDA swap path, so
+        # the default can exceed host RAM before the Neuron model is loaded.
+        "swap_space": 0,
     }
     gpu_memory_utilization = getattr(args, "gpu_memory_utilization", None)
     if gpu_memory_utilization is not None:

@@ -92,11 +92,36 @@ def _build_args(args: argparse.Namespace, artifact_config: dict[str, Any]) -> Si
     )
     if not cte_buckets:
         cte_buckets = "256,512"
+    token_generation_buckets = args.token_generation_buckets
+    if token_generation_buckets is None:
+        artifact_tkg_buckets = artifact_config.get("token_generation_buckets") or []
+        if artifact_tkg_buckets:
+            token_generation_buckets = [
+                ",".join(str(item) for item in artifact_tkg_buckets)
+            ]
+    token_generation_batches = args.token_generation_batches
+    if token_generation_batches is None:
+        artifact_tkg_batches = artifact_config.get("token_generation_batches") or []
+        if artifact_tkg_batches:
+            token_generation_batches = [
+                ",".join(str(item) for item in artifact_tkg_batches)
+            ]
+    async_mode = (
+        bool(args.async_mode)
+        if args.async_mode is not None
+        else bool(artifact_config.get("async_mode", False))
+    )
     pa_num_blocks = int(
         args.pa_num_blocks
         if args.pa_num_blocks is not None
         else artifact_config.get("pa_num_blocks") or ((seq_len + args.block_size - 1) // args.block_size)
     )
+    ctx_batch_size = int(
+        args.ctx_batch_size
+        if args.ctx_batch_size is not None
+        else artifact_config.get("ctx_batch_size") or 1
+    )
+    max_num_seqs = int(args.max_num_seqs or 1)
     return SimpleNamespace(
         model_path=str(args.model_path),
         compiled_artifacts=str(args.compiled_artifacts),
@@ -107,9 +132,12 @@ def _build_args(args: argparse.Namespace, artifact_config: dict[str, Any]) -> Si
         cte_buckets=[cte_buckets],
         cte_bucket_profile="single",
         tensor_parallel_size=args.tensor_parallel_size,
-        max_num_seqs=1,
+        max_num_seqs=max_num_seqs,
         logical_nc_config=args.logical_nc_config,
-        ctx_batch_size=1,
+        ctx_batch_size=ctx_batch_size,
+        token_generation_buckets=token_generation_buckets,
+        token_generation_batches=token_generation_batches,
+        async_mode=async_mode,
         block_size=args.block_size,
         gdn_checkpoint_interval=args.gdn_checkpoint_interval,
         max_gdn_checkpoint_slots=args.max_gdn_checkpoint_slots,
@@ -145,7 +173,12 @@ def main() -> int:
     parser.add_argument("--pa-num-blocks", type=int)
     parser.add_argument("--gpu-memory-utilization", type=float)
     parser.add_argument("--tensor-parallel-size", type=int, default=4)
+    parser.add_argument("--max-num-seqs", type=int)
     parser.add_argument("--logical-nc-config", type=int, default=2)
+    parser.add_argument("--ctx-batch-size", type=int)
+    parser.add_argument("--token-generation-buckets", nargs="+", default=None)
+    parser.add_argument("--token-generation-batches", nargs="+", default=None)
+    parser.add_argument("--async-mode", action="store_true", default=None)
     parser.add_argument("--block-size", type=int, default=256)
     parser.add_argument("--gdn-checkpoint-interval", type=int, default=256)
     parser.add_argument("--max-gdn-checkpoint-slots", type=int, default=64)

@@ -331,6 +331,33 @@ def get_sampler(topk, num_beams, on_device=True):
     return Sampler(neuron_config, **sampler_kwargs)
 
 
+def test_greedy_full_vocab_argmax_uses_torch_argmax():
+    neuron_config = NeuronConfig(
+        on_device_sampling_config=OnDeviceSamplingConfig(do_sample=False)
+    )
+    neuron_config.on_cpu = False
+    neuron_config.vocab_parallel = False
+
+    with patch(
+        "neuronx_distributed_inference.modules.generation.sampling.parallel_state.get_tensor_model_parallel_group",
+        return_value=None,
+    ):
+        sampler = Sampler(neuron_config)
+
+    logits = torch.tensor(
+        [[0.0, 4.0, 1.0], [3.0, -1.0, 2.0]],
+        dtype=torch.float32,
+    )
+    with patch(
+        "neuronx_distributed_inference.modules.generation.sampling.nxd_argmax",
+        side_effect=AssertionError("distributed argmax should not be used"),
+    ):
+        tokens = sampler._argmax_sample(logits, return_values=False, dim=1)
+
+    assert tokens.dtype == torch.int32
+    assert tokens.tolist() == [1, 0]
+
+
 def run_sampler_accuracy_test(batch_size, topk, num_beams=1):
     torch.manual_seed(0)
     torch.distributed.init_process_group("xla", init_method="pjrt://")
