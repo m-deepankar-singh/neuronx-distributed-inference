@@ -43,6 +43,18 @@ Result file: `teacher_forced_hybrid_cte256_512_blockkv.json`
 
 The E2E R-ratio is very large (`mean=359983.34`, `max=2932735.15`) because the BF16-vs-FP32 denominator is extremely small. Given the `100%` top-1 agreement, high cosine, and low KL, the Stage 5/6 functional signal is good, with the R-ratio requiring denominator-aware interpretation.
 
+## Stage 7
+
+Result files: `stage7/bench_config.yaml`, `stage7/stage7_run.log`
+
+The official Stage 7 skill runner was invoked with a small HellaSwag sanity config, but it did not reach model loading or benchmark execution because the required `neuron_bench` package was not installed on the validation host or included in the installed AWS skill bundle.
+
+Failure:
+
+`ModuleNotFoundError: No module named 'neuron_bench'`
+
+Stage 7 is therefore blocked on installing or providing the exact `neuron_bench` package expected by `scripts/run_stage7.py`; no downstream score should be inferred from this run.
+
 ## Files
 
 - `stage1_hybrid_cte256_512_adapterfix.json`
@@ -53,5 +65,7 @@ The E2E R-ratio is very large (`mean=359983.34`, `max=2932735.15`) because the B
 - `stage3.log`
 - `teacher_forced_hybrid_cte256_512_blockkv.json`
 - `teacher_forced_hybrid_cte256_512_blockkv.log`
+- `stage7/bench_config.yaml`
+- `stage7/stage7_run.log`
 - `component_mapping.json`
 - `class_divergence_report.json`

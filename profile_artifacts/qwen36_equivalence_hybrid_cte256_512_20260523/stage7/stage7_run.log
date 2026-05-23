@@ -1,0 +1,7 @@
+Traceback (most recent call last):
+  File "/home/ubuntu/codex_installed_skills_github_20260523/neuron-framework-equivalence/scripts/run_stage7.py", line 102, in <module>
+    sys.exit(main())
+             ^^^^^^
+  File "/home/ubuntu/codex_installed_skills_github_20260523/neuron-framework-equivalence/scripts/run_stage7.py", line 38, in main
+    from neuron_bench.config import parse_config
+ModuleNotFoundError: No module named 'neuron_bench'
