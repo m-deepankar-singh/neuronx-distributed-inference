@@ -1,0 +1,104 @@
+{
+  "token_matching": {
+    "total_tokens_compared": 320,
+    "matching_tokens": 287,
+    "match_rate": 0.896875,
+    "num_prompts_tested": 10,
+    "per_prompt_results": [
+      {
+        "prompt": "<|im_start|>user\nThe capital of France is<|im_end|>\n<|im_start|>assistant\n<think>\n",
+        "match_rate": 1.0,
+        "matching_tokens": 32,
+        "total_tokens": 32,
+        "first_divergence_idx": null,
+        "hf_output": "user\nThe capital of France is\nassistant\n<think>\nHere's a thinking process:\n\n1.  **Analyze User Input:** The user says \"The capital of France is\". This is a straightforward factual question",
+        "neuron_output": "user\nThe capital of France is\nassistant\n<think>\nHere's a thinking process:\n\n1.  **Analyze User Input:** The user says \"The capital of France is\". This is a straightforward factual question"
+      },
+      {
+        "prompt": "<|im_start|>user\nThe color of the sky is<|im_end|>\n<|im_start|>assistant\n<think>\n",
+        "match_rate": 1.0,
+        "matching_tokens": 32,
+        "total_tokens": 32,
+        "first_divergence_idx": null,
+        "hf_output": "user\nThe color of the sky is\nassistant\n<think>\nHere's a thinking process:\n\n1.  **Analyze User Input:**\n   - User says: \"The color of the sky is\"\n  ",
+        "neuron_output": "user\nThe color of the sky is\nassistant\n<think>\nHere's a thinking process:\n\n1.  **Analyze User Input:**\n   - User says: \"The color of the sky is\"\n  "
+      },
+      {
+        "prompt": "<|im_start|>user\nWater freezes at<|im_end|>\n<|im_start|>assistant\n<think>\n",
+        "match_rate": 0.96875,
+        "matching_tokens": 31,
+        "total_tokens": 32,
+        "first_divergence_idx": 31,
+        "hf_output": "user\nWater freezes at\nassistant\n<think>\nHere's a thinking process:\n\n1.  **Analyze User Input:** The user says \"Water freezes at\". This is an incomplete sentence, clearly asking",
+        "neuron_output": "user\nWater freezes at\nassistant\n<think>\nHere's a thinking process:\n\n1.  **Analyze User Input:** The user says \"Water freezes at\". This is an incomplete sentence, clearly expecting"
+      },
+      {
+        "prompt": "<|im_start|>user\nThe largest planet in our solar system is<|im_end|>\n<|im_start|>assistant\n<think>\n",
+        "match_rate": 1.0,
+        "matching_tokens": 32,
+        "total_tokens": 32,
+        "first_divergence_idx": null,
+        "hf_output": "user\nThe largest planet in our solar system is\nassistant\n<think>\nHere's a thinking process:\n\n1.  **Identify the core question**: The user is asking for the largest planet in our solar system.\n2",
+        "neuron_output": "user\nThe largest planet in our solar system is\nassistant\n<think>\nHere's a thinking process:\n\n1.  **Identify the core question**: The user is asking for the largest planet in our solar system.\n2"
+      },
+      {
+        "prompt": "<|im_start|>user\nThe speed of light is approximately<|im_end|>\n<|im_start|>assistant\n<think>\n",
+        "match_rate": 1.0,
+        "matching_tokens": 32,
+        "total_tokens": 32,
+        "first_divergence_idx": null,
+        "hf_output": "user\nThe speed of light is approximately\nassistant\n<think>\nHere's a thinking process that leads to the suggested answer:\n\n1.  **Analyze the Request:**\n    *   The user is asking for the",
+        "neuron_output": "user\nThe speed of light is approximately\nassistant\n<think>\nHere's a thinking process that leads to the suggested answer:\n\n1.  **Analyze the Request:**\n    *   The user is asking for the"
+      },
+      {
+        "prompt": "<|im_start|>user\nThe chemical symbol for gold is<|im_end|>\n<|im_start|>assistant\n<think>\n",
+        "match_rate": 0.03125,
+        "matching_tokens": 1,
+        "total_tokens": 32,
+        "first_divergence_idx": 0,
+        "hf_output": "user\nThe chemical symbol for gold is\nassistant\n<think>\nThinking Process:\n\n1.  **Identify the user's question**: The user is asking for the chemical symbol for gold.\n2.  **Retrieve",
+        "neuron_output": "user\nThe chemical symbol for gold is\nassistant\n<think>\nHere's a thinking process:\n\n1.  **Identify the User's Question**: The user is asking for the chemical symbol for gold.\n2."
+      },
+      {
+        "prompt": "<|im_start|>user\nThe square root of 144 is<|im_end|>\n<|im_start|>assistant\n<think>\n",
+        "match_rate": 1.0,
+        "matching_tokens": 32,
+        "total_tokens": 32,
+        "first_divergence_idx": null,
+        "hf_output": "user\nThe square root of 144 is\nassistant\n<think>\nThinking Process:\n\n1.  **Identify the user's request:** The user is asking for the square root of 144.\n2.",
+        "neuron_output": "user\nThe square root of 144 is\nassistant\n<think>\nThinking Process:\n\n1.  **Identify the user's request:** The user is asking for the square root of 144.\n2."
+      },
+      {
+        "prompt": "<|im_start|>user\nThe first president of the United States was<|im_end|>\n<|im_start|>assistant\n<think>\n",
+        "match_rate": 1.0,
+        "matching_tokens": 32,
+        "total_tokens": 32,
+        "first_divergence_idx": null,
+        "hf_output": "user\nThe first president of the United States was\nassistant\n<think>\nHere's a thinking process:\n\n1.  **Identify the core question**: The user is asking \"The first president of the United States was\"\n",
+        "neuron_output": "user\nThe first president of the United States was\nassistant\n<think>\nHere's a thinking process:\n\n1.  **Identify the core question**: The user is asking \"The first president of the United States was\"\n"
+      },
+      {
+        "prompt": "<|im_start|>user\nThe boiling point of water is<|im_end|>\n<|im_start|>assistant\n<think>\n",
+        "match_rate": 1.0,
+        "matching_tokens": 32,
+        "total_tokens": 32,
+        "first_divergence_idx": null,
+        "hf_output": "user\nThe boiling point of water is\nassistant\n<think>\nHere's a thinking process that leads to the answer:\n\n1.  **Analyze the Request:**\n    *   The user is asking for the boiling",
+        "neuron_output": "user\nThe boiling point of water is\nassistant\n<think>\nHere's a thinking process that leads to the answer:\n\n1.  **Analyze the Request:**\n    *   The user is asking for the boiling"
+      },
+      {
+        "prompt": "<|im_start|>user\nThe number of continents on Earth is<|im_end|>\n<|im_start|>assistant\n<think>\n",
+        "match_rate": 0.96875,
+        "matching_tokens": 31,
+        "total_tokens": 32,
+        "first_divergence_idx": 20,
+        "hf_output": "user\nThe number of continents on Earth is\nassistant\n<think>\nHere's a thinking process:\n\n1.  **Analyze User Input:**\n   - User says: \"The number of continents on Earth is\"\n",
+        "neuron_output": "user\nThe number of continents on Earth is\nassistant\n<think>\nHere's a thinking process:\n\n1.  **Analyze User Input:**\n   - User statement: \"The number of continents on Earth is\"\n"
+      }
+    ]
+  },
+  "enhanced_metrics": {
+    "enhanced_metrics_available": false,
+    "enhanced_metrics_error": "hybrid APC request prep requires attention hit length"
+  }
+}

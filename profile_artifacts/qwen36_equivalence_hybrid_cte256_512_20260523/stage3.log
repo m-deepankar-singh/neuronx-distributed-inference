@@ -1,0 +1,14 @@
+Stage 3: 1 fault(s) localized
+============================================================
+  Primary fault: rmsnorm
+    R-ratio: 266.6859
+    Pattern: spike
+    Root cause: missing_algorithm
+    R=266.7 >> 10: likely missing algorithm or wrong formula.
+
+  All faults:
+    [missing_algorithm] rmsnorm: R=266.6859 (spike)
+      R=266.7 >> 10: likely missing algorithm or wrong formula.
+============================================================
+
+Results saved to /home/ubuntu/agent_artifacts/equiv_qwen36_fused_vocabparallel_exact_20260523T144742Z/results/stage3.json

@@ -1,0 +1,19 @@
+{
+  "faults": [
+    {
+      "component": "rmsnorm",
+      "r_ratio": 266.6859,
+      "pattern": "spike",
+      "root_cause": "missing_algorithm",
+      "description": "R=266.7 >> 10: likely missing algorithm or wrong formula."
+    }
+  ],
+  "num_faults": 1,
+  "primary_fault": {
+    "component": "rmsnorm",
+    "r_ratio": 266.6859,
+    "pattern": "spike",
+    "root_cause": "missing_algorithm",
+    "description": "R=266.7 >> 10: likely missing algorithm or wrong formula."
+  }
+}

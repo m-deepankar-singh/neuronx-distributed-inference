@@ -1,0 +1,127 @@
+/opt/aws_neuronx_venv_pytorch_inference_vllm_0_16/lib/python3.12/site-packages/neuronx_distributed/modules/moe/blockwise.py:100: DeprecationWarning: torch_neuronx.nki_jit is deprecated, use nki.jit instead.
+  component, error = import_nki(config)
+/opt/aws_neuronx_venv_pytorch_inference_vllm_0_16/lib/python3.12/site-packages/neuronx_distributed/modules/moe/blockwise.py:102: UserWarning: Warning: Failed to import blockwise_mm_baseline_shard_hidden: No module named 'neuronxcc.nki._private.blockwise_mm'
+  warnings.warn(f"Warning: {error}")
+/opt/aws_neuronx_venv_pytorch_inference_vllm_0_16/lib/python3.12/site-packages/neuronx_distributed/modules/moe/blockwise.py:102: UserWarning: Warning: Failed to import blockwise_mm_bwd: No module named 'neuronxcc.nki._private.blockwise_mm_bwd'
+  warnings.warn(f"Warning: {error}")
+/opt/aws_neuronx_venv_pytorch_inference_vllm_0_16/lib/python3.12/site-packages/neuronx_distributed/modules/moe/blockwise.py:102: UserWarning: Warning: Failed to import blockwise_mm_bwd_baseline_shard_hidden: No module named 'neuronxcc.nki._private.blockwise_mm_bwd'
+  warnings.warn(f"Warning: {error}")
+/opt/aws_neuronx_venv_pytorch_inference_vllm_0_16/lib/python3.12/site-packages/neuronx_distributed/parallel_layers/layers.py:539: UserWarning: Parallel state is not initialized. Falling back to non-parallel equivalent.
+  super().__init__(device=device)
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+
+============================================================
+  [FAIL] rmsnorm
+============================================================
+  Baseline (ref_bf16 vs ref_fp32):
+    rel_fro_norm  = 2.682777e-03
+    abs_max_diff  = 4.226017e-02
+  Target (port_bf16 vs ref_fp32):
+    rel_fro_norm  = 7.154590e-01
+    abs_max_diff  = 4.582740e+00
+  R-ratio = 266.6859  (threshold=1.2)
+============================================================
+[2026-05-23 17:54:29.920: I neuronx_distributed/parallel_layers/parallel_state.py:638] > initializing tensor model parallel with size 1
+[2026-05-23 17:54:29.921: I neuronx_distributed/parallel_layers/parallel_state.py:639] > initializing pipeline model parallel with size 1
+[2026-05-23 17:54:29.921: I neuronx_distributed/parallel_layers/parallel_state.py:640] > initializing context model parallel with size 1
+[2026-05-23 17:54:29.921: I neuronx_distributed/parallel_layers/parallel_state.py:641] > initializing data parallel with size 1
+[2026-05-23 17:54:29.921: I neuronx_distributed/parallel_layers/parallel_state.py:642] > initializing world size to 1
+[2026-05-23 17:54:29.921: I neuronx_distributed/parallel_layers/parallel_state.py:387] [rank_0_pp-1_tp-1_dp-1_cp-1] Chosen Logic for replica groups ret_logic=<PG_Group_Logic.LOGIC1: (<function ascending_ring_PG_group at 0x762598de9d00>, 'Ascending Ring PG Group')>
+[2026-05-23 17:54:29.921: I neuronx_distributed/parallel_layers/parallel_state.py:666] [rank_0_pp-1_tp-1_dp-1_cp-1] tp_groups: replica_groups.tp_groups=[[0]]
+[2026-05-23 17:54:29.922: I neuronx_distributed/parallel_layers/parallel_state.py:667] [rank_0_pp-1_tp-1_dp-1_cp-1] dp_groups: replica_groups.dp_groups=[[0]]
+[2026-05-23 17:54:29.922: I neuronx_distributed/parallel_layers/parallel_state.py:668] [rank_0_pp-1_tp-1_dp-1_cp-1] pp_groups: replica_groups.pp_groups=[[0]]
+[2026-05-23 17:54:29.922: I neuronx_distributed/parallel_layers/parallel_state.py:669] [rank_0_pp-1_tp-1_dp-1_cp-1] cp_groups: replica_groups.cp_groups=[[0]]
+[2026-05-23 17:54:29.922: I neuronx_distributed/parallel_layers/parallel_state.py:670] [rank_0_pp-1_tp-1_dp-1_cp-1] ep_model_groups: replica_groups.ep_model_groups=[[0]]
+[2026-05-23 17:54:29.922: I neuronx_distributed/parallel_layers/parallel_state.py:671] [rank_0_pp-1_tp-1_dp-1_cp-1] ep_data_groups: replica_groups.ep_data_groups=[[0]]
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+/opt/aws_neuronx_venv_pytorch_inference_vllm_0_16/lib/python3.12/site-packages/neuronx_distributed/parallel_layers/layers.py:531: FutureWarning: `torch.cuda.amp.autocast(args...)` is deprecated. Please use `torch.amp.autocast('cuda', args...)` instead.
+  with torch.cuda.amp.autocast(enabled=False):
+
+============================================================
+  [PASS] mlp.down_proj
+============================================================
+  Baseline (ref_bf16 vs ref_fp32):
+    rel_fro_norm  = 2.871957e-03
+    abs_max_diff  = 3.900051e-02
+  Target (port_bf16 vs ref_fp32):
+    rel_fro_norm  = 2.871957e-03
+    abs_max_diff  = 3.900051e-02
+  R-ratio = 1.0000  (threshold=1.2)
+============================================================
+
+============================================================
+  [PASS] mlp.gate_proj
+============================================================
+  Baseline (ref_bf16 vs ref_fp32):
+    rel_fro_norm  = 2.870278e-03
+    abs_max_diff  = 2.147913e-02
+  Target (port_bf16 vs ref_fp32):
+    rel_fro_norm  = 2.870278e-03
+    abs_max_diff  = 2.147913e-02
+  R-ratio = 1.0000  (threshold=1.2)
+============================================================
+
+============================================================
+  [PASS] mlp.swiglu
+============================================================
+  Baseline (ref_bf16 vs ref_fp32):
+    rel_fro_norm  = 5.269963e-03
+    abs_max_diff  = 7.697582e-02
+  Target (port_bf16 vs ref_fp32):
+    rel_fro_norm  = 5.269963e-03
+    abs_max_diff  = 7.697582e-02
+  R-ratio = 1.0000  (threshold=1.2)
+============================================================
+
+============================================================
+  [PASS] mlp.up_proj
+============================================================
+  Baseline (ref_bf16 vs ref_fp32):
+    rel_fro_norm  = 2.870310e-03
+    abs_max_diff  = 2.226543e-02
+  Target (port_bf16 vs ref_fp32):
+    rel_fro_norm  = 2.870310e-03
+    abs_max_diff  = 2.226543e-02
+  R-ratio = 1.0000  (threshold=1.2)
+============================================================
+
+============================================================
+  [PASS] embedding.small_vocab
+============================================================
+  Baseline (ref_bf16 vs ref_fp32):
+    rel_fro_norm  = 1.660609e-03
+    abs_max_diff  = 2.371222e-04
+  Target (port_bf16 vs ref_fp32):
+    rel_fro_norm  = 1.660609e-03
+    abs_max_diff  = 2.371222e-04
+  R-ratio = 1.0000  (threshold=1.2)
+============================================================
+
+============================================================
+  [PASS] lm_head.small_vocab
+============================================================
+  Baseline (ref_bf16 vs ref_fp32):
+    rel_fro_norm  = 2.862763e-03
+    abs_max_diff  = 1.830482e-02
+  Target (port_bf16 vs ref_fp32):
+    rel_fro_norm  = 2.862763e-03
+    abs_max_diff  = 1.830482e-02
+  R-ratio = 1.0000  (threshold=1.2)
+============================================================
+
+============================================================
+  Stage 2 Summary: 6/7 passed, 1 failed
+============================================================
+  ✗ rmsnorm: R=266.6859
+  ✓ mlp.down_proj: R=1.0000
+  ✓ mlp.gate_proj: R=1.0000
+  ✓ mlp.swiglu: R=1.0000
+  ✓ mlp.up_proj: R=1.0000
+  ✓ embedding.small_vocab: R=1.0000
+  ✓ lm_head.small_vocab: R=1.0000

@@ -199,8 +199,26 @@ class HuggingFaceGenerationAdapter(PreTrainedModel, GenerationMixin):
             # forward pass to get next token
             outputs = self(**model_inputs, return_dict=True)
 
-            if outputs.logits is not None:
-                next_token_logits = outputs.logits[:, -1, :].clone()
+            if outputs.logits is not None and (
+                not self.on_device_sampling or output_scores or output_logits
+            ):
+                logits = outputs.logits
+                if isinstance(logits, (list, tuple)):
+                    logits = next(
+                        (
+                            tensor
+                            for tensor in logits
+                            if hasattr(tensor, "ndim")
+                            and tensor.ndim >= 2
+                            and torch.is_floating_point(tensor)
+                        ),
+                        logits[0],
+                    )
+                next_token_logits = (
+                    logits[:, -1, :].clone()
+                    if logits.ndim >= 3
+                    else logits.clone()
+                )
 
                 # pre-process distribution
                 next_token_scores = logits_processor(input_ids, next_token_logits)
@@ -228,6 +246,18 @@ class HuggingFaceGenerationAdapter(PreTrainedModel, GenerationMixin):
                 next_tokens = self.sampler(next_token_scores, sampling_params)
             else:
                 next_tokens = outputs.tokens
+                if isinstance(next_tokens, (list, tuple)):
+                    next_tokens = next(
+                        (
+                            tensor
+                            for tensor in next_tokens
+                            if hasattr(tensor, "ndim")
+                            and not torch.is_floating_point(tensor)
+                        ),
+                        next_tokens[0],
+                    )
+                if hasattr(next_tokens, "ndim") and next_tokens.ndim > 1:
+                    next_tokens = next_tokens.reshape(next_tokens.shape[0], -1)[:, -1]
 
             # finished sentences should have their next token be a padding token
             if has_eos_stopping_criteria:
@@ -278,6 +308,7 @@ class HuggingFaceGenerationAdapter(PreTrainedModel, GenerationMixin):
         scatter_index = kwargs.get("scatter_index", None)
         position_ids = kwargs.get("position_ids", None)
         input_capture_hook = kwargs.get("input_capture_hook", None)
+        tensor_capture_hook = kwargs.get("tensor_capture_hook", None)
 
         if attention_mask is not None and position_ids is None:
             # create position_ids on the fly for batch generation
@@ -310,10 +341,11 @@ class HuggingFaceGenerationAdapter(PreTrainedModel, GenerationMixin):
                 "medusa_args": (accepted_indices, current_length, medusa_mask, scatter_index),
                 "sampling_params": sampling_params,
                 "input_capture_hook": input_capture_hook,
-                "tensor_capture_hook": tensor_capture_hook,
                 "adapter_ids": adapter_ids
             }
         )
+        if tensor_capture_hook is not None:
+            model_inputs["tensor_capture_hook"] = tensor_capture_hook
 
         tf_args = []
         if self.neuron_config.tensor_replacement_config:
