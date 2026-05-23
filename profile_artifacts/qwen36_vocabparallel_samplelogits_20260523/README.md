@@ -18,7 +18,12 @@ Code head before the local clone fix: `aad1987`
   - `full_prefix_exact=true`
   - `partial_prefix_exact=true`
   - `real_generated_tokens_passed=true`
+- HF greedy reference comparison using an isolated Transformers-main install passed the target threshold:
+  - `156/160` token positions matched HF greedy (`97.5%`)
+  - `9/10` prompts matched exactly for all `16` generated tokens
+  - The only mismatch was prompt index `8`, after `12` exact tokens: HF selected token `1826`, Neuron selected token `34099`
+  - Neuron offline decode throughput during this comparison was about `11.08-14.75 tok/s` across the 10 prompts
 
 ## Notes
 
-HF greedy match was not measured on this host because the installed Transformers build does not recognize `model_type=qwen3_5`, and the copied model directory does not include HF remote-code Python files. Reuse old HF goldens or install a compatible Transformers/Qwen implementation before claiming an HF token match rate.
+The host Neuron/vLLM virtualenv was left unchanged. HF greedy references were generated with an isolated Transformers-main install at `/home/ubuntu/hf_ref_pkgs_transformers_main_clean2_20260523`, because the packaged Transformers build in the Neuron environment did not recognize `model_type=qwen3_5`.
