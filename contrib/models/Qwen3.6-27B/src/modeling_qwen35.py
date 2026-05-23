@@ -27,6 +27,7 @@ Config compatibility notes:
 """
 
 import gc
+import json
 import math
 import logging
 import os
@@ -1404,6 +1405,50 @@ class NeuronGatedDeltaNet(nn.Module):
 
 class Qwen35InferenceConfig(InferenceConfig):
     """Config for Qwen3.5/3.6-27B (dense) with hybrid DeltaNet + Attention."""
+
+    @classmethod
+    def from_pretrained(cls, model_path: str, **kwargs) -> "Qwen35InferenceConfig":
+        """Load Qwen3.5/Qwen3.6 text config from a pretrained model directory.
+
+        Qwen3.6 stores the decoder settings under the top-level multimodal
+        `text_config`. NxDI's text-only inference config expects those fields
+        flattened onto the inference config itself.
+        """
+        neuron_config = kwargs.pop("neuron_config", None)
+        if neuron_config is None:
+            neuron_config = NeuronConfig(
+                tp_degree=1,
+                batch_size=1,
+                seq_len=128,
+                torch_dtype=torch.bfloat16,
+                save_sharded_checkpoint=True,
+            )
+
+        config_path = os.path.join(model_path, "config.json")
+        if not os.path.exists(config_path):
+            raise FileNotFoundError(f"Configuration file not found at {config_path}")
+
+        with open(config_path, "r", encoding="utf-8") as handle:
+            config_dict = json.load(handle)
+
+        text_config = config_dict.get("text_config", config_dict)
+        rope_parameters = text_config.get("rope_parameters") or {}
+        inference_config = dict(text_config)
+        inference_config.setdefault("_name_or_path", model_path)
+        inference_config.setdefault("model_type", "qwen3_5_text")
+        inference_config.setdefault("architectures", config_dict.get("architectures", []))
+        inference_config.setdefault("tie_word_embeddings", config_dict.get("tie_word_embeddings", False))
+        if "rope_theta" not in inference_config and "rope_theta" in rope_parameters:
+            inference_config["rope_theta"] = rope_parameters["rope_theta"]
+        if (
+            "partial_rotary_factor" not in inference_config
+            and "partial_rotary_factor" in rope_parameters
+        ):
+            inference_config["partial_rotary_factor"] = rope_parameters[
+                "partial_rotary_factor"
+            ]
+        inference_config.update(kwargs)
+        return cls(neuron_config=neuron_config, **inference_config)
 
     def __init__(self, *args, **kwargs):
         # Set defaults BEFORE super().__init__() because it calls validate_config()
