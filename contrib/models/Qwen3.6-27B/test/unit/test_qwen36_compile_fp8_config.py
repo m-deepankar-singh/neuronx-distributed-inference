@@ -81,6 +81,8 @@ def _args(**overrides):
         cte_bucket=512,
         cte_buckets=["256,512"],
         prefix_buckets=None,
+        token_generation_buckets=None,
+        token_generation_batches=None,
         block_size=256,
         pa_num_blocks=8,
         pa_headroom_blocks=0,
@@ -89,11 +91,13 @@ def _args(**overrides):
         max_num_seqs=1,
         ctx_batch_size=1,
         skip_warmup=False,
+        async_mode=False,
         enable_prefix_caching=True,
         enable_hybrid_apc=True,
         enable_vllm_chunked_prefill=False,
         deltanet_cte_backend="env",
         disable_on_device_sampling=True,
+        output_logits_with_on_device_sampling=False,
         kernel_q_tile_size=128,
         kernel_kv_tile_size=1024,
         disable_static_hybrid_cache=False,
@@ -197,7 +201,32 @@ class TestQwen36CompileFp8Config(unittest.TestCase):
             )
 
         self.assertIsNotNone(config.neuron_config.on_device_sampling_config)
+        self.assertFalse(config.neuron_config.output_logits)
+        self.assertTrue(config.neuron_config.vocab_parallel)
         self.assertEqual(config.neuron_config.pa_num_blocks, 8)
+
+    def test_on_device_sampling_can_also_return_logits_for_debug(self):
+        with patch.object(
+            _COMPILE,
+            "_load_text_config",
+            return_value={"num_hidden_layers": 2},
+        ), patch.dict(
+            sys.modules,
+            {
+                "neuronx_distributed_inference.models.config": _fake_config_module(),
+                "src.modeling_qwen35": _fake_qwen_module(),
+            },
+        ):
+            config, _modules = _COMPILE._build_config(
+                _args(
+                    disable_on_device_sampling=False,
+                    output_logits_with_on_device_sampling=True,
+                ),
+            )
+
+        self.assertIsNotNone(config.neuron_config.on_device_sampling_config)
+        self.assertTrue(config.neuron_config.output_logits)
+        self.assertTrue(config.neuron_config.vocab_parallel)
 
     def test_bf16_control_compile_disables_quantization_and_keeps_host_logits(self):
         with patch.object(

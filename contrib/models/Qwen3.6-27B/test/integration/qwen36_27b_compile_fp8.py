@@ -482,6 +482,12 @@ def _build_config(args: argparse.Namespace):
             top_p=1.0,
             temperature=1.0,
         )
+        # Qwen's LM head is vocab-sharded when on-device sampling is enabled
+        # (gather_output=False). The sampler must do distributed argmax/top-k
+        # across vocab shards instead of sampling only from rank 0's shard.
+        neuron_config_kwargs["vocab_parallel"] = True
+        if args.output_logits_with_on_device_sampling:
+            neuron_config_kwargs["output_logits"] = True
     if args.enable_prefix_caching or args.enable_hybrid_apc or args.enable_vllm_chunked_prefill:
         neuron_config_kwargs["is_block_kv_layout"] = True
         neuron_config_kwargs["pa_block_size"] = args.block_size
@@ -607,6 +613,15 @@ def main() -> int:
         ),
     )
     parser.add_argument("--disable-on-device-sampling", action="store_true")
+    parser.add_argument(
+        "--output-logits-with-on-device-sampling",
+        action="store_true",
+        help=(
+            "Debug mode: keep on-device greedy sampling enabled but also return "
+            "logits from the trace so sampled token IDs can be compared with "
+            "host argmax."
+        ),
+    )
     parser.add_argument("--kernel-q-tile-size", type=int, default=128)
     parser.add_argument("--kernel-kv-tile-size", type=int, default=1024)
     parser.add_argument("--disable-static-hybrid-cache", action="store_true")

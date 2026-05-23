@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import importlib.abc
 import importlib.machinery
+import json
 import logging
 import os
 import struct
@@ -20,7 +21,12 @@ from typing import Any, Hashable, NamedTuple
 logger = logging.getLogger(__name__)
 _SCHEDULER_MODULE = "vllm.v1.core.sched.scheduler"
 _VLLM_NEURON_RUNNER_MODULE = "vllm_neuron.worker.neuronx_distributed_model_runner"
-_PATCHED_MODULES = {_SCHEDULER_MODULE, _VLLM_NEURON_RUNNER_MODULE}
+_VLLM_NEURON_LOADER_MODULE = "vllm_neuron.worker.neuronx_distributed_model_loader"
+_PATCHED_MODULES = {
+    _SCHEDULER_MODULE,
+    _VLLM_NEURON_RUNNER_MODULE,
+    _VLLM_NEURON_LOADER_MODULE,
+}
 
 
 class HybridGDNPrefixKey(NamedTuple):
@@ -1362,6 +1368,172 @@ def _prefill_completion_has_incomplete_row(prefill_completion_state: Any) -> boo
     return False
 
 
+def _shape_of(value: Any) -> list[int] | None:
+    shape = getattr(value, "shape", None)
+    if shape is None:
+        return None
+    return [int(item) for item in shape]
+
+
+def _flatten_int_sample(value: Any, *, limit: int = 8) -> list[int] | None:
+    detach = getattr(value, "detach", None)
+    if detach is None:
+        return None
+    try:
+        tensor = detach().cpu().reshape(-1)
+        return [int(item) for item in tensor[:limit].tolist()]
+    except Exception:
+        return None
+
+
+def _is_tensor_like(value: Any) -> bool:
+    return hasattr(value, "detach") and hasattr(value, "shape")
+
+
+def _first_tensor_like(value: Any) -> Any:
+    if _is_tensor_like(value):
+        return value
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            found = _first_tensor_like(item)
+            if found is not None:
+                return found
+    return None
+
+
+def _describe_sample_logits_value(value: Any, *, depth: int = 0) -> dict[str, Any]:
+    row: dict[str, Any] = {"type": type(value).__name__}
+    shape = _shape_of(value)
+    if shape is not None:
+        row["shape"] = shape
+    if isinstance(value, (list, tuple)):
+        row["len"] = len(value)
+        if depth < 3:
+            row["items"] = [
+                _describe_sample_logits_value(item, depth=depth + 1)
+                for item in value[:4]
+            ]
+    return row
+
+
+def _split_sample_logits_output(value: Any) -> tuple[Any, Any, str]:
+    """Return token IDs and logits from sample+logits debug model outputs."""
+
+    tokens = getattr(value, "tokens", None)
+    logits = getattr(value, "logits", None)
+    if tokens is not None or logits is not None:
+        return tokens, logits, type(value).__name__
+
+    if isinstance(value, (list, tuple)):
+        if len(value) == 1:
+            nested_tokens, nested_logits, nested_kind = _split_sample_logits_output(
+                value[0]
+            )
+            return nested_tokens, nested_logits, f"{type(value).__name__}[{nested_kind}]"
+        if len(value) >= 2:
+            return value[0], value[1], type(value).__name__
+
+    return value, None, type(value).__name__
+
+
+def _log_sample_logits_comparison(
+    hidden_states: Any,
+    model_input: Any,
+    sampler_output: Any,
+) -> None:
+    """Debug-only compare traced sampled tokens with returned logits argmax."""
+
+    path = os.environ.get("QWEN36_SAMPLE_LOGITS_COMPARE_JSONL")
+    if not path:
+        return
+    try:
+        tokens, logits, hidden_state_kind = _split_sample_logits_output(hidden_states)
+        token_tensor = _first_tensor_like(tokens)
+        logits_tensor = _first_tensor_like(logits)
+        row: dict[str, Any] = {
+            "request_ids": list(getattr(model_input, "request_ids", ()) or ()),
+            "hidden_state_type": hidden_state_kind,
+            "hidden_state_structure": _describe_sample_logits_value(hidden_states),
+            "tokens_shape": _shape_of(token_tensor),
+            "logits_shape": _shape_of(logits_tensor),
+            "sampler_output_type": type(sampler_output).__name__,
+        }
+        if token_tensor is not None and logits_tensor is not None:
+            logits_tensor = logits_tensor.detach().float()
+            logits_for_argmax = (
+                logits_tensor[:, -1, :]
+                if logits_tensor.dim() >= 3
+                else logits_tensor
+            )
+            argmax_tokens = logits_for_argmax.argmax(dim=-1).detach().cpu().reshape(-1)
+            sampled_tokens = token_tensor.detach().cpu().reshape(-1)
+            count = min(int(argmax_tokens.numel()), int(sampled_tokens.numel()))
+            row.update(
+                {
+                    "sampled_tokens": [
+                        int(item) for item in sampled_tokens[: min(count, 8)].tolist()
+                    ],
+                    "logits_argmax_tokens": [
+                        int(item) for item in argmax_tokens[: min(count, 8)].tolist()
+                    ],
+                    "num_compared": count,
+                    "num_matches": int(
+                        (sampled_tokens[:count] == argmax_tokens[:count]).sum().item()
+                    )
+                    if count
+                    else 0,
+                }
+            )
+        else:
+            row["sampled_tokens"] = _flatten_int_sample(token_tensor)
+
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(row, sort_keys=True) + "\n")
+    except Exception as exc:
+        try:
+            with open(path, "a", encoding="utf-8") as handle:
+                handle.write(
+                    json.dumps(
+                        {
+                            "error": f"{type(exc).__name__}: {exc}",
+                            "hidden_state_type": type(hidden_states).__name__,
+                            "stage": "sample_logits_compare",
+                        },
+                        sort_keys=True,
+                    )
+                    + "\n"
+                )
+        except Exception:
+            return
+
+
+def _log_sample_logits_split_error(
+    hidden_states: Any,
+    model_input: Any,
+    exc: BaseException,
+) -> None:
+    path = os.environ.get("QWEN36_SAMPLE_LOGITS_COMPARE_JSONL")
+    if not path:
+        return
+    try:
+        tokens, logits, hidden_state_kind = _split_sample_logits_output(hidden_states)
+        token_tensor = _first_tensor_like(tokens)
+        logits_tensor = _first_tensor_like(logits)
+        row = {
+            "error": f"{type(exc).__name__}: {exc}",
+            "hidden_state_type": hidden_state_kind,
+            "hidden_state_structure": _describe_sample_logits_value(hidden_states),
+            "logits_shape": _shape_of(logits_tensor),
+            "request_ids": list(getattr(model_input, "request_ids", ()) or ()),
+            "stage": "sample_on_device",
+            "tokens_shape": _shape_of(token_tensor),
+        }
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(row, sort_keys=True) + "\n")
+    except Exception:
+        return
+
+
 def patch_neuron_model_runner_class(runner_cls: type) -> bool:
     """Patch vLLM-Neuron runner to expose scheduler row metadata."""
 
@@ -1510,13 +1682,25 @@ def patch_neuron_model_runner_class(runner_cls: type) -> bool:
                 clone = getattr(hidden_states, "clone", None)
                 if clone is not None:
                     hidden_states = clone()
-            return original_sample_on_device(
-                self,
-                hidden_states,
-                model_input,
-                *args,
-                **kwargs,
+            hidden_states_for_sampling, _, _ = _split_sample_logits_output(
+                hidden_states
             )
+            token_tensor_for_sampling = _first_tensor_like(hidden_states_for_sampling)
+            if token_tensor_for_sampling is not None:
+                hidden_states_for_sampling = token_tensor_for_sampling
+            try:
+                sampler_output = original_sample_on_device(
+                    self,
+                    hidden_states_for_sampling,
+                    model_input,
+                    *args,
+                    **kwargs,
+                )
+            except Exception as exc:
+                _log_sample_logits_split_error(hidden_states, model_input, exc)
+                raise
+            _log_sample_logits_comparison(hidden_states, model_input, sampler_output)
+            return sampler_output
 
         sample_on_device_with_incomplete_prefill_clone._qwen36_clone_incomplete_prefill_tokens_patched = (
             True
@@ -1620,11 +1804,121 @@ def _patch_neuron_runner_module(module: Any) -> bool:
     return installed
 
 
+def _restore_nested_output(restore, value: Any) -> Any:
+    if hasattr(value, "shape"):
+        return restore(value)
+    if isinstance(value, list):
+        return [_restore_nested_output(restore, item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_restore_nested_output(restore, item) for item in value)
+    return value
+
+
+def _patch_neuron_loader_module(module: Any) -> bool:
+    causal_lm_cls = getattr(module, "NeuronCausalLM", None)
+    if causal_lm_cls is None:
+        return False
+    original_forward = getattr(causal_lm_cls, "forward", None)
+    if original_forward is None or getattr(
+        original_forward,
+        "_qwen36_sample_logits_tokens_patched",
+        False,
+    ):
+        return False
+
+    def forward_with_sample_logits_tokens(
+        self,
+        input_ids,
+        input_block_ids,
+        **kwargs,
+    ):
+        import time as _time  # noqa: WPS433
+
+        forward_start = _time.perf_counter()
+        batch_size = (
+            input_ids.shape[0]
+            if hasattr(input_ids, "shape")
+            else len(input_ids)
+        )
+
+        with self._reordered(input_block_ids, input_ids=input_ids, **kwargs) as (
+            sorted_ids,
+            inputs,
+            restore,
+        ):
+            model_start = _time.perf_counter()
+            output = self.model(
+                inputs["input_ids"],
+                attention_mask=None,
+                seq_ids=sorted_ids,
+                block_table=inputs["block_tables"],
+                **{
+                    key: value
+                    for key, value in inputs.items()
+                    if key
+                    not in ["input_ids", "block_tables", "prefill_completion_state"]
+                },
+            )
+            model_elapsed = (_time.perf_counter() - model_start) * 1000
+            module.logger.debug("[PERF]     model_execution: %.2fms", model_elapsed)
+
+            output_proc_start = _time.perf_counter()
+            if self.model.config.neuron_config.on_device_sampling_config:
+                tokens = getattr(output, "tokens", None)
+                logits = getattr(output, "logits", None)
+                if tokens is not None and logits is not None:
+                    output = [tokens, logits]
+                else:
+                    output = output.hidden_states
+                if getattr(
+                    self.model.config.neuron_config,
+                    "enable_fused_speculation",
+                    False,
+                ):
+                    fused = output
+                    output = self._remask_fused_spec_output(fused, inputs)
+            else:
+                if self.neuron_config.is_chunked_prefill:
+                    assert kwargs.get("prefill_completion_state") is not None
+                    idx_for_sampling = (
+                        kwargs["prefill_completion_state"].nonzero().flatten()
+                    )
+                    output = output.logits[0, idx_for_sampling, :]
+                else:
+                    output = output.logits[:, -1, :]
+            output_proc_elapsed = (_time.perf_counter() - output_proc_start) * 1000
+            module.logger.debug(
+                "[PERF]     output_processing: %.2fms",
+                output_proc_elapsed,
+            )
+
+            restore_start = _time.perf_counter()
+            result = _restore_nested_output(restore, output)
+            restore_elapsed = (_time.perf_counter() - restore_start) * 1000
+            module.logger.debug("[PERF]     restore: %.2fms", restore_elapsed)
+
+            forward_elapsed = (_time.perf_counter() - forward_start) * 1000
+            module.logger.debug(
+                "[PERF]   forward() total: %.2fms [batch=%d]",
+                forward_elapsed,
+                batch_size,
+            )
+            return result
+
+    forward_with_sample_logits_tokens._qwen36_sample_logits_tokens_patched = True
+    forward_with_sample_logits_tokens._qwen36_original_forward = original_forward
+    causal_lm_cls.forward = forward_with_sample_logits_tokens
+    logger.info("Installed Qwen sample+logits vLLM-Neuron loader patch")
+    return True
+
+
 def _patch_module(module_name: str, module: Any) -> bool:
     if module_name == _SCHEDULER_MODULE:
         return _patch_scheduler_module(module)
     if module_name == _VLLM_NEURON_RUNNER_MODULE:
         return _patch_neuron_runner_module(module)
+    if module_name == _VLLM_NEURON_LOADER_MODULE:
+        return _patch_neuron_loader_module(module)
     return False
 
 
@@ -1689,6 +1983,9 @@ def install() -> bool:
     runner_module = sys.modules.get(_VLLM_NEURON_RUNNER_MODULE)
     if runner_module is not None:
         installed = _patch_neuron_runner_module(runner_module) or installed
+    loader_module = sys.modules.get(_VLLM_NEURON_LOADER_MODULE)
+    if loader_module is not None:
+        installed = _patch_neuron_loader_module(loader_module) or installed
     if installed:
         logger.info("Installed Qwen Hybrid APC scheduler fallback patch")
     return installed
