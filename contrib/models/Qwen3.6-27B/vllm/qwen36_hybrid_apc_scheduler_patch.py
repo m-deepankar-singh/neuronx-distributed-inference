@@ -1687,6 +1687,9 @@ def patch_neuron_model_runner_class(runner_cls: type) -> bool:
             )
             token_tensor_for_sampling = _first_tensor_like(hidden_states_for_sampling)
             if token_tensor_for_sampling is not None:
+                clone = getattr(token_tensor_for_sampling, "clone", None)
+                if clone is not None:
+                    token_tensor_for_sampling = clone()
                 hidden_states_for_sampling = token_tensor_for_sampling
             try:
                 sampler_output = original_sample_on_device(
