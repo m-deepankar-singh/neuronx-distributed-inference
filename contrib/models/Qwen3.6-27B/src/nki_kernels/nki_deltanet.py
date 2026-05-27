@@ -12,6 +12,7 @@ g and beta are scalars per token, expanded to (S, 128) by the caller.
 Two kernel variants:
   deltanet_recurrent_fwd        -- returns output only (original)
   deltanet_recurrent_fwd_state  -- returns (output, final_state) for CTE->TKG carry-over
+  deltanet_recurrent_step       -- one-token state-in/state-out decode step
 """
 
 import nki
@@ -23,6 +24,116 @@ P_MAX = 128
 
 # Shuffle mask: broadcast partition 0 to all partitions in a 32-wide group
 _BROADCAST_MASK = [0] * 32
+
+
+@nki.jit
+def deltanet_recurrent_step(
+    query: nl.ndarray,  # (1, 128) float32
+    key: nl.ndarray,  # (1, 128) float32
+    value: nl.ndarray,  # (1, 128) float32
+    g_in: nl.ndarray,  # (1, 128) float32, log-decay broadcast to 128
+    beta_in: nl.ndarray,  # (1, 128) float32, write gate broadcast to 128
+    state_in: nl.ndarray,  # (128, 128) float32
+):
+    """Stateful one-token DeltaNet decode step.
+
+    This is the token-generation equivalent of one iteration from
+    ``deltanet_recurrent_fwd_state``.  The caller supplies the recurrent
+    state restored from the decode cache and receives the updated state.
+
+    Returns:
+        output:    (1, 128) float32
+        state_out: (128, 128) float32
+    """
+    _, dim = query.shape
+
+    output = nl.ndarray((1, dim), dtype=query.dtype, buffer=nl.shared_hbm)
+    state_out = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.shared_hbm)
+
+    q_t = nl.ndarray((P_MAX, 1), dtype=query.dtype, buffer=nl.sbuf)
+    nisa.dma_copy(dst=q_t, src=query.ap(pattern=[[1, P_MAX]], offset=0))
+
+    k_t = nl.ndarray((P_MAX, 1), dtype=key.dtype, buffer=nl.sbuf)
+    nisa.dma_copy(dst=k_t, src=key.ap(pattern=[[1, P_MAX]], offset=0))
+
+    v_t = nl.ndarray((P_MAX, 1), dtype=value.dtype, buffer=nl.sbuf)
+    nisa.dma_copy(dst=v_t, src=value.ap(pattern=[[1, P_MAX]], offset=0))
+
+    g_t = nl.ndarray((P_MAX, 1), dtype=g_in.dtype, buffer=nl.sbuf)
+    nisa.dma_copy(dst=g_t, src=g_in.ap(pattern=[[1, P_MAX]], offset=0))
+
+    beta_t = nl.ndarray((P_MAX, 1), dtype=beta_in.dtype, buffer=nl.sbuf)
+    nisa.dma_copy(dst=beta_t, src=beta_in.ap(pattern=[[1, P_MAX]], offset=0))
+
+    state = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.dma_copy(dst=state, src=state_in)
+
+    exp_g = nl.ndarray((P_MAX, 1), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.activation(dst=exp_g, op=nl.exp, data=g_t, bias=None, scale=1.0)
+
+    state_decayed = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_scalar(
+        dst=state_decayed,
+        data=state,
+        op0=nl.multiply,
+        operand0=exp_g,
+        engine=nisa.vector_engine,
+    )
+    nisa.tensor_copy(dst=state, src=state_decayed)
+
+    kv_mem_psum = nl.ndarray((P_MAX, 1), dtype=nl.float32, buffer=nl.psum)
+    nisa.nc_matmul(dst=kv_mem_psum, stationary=state, moving=k_t)
+    kv_mem = nl.ndarray((P_MAX, 1), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_copy(dst=kv_mem, src=kv_mem_psum)
+
+    v_sub = nl.ndarray((P_MAX, 1), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_tensor(dst=v_sub, data1=v_t, data2=kv_mem, op=nl.subtract)
+
+    delta = nl.ndarray((P_MAX, 1), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_scalar(
+        dst=delta,
+        data=v_sub,
+        op0=nl.multiply,
+        operand0=beta_t,
+        engine=nisa.vector_engine,
+    )
+
+    delta_row_psum = nl.ndarray((1, P_MAX), dtype=nl.float32, buffer=nl.psum)
+    nisa.nc_transpose(dst=delta_row_psum, data=delta)
+
+    delta_row_sb = nl.ndarray((1, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_copy(dst=delta_row_sb, src=delta_row_psum)
+
+    delta_broadcast = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.sbuf)
+    for i_shuf in nl.static_range(P_MAX // 32):
+        nisa.nc_stream_shuffle(
+            src=delta_row_sb[0:1, 0:P_MAX],
+            dst=delta_broadcast[i_shuf * 32 : i_shuf * 32 + 32, 0:P_MAX],
+            shuffle_mask=_BROADCAST_MASK,
+        )
+
+    outer_prod = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_scalar(
+        dst=outer_prod,
+        data=delta_broadcast,
+        op0=nl.multiply,
+        operand0=k_t,
+        engine=nisa.vector_engine,
+    )
+
+    state_new = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_tensor(dst=state_new, data1=state, data2=outer_prod, op=nl.add)
+    nisa.tensor_copy(dst=state, src=state_new)
+
+    o_t_psum = nl.ndarray((P_MAX, 1), dtype=nl.float32, buffer=nl.psum)
+    nisa.nc_matmul(dst=o_t_psum, stationary=state, moving=q_t)
+    o_t = nl.ndarray((P_MAX, 1), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_copy(dst=o_t, src=o_t_psum)
+
+    nisa.dma_copy(dst=output.ap(pattern=[[1, dim]], offset=0), src=o_t)
+    nisa.dma_copy(dst=state_out, src=state)
+
+    return output, state_out
 
 
 @nki.jit

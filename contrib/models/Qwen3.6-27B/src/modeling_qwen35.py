@@ -73,6 +73,9 @@ from src.nki_kernels.nki_deltanet import deltanet_recurrent_fwd as _deltanet_nki
 from src.nki_kernels.nki_deltanet import (
     deltanet_recurrent_fwd_state as _deltanet_nki_kernel_state,
 )
+from src.nki_kernels.nki_deltanet import (
+    deltanet_recurrent_step as _deltanet_nki_step_kernel,
+)
 from src.nki_kernels.nki_deltanet_chunked import (
     deltanet_chunk_step as _deltanet_nki_chunk_step,
 )
@@ -404,6 +407,9 @@ class NeuronGatedDeltaNet(nn.Module):
         self.use_qwen_hybrid_chunked_prefill_nki = getattr(
             tc, "use_qwen_hybrid_chunked_prefill_nki", False
         )
+        self.use_qwen_deltanet_decode_nki = getattr(
+            tc, "use_qwen_deltanet_decode_nki", False
+        )
         self.use_cold_zero_conv_fast_path = getattr(
             tc, "use_cold_zero_conv_fast_path", False
         )
@@ -547,6 +553,55 @@ class NeuronGatedDeltaNet(nn.Module):
         output = (new_state * q_t.unsqueeze(-1)).sum(dim=-2)
 
         return output.unsqueeze(2), new_state
+
+    def _nki_recurrent_step(self, query, key, value, g, beta, recurrent_state):
+        """Single-step recurrent update using the stateful NKI decode kernel."""
+        query = l2norm(query, dim=-1)
+        key = l2norm(key, dim=-1)
+        B, H, S, k_dim = query.shape
+        v_dim = value.shape[-1]
+        scale = 1.0 / (k_dim**0.5)
+        query = query * scale
+
+        BH = B * H
+        query_flat = query.reshape(BH, S, k_dim).contiguous()
+        key_flat = key.reshape(BH, S, k_dim).contiguous()
+        value_flat = value.reshape(BH, S, v_dim).contiguous()
+        g_flat = (
+            g.reshape(BH, S)
+            .unsqueeze(-1)
+            .expand(-1, -1, v_dim)
+            .contiguous()
+        )
+        beta_flat = (
+            beta.reshape(BH, S)
+            .unsqueeze(-1)
+            .expand(-1, -1, v_dim)
+            .contiguous()
+        )
+        state_flat = recurrent_state.reshape(BH, k_dim, v_dim).float().contiguous()
+
+        outputs = []
+        states = []
+        for bh in range(BH):
+            out_bh, state_bh = _deltanet_nki_step_kernel(
+                query_flat[bh],
+                key_flat[bh],
+                value_flat[bh],
+                g_flat[bh],
+                beta_flat[bh],
+                state_flat[bh],
+            )
+            outputs.append(out_bh)
+            states.append(state_bh)
+
+        output = torch.stack(outputs, dim=0)
+        output = output.reshape(B, H, S, v_dim)
+
+        new_state = torch.stack(states, dim=0)
+        new_state = new_state.reshape(B, H, k_dim, v_dim)
+
+        return output, new_state
 
     def _nki_recurrent_forward(self, query, key, value, g, beta):
         """Full-sequence recurrent forward using NKI kernel for context encoding."""
@@ -1218,9 +1273,18 @@ class NeuronGatedDeltaNet(nn.Module):
             else:
                 recurrent_state = self.recurrent_state_buffer[:batch_size].float()
 
-            output, new_state = self._recurrent_step(
-                query, key, value, g, beta, recurrent_state
+            use_nki_decode = (
+                self.use_qwen_deltanet_decode_nki
+                or os.environ.get("USE_NKI_DECODE") == "1"
             )
+            if use_nki_decode and seq_len == 1:
+                output, new_state = self._nki_recurrent_step(
+                    query, key, value, g, beta, recurrent_state
+                )
+            else:
+                output, new_state = self._recurrent_step(
+                    query, key, value, g, beta, recurrent_state
+                )
             new_state_bf16 = new_state.to(self.recurrent_state_buffer.dtype)
             alloc_bs = self.recurrent_state_buffer.shape[0]
             if static_hybrid_cache_active:
@@ -1484,6 +1548,7 @@ class Qwen35InferenceConfig(InferenceConfig):
         kwargs.setdefault("use_hybrid_apc_manager", False)
         kwargs.setdefault("use_qwen_hybrid_chunked_prefill", False)
         kwargs.setdefault("use_qwen_hybrid_chunked_prefill_nki", False)
+        kwargs.setdefault("use_qwen_deltanet_decode_nki", False)
         kwargs.setdefault("gdn_checkpoint_interval", 256)
         kwargs.setdefault("max_gdn_checkpoint_slots", 8)
         kwargs.setdefault("hybrid_apc_layout_version", 1)

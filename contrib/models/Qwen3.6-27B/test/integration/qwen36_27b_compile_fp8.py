@@ -717,6 +717,9 @@ def _build_config(args: argparse.Namespace):
     )
     config_dict["use_qwen_hybrid_chunked_prefill"] = args.enable_vllm_chunked_prefill
     config_dict["use_qwen_hybrid_chunked_prefill_nki"] = args.enable_vllm_chunked_prefill
+    config_dict["use_qwen_deltanet_decode_nki"] = getattr(
+        args, "enable_deltanet_decode_nki", False
+    )
 
     inf_config = Qwen35InferenceConfig(neuron_config=neuron_config, **config_dict)
     return inf_config, modules_to_not_convert
@@ -806,6 +809,14 @@ def main() -> int:
     parser.add_argument("--enable-prefix-caching", action="store_true")
     parser.add_argument("--enable-hybrid-apc", action="store_true")
     parser.add_argument("--enable-vllm-chunked-prefill", action="store_true")
+    parser.add_argument(
+        "--enable-deltanet-decode-nki",
+        action="store_true",
+        help=(
+            "Trace token generation with the stateful one-token DeltaNet NKI "
+            "decode step instead of the default Torch/XLA recurrent step."
+        ),
+    )
     parser.add_argument(
         "--deltanet-cte-backend",
         choices=[
@@ -1017,6 +1028,7 @@ def main() -> int:
                 "enable_prefix_caching": args.enable_prefix_caching,
                 "enable_hybrid_apc": args.enable_hybrid_apc,
                 "enable_vllm_chunked_prefill": args.enable_vllm_chunked_prefill,
+                "enable_deltanet_decode_nki": args.enable_deltanet_decode_nki,
                 "block_size": args.block_size,
                 "pa_min_blocks": _pa_min_blocks(args),
                 "pa_requested_blocks": _pa_requested_blocks(args),

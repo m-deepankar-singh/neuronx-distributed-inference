@@ -97,6 +97,7 @@ def _args(**overrides):
         enable_prefix_caching=True,
         enable_hybrid_apc=True,
         enable_vllm_chunked_prefill=False,
+        enable_deltanet_decode_nki=False,
         deltanet_cte_backend="env",
         disable_on_device_sampling=True,
         output_logits_with_on_device_sampling=False,
@@ -583,6 +584,24 @@ class TestQwen36CompileFp8Config(unittest.TestCase):
         self.assertIsNone(getattr(config.neuron_config, "chunked_prefill_config", None))
         self.assertTrue(config.config_dict["use_qwen_hybrid_chunked_prefill"])
         self.assertTrue(config.config_dict["use_qwen_hybrid_chunked_prefill_nki"])
+
+    def test_deltanet_decode_nki_compile_flag_is_forwarded(self):
+        with patch.object(
+            _COMPILE,
+            "_load_text_config",
+            return_value={"num_hidden_layers": 2},
+        ), patch.dict(
+            sys.modules,
+            {
+                "neuronx_distributed_inference.models.config": _fake_config_module(),
+                "src.modeling_qwen35": _fake_qwen_module(),
+            },
+        ):
+            config, _modules = _COMPILE._build_config(
+                _args(enable_deltanet_decode_nki=True),
+            )
+
+        self.assertTrue(config.config_dict["use_qwen_deltanet_decode_nki"])
 
 
 if __name__ == "__main__":
