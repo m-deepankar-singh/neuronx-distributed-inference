@@ -266,6 +266,16 @@ Required because AWS Neuron 2.30 `attention_segmented_cte` rejects `head_dim > 1
 - **Fix attempted:** Fill active block ids from `slot_mapping // pa_block_size` before NKI dispatch. Aligned with AWS docs on `nisa.dma_copy` dynamic addressing.
 - **Result:** Helped the 8K smoke test but did NOT fix the 256K case. The real bug was §5.9.
 
+### 5.11 Production envelope and fail-closed hardening
+
+- **Finding:** The bound-fix 256K artifact has strong validation evidence, but only for the exact serving envelope: 256K context, `pa_num_blocks=1025`, one `cte3072:pfx262144` bucket, `qwen_segcte256` segment size 512, batch/concurrency 1, backed prefix reads, non-KVP, and non-transposed K cache.
+- **Risk:** Enabling Hybrid APC outside the blessed vLLM launcher could previously fall back to local prompt hashing or synthetic attention block refs.
+- **Fix:** When `use_hybrid_apc_manager=True`, `Qwen35InferenceConfig` now defaults to requiring vLLM metadata and attention block refs, with local hash fallback disabled. Validation-only flows can still opt back into local fallback explicitly.
+- **Risk:** The generic ModelWrapper used absolute Hybrid APC control positions (`args[25]`) for restore-active detection.
+- **Fix:** Restore-active detection now reads from the final five Hybrid APC control args, so future pre-control extras do not silently misbucket CTE.
+- **Risk:** `qwen_segcte256` still exposed KVP and transposed-K branches that were not validated for production and contained NKI 0.3-sensitive HBM output/intermediate patterns.
+- **Fix:** `qwen_segcte256` now raises immediately for `kvp_offset`/KVP or `k_pre_transposed=True`. The validated production path remains the non-KVP, non-transposed K path used by `attention_base.py`.
+
 ---
 
 ## 6. Validation Harness & Measurement Bugs
@@ -390,6 +400,6 @@ Two operational rules added to the repo's [AGENTS.md](../../../../AGENTS.md):
 | 16K | `cte512_768_1536_3072_pfx16k` | **Production-validated** — chat + multi-turn smoke pass |
 | 64K | `pfx32k_64k_pa256` | **Loads + runs**, prefill + chat pass |
 | 128K | `pfx128k_pa512` | **Loads + runs**, prefill + chat pass |
-| 256K | `pfx256k_segcte512stream_qpack4_boundfix_pa1025` | **Loads + runs** — cold `551.97s`, warm refill `10.76s`, real tokens validated |
+| 256K | `pfx256k_segcte512stream_qpack4_boundfix_pa1025` | **Validated only for the exact gated config** — cold `551.97s`, warm refill `10.76s`, real tokens validated |
 
-**Open work before "production-ready":** repeat 256K runs (×3-5), full OpenAI server path test on `pfx256k`, multi-turn chat at long context, soak/load test, branch cleanup and commits.
+**Open work before general "production-ready":** repeat 256K runs (×3-5), full OpenAI server path test on `pfx256k`, multi-turn chat at long context, soak/load test, and fresh validation for any other bucket, KVP, transposed K cache, sliding-window, or multi-seq serving configuration.

@@ -176,6 +176,12 @@ def load_kv_cache(
         k_pre_transposed: If True, K cache is already stored in transposed layout
             (head_dim, block_size) per block, so no transpose is needed during loading.
     """
+    if k_pre_transposed:
+        raise ValueError(
+            "qwen_segcte256 supports only k_pre_transposed=False; "
+            "the transposed-K path has not been production validated"
+        )
+
     num_kv_head = v_cache.shape[1]
     block_size = v_cache.shape[2]
     head_dim = v_cache.shape[3]
@@ -1216,6 +1222,17 @@ def attention_segmented_cte(
         prior_tokens=640:  prior_last_segment_tokens=128, iterations=2 (prior_seg_size=512)
         prior_tokens=1024: prior_last_segment_tokens=512, iterations=2 (prior_seg_size=512)
     """
+    if kvp_offset != None:
+        raise ValueError(
+            "qwen_segcte256 KVP mode is not production validated; use the "
+            "non-KVP segmented CTE path"
+        )
+    if k_pre_transposed:
+        raise ValueError(
+            "qwen_segcte256 supports only k_pre_transposed=False; "
+            "the transposed-K path has not been production validated"
+        )
+
     # Extract dimensions
     if tp_q:
         bs_q, seqlen_q, d = q.shape
@@ -1231,12 +1248,12 @@ def attention_segmented_cte(
     # Get sharding info for multi-core parallelization
     grid_ndim, num_shard, shard_id = get_verified_program_sharding_info("attention_segmented_cte", max_sharding=2)
 
-    # When kvp_offset is set (KV-parallel mode), the KVP kernel already handles LNC sharding
-    # externally. Override to single-core mode and use private nl.hbm to avoid buffer collisions.
+    # KVP is intentionally rejected above. Keep all public outputs in shared_hbm
+    # per NKI 0.3 output-buffer requirements.
     if kvp_offset is not None:
         num_shard = 1
         shard_id = 0
-    result_buffer = nl.hbm if kvp_offset is not None else nl.shared_hbm
+    result_buffer = nl.shared_hbm
 
     # Primary sharding: divide bs_q (batch_size * num_q_heads) evenly across shards
     num_bs_per_shard = bs_q // num_shard

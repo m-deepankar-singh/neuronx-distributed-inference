@@ -506,6 +506,48 @@ def test_prefix_caching_pad_zeros_hybrid_apc_controls_for_dummy_rows():
     assert torch.equal(padded_args[28], torch.tensor([1, 0], dtype=torch.int32))
 
 
+def test_prefix_caching_hybrid_apc_restore_active_uses_control_tail():
+    wrapper = _batched_prefix_cte_wrapper()
+    wrapper.config.use_hybrid_apc_manager = True
+    captured = {}
+
+    def _capture_forward(*args):
+        captured["args"] = args
+        return torch.zeros((2, 1), dtype=torch.float32)
+
+    wrapper._forward = _capture_forward
+    wrapper.is_neuron = lambda: True
+    empty = torch.empty(0)
+    rotary_position_ids = torch.zeros((3, 1, 16), dtype=torch.int32)
+    hybrid_extra_args = (
+        empty,
+        empty,
+        empty,
+        empty,
+        empty,
+        empty,
+        rotary_position_ids,
+        empty,
+        empty,
+        torch.tensor([99], dtype=torch.int32),
+        torch.tensor([3], dtype=torch.int32),
+        torch.tensor([1], dtype=torch.int32),
+        torch.tensor([256], dtype=torch.int32),
+        torch.tensor([4], dtype=torch.int32),
+        torch.tensor([1], dtype=torch.int32),
+    )
+
+    wrapper._forward_with_pad(
+        *_batched_prefix_cte_args(16, query_lens=[16], prefix_lens=[0]),
+        *hybrid_extra_args,
+    )
+
+    padded_args = captured["args"]
+    assert torch.equal(padded_args[-5], torch.tensor([3, 0], dtype=torch.int32))
+    assert torch.equal(padded_args[-4], torch.tensor([1, 0], dtype=torch.int32))
+    assert wrapper._hybrid_apc_restore_active(padded_args)
+
+
 def test_batch_bucketing_target_bucket_selection():
     """Test get_target_bucket selects smallest bucket that fits."""
     config = create_base_config()

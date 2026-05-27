@@ -1159,7 +1159,18 @@ def fused_segmented_attention_impl(
     """
     orig_addr = allocator.get_current_address()
 
-    is_kvp = kvp_offset is not None
+    if kvp_offset != None:
+        raise ValueError(
+            "qwen_segcte256 KVP mode is not production validated; use the "
+            "non-KVP segmented CTE path"
+        )
+    if k_pre_transposed:
+        raise ValueError(
+            "qwen_segcte256 supports only k_pre_transposed=False; "
+            "the transposed-K path has not been production validated"
+        )
+
+    is_kvp = False
     # KVP: compute kvp_offset_active = kvp_offset - prior_tokens_sbuf (for active segment cp_offset)
     # and allocate kvp_offset_prior_sbuf/hbm for per-iteration prior segment cp_offset.
     kvp_offset_active_hbm = None
@@ -1167,11 +1178,11 @@ def fused_segmented_attention_impl(
     kvp_offset_prior_hbm = None
     if is_kvp:
         kvp_offset_active_sbuf = allocator.alloc_sbuf_tensor((1, 1), nl.int32)
-        kvp_offset_active_hbm = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.hbm)
+        kvp_offset_active_hbm = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.shared_hbm)
         nisa.tensor_tensor(dst=kvp_offset_active_sbuf, data1=kvp_offset, data2=prior_tokens_sbuf, op=nl.subtract)
         nisa.dma_copy(dst=kvp_offset_active_hbm, src=kvp_offset_active_sbuf)
         kvp_offset_prior_sbuf = allocator.alloc_sbuf_tensor((1, 1), nl.int32)
-        kvp_offset_prior_hbm = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.hbm)
+        kvp_offset_prior_hbm = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.shared_hbm)
 
     seqlen_q = q_hbm.shape[1] if tp_q else q_hbm.shape[2]
     seqlen_k_active = seqlen_q  # actual tokens, not rounded to tile boundary

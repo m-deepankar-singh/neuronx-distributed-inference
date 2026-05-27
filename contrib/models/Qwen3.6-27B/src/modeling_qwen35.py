@@ -1489,9 +1489,16 @@ class Qwen35InferenceConfig(InferenceConfig):
         kwargs.setdefault("hybrid_apc_layout_version", 1)
         kwargs.setdefault("hybrid_apc_allow_residual_replay", False)
         kwargs.setdefault("hybrid_apc_cache_salt", None)
-        kwargs.setdefault("hybrid_apc_require_vllm_metadata", False)
-        kwargs.setdefault("hybrid_apc_allow_local_hash_fallback", True)
-        kwargs.setdefault("hybrid_apc_require_attention_block_refs", False)
+        use_hybrid_apc_manager = bool(kwargs.get("use_hybrid_apc_manager", False))
+        kwargs.setdefault(
+            "hybrid_apc_require_vllm_metadata", use_hybrid_apc_manager
+        )
+        kwargs.setdefault(
+            "hybrid_apc_allow_local_hash_fallback", not use_hybrid_apc_manager
+        )
+        kwargs.setdefault(
+            "hybrid_apc_require_attention_block_refs", use_hybrid_apc_manager
+        )
         kwargs.setdefault("hybrid_apc_reject_unbacked_attention_hits", True)
         kwargs.setdefault("hybrid_apc_disable_unbacked_prefix_reads", False)
         kwargs.setdefault("hybrid_apc_enable_backed_prefix_reads", False)

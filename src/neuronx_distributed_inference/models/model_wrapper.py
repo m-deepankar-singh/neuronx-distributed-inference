@@ -38,6 +38,11 @@ MEDUSA_MODEL_TAG = "medusa_speculation_model"
 FUSED_SPECULATION_MODEL_TAG = "fused_speculation_model"
 VISION_ENCODER_MODEL_TAG = "vision_encoder_model"
 
+_HYBRID_APC_MIN_EXTRA_PREFIX_ARG_COUNT = 14
+_HYBRID_APC_CONTROL_EXTRA_ARG_COUNT = 5
+_HYBRID_APC_RESTORE_ACTIVE_CONTROL_ARG_INDEX = 1
+_PREFIX_CACHING_EXTRA_ARG_START = 15
+
 
 # Get the modules_to_not_convert from the neuron configs
 def get_modules_to_not_convert(neuron_config: NeuronConfig):
@@ -795,8 +800,43 @@ class ModelWrapper(torch.nn.Module):
         if self.tag not in (CONTEXT_ENCODING_MODEL_TAG, TOKEN_GENERATION_MODEL_TAG):
             return False
         return (
-            extra_prefix_arg_count >= 14
-            and extra_prefix_arg_index >= extra_prefix_arg_count - 5
+            extra_prefix_arg_count >= _HYBRID_APC_MIN_EXTRA_PREFIX_ARG_COUNT
+            and extra_prefix_arg_index
+            >= extra_prefix_arg_count - _HYBRID_APC_CONTROL_EXTRA_ARG_COUNT
+        )
+
+    def _has_hybrid_apc_control_tail(self, args) -> bool:
+        if not getattr(self.config, "use_hybrid_apc_manager", False):
+            return False
+        if self.tag not in (CONTEXT_ENCODING_MODEL_TAG, TOKEN_GENERATION_MODEL_TAG):
+            return False
+        return len(args) >= (
+            _PREFIX_CACHING_EXTRA_ARG_START + _HYBRID_APC_MIN_EXTRA_PREFIX_ARG_COUNT
+        )
+
+    def _hybrid_apc_restore_active_arg(self, args):
+        if self.tag != CONTEXT_ENCODING_MODEL_TAG:
+            return None
+        if not self._has_hybrid_apc_control_tail(args):
+            return None
+
+        control_start = len(args) - _HYBRID_APC_CONTROL_EXTRA_ARG_COUNT
+        restore_active = args[
+            control_start + _HYBRID_APC_RESTORE_ACTIVE_CONTROL_ARG_INDEX
+        ]
+        if not torch.is_tensor(restore_active):
+            raise RuntimeError(
+                "Hybrid APC argument contract mismatch: expected restore-active "
+                "tensor at index 1 of the final 5 Hybrid APC control args"
+            )
+        return restore_active
+
+    def _hybrid_apc_restore_active(self, args) -> bool:
+        restore_active = self._hybrid_apc_restore_active_arg(args)
+        return (
+            restore_active is not None
+            and restore_active.numel() > 0
+            and bool(restore_active.to(torch.bool).any().item())
         )
 
     def _forward(self, *args):
@@ -1057,13 +1097,7 @@ class ModelWrapper(torch.nn.Module):
         else:
             vertical_dim = args[13]
             horizontal_dim = args[14]
-        hybrid_apc_restore_active = (
-            self.tag == CONTEXT_ENCODING_MODEL_TAG
-            and len(args) >= 26
-            and torch.is_tensor(args[25])
-            and args[25].numel() > 0
-            and bool(args[25].to(torch.bool).any().item())
-        )
+        hybrid_apc_restore_active = self._hybrid_apc_restore_active(args)
 
         if not self.tag == CONTEXT_ENCODING_MODEL_TAG:
             if self.tag == TOKEN_GENERATION_MODEL_TAG:
@@ -1229,13 +1263,7 @@ class ModelWrapper(torch.nn.Module):
             return f"{int(flat.min().item())}:{int(flat.max().item())}"
 
         debug_hybrid_apc = os.environ.get("QWEN36_HYBRID_APC_DEBUG") == "1"
-        hybrid_apc_restore_active = (
-            self.tag == CONTEXT_ENCODING_MODEL_TAG
-            and len(args) >= 26
-            and torch.is_tensor(args[25])
-            and args[25].numel() > 0
-            and bool(args[25].to(torch.bool).any().item())
-        )
+        hybrid_apc_restore_active = self._hybrid_apc_restore_active(args)
 
         def _first_or_default(tensor, default_value):
             if tensor.numel() == 0:
