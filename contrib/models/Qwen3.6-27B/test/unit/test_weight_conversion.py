@@ -275,6 +275,42 @@ class TestQProjSplit(unittest.TestCase):
                 torch.all(gate_head == float(h + 100)), f"Head {h} gate values wrong"
             )
 
+    def test_q_proj_scale_deinterleave_correct(self):
+        """FP8 q_proj scale should split the same way as q_proj weight."""
+        config = _make_mini_config(fused_qkv=False)
+        sd = _make_mini_state_dict(config)
+
+        l = 3
+        num_heads = config.num_attention_heads
+        head_dim = config.head_dim
+
+        interleaved_scale = torch.zeros(num_heads * head_dim * 2, 1)
+        for h in range(num_heads):
+            interleaved_scale[
+                h * head_dim * 2 : h * head_dim * 2 + head_dim,
+                :,
+            ] = float(h + 1)
+            interleaved_scale[
+                h * head_dim * 2 + head_dim : (h + 1) * head_dim * 2,
+                :,
+            ] = float(h + 100)
+
+        sd[f"layers.{l}.self_attn.q_proj.scale"] = interleaved_scale
+        result = convert_qwen35_hf_to_neuron_state_dict(sd, config)
+
+        q_scale = result[f"layers.{l}.self_attn.q_proj.scale"]
+        gate_scale = result[f"layers.{l}.self_attn.output_gate_proj.scale"]
+
+        for h in range(num_heads):
+            q_head = q_scale[h * head_dim : (h + 1) * head_dim, :]
+            gate_head = gate_scale[h * head_dim : (h + 1) * head_dim, :]
+            self.assertTrue(
+                torch.all(q_head == float(h + 1)), f"Head {h} query scale wrong"
+            )
+            self.assertTrue(
+                torch.all(gate_head == float(h + 100)), f"Head {h} gate scale wrong"
+            )
+
 
 class TestQKNormRename(unittest.TestCase):
     """Test q_norm -> q_layernorm and k_norm -> k_layernorm renaming."""
@@ -328,6 +364,39 @@ class TestFusedQKV(unittest.TestCase):
                 self.assertNotIn(f"layers.{l}.self_attn.k_proj.weight", result)
                 self.assertNotIn(f"layers.{l}.self_attn.v_proj.weight", result)
 
+    def test_fused_qkv_scale_created_and_individual_scales_removed(self):
+        config = _make_mini_config(fused_qkv=True)
+        sd = _make_mini_state_dict(config)
+        l = 3
+        q_dim = config.num_attention_heads * config.head_dim
+        kv_dim = config.num_key_value_heads * config.head_dim
+
+        sd[f"layers.{l}.self_attn.q_proj.scale"] = torch.arange(
+            q_dim * 2,
+            dtype=torch.float32,
+        ).reshape(q_dim * 2, 1)
+        sd[f"layers.{l}.self_attn.k_proj.scale"] = torch.full((kv_dim, 1), 7.0)
+        sd[f"layers.{l}.self_attn.v_proj.scale"] = torch.full((kv_dim, 1), 9.0)
+
+        result = convert_qwen35_hf_to_neuron_state_dict(sd, config)
+
+        fused_scale_key = f"layers.{l}.self_attn.Wqkv.scale"
+        gate_scale_key = f"layers.{l}.self_attn.output_gate_proj.scale"
+        self.assertIn(fused_scale_key, result)
+        self.assertIn(gate_scale_key, result)
+        self.assertNotIn(f"layers.{l}.self_attn.q_proj.scale", result)
+        self.assertNotIn(f"layers.{l}.self_attn.k_proj.scale", result)
+        self.assertNotIn(f"layers.{l}.self_attn.v_proj.scale", result)
+        self.assertEqual(result[fused_scale_key].shape, (q_dim + 2 * kv_dim, 1))
+        torch.testing.assert_close(
+            result[fused_scale_key][q_dim : q_dim + kv_dim],
+            torch.full((kv_dim, 1), 7.0),
+        )
+        torch.testing.assert_close(
+            result[fused_scale_key][q_dim + kv_dim :],
+            torch.full((kv_dim, 1), 9.0),
+        )
+
 
 class TestDeltaNetPassthrough(unittest.TestCase):
     """Test that DeltaNet layer weights pass through conversion unchanged."""
@@ -376,6 +445,36 @@ class TestDeltaNetPassthrough(unittest.TestCase):
                     torch.allclose(w, torch.full_like(w, 0.87), atol=0.01),
                     f"Layer {l} DeltaNet norm was incorrectly modified",
                 )
+
+    def test_deltanet_qkv_scale_reordered_for_tp(self):
+        config = _make_mini_config(tp_degree=2)
+        sd = _make_mini_state_dict(config)
+        l = 0
+        key_dim = config.linear_num_key_heads * config.linear_key_head_dim
+        value_dim = config.linear_num_value_heads * config.linear_value_head_dim
+        conv_dim = key_dim * 2 + value_dim
+        scale = torch.arange(conv_dim, dtype=torch.float32).reshape(conv_dim, 1)
+        sd[f"layers.{l}.linear_attn.in_proj_qkv.scale"] = scale
+
+        result = convert_qwen35_hf_to_neuron_state_dict(sd, config)
+
+        local_key_dim = key_dim // config.neuron_config.tp_degree
+        local_value_dim = value_dim // config.neuron_config.tp_degree
+        expected = torch.cat(
+            [
+                scale[0:local_key_dim],
+                scale[key_dim : key_dim + local_key_dim],
+                scale[2 * key_dim : 2 * key_dim + local_value_dim],
+                scale[local_key_dim:key_dim],
+                scale[key_dim + local_key_dim : 2 * key_dim],
+                scale[2 * key_dim + local_value_dim : 2 * key_dim + value_dim],
+            ],
+            dim=0,
+        )
+        torch.testing.assert_close(
+            result[f"layers.{l}.linear_attn.in_proj_qkv.scale"],
+            expected,
+        )
 
 
 class TestRankUtil(unittest.TestCase):

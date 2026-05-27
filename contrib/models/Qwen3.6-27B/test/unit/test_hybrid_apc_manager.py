@@ -823,6 +823,44 @@ class TestHybridAPCSchedulerBridge(unittest.TestCase):
         bridge.finish_request("req-warm")
         self.assertEqual(store.lookup(restored_key).refcount, 0)
 
+    def test_bridge_full_input_commit_combines_restored_and_suffix_refs(self):
+        store = _store()
+        allocator = HybridAPCSlotAllocator(num_slots=4)
+        input_ids = torch.arange(256, dtype=torch.int32).unsqueeze(0)
+        hashes = build_cumulative_prefix_hashes(input_ids, block_size=128)
+        restored_key, _checkpoint = _insert(
+            store,
+            128,
+            prefix_hash=hashes[128],
+            attention_block_refs=(7,),
+            gdn_checkpoint_slot=3,
+        )
+        bridge = HybridAPCSchedulerBridge(
+            store=store,
+            slot_allocator=allocator,
+            cache_salt="tenant-a",
+            model_revision="rev-a",
+            require_attention_block_refs=True,
+        )
+
+        prepared = bridge.prepare_request(
+            request_id="req-full-offset-refs",
+            input_dict={
+                "input_ids": input_ids,
+                "attention_mask": torch.ones((1, 256), dtype=torch.int32),
+                "position_ids": torch.arange(256, dtype=torch.int32).unsqueeze(0),
+            },
+            attention_hit_len=128,
+            cumulative_hashes_by_prefix_len=hashes,
+            attention_block_refs_by_prefix_len={128: (9,)},
+        )
+
+        self.assertEqual(prepared.plan.checkpoint_key, restored_key)
+        self.assertEqual(prepared.attention_block_refs, (7, 9))
+        committed = bridge.commit_prefill(prepared)
+        self.assertIsNotNone(committed)
+        self.assertEqual(committed.attention_block_refs, (7, 9))
+
     def test_bridge_misses_without_gdn_checkpoint_and_cancels_reserved_slot(self):
         store = _store()
         allocator = HybridAPCSlotAllocator(num_slots=2)
@@ -1121,6 +1159,47 @@ class TestHybridAPCSchedulerBridge(unittest.TestCase):
         self.assertEqual(committed.attention_block_refs, (8, 9))
         self.assertIsNotNone(store.lookup(prepared.commit_key))
 
+    def test_bridge_suffix_only_commit_combines_restored_and_suffix_refs(self):
+        store = _store()
+        allocator = HybridAPCSlotAllocator(num_slots=3)
+        input_ids = torch.arange(256, dtype=torch.int32).unsqueeze(0)
+        hashes = build_cumulative_prefix_hashes(input_ids, block_size=128)
+        restored_key, _checkpoint = _insert(
+            store,
+            128,
+            prefix_hash=hashes[128],
+            attention_block_refs=(7,),
+            gdn_checkpoint_slot=2,
+        )
+        bridge = HybridAPCSchedulerBridge(
+            store=store,
+            slot_allocator=allocator,
+            cache_salt="tenant-a",
+            model_revision="rev-a",
+            require_attention_block_refs=True,
+        )
+        _SCHEDULER_PATCH.authorize_hybrid_apc_prefix_read(
+            restored_key,
+            request_id="req-suffix-offset-refs",
+        )
+
+        prepared = bridge.prepare_suffix_only_request(
+            request_id="req-suffix-offset-refs",
+            input_dict={
+                "input_ids": torch.arange(128, 256, dtype=torch.int32).unsqueeze(0)
+            },
+            attention_hit_len=128,
+            request_prefix_len=256,
+            cumulative_hashes_by_prefix_len=hashes,
+            attention_block_refs_by_prefix_len={128: (9,)},
+        )
+
+        self.assertIsNotNone(prepared)
+        self.assertEqual(prepared.attention_block_refs, (7, 9))
+        committed = bridge.commit_prefill(prepared)
+        self.assertIsNotNone(committed)
+        self.assertEqual(committed.attention_block_refs, (7, 9))
+
     def test_bridge_suffix_only_restore_rejects_ambiguous_prefix_len(self):
         store = _store()
         _insert(store, 128, prefix_hash="h128-a", gdn_checkpoint_slot=0)
@@ -1394,6 +1473,126 @@ class TestHybridAPCSchedulerBridge(unittest.TestCase):
 
         self.assertEqual(allocator.reserved_slots, ())
         self.assertEqual(allocator.committed_slots, (0,))
+
+    def test_scheduler_metadata_carries_prompt_tokens_only(self):
+        scheduler = types.SimpleNamespace(
+            cache_config=types.SimpleNamespace(block_size=128),
+        )
+        request = types.SimpleNamespace(
+            prompt_token_ids=[11, 12],
+            all_token_ids=[11, 12, 13],
+            num_tokens=3,
+            block_hashes=[],
+        )
+
+        metadata = _SCHEDULER_PATCH._scheduler_request_metadata(
+            scheduler,
+            request,
+            num_computed_tokens=2,
+        )
+
+        self.assertEqual(metadata["request_prefix_len"], 2)
+        self.assertEqual(metadata["full_input_ids"], (11, 12))
+
+    def test_scheduler_metadata_omits_full_tokens_for_cold_chunk(self):
+        scheduler = types.SimpleNamespace(
+            cache_config=types.SimpleNamespace(block_size=128),
+        )
+        request = types.SimpleNamespace(
+            prompt_token_ids=[11, 12, 13],
+            all_token_ids=[11, 12, 13],
+            num_tokens=3,
+            block_hashes=[],
+        )
+
+        metadata = _SCHEDULER_PATCH._scheduler_request_metadata(
+            scheduler,
+            request,
+            num_computed_tokens=0,
+        )
+
+        self.assertNotIn("full_input_ids", metadata)
+
+    def test_scheduler_request_records_preserve_full_input_ids(self):
+        scheduler_output = types.SimpleNamespace(
+            num_scheduled_tokens={"req-a": 16},
+        )
+        setattr(
+            scheduler_output,
+            _SCHEDULER_PATCH._SCHEDULER_OUTPUT_METADATA_ATTR,
+            {
+                "req-a": {
+                    "request_prefix_len": 144,
+                    "full_input_ids": tuple(range(144)),
+                    "vllm_attention_hit_len": 128,
+                },
+            },
+        )
+        model_input = types.SimpleNamespace(request_ids=("req-a",))
+
+        records = _SCHEDULER_PATCH._hybrid_apc_request_records_from_model_input(
+            model_input,
+            scheduler_output,
+        )
+
+        self.assertIsNotNone(records)
+        self.assertEqual(records[0]["full_input_ids"], tuple(range(144)))
+        self.assertEqual(records[0]["active_suffix_len"], 16)
+
+    def test_prepare_with_request_record_full_input_ids_restores_suffix(self):
+        store = _store()
+        allocator = HybridAPCSlotAllocator(num_slots=2)
+        bridge = HybridAPCSchedulerBridge(
+            store=store,
+            slot_allocator=allocator,
+            cache_salt="tenant-a",
+            model_revision="rev-a",
+            require_attention_block_refs=True,
+        )
+        model = types.SimpleNamespace(
+            config=types.SimpleNamespace(
+                use_hybrid_apc_manager=True,
+                hybrid_apc_require_vllm_metadata=True,
+                pad_token_id=0,
+            ),
+            hybrid_apc_bridge=bridge,
+        )
+        full_input_ids = torch.arange(144, dtype=torch.int32).unsqueeze(0)
+        suffix_input_ids = full_input_ids[:, 128:144]
+        hashes = build_cumulative_prefix_hashes(full_input_ids, block_size=128)
+        _insert(
+            store,
+            128,
+            prefix_hash=hashes[128],
+            attention_block_refs=(11,),
+            gdn_checkpoint_slot=0,
+        )
+        original_input = {
+            "input_ids": suffix_input_ids,
+            "hybrid_request_records": (
+                {
+                    "request_id": "req-record-full-ids",
+                    "vllm_attention_hit_len": 128,
+                    "request_prefix_len": 144,
+                    "full_input_ids": tuple(int(item) for item in full_input_ids[0]),
+                    "cumulative_hashes_by_prefix_len": hashes,
+                    "attention_block_refs_by_prefix_len": {128: (11,)},
+                    "active_suffix_len": 16,
+                },
+            ),
+        }
+
+        prepared_inputs = prepare_hybrid_apc_request_for_execution(
+            model,
+            original_input,
+        )
+
+        self.assertTrue(
+            torch.equal(prepared_inputs["input_ids"], suffix_input_ids),
+        )
+        self.assertEqual(prepared_inputs["computed_context_lens"].item(), 128)
+        self.assertEqual(prepared_inputs["full_context_lens"].item(), 144)
+        self.assertEqual(prepared_inputs["num_queries"].item(), 16)
 
     def test_bridge_evicts_lru_checkpoint_before_reserving_when_slots_full(self):
         store = _store(max_checkpoints=2)

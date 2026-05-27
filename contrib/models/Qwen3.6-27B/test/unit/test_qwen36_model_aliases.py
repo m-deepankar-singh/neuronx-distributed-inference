@@ -408,6 +408,41 @@ class TestQwen36ModelAliases(unittest.TestCase):
         self.assertEqual(generated[13].shape, (1, 1))
         self.assertEqual(generated[14].shape, (1, 1))
 
+    def test_prefix_cache_pad_inputs_expands_minimal_runtime_args(self):
+        wrapper = _make_wrapper(
+            self.qwen_module,
+            tag=self.qwen_module.CONTEXT_ENCODING_MODEL_TAG,
+            use_hybrid_apc_manager=False,
+        )
+        wrapper.is_prefix_caching = True
+        wrapper.neuron_config = SimpleNamespace(
+            enable_fused_speculation=False,
+            enable_eagle_speculation=False,
+        )
+
+        padded = wrapper.pad_inputs(*wrapper._base_inputs[0])
+
+        self.assertEqual(len(padded), 24)
+        self.assertEqual(padded[15].numel(), 0)
+        self.assertEqual(padded[21].shape, (3, 1, 1))
+
+    def test_hybrid_prefix_cache_pad_inputs_expands_minimal_runtime_args(self):
+        wrapper = _make_wrapper(
+            self.qwen_module,
+            tag=self.qwen_module.CONTEXT_ENCODING_MODEL_TAG,
+        )
+        wrapper.is_prefix_caching = True
+        wrapper.neuron_config = SimpleNamespace(
+            enable_fused_speculation=False,
+            enable_eagle_speculation=False,
+        )
+
+        padded = wrapper.pad_inputs(*wrapper._base_inputs[0])
+
+        self.assertEqual(len(padded), 29)
+        self.assertEqual(padded[15].numel(), 0)
+        self.assertEqual(padded[24].shape, (1,))
+
     def test_nonlegacy_tkg_trace_args_keep_prefix_and_hybrid_metadata(self):
         wrapper = _make_wrapper(
             self.qwen_module,

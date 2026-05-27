@@ -7,6 +7,9 @@ baseline and changes only weight quantization. Supported modes:
 * ``fp8_mlp_only``: MLP linear weights are converted to FP8 while attention,
   DeltaNet, normalization, embeddings, lm_head, KV cache, and recurrent state
   remain BF16.
+* ``fp8_full``: all supported linear/matmul weights are converted to FP8 while
+  embeddings, normalization, rotary state, DeltaNet recurrent/conv state, KV
+  cache, and lm_head remain BF16 by default.
 * ``bf16_control``: no FP8 conversion; this is the real-token host-logits
   control for separating FP8 conversion failures from serving/logits failures.
 """
@@ -29,6 +32,7 @@ _FP8_ENV_DEFAULTS = {
 }
 
 _WEIGHT_DTYPE_FP8_MLP_ONLY = "fp8_mlp_only"
+_WEIGHT_DTYPE_FP8_FULL = "fp8_full"
 _WEIGHT_DTYPE_BF16_CONTROL = "bf16_control"
 _DELTANET_CTE_BACKEND_ENV = {
     "USE_NKI_FUSED",
@@ -73,6 +77,25 @@ def _parse_int_list(values: list[str] | None) -> list[int] | None:
     return [int(token) for token in tokens]
 
 
+def _parse_bucket_pairs(values: list[str] | None) -> list[tuple[int, int]] | None:
+    if values is None:
+        return None
+    pairs: list[tuple[int, int]] = []
+    for value in values:
+        for token in value.replace(",", " ").split():
+            if ":" in token:
+                active, prefix = token.split(":", 1)
+            elif "x" in token:
+                active, prefix = token.split("x", 1)
+            else:
+                raise ValueError(
+                    "--context-encoding-bucket-pairs entries must use "
+                    f"ACTIVE:PREFIX syntax, got {token!r}"
+                )
+            pairs.append((int(active), int(prefix)))
+    return pairs
+
+
 def _cte_buckets(args: argparse.Namespace) -> list[int]:
     buckets = _parse_int_list(args.cte_buckets) or [args.cte_bucket]
     buckets = sorted(set(buckets))
@@ -109,6 +132,53 @@ def _prefix_buckets(args: argparse.Namespace, cte_buckets: list[int]) -> list[in
             f"Largest prefix bucket {buckets[-1]} exceeds --seq-len {args.seq_len}"
         )
     return buckets
+
+
+def _context_encoding_bucket_pairs(
+    args: argparse.Namespace,
+    cte_buckets: list[int],
+    prefix_buckets: list[int],
+) -> list[list[int]] | None:
+    raw_pairs = _parse_bucket_pairs(args.context_encoding_bucket_pairs)
+    if raw_pairs is None:
+        return None
+
+    cte_bucket_set = set(cte_buckets)
+    prefix_bucket_set = set(prefix_buckets)
+    pairs = set()
+    if not getattr(args, "omit_zero_prefix_pair", False):
+        pairs.update((cte_bucket, 0) for cte_bucket in cte_buckets)
+    for active_tokens, prefix_tokens in raw_pairs:
+        if active_tokens not in cte_bucket_set:
+            raise ValueError(
+                "--context-encoding-bucket-pairs active bucket must be present "
+                f"in --cte-buckets, got {active_tokens} with {cte_buckets}"
+            )
+        if prefix_tokens < 0:
+            raise ValueError(
+                "--context-encoding-bucket-pairs prefix bucket must be "
+                f"non-negative, got {prefix_tokens}"
+            )
+        if prefix_tokens > 0 and prefix_tokens not in prefix_bucket_set:
+            raise ValueError(
+                "--context-encoding-bucket-pairs prefix bucket must be 0 or "
+                f"present in --prefix-buckets, got {prefix_tokens} with "
+                f"{prefix_buckets}"
+            )
+        pairs.add((active_tokens, prefix_tokens))
+
+    prefix_order = {0: 0}
+    prefix_order.update(
+        {prefix_bucket: index + 1 for index, prefix_bucket in enumerate(prefix_buckets)}
+    )
+    cte_order = {cte_bucket: index for index, cte_bucket in enumerate(cte_buckets)}
+    return [
+        [active_tokens, prefix_tokens]
+        for active_tokens, prefix_tokens in sorted(
+            pairs,
+            key=lambda pair: (cte_order[pair[0]], prefix_order[pair[1]]),
+        )
+    ]
 
 
 def _token_generation_buckets(args: argparse.Namespace) -> list[int]:
@@ -274,6 +344,57 @@ def _mlp_only_modules_to_not_convert(num_layers: int) -> list[str]:
     return modules
 
 
+def _full_fp8_modules_to_not_convert(
+    num_layers: int,
+    *,
+    quantize_lm_head: bool,
+) -> list[str]:
+    """Exclude non-linear or sensitive modules from full FP8 conversion.
+
+    This follows the common NVIDIA/vLLM policy: quantize eligible Linear
+    matmuls, keep lm_head in higher precision unless explicitly requested, and
+    keep normalization/cache/state tensors unquantized.
+    """
+    modules = [
+        "embed_tokens",
+        "model.embed_tokens",
+        "norm",
+        "model.norm",
+        "rotary_emb",
+        "model.rotary_emb",
+        "mrope_emb",
+        "model.mrope_emb",
+    ]
+    if not quantize_lm_head:
+        modules.extend(["lm_head", "model.lm_head"])
+
+    for layer_idx in range(num_layers):
+        for prefix in ("layers", "model.layers"):
+            layer_prefix = f"{prefix}.{layer_idx}"
+            modules.extend(
+                [
+                    f"{layer_prefix}.input_layernorm",
+                    f"{layer_prefix}.post_attention_layernorm",
+                    f"{layer_prefix}.self_attn.q_norm",
+                    f"{layer_prefix}.self_attn.k_norm",
+                    f"{layer_prefix}.self_attn.q_layernorm",
+                    f"{layer_prefix}.self_attn.k_layernorm",
+                    f"{layer_prefix}.self_attn.rotary_emb",
+                    f"{layer_prefix}.self_attn.mrope_emb",
+                    f"{layer_prefix}.linear_attn.conv1d",
+                    f"{layer_prefix}.linear_attn.conv1d_weight",
+                    f"{layer_prefix}.linear_attn.A_log",
+                    f"{layer_prefix}.linear_attn.A_log_weight",
+                    f"{layer_prefix}.linear_attn.dt_bias",
+                    f"{layer_prefix}.linear_attn.dt_bias_weight",
+                    f"{layer_prefix}.linear_attn.norm",
+                    f"{layer_prefix}.linear_attn.recurrent_state_buffer",
+                    f"{layer_prefix}.linear_attn.conv_state_buffer",
+                ]
+            )
+    return modules
+
+
 def _quantized_checkpoint_ready(path: Path) -> bool:
     if path.is_file():
         return True
@@ -317,6 +438,35 @@ def _is_mlp_weight(
     return layer_idx not in {0, num_layers - 1}
 
 
+def _is_full_fp8_weight(
+    name: str,
+    *,
+    quantize_lm_head: bool,
+) -> bool:
+    if not name.endswith(".weight"):
+        return False
+    parts = name.split(".")
+    if len(parts) >= 2 and parts[-2] == "lm_head":
+        return quantize_lm_head
+    if len(parts) < 4:
+        return False
+
+    module_name = parts[-3]
+    projection_name = parts[-2]
+    supported_projection_names = {
+        "mlp": {"gate_proj", "up_proj", "down_proj"},
+        "self_attn": {"q_proj", "k_proj", "v_proj", "o_proj"},
+        "linear_attn": {
+            "in_proj_qkv",
+            "in_proj_z",
+            "in_proj_a",
+            "in_proj_b",
+            "out_proj",
+        },
+    }
+    return projection_name in supported_projection_names.get(module_name, set())
+
+
 def _scale_name(weight_name: str) -> str:
     return weight_name[: -len(".weight")] + ".weight_scale"
 
@@ -328,16 +478,18 @@ def _clear_quantized_checkpoint_dir(path: Path) -> None:
             child.unlink()
 
 
-def _save_mlp_only_fp8_state_dict(
+def _save_manual_fp8_state_dict(
     model_path: Path,
     output_path: Path,
     *,
+    weight_dtype: str,
     quantize_edge_mlp_layers: bool,
+    quantize_lm_head: bool,
 ) -> None:
     """Create a sharded FP8 checkpoint directly from HF safetensors.
 
     Loading the HF architecture requires a newer Transformers than the Neuron
-    venv uses internally. For this MLP-only ablation, we do not need model
+    venv uses internally. For these FP8 ablations, we do not need model
     execution: the checkpoint transform is a direct tensor rewrite.
     """
     from safetensors.torch import load_file, save_file  # noqa: WPS433
@@ -367,11 +519,21 @@ def _save_mlp_only_fp8_state_dict(
         shard = load_file(str(model_path / filename))
         output_shard = {}
         for name, tensor in shard.items():
-            if _is_mlp_weight(
-                name,
-                num_layers=num_layers,
-                quantize_edge_mlp_layers=quantize_edge_mlp_layers,
-            ):
+            if weight_dtype == _WEIGHT_DTYPE_FP8_MLP_ONLY:
+                should_quantize = _is_mlp_weight(
+                    name,
+                    num_layers=num_layers,
+                    quantize_edge_mlp_layers=quantize_edge_mlp_layers,
+                )
+            elif weight_dtype == _WEIGHT_DTYPE_FP8_FULL:
+                should_quantize = _is_full_fp8_weight(
+                    name,
+                    quantize_lm_head=quantize_lm_head,
+                )
+            else:
+                raise ValueError(f"Unsupported FP8 weight dtype: {weight_dtype}")
+
+            if should_quantize:
                 weight, scale = quantize_fp8_per_channel(
                     tensor,
                     torch.float8_e4m3fn,
@@ -405,7 +567,7 @@ def _save_mlp_only_fp8_state_dict(
                 sort_keys=True,
             )
 
-    print("MANUAL_FP8_MLP_WEIGHT_COUNT", quantized_count, flush=True)
+    print("MANUAL_FP8_WEIGHT_COUNT", quantized_count, flush=True)
 
 
 def _build_config(args: argparse.Namespace):
@@ -418,7 +580,13 @@ def _build_config(args: argparse.Namespace):
     model_path = Path(args.model_path).expanduser().resolve()
     config_dict = _load_text_config(model_path)
     num_layers = int(config_dict["num_hidden_layers"])
-    modules_to_not_convert = _mlp_only_modules_to_not_convert(num_layers)
+    if args.weight_dtype == _WEIGHT_DTYPE_FP8_FULL:
+        modules_to_not_convert = _full_fp8_modules_to_not_convert(
+            num_layers,
+            quantize_lm_head=args.quantize_lm_head,
+        )
+    else:
+        modules_to_not_convert = _mlp_only_modules_to_not_convert(num_layers)
     if (
         args.weight_dtype == _WEIGHT_DTYPE_FP8_MLP_ONLY
         and not args.quantize_edge_mlp_layers
@@ -429,6 +597,11 @@ def _build_config(args: argparse.Namespace):
     cte_buckets = _cte_buckets(args)
     max_context_length = _max_context_length(args, cte_buckets)
     prefix_buckets = _prefix_buckets(args, cte_buckets)
+    context_encoding_bucket_pairs = _context_encoding_bucket_pairs(
+        args,
+        cte_buckets,
+        prefix_buckets,
+    )
     token_generation_buckets = _token_generation_buckets(args)
     token_generation_batches = _token_generation_batches(args)
     _validate_prefix_buckets_fit_context(args, max_context_length, prefix_buckets)
@@ -454,7 +627,7 @@ def _build_config(args: argparse.Namespace):
         neuron_config_kwargs["async_mode"] = True
     if token_generation_batches is not None:
         neuron_config_kwargs["token_generation_batches"] = token_generation_batches
-    if args.weight_dtype == _WEIGHT_DTYPE_FP8_MLP_ONLY:
+    if args.weight_dtype in (_WEIGHT_DTYPE_FP8_MLP_ONLY, _WEIGHT_DTYPE_FP8_FULL):
         neuron_config_kwargs.update(
             {
                 "quantized": True,
@@ -495,6 +668,21 @@ def _build_config(args: argparse.Namespace):
     if args.enable_prefix_caching or args.enable_hybrid_apc:
         neuron_config_kwargs["is_prefix_caching"] = True
         neuron_config_kwargs["prefix_buckets"] = prefix_buckets
+        if context_encoding_bucket_pairs is not None:
+            neuron_config_kwargs["context_encoding_bucket_pairs"] = (
+                context_encoding_bucket_pairs
+            )
+        if args.prefix_cte_attention_chunk_size is not None:
+            neuron_config_kwargs["prefix_cte_attention_chunk_size"] = (
+                args.prefix_cte_attention_chunk_size
+            )
+        neuron_config_kwargs["prefix_cte_attention_backend"] = (
+            args.prefix_cte_attention_backend
+        )
+        if args.prefix_cte_attention_segment_size is not None:
+            neuron_config_kwargs["prefix_cte_attention_segment_size"] = (
+                args.prefix_cte_attention_segment_size
+            )
     if args.enable_vllm_chunked_prefill:
         # This flag selects Qwen's custom vLLM/Hybrid APC CTE prefix path.
         # Do not set NeuronConfig.chunked_prefill_config here: NxDI's generic
@@ -550,7 +738,11 @@ def main() -> int:
     )
     parser.add_argument(
         "--weight-dtype",
-        choices=[_WEIGHT_DTYPE_FP8_MLP_ONLY, _WEIGHT_DTYPE_BF16_CONTROL],
+        choices=[
+            _WEIGHT_DTYPE_FP8_MLP_ONLY,
+            _WEIGHT_DTYPE_FP8_FULL,
+            _WEIGHT_DTYPE_BF16_CONTROL,
+        ],
         default=_WEIGHT_DTYPE_FP8_MLP_ONLY,
         help=(
             "Weight mode to compile. Use bf16_control for the non-FP8 "
@@ -571,6 +763,25 @@ def main() -> int:
     parser.add_argument("--cte-bucket", type=int, default=512)
     parser.add_argument("--cte-buckets", nargs="+", default=None)
     parser.add_argument("--prefix-buckets", nargs="+", default=None)
+    parser.add_argument(
+        "--context-encoding-bucket-pairs",
+        nargs="+",
+        default=None,
+        help=(
+            "Optional sparse context-encoding 2D buckets as ACTIVE:PREFIX "
+            "pairs. Prefix 0 pairs for every CTE bucket are added "
+            "automatically unless --omit-zero-prefix-pair is set."
+        ),
+    )
+    parser.add_argument(
+        "--omit-zero-prefix-pair",
+        action="store_true",
+        help=(
+            "Do not automatically add ACTIVE:0 dense context-encoding pairs. "
+            "Use for long-prefix fallback artifacts that should not load the "
+            "dense cold-prefill NEFF."
+        ),
+    )
     parser.add_argument("--token-generation-buckets", nargs="+", default=None)
     parser.add_argument("--token-generation-batches", nargs="+", default=None)
     parser.add_argument("--block-size", type=int, default=256)
@@ -624,6 +835,38 @@ def main() -> int:
     )
     parser.add_argument("--kernel-q-tile-size", type=int, default=128)
     parser.add_argument("--kernel-kv-tile-size", type=int, default=1024)
+    parser.add_argument(
+        "--prefix-cte-attention-chunk-size",
+        type=int,
+        default=None,
+        help=(
+            "When set, long prefix-cache CTE attention streams cached prefix KV "
+            "in chunks of this size using online softmax instead of compiling "
+            "one monolithic [active_tokens, prefix_tokens] attention score "
+            "tensor. This is intended for 256K prefix buckets that exceed "
+            "Neuron HBM scratchpad when compiled as a single prefix-attention "
+            "shape."
+        ),
+    )
+    parser.add_argument(
+        "--prefix-cte-attention-backend",
+        choices=["attention_cte", "segmented_cte"],
+        default="attention_cte",
+        help=(
+            "Prefix-cache CTE attention backend. attention_cte is the existing "
+            "flat-prior kernel. segmented_cte uses the Neuron 2.30 block-KV "
+            "segmented CTE kernel to stream long cached prefixes by segment."
+        ),
+    )
+    parser.add_argument(
+        "--prefix-cte-attention-segment-size",
+        type=int,
+        default=None,
+        help=(
+            "Prior segment size for --prefix-cte-attention-backend segmented_cte. "
+            "Must be positive and divisible by --block-size."
+        ),
+    )
     parser.add_argument("--disable-static-hybrid-cache", action="store_true")
     parser.add_argument("--gdn-checkpoint-interval", type=int, default=256)
     parser.add_argument("--max-gdn-checkpoint-slots", type=int, default=8)
@@ -645,15 +888,32 @@ def main() -> int:
             "edge-layer policy."
         ),
     )
+    parser.add_argument(
+        "--quantize-lm-head",
+        action="store_true",
+        help=(
+            "Also quantize lm_head in fp8_full mode. Default keeps lm_head BF16, "
+            "matching common NVIDIA/vLLM FP8 policy."
+        ),
+    )
     parser.add_argument("--force-quantize", action="store_true")
     parser.add_argument("--quantize-only", action="store_true")
     parser.add_argument("--load-after-compile", action="store_true")
     args = parser.parse_args()
     if (
-        args.weight_dtype == _WEIGHT_DTYPE_FP8_MLP_ONLY
+        args.weight_dtype in (_WEIGHT_DTYPE_FP8_MLP_ONLY, _WEIGHT_DTYPE_FP8_FULL)
         and not args.quantized_checkpoints_path
     ):
-        parser.error("--quantized-checkpoints-path is required for fp8_mlp_only")
+        parser.error("--quantized-checkpoints-path is required for FP8 weight modes")
+    if args.quantize_lm_head and args.weight_dtype != _WEIGHT_DTYPE_FP8_FULL:
+        parser.error("--quantize-lm-head is only valid with --weight-dtype fp8_full")
+    if (
+        args.context_encoding_bucket_pairs is not None
+        and not (args.enable_prefix_caching or args.enable_hybrid_apc)
+    ):
+        parser.error(
+            "--context-encoding-bucket-pairs requires prefix caching or Hybrid APC"
+        )
     if args.max_num_seqs <= 0:
         parser.error("--max-num-seqs must be positive")
     if args.ctx_batch_size <= 0:
@@ -662,6 +922,23 @@ def main() -> int:
         parser.error("--pa-headroom-blocks must be non-negative")
     if args.pa_num_blocks is not None and args.pa_headroom_blocks:
         parser.error("--pa-headroom-blocks cannot be combined with --pa-num-blocks")
+    if (
+        args.prefix_cte_attention_chunk_size is not None
+        and args.prefix_cte_attention_chunk_size <= 0
+    ):
+        parser.error("--prefix-cte-attention-chunk-size must be positive")
+    if (
+        args.prefix_cte_attention_segment_size is not None
+        and args.prefix_cte_attention_segment_size <= 0
+    ):
+        parser.error("--prefix-cte-attention-segment-size must be positive")
+    if (
+        args.prefix_cte_attention_segment_size is not None
+        and args.prefix_cte_attention_segment_size % args.block_size != 0
+    ):
+        parser.error(
+            "--prefix-cte-attention-segment-size must be divisible by --block-size"
+        )
     if args.enable_hybrid_apc and args.gdn_checkpoint_interval != args.block_size:
         parser.error(
             "--enable-hybrid-apc v0 requires --gdn-checkpoint-interval to "
@@ -673,7 +950,7 @@ def main() -> int:
     sys.path.insert(0, str(repo / "src"))
     sys.path.insert(0, str(repo))
     sys.path.insert(0, str(contrib_model_dir))
-    if args.weight_dtype == _WEIGHT_DTYPE_FP8_MLP_ONLY:
+    if args.weight_dtype in (_WEIGHT_DTYPE_FP8_MLP_ONLY, _WEIGHT_DTYPE_FP8_FULL):
         _ensure_fp8_environment()
     _configure_deltanet_cte_backend(args.deltanet_cte_backend)
 
@@ -696,8 +973,11 @@ def main() -> int:
     print("WEIGHT_DTYPE_MODE", args.weight_dtype, flush=True)
     if args.weight_dtype == _WEIGHT_DTYPE_FP8_MLP_ONLY:
         print("FP8_MODE mlp_only", flush=True)
+    elif args.weight_dtype == _WEIGHT_DTYPE_FP8_FULL:
+        print("FP8_MODE full", flush=True)
     else:
         print("FP8_MODE disabled_bf16_control", flush=True)
+    print("QUANTIZE_LM_HEAD", bool(args.quantize_lm_head), flush=True)
     print("MODEL_PATH", str(model_path), flush=True)
     print("COMPILED_PATH", str(compiled_path), flush=True)
     print("BASE_COMPILE_WORK_DIR", str(base_compile_work_dir), flush=True)
@@ -717,6 +997,16 @@ def main() -> int:
                 "max_context_length": _max_context_length(args, _cte_buckets(args)),
                 "context_encoding_buckets": _cte_buckets(args),
                 "prefix_buckets": _prefix_buckets(args, _cte_buckets(args)),
+                "prefix_cte_attention_backend": args.prefix_cte_attention_backend,
+                "prefix_cte_attention_segment_size": (
+                    args.prefix_cte_attention_segment_size
+                ),
+                "prefix_cte_attention_chunk_size": args.prefix_cte_attention_chunk_size,
+                "context_encoding_bucket_pairs": _context_encoding_bucket_pairs(
+                    args,
+                    _cte_buckets(args),
+                    _prefix_buckets(args, _cte_buckets(args)),
+                ),
                 "token_generation_buckets": _token_generation_buckets(args),
                 "token_generation_batches": _token_generation_batches(args),
                 "max_num_seqs": args.max_num_seqs,
@@ -748,11 +1038,13 @@ def main() -> int:
     if args.weight_dtype == _WEIGHT_DTYPE_BF16_CONTROL:
         print("QUANTIZE_SKIP bf16_control", flush=True)
     elif args.force_quantize or not _quantized_checkpoint_ready(quantized_path):
-        print("QUANTIZE_START manual_mlp_only", flush=True)
-        _save_mlp_only_fp8_state_dict(
+        print("QUANTIZE_START manual_fp8", flush=True)
+        _save_manual_fp8_state_dict(
             model_path,
             quantized_path,
+            weight_dtype=args.weight_dtype,
             quantize_edge_mlp_layers=args.quantize_edge_mlp_layers,
+            quantize_lm_head=args.quantize_lm_head,
         )
         print("QUANTIZE_DONE", flush=True)
     else:

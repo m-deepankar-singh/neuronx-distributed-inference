@@ -1879,6 +1879,12 @@ class NeuronQwen35Attention(NeuronAttentionBase):
         past_key_value,
         position_ids,
         attention_mask=None,
+        kv_mgr=None,
+        idx=None,
+        active_block_table=None,
+        computed_context_lens=None,
+        scatter_index=None,
+        kvcache_buffer=None,
     ):
         """Exact chunked CTE over full-cache or selected-prefix KV.
 
@@ -1891,6 +1897,38 @@ class NeuronQwen35Attention(NeuronAttentionBase):
         k_cache, v_cache = past_key_value
         B, q_heads, q_len, head_dim = Q.shape
         kv_heads = K.shape[1]
+        use_segmented_prefix_cte = (
+            getattr(
+                self.config.neuron_config,
+                "prefix_cte_attention_backend",
+                "attention_cte",
+            )
+            == "segmented_cte"
+            and active_block_table is not None
+            and getattr(active_block_table, "ndim", 0) > 1
+        )
+        if use_segmented_prefix_cte:
+            if kv_mgr is None or idx is None or scatter_index is None:
+                raise ValueError(
+                    "segmented_cte Qwen prefix prefill requires kv_mgr, idx, "
+                    "and scatter_index so active KV can be written to block KV."
+                )
+            updated_kv = kv_mgr.update_kv_by_layer_id(
+                idx=idx,
+                kv_per_layer=(K.to(self.torch_dtype), V.to(self.torch_dtype)),
+                scatter_index=scatter_index,
+                kvcache_buffer=kvcache_buffer,
+            )
+            attn_output, _flash_strategy = self.perform_prefix_prefill_segmented_cte(
+                Q,
+                q_len,
+                B,
+                updated_kv,
+                active_block_table,
+                computed_context_lens,
+            )
+            return attn_output.permute(0, 1, 3, 2).contiguous(), updated_kv
+
         if k_cache.shape[0] != B:
             # The cache is allocated at kv_cache_batch_size, while CTE can trace a
             # smaller active batch. Keep attention reshapes on the active batch.
@@ -1983,7 +2021,7 @@ class NeuronQwen35Attention(NeuronAttentionBase):
             causal_mask = causal_mask & key_valid_mask
         attn_weights = attn_weights.masked_fill(~causal_mask, -65504.0)
         attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(Q.dtype)
-        return torch.matmul(attn_weights, V_full)
+        return torch.matmul(attn_weights, V_full), None
 
     def forward(
         self,
@@ -2037,13 +2075,19 @@ class NeuronQwen35Attention(NeuronAttentionBase):
                 Q, K, V, q_len, bsz, attention_mask
             )
         elif qwen_chunked_prefill_active:
-            attn_output = self.perform_qwen_chunked_prefill(
+            attn_output, present_key_value = self.perform_qwen_chunked_prefill(
                 Q,
                 K,
                 V,
                 past_key_value,
                 position_ids,
                 attention_mask,
+                kv_mgr=kwargs.get("kv_mgr"),
+                idx=kwargs.get("idx"),
+                active_block_table=kwargs.get("active_block_table"),
+                computed_context_lens=kwargs.get("computed_context_lens"),
+                scatter_index=kwargs.get("scatter_index"),
+                kvcache_buffer=kwargs.get("kvcache_buffer"),
             )
         else:
             # Token generation (decode)
@@ -2068,7 +2112,9 @@ class NeuronQwen35Attention(NeuronAttentionBase):
         # (prevents mixed-precision dynamic-update-slice in neuronx-cc)
         K = K.to(self.torch_dtype)
         V = V.to(self.torch_dtype)
-        past_key_value = (K, V)
+        if "present_key_value" not in locals() or present_key_value is None:
+            present_key_value = (K, V)
+        past_key_value = present_key_value
         return attn_output, past_key_value, cos_cache, sin_cache
 
 
@@ -2605,14 +2651,31 @@ class QwenHybridBlockKVCacheManager(BlockKVCacheManager):
 
     def get_cache(self, active_block_table=None, kvcache_buffer=None, **kwargs):
         past_key_values = []
+        use_segmented_prefix_cte = (
+            kwargs.get("is_for_context_encoding", False)
+            and getattr(
+                self.neuron_config,
+                "prefix_cte_attention_backend",
+                "attention_cte",
+            )
+            == "segmented_cte"
+            and active_block_table is not None
+            and getattr(active_block_table, "ndim", 0) > 1
+        )
         for idx in range(len(self.past_key_values) // 2):
             if self._is_attention_layer(idx):
-                k_cache, v_cache = self.get_kv_by_layer_id(
-                    idx,
-                    active_block_table,
-                    kvcache_buffer=kvcache_buffer,
-                    **kwargs,
-                )
+                if use_segmented_prefix_cte:
+                    k_cache, v_cache = self.get_raw_kv_by_layer_id(
+                        idx,
+                        kvcache_buffer=kvcache_buffer,
+                    )
+                else:
+                    k_cache, v_cache = self.get_kv_by_layer_id(
+                        idx,
+                        active_block_table,
+                        kvcache_buffer=kvcache_buffer,
+                        **kwargs,
+                    )
             else:
                 k_cache, v_cache = self._fetch_cache(
                     idx,
@@ -2620,6 +2683,19 @@ class QwenHybridBlockKVCacheManager(BlockKVCacheManager):
                 )
             past_key_values.append([k_cache, v_cache])
         return past_key_values
+
+    def _is_raw_block_kv_pair(self, kv_per_layer: List[torch.Tensor]) -> bool:
+        if len(kv_per_layer) != 2:
+            return False
+        k_cache, v_cache = kv_per_layer
+        return (
+            k_cache.ndim == 4
+            and v_cache.ndim == 4
+            and k_cache.shape[0] == self.pa_num_blocks + self._NUM_EXTRA_RESERVED_BLOCK
+            and v_cache.shape[0] == self.pa_num_blocks + self._NUM_EXTRA_RESERVED_BLOCK
+            and k_cache.shape[1] == self.pa_block_size
+            and v_cache.shape[1] == self.pa_block_size
+        )
 
     def update_cache(
         self,
@@ -2630,7 +2706,11 @@ class QwenHybridBlockKVCacheManager(BlockKVCacheManager):
     ):
         updated_kv_cache = []
         for idx, kv_per_layer in enumerate(new_key_values):
-            if self._is_attention_layer(idx):
+            if self._is_attention_layer(idx) and self._is_raw_block_kv_pair(
+                kv_per_layer
+            ):
+                k_cache, v_cache = kv_per_layer
+            elif self._is_attention_layer(idx):
                 k_cache, v_cache = self.update_kv_by_layer_id(
                     idx=idx,
                     kv_per_layer=kv_per_layer,
@@ -2944,6 +3024,46 @@ def _use_expanded_hybrid_args_for_tag(config, tag: str) -> bool:
     if tag == TOKEN_GENERATION_MODEL_TAG:
         return True
     return False
+
+
+def _qwen36_shape_entry_arg_count(entry) -> int | None:
+    if isinstance(entry, str):
+        try:
+            entry = json.loads(entry)
+        except Exception:
+            return None
+    if isinstance(entry, (list, tuple)):
+        return len(entry)
+    return None
+
+
+def _qwen36_compiled_arg_count(model_wrapper) -> int | None:
+    counts = []
+    for owner in (
+        model_wrapper,
+        getattr(model_wrapper, "model", None),
+        getattr(getattr(model_wrapper, "model", None), "nxd_model", None),
+    ):
+        shape_map = getattr(owner, "input_shape_map", None)
+        keys = getattr(shape_map, "keys", None)
+        if not callable(keys):
+            continue
+        try:
+            iterable = keys()
+        except Exception:
+            continue
+        for entry in iterable:
+            count = _qwen36_shape_entry_arg_count(entry)
+            if count is not None:
+                counts.append(count)
+    return max(counts) if counts else None
+
+
+def _use_expanded_hybrid_args_for_wrapper(model_wrapper, tag: str) -> bool:
+    compiled_arg_count = _qwen36_compiled_arg_count(model_wrapper)
+    if compiled_arg_count is not None:
+        return compiled_arg_count >= 29
+    return _use_expanded_hybrid_args_for_tag(model_wrapper.config, tag)
 
 
 def _qwen36_expected_arg_count(config, tag: str) -> int:
@@ -4450,6 +4570,26 @@ class NeuronQwen35Model(NeuronBaseModel):
 # ============================================================
 
 
+_QWEN36_FP8_DTYPES = tuple(
+    dtype
+    for dtype in (
+        getattr(torch, "float8_e4m3fn", None),
+        getattr(torch, "float8_e5m2", None),
+    )
+    if dtype is not None
+)
+
+
+def _qwen36_cat(tensors, dim=0):
+    """Concatenate tensors, including FP8 tensors on builds without FP8 cat."""
+    if tensors and tensors[0].dtype in _QWEN36_FP8_DTYPES:
+        return torch.cat(
+            [tensor.contiguous().view(torch.int8) for tensor in tensors],
+            dim=dim,
+        ).view(tensors[0].dtype)
+    return torch.cat(tensors, dim=dim)
+
+
 def convert_qwen35_hf_to_neuron_state_dict(neuron_state_dict, config):
     """Convert HF Qwen3.5/3.6-27B weights to NxDI format.
 
@@ -4471,6 +4611,11 @@ def convert_qwen35_hf_to_neuron_state_dict(neuron_state_dict, config):
     Dense MLP (all layers):
       HF: layers.X.mlp.{gate_proj, up_proj, down_proj}.weight
       NxDI: layers.X.mlp.{gate_proj, up_proj, down_proj}.weight (same names)
+
+    FP8 quantized checkpoints carry one scale tensor next to each quantized
+    weight. NxDI normalizes saved ``.weight_scale`` keys to model ``.scale``
+    keys before this converter runs, so any Qwen-specific weight split/reorder/
+    fusion below must apply the same transformation to the matching scale.
     """
     # Add rank_util
     neuron_state_dict["rank_util.rank"] = torch.arange(
@@ -4527,7 +4672,7 @@ def convert_qwen35_hf_to_neuron_state_dict(neuron_state_dict, config):
                     rank * local_v_heads : (rank + 1) * local_v_heads
                 ].reshape(-1, qkv_weight.shape[1])
             )
-        return torch.cat(blocks, dim=0).contiguous()
+        return _qwen36_cat(blocks, dim=0).contiguous()
 
     def _reorder_deltanet_qkv_channels_for_tp(channel_tensor: torch.Tensor) -> torch.Tensor:
         """Repack a first-dimension Q/K/V channel tensor into TP rank blocks."""
@@ -4550,7 +4695,25 @@ def convert_qwen35_hf_to_neuron_state_dict(neuron_state_dict, config):
             blocks.append(
                 v_tensor[rank * local_value_dim : (rank + 1) * local_value_dim]
             )
-        return torch.cat(blocks, dim=0).contiguous()
+        return _qwen36_cat(blocks, dim=0).contiguous()
+
+    def _split_interleaved_q_proj_tensor(
+        tensor: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Split interleaved Qwen q_proj tensor into query and output gate."""
+        num_heads = config.num_attention_heads
+        head_dim = config.head_dim
+        trailing_shape = tensor.shape[1:]
+        tensor = tensor.reshape(num_heads, head_dim * 2, *trailing_shape)
+        query_tensor = tensor[:, :head_dim, ...].reshape(
+            num_heads * head_dim,
+            *trailing_shape,
+        )
+        gate_tensor = tensor[:, head_dim:, ...].reshape(
+            num_heads * head_dim,
+            *trailing_shape,
+        )
+        return query_tensor.contiguous(), gate_tensor.contiguous()
 
     # CRITICAL: Convert (1+weight) RMSNorm weights to standard RMSNorm weights.
     # Qwen3.5 uses RMSNorm with `output = norm(x) * (1 + weight)` where weight
@@ -4587,14 +4750,26 @@ def convert_qwen35_hf_to_neuron_state_dict(neuron_state_dict, config):
                 neuron_state_dict[qkv_key] = _reorder_deltanet_qkv_for_tp(
                     neuron_state_dict[qkv_key]
                 )
+            qkv_scale_key = f"layers.{l}.linear_attn.in_proj_qkv.scale"
+            if qkv_scale_key in neuron_state_dict and config.neuron_config.tp_degree > 1:
+                neuron_state_dict[qkv_scale_key] = _reorder_deltanet_qkv_channels_for_tp(
+                    neuron_state_dict[qkv_scale_key]
+                )
 
             conv_key = f"layers.{l}.linear_attn.conv1d.weight"
             conv_weight_key = f"layers.{l}.linear_attn.conv1d_weight.weight"
+            conv_scale_key = f"layers.{l}.linear_attn.conv1d.scale"
+            conv_weight_scale_key = f"layers.{l}.linear_attn.conv1d_weight.scale"
             if conv_key in neuron_state_dict:
                 conv_weight = neuron_state_dict.pop(conv_key)
                 if config.neuron_config.tp_degree > 1:
                     conv_weight = _reorder_deltanet_qkv_channels_for_tp(conv_weight)
                 neuron_state_dict[conv_weight_key] = conv_weight.squeeze(1).contiguous()
+            if conv_scale_key in neuron_state_dict:
+                conv_scale = neuron_state_dict.pop(conv_scale_key)
+                if config.neuron_config.tp_degree > 1:
+                    conv_scale = _reorder_deltanet_qkv_channels_for_tp(conv_scale)
+                neuron_state_dict[conv_weight_scale_key] = conv_scale.contiguous()
 
             for vector_name in ("A_log", "dt_bias"):
                 vector_key = f"layers.{l}.linear_attn.{vector_name}"
@@ -4627,24 +4802,24 @@ def convert_qwen35_hf_to_neuron_state_dict(neuron_state_dict, config):
             # q_proj is doubled: (12288, 5120) = (num_heads * head_dim * 2, hidden)
             # INTERLEAVED: [head0_query(256) | head0_gate(256) | head1_query(256) | ...]
             q_proj_key = f"layers.{l}.self_attn.q_proj.weight"
+            q_proj_scale_key = f"layers.{l}.self_attn.q_proj.scale"
             if q_proj_key in neuron_state_dict:
                 q_proj_w = neuron_state_dict.pop(q_proj_key)
-                num_heads = config.num_attention_heads  # 24
-                head_dim = config.head_dim  # 256
-                q_proj_w = q_proj_w.reshape(num_heads, head_dim * 2, config.hidden_size)
-                query_w = q_proj_w[:, :head_dim, :]  # (24, 256, 5120)
-                gate_w = q_proj_w[:, head_dim:, :]  # (24, 256, 5120)
-                query_w = query_w.reshape(
-                    num_heads * head_dim, config.hidden_size
-                )  # (6144, 5120)
-                gate_w = gate_w.reshape(
-                    num_heads * head_dim, config.hidden_size
-                )  # (6144, 5120)
+                query_w, gate_w = _split_interleaved_q_proj_tensor(q_proj_w)
 
                 neuron_state_dict[q_proj_key] = query_w
                 neuron_state_dict[f"layers.{l}.self_attn.output_gate_proj.weight"] = (
                     gate_w
                 )
+                if q_proj_scale_key in neuron_state_dict:
+                    q_proj_scale = neuron_state_dict.pop(q_proj_scale_key)
+                    query_scale, gate_scale = _split_interleaved_q_proj_tensor(
+                        q_proj_scale
+                    )
+                    neuron_state_dict[q_proj_scale_key] = query_scale
+                    neuron_state_dict[f"layers.{l}.self_attn.output_gate_proj.scale"] = (
+                        gate_scale
+                    )
 
             # Fuse QKV
             if config.neuron_config.fused_qkv:
@@ -4652,13 +4827,38 @@ def convert_qwen35_hf_to_neuron_state_dict(neuron_state_dict, config):
                 k_key = f"layers.{l}.self_attn.k_proj.weight"
                 v_key = f"layers.{l}.self_attn.v_proj.weight"
                 if q_key in neuron_state_dict:
-                    neuron_state_dict[f"layers.{l}.self_attn.Wqkv.weight"] = torch.cat(
+                    neuron_state_dict[f"layers.{l}.self_attn.Wqkv.weight"] = _qwen36_cat(
                         [
                             neuron_state_dict[q_key],
                             neuron_state_dict[k_key],
                             neuron_state_dict[v_key],
                         ]
                     )
+                    q_scale_key = f"layers.{l}.self_attn.q_proj.scale"
+                    k_scale_key = f"layers.{l}.self_attn.k_proj.scale"
+                    v_scale_key = f"layers.{l}.self_attn.v_proj.scale"
+                    scale_keys = [q_scale_key, k_scale_key, v_scale_key]
+                    scale_keys_present = [key in neuron_state_dict for key in scale_keys]
+                    if any(scale_keys_present):
+                        if not all(scale_keys_present):
+                            missing = [
+                                key
+                                for key, present in zip(scale_keys, scale_keys_present)
+                                if not present
+                            ]
+                            raise ValueError(
+                                f"Missing FP8 fused-QKV scale tensor(s): {missing}"
+                            )
+                        neuron_state_dict[f"layers.{l}.self_attn.Wqkv.scale"] = _qwen36_cat(
+                            [
+                                neuron_state_dict[q_scale_key],
+                                neuron_state_dict[k_scale_key],
+                                neuron_state_dict[v_scale_key],
+                            ]
+                        )
+                        del neuron_state_dict[q_scale_key]
+                        del neuron_state_dict[k_scale_key]
+                        del neuron_state_dict[v_scale_key]
                     del neuron_state_dict[q_key]
                     del neuron_state_dict[k_key]
                     del neuron_state_dict[v_key]
@@ -5017,6 +5217,25 @@ class Qwen35ModelWrapper(ModelWrapper):
     def pad_inputs(self, *args, pad_type="first_fit"):
         """Override to pad mrope_position_ids and vision inputs to bucket size."""
         args = self._prepare_hybrid_apc_pad_inputs(args)
+        if (
+            self.tag in (CONTEXT_ENCODING_MODEL_TAG, TOKEN_GENERATION_MODEL_TAG)
+            and len(args) == 15
+            and self.is_prefix_caching
+            and not getattr(
+                getattr(self, "neuron_config", None),
+                "enable_fused_speculation",
+                False,
+            )
+            and not getattr(
+                getattr(self, "neuron_config", None),
+                "enable_eagle_speculation",
+                False,
+            )
+        ):
+            args = tuple(
+                _normalize_qwen36_prefix_args(args)
+                + [_empty_qwen36_arg(), _empty_qwen36_arg(), _empty_qwen36_arg()]
+            )
         orig_mrope = args[21] if len(args) >= 22 else None
         orig_vis_emb = args[22] if len(args) >= 23 else None
         orig_vis_mask = args[23] if len(args) >= 24 else None

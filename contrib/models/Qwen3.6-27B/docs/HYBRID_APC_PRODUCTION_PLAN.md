@@ -144,6 +144,145 @@ still required before production:
   Trainium execution of cold/warm exactness harness on compiled artifacts
   production cancellation/eviction callback wiring from vLLM events
   long-context HBM sweep to choose checkpoint slot count and commit policy
+  larger production prefix buckets for 32K+ warm reuse
+```
+
+Production prefix-bucket plan:
+
+```text
+Previous 256K FP8 artifact was correct only up to its compiled prefix bucket
+coverage:
+  prefix_buckets = [256, 512, 1024, 2048, 4096, 8192, 16384]
+
+32K/64K/128K contexts can still run on the 256K artifact, but warm APC reuse
+above 16K must replay the remainder. This is correct but slower.
+
+Production strategy is one sparse 2D CTE/prefix artifact, not two separate
+models:
+
+  dense fast path:
+    CTE buckets    = [512, 768, 1536, 3072]
+    prefix buckets = [0, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768]
+
+  long-prefix fallback:
+    [CTE 3072, prefix 65536]
+    [CTE 3072, prefix 131072]
+    [CTE 3072, prefix 262144]
+
+The dense fast path is for common short/normal cached prefixes and preserves
+prefill speed by avoiding unnecessary padding to 3072. The sparse long-prefix
+fallback enables 64K/128K/256K prefix reuse without compiling the full CTE x
+prefix Cartesian grid that triggers Neuron compiler tensorization failures.
+```
+
+Implementation notes:
+
+```text
+compile flag:
+  --context-encoding-bucket-pairs ACTIVE:PREFIX ...
+
+runtime behavior:
+  Prefix-caching CTE bucket selection now chooses the smallest actual compiled
+  [active_tokens, prefix_tokens] pair that can serve the request, instead of
+  assuming every CTE bucket exists for every prefix bucket.
+
+serving behavior:
+  vLLM override config forwards context_encoding_bucket_pairs so loaded
+  artifacts use the same sparse matrix they were compiled with.
+```
+
+## Fixed Bug Record: Neuron Tensorization Failure on Full 2D Prefix Grid
+
+```text
+What failed:
+  256K FP8 full Hybrid APC compile with pfx256k and multiple CTE buckets.
+
+How we got there:
+  Host: ubuntu@16.26.202.235
+  Script:
+    tmp_compile_qwen256k_fp8_full_cte512_768_1536_3072_pfx256k_hostlogits.sh
+  Key args:
+    --seq-len 262144
+    --max-context-length 262144
+    --cte-buckets 512 768 1536 3072
+    --prefix-buckets 256 512 1024 2048 4096 8192 16384 32768 65536 131072 262144
+    --weight-dtype fp8_full
+    --enable-prefix-caching
+    --enable-hybrid-apc
+    --enable-vllm-chunked-prefill
+
+Exact error:
+  NCC_ITIN902 TensorInitialization error:
+    AffineIV doesn't appear in params or loopnest
+
+Failed generated buckets:
+  bk9  = [CTE 512, prefix 65536]
+  bk10 = [CTE 512, prefix 131072]
+  bk21 = [CTE 768, prefix 65536]
+  bk22 = [CTE 768, prefix 131072]
+
+Root cause hypothesis:
+  HLO generation succeeds, then neuronx-cc fails inside internal tensorization
+  for some small-active-token / large-prefix-token 2D prefix-cache shapes. This
+  is a Neuron compiler lowering bug, not disk pressure and not an invalid model
+  config.
+
+Fix:
+  Stop compiling the full Cartesian product. Add explicit sparse
+  context_encoding_bucket_pairs and route runtime selection over the actual
+  compiled pair list.
+
+Mitigation shape set:
+  Dense fast path only up to 32K prefix for all production CTE buckets:
+    [512/768/1536/3072] x [0..32768]
+  Long-prefix fallback only on largest CTE bucket:
+    [3072, 65536], [3072, 131072], [3072, 262144]
+
+Verification:
+  Unit/config tests passed:
+    38 local contrib tests passed
+    86 remote Neuron-env focused tests passed
+  Sparse high-prefix probe compile started with 7 CTE HLOs and no NCC_ITIN902
+  observed at HLO generation time; final NEFF compile result must still be
+  checked before treating the sparse artifact as production-ready.
+```
+
+## Fixed Bug Record: Invalid Fast Warm Prefill
+
+This bug is useful to showcase because the first symptom looked like excellent
+performance, but the warm path was not executing the same model semantics as
+cold prefill.
+
+```text
+Symptom:
+  Warm prefill appeared sub-second, but cold/warm generated token IDs diverged.
+  Cold also leaked placeholder token IDs:
+    cold = [0, 0, 3817, 7840]
+    warm = [3817, 7840, 9197, 4590]
+
+Root causes:
+  1. vLLM attention prefix hits could exceed the deepest GDN checkpoint that
+     was actually available.
+  2. Scheduler metadata used request token counts that could include generated
+     tokens instead of prompt-only tokens.
+  3. Incomplete chunked-prefill rows in the host-logits path could append
+     placeholder sampled IDs as real generated tokens.
+
+Fix:
+  1. Cap vLLM prefix-cache reads to the largest GDN-backed checkpoint.
+  2. Build Hybrid APC metadata from prompt-only length/token IDs.
+  3. Mask incomplete chunked-prefill sampled IDs to -1 before vLLM appends
+     them to request state.
+
+Evidence after fix:
+  8K cold/warm exactness passed:
+    cold = [3817, 7840, 9197, 4590]
+    warm = [3817, 7840, 9197, 4590]
+    repeat_exact = true
+
+  Warm prefill became slower than the invalid shortcut, but correct:
+    cold ~= 15.26s
+    warm ~= 4.95s
 ```
 
 ### Sprint 2: Dynamic CTE Buckets

@@ -84,6 +84,29 @@ class TestPrefixCachingBucketSelection:
         assert computed_prefill_bucket == prefill_bucket
         assert computed_prefix_bucket == prefix_bucket
 
+    def test_cte_sparse_grid_selects_next_compiled_pair(self):
+        model_wrapper = self.setup_context_encoding()
+        model_wrapper.neuron_config.buckets = [
+            [512, 0],
+            [512, 32768],
+            [1536, 0],
+            [1536, 65536],
+            [3072, 0],
+            [3072, 131072],
+        ]
+        inp_args = (
+            [torch.tensor(0)] * 13
+            + [torch.tensor([[512]])]
+            + [torch.tensor([[131072]])]
+        )
+
+        computed_prefill_bucket, computed_prefix_bucket = (
+            model_wrapper.get_target_2d_bucket_for_prefix_caching(*inp_args)
+        )
+
+        assert computed_prefill_bucket == 3072
+        assert computed_prefix_bucket == 131072
+
     @pytest.mark.parametrize(
         "inp_args, prefix_bucket",
         [
@@ -355,6 +378,49 @@ class TestPrefixCachingBucketSelection:
         )
         assert torch.equal(
             padded_args[14], torch.tensor([[prefix_len]], dtype=torch.int32)
+        )
+
+    def test_segmented_cte_padding_fills_active_block_table_from_slots(self):
+        model_wrapper = self.setup_context_encoding()
+        model_wrapper.neuron_config.buckets = [
+            [256, 1024],
+        ]
+        model_wrapper.neuron_config.pa_block_size = 256
+        model_wrapper.neuron_config.max_context_length = 1024
+        model_wrapper.neuron_config.prefix_cte_attention_backend = "segmented_cte"
+
+        suffix_len = 48
+        prefix_len = 768
+        inp_args = [
+            torch.arange(suffix_len, dtype=torch.int32).reshape(1, suffix_len),
+            torch.ones((1, suffix_len), dtype=torch.int32),
+            torch.arange(
+                prefix_len,
+                prefix_len + suffix_len,
+                dtype=torch.int32,
+            ).reshape(1, suffix_len),
+            torch.zeros((1,), dtype=torch.int32),
+            torch.ones((1, 3), dtype=torch.float32),
+            torch.empty(0),
+            torch.zeros((1,), dtype=torch.int32),
+            torch.empty(0),
+            torch.empty(0),
+            torch.empty(0),
+            torch.empty(0),
+            torch.arange(1024, 1024 + suffix_len, dtype=torch.int32).reshape(
+                1,
+                suffix_len,
+            ),
+            torch.tensor([[0, 1, 2, -1]], dtype=torch.int32),
+            torch.tensor([[suffix_len]], dtype=torch.int32),
+            torch.tensor([[prefix_len]], dtype=torch.int32),
+        ]
+
+        padded_args = model_wrapper._pad_prefix_caching_inputs(*inp_args)
+
+        assert torch.equal(
+            padded_args[12],
+            torch.tensor([[0, 1, 2, 4]], dtype=torch.int32),
         )
 
     def test_cte_batched_hybrid_apc_restore_padding_uses_full_attention_mask(self):

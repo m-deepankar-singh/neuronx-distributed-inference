@@ -912,6 +912,25 @@ class HybridAPCSchedulerBridge:
                         (),
                     )
                 )
+                if not attention_block_refs and plan.checkpoint_key is not None:
+                    suffix_refs = tuple(
+                        int(ref)
+                        for ref in attention_block_refs_by_prefix_len.get(
+                            plan.suffix_len,
+                            (),
+                        )
+                    )
+                    checkpoint = self.store.lookup(plan.checkpoint_key)
+                    if (
+                        checkpoint is not None
+                        and suffix_refs
+                        and commit_prefix_len
+                        == checkpoint.prefix_len + plan.suffix_len
+                    ):
+                        attention_block_refs = (
+                            tuple(int(ref) for ref in checkpoint.attention_block_refs)
+                            + suffix_refs
+                        )
             if not attention_block_refs and not self.require_attention_block_refs:
                 attention_block_refs = tuple(
                     range(commit_prefix_len // self.store.block_size)
@@ -1091,6 +1110,22 @@ class HybridAPCSchedulerBridge:
                         (),
                     )
                 )
+                if not attention_block_refs:
+                    suffix_refs = tuple(
+                        int(ref)
+                        for ref in attention_block_refs_by_prefix_len.get(
+                            suffix_len,
+                            (),
+                        )
+                    )
+                    if (
+                        suffix_refs
+                        and commit_prefix_len == checkpoint.prefix_len + suffix_len
+                    ):
+                        attention_block_refs = (
+                            tuple(int(ref) for ref in checkpoint.attention_block_refs)
+                            + suffix_refs
+                        )
             if not attention_block_refs and not self.require_attention_block_refs:
                 attention_block_refs = tuple(
                     range(commit_prefix_len // self.store.block_size)

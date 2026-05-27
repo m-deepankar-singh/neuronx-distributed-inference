@@ -26,6 +26,30 @@ def _parse_buckets(raw: str) -> list[int]:
     return [int(item) for item in raw.replace(",", " ").split() if item]
 
 
+def _parse_bucket_pairs(raw: str | None) -> list[list[int]] | None:
+    if not raw:
+        return None
+    pairs: set[tuple[int, int]] = set()
+    for token in raw.replace(",", " ").split():
+        if ":" in token:
+            active, prefix = token.split(":", 1)
+        elif "x" in token:
+            active, prefix = token.split("x", 1)
+        else:
+            raise ValueError(
+                "context-encoding bucket pairs must use ACTIVE:PREFIX syntax, "
+                f"got {token!r}"
+            )
+        active_tokens, prefix_tokens = int(active), int(prefix)
+        if active_tokens <= 0 or prefix_tokens < 0:
+            raise ValueError(
+                "context-encoding bucket pairs must use positive active tokens "
+                f"and non-negative prefix tokens, got {token!r}"
+            )
+        pairs.add((active_tokens, prefix_tokens))
+    return [[active, prefix] for active, prefix in sorted(pairs)]
+
+
 def _validated_int_list(
     values: list[int],
     *,
@@ -51,6 +75,33 @@ def _artifact_neuron_config(compiled_artifacts: Path) -> dict[str, Any]:
         config = json.load(handle)
     nested = config.get("neuron_config")
     return nested if isinstance(nested, dict) else config
+
+
+def _runtime_pa_override(
+    args: argparse.Namespace,
+    artifact_config: dict[str, Any],
+    *,
+    max_model_len: int,
+) -> int:
+    """Return vLLM's user-intended block count, excluding its null block."""
+
+    block_size = int(args.block_size)
+    max_num_seqs = int(args.max_num_seqs or 1)
+    min_usable_blocks = ((max_model_len + block_size - 1) // block_size) * max_num_seqs
+    if args.pa_num_blocks is not None:
+        return max(1, int(args.pa_num_blocks))
+
+    artifact_blocks = int(artifact_config.get("pa_num_blocks") or 0)
+    if artifact_blocks <= 0:
+        return max(1, min_usable_blocks)
+
+    uses_block_kv = bool(
+        artifact_config.get("is_block_kv_layout")
+        or artifact_config.get("is_prefix_caching")
+    )
+    if uses_block_kv and artifact_blocks > min_usable_blocks:
+        return artifact_blocks - 1
+    return artifact_blocks
 
 
 def _resolve_config_defaults(args: argparse.Namespace) -> dict[str, Any]:
@@ -101,19 +152,27 @@ def _resolve_config_defaults(args: argparse.Namespace) -> dict[str, Any]:
             name="token generation batches",
             maximum=args.max_num_seqs,
         )
-    pa_num_blocks = int(
-        args.pa_num_blocks
-        if args.pa_num_blocks is not None
-        else artifact_config.get("pa_num_blocks") or 0
+    pa_num_blocks = _runtime_pa_override(
+        args,
+        artifact_config,
+        max_model_len=max_model_len,
     )
-    if pa_num_blocks <= 0:
-        block_size = int(args.block_size)
-        pa_num_blocks = (max_model_len + block_size - 1) // block_size
+    context_encoding_bucket_pairs = _parse_bucket_pairs(
+        args.context_encoding_bucket_pairs
+    )
+    if context_encoding_bucket_pairs is None:
+        artifact_pairs = artifact_config.get("context_encoding_bucket_pairs") or []
+        if artifact_pairs:
+            context_encoding_bucket_pairs = [
+                [int(active), int(prefix)]
+                for active, prefix in artifact_pairs
+            ]
     return {
         "artifact_config": artifact_config,
         "seq_len": seq_len,
         "max_model_len": max_model_len,
         "cte_buckets": cte_buckets,
+        "context_encoding_bucket_pairs": context_encoding_bucket_pairs,
         "token_generation_buckets": token_generation_buckets,
         "token_generation_batches": token_generation_batches,
         "pa_num_blocks": pa_num_blocks,
@@ -170,6 +229,10 @@ def _additional_config(args: argparse.Namespace) -> dict[str, Any]:
     }
     if args.async_mode:
         override_neuron_config["async_mode"] = True
+    if args.resolved_context_encoding_bucket_pairs is not None:
+        override_neuron_config["context_encoding_bucket_pairs"] = (
+            args.resolved_context_encoding_bucket_pairs
+        )
     if args.resolved_token_generation_batches is not None:
         override_neuron_config["token_generation_batches"] = (
             args.resolved_token_generation_batches
@@ -269,6 +332,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-model-len", type=int)
     parser.add_argument("--seq-len", type=int)
     parser.add_argument("--cte-buckets")
+    parser.add_argument("--context-encoding-bucket-pairs")
     parser.add_argument("--token-generation-buckets")
     parser.add_argument("--token-generation-batches")
     parser.add_argument("--async-mode", action="store_true")
@@ -297,6 +361,9 @@ def main() -> int:
     args.seq_len = resolved["seq_len"]
     args.max_model_len = resolved["max_model_len"]
     args.resolved_cte_buckets = resolved["cte_buckets"]
+    args.resolved_context_encoding_bucket_pairs = resolved[
+        "context_encoding_bucket_pairs"
+    ]
     args.resolved_token_generation_buckets = resolved["token_generation_buckets"]
     args.resolved_token_generation_batches = resolved["token_generation_batches"]
     args.pa_num_blocks = resolved["pa_num_blocks"]
@@ -313,6 +380,7 @@ def main() -> int:
         "pa_num_blocks": args.pa_num_blocks,
         "cte_buckets": args.resolved_cte_buckets,
         "token_generation_buckets": args.resolved_token_generation_buckets,
+        "context_encoding_bucket_pairs": args.resolved_context_encoding_bucket_pairs,
         "token_generation_batches": args.resolved_token_generation_batches,
         "async_mode": args.async_mode,
         "max_model_len": args.max_model_len,

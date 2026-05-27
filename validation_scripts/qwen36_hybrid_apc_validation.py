@@ -104,6 +104,13 @@ def _align_additional_config_to_compiled_artifact(
     aligned["max_prompt_length"] = compiled_max_prompt
     override = dict(aligned.get("override_neuron_config") or {})
     override["max_context_length"] = compiled_max_prompt
+    if (
+        "context_encoding_bucket_pairs" not in override
+        and compiled_config.get("context_encoding_bucket_pairs") is not None
+    ):
+        override["context_encoding_bucket_pairs"] = compiled_config[
+            "context_encoding_bucket_pairs"
+        ]
     aligned["override_neuron_config"] = override
     return aligned
 
@@ -203,6 +210,9 @@ def _runner_args(args, *, enable_hybrid_apc: bool):
     return SimpleNamespace(
         cte_bucket=args.cte_bucket,
         cte_buckets=args.cte_buckets,
+        context_encoding_bucket_pairs=getattr(
+            args, "context_encoding_bucket_pairs", None
+        ),
         cte_bucket_profile=args.cte_bucket_profile,
         seq_len=args.seq_len,
         tensor_parallel_size=args.tensor_parallel_size,
@@ -245,6 +255,11 @@ def _runner_args(args, *, enable_hybrid_apc: bool):
             args,
             "hybrid_apc_enable_backed_prefix_reads",
             False,
+        ),
+        hybrid_apc_prefill_chunk_tokens=getattr(
+            args,
+            "hybrid_apc_prefill_chunk_tokens",
+            0,
         ),
         hybrid_apc_max_backed_prefix_read_len=getattr(
             args,
@@ -1327,6 +1342,7 @@ def parse_args():
         exact.add_argument("--seq-len", type=int, default=2048)
         exact.add_argument("--cte-bucket", type=int, default=512)
         exact.add_argument("--cte-buckets", nargs="+", default=["256,512"])
+        exact.add_argument("--context-encoding-bucket-pairs", nargs="+", default=None)
         exact.add_argument(
             "--align-prompts-to-cte-buckets",
             action="store_true",

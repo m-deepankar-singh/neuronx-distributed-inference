@@ -37,6 +37,31 @@ def _parse_int_list(values: list[str] | None) -> list[int] | None:
     return [int(token) for token in tokens]
 
 
+def _parse_bucket_pairs(values: list[str] | None) -> list[list[int]] | None:
+    if values is None:
+        return None
+    pairs: set[tuple[int, int]] = set()
+    for value in values:
+        for token in value.replace(",", " ").split():
+            if ":" in token:
+                active, prefix = token.split(":", 1)
+            elif "x" in token:
+                active, prefix = token.split("x", 1)
+            else:
+                raise ValueError(
+                    "--context-encoding-bucket-pairs entries must use "
+                    f"ACTIVE:PREFIX syntax, got {token!r}"
+                )
+            active_tokens, prefix_tokens = int(active), int(prefix)
+            if active_tokens <= 0 or prefix_tokens < 0:
+                raise ValueError(
+                    "Context-encoding bucket pairs must be positive active "
+                    f"tokens and non-negative prefix tokens, got {token!r}"
+                )
+            pairs.add((active_tokens, prefix_tokens))
+    return [[active, prefix] for active, prefix in sorted(pairs)]
+
+
 def _cte_buckets(args: argparse.Namespace) -> list[int]:
     profile_buckets = {
         "short": [128, 256, 512, 1024],
@@ -123,15 +148,19 @@ def _max_num_batched_tokens(args: argparse.Namespace, cte_buckets: list[int]) ->
         return max_cte_bucket
 
     checkpoint_interval = int(args.gdn_checkpoint_interval)
-    if checkpoint_interval not in cte_buckets:
+    checkpoint_aligned_buckets = [
+        bucket for bucket in cte_buckets if bucket % checkpoint_interval == 0
+    ]
+    if not checkpoint_aligned_buckets:
         raise ValueError(
-            "--enable-hybrid-apc with vLLM chunked prefill requires a CTE bucket "
-            f"equal to --gdn-checkpoint-interval ({checkpoint_interval}) so "
-            "scheduler chunks can commit backed GDN prefix checkpoints"
+            "--enable-hybrid-apc with vLLM chunked prefill requires at least "
+            "one compiled CTE bucket that is a multiple of "
+            f"--gdn-checkpoint-interval ({checkpoint_interval}); got "
+            f"{cte_buckets}"
         )
     requested_chunk = int(getattr(args, "hybrid_apc_prefill_chunk_tokens", 0) or 0)
     if requested_chunk <= 0:
-        return min(max_cte_bucket, checkpoint_interval)
+        return min(max_cte_bucket, checkpoint_aligned_buckets[0])
     if requested_chunk % checkpoint_interval != 0:
         raise ValueError(
             "--hybrid-apc-prefill-chunk-tokens must be a multiple of "
@@ -160,6 +189,9 @@ def _override_config(args: argparse.Namespace) -> dict:
     _validate_hybrid_apc_args(args)
     cte_buckets = _cte_buckets(args)
     max_cte_bucket = cte_buckets[-1]
+    context_encoding_bucket_pairs = _parse_bucket_pairs(
+        args.context_encoding_bucket_pairs
+    )
     token_generation_buckets = _token_generation_buckets(args)
     token_generation_batches = _token_generation_batches(args)
     recurrent_cache_dtype = (
@@ -194,8 +226,13 @@ def _override_config(args: argparse.Namespace) -> dict:
         neuron_config["is_block_kv_layout"] = True
         neuron_config["pa_block_size"] = args.block_size
         neuron_config["pa_num_blocks"] = _pa_num_blocks(args)
-    if args.enable_prefix_caching or args.enable_hybrid_apc:
+    uses_prefix_cte_contract = context_encoding_bucket_pairs is not None
+    if args.enable_prefix_caching or args.enable_hybrid_apc or uses_prefix_cte_contract:
         neuron_config["is_prefix_caching"] = True
+        if context_encoding_bucket_pairs is not None:
+            neuron_config["context_encoding_bucket_pairs"] = (
+                context_encoding_bucket_pairs
+            )
     if args.enable_vllm_chunked_prefill:
         neuron_config.update(
             {
@@ -351,6 +388,7 @@ def main() -> int:
     parser.add_argument("--seq-len", type=int, default=512)
     parser.add_argument("--cte-bucket", type=int, default=512)
     parser.add_argument("--cte-buckets", nargs="+", default=None)
+    parser.add_argument("--context-encoding-bucket-pairs", nargs="+", default=None)
     parser.add_argument(
         "--cte-bucket-profile",
         choices=("single", "short", "general", "long", "262k"),

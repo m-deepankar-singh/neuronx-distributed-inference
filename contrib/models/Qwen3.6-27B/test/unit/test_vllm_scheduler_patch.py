@@ -22,6 +22,15 @@ _SCHEDULER_MODULE = "vllm.v1.core.sched.scheduler"
 _VLLM_NEURON_RUNNER_MODULE = "vllm_neuron.worker.neuronx_distributed_model_runner"
 
 
+@dataclass(frozen=True)
+class FullAttentionSpec:
+    block_size: int
+    num_kv_heads: int
+    head_size: int
+    dtype: str
+    sliding_window: int | None = None
+
+
 def _load_patch_module():
     spec = importlib.util.spec_from_file_location("qwen36_scheduler_patch", _PATCH_PATH)
     module = importlib.util.module_from_spec(spec)
@@ -325,7 +334,7 @@ class TestQwen36HybridAPCSchedulerPatch(unittest.TestCase):
             )
         )
 
-    def test_partial_gdn_coverage_keeps_prefix_read_disabled(self):
+    def test_partial_gdn_coverage_caps_prefix_read_to_backed_checkpoint(self):
         scheduler = _scheduler(
             block_size=2,
             enable_backed_prefix_reads=True,
@@ -365,11 +374,19 @@ class TestQwen36HybridAPCSchedulerPatch(unittest.TestCase):
                 self.patch.backed_gdn_prefix_hit_len(scheduler, request),
                 4,
             )
-            self.assertTrue(
+            self.assertFalse(
                 self.patch.should_disable_unbacked_prefix_reads(scheduler, request)
             )
 
-        self.assertIsNone(
+        self.assertEqual(
+            getattr(request, self.patch._MAX_PREFIX_CACHE_HIT_LEN_ATTR),
+            4,
+        )
+        self.assertEqual(
+            getattr(request, self.patch._MAX_PREFIX_CACHE_BLOCKS_ATTR),
+            2,
+        )
+        self.assertIsNotNone(
             self.patch.pop_hybrid_apc_authorized_prefix_key(
                 prefix_len=4,
                 request_id="req-partial",
@@ -382,7 +399,7 @@ class TestQwen36HybridAPCSchedulerPatch(unittest.TestCase):
             )
         )
 
-    def test_max_backed_prefix_cap_keeps_larger_prefix_read_disabled(self):
+    def test_max_backed_prefix_cap_selects_largest_backed_prefix_under_cap(self):
         scheduler = _scheduler(
             block_size=2,
             enable_backed_prefix_reads=True,
@@ -420,13 +437,21 @@ class TestQwen36HybridAPCSchedulerPatch(unittest.TestCase):
             os.environ,
             {"QWEN36_HYBRID_APC_DISABLE_UNBACKED_PREFIX_READS": "1"},
         ):
-            self.assertTrue(
+            self.assertFalse(
                 self.patch.should_disable_unbacked_prefix_reads(scheduler, request)
             )
 
-        self.assertIsNone(
+        self.assertEqual(
+            getattr(request, self.patch._MAX_PREFIX_CACHE_HIT_LEN_ATTR),
+            2,
+        )
+        self.assertEqual(
+            getattr(request, self.patch._MAX_PREFIX_CACHE_BLOCKS_ATTR),
+            1,
+        )
+        self.assertIsNotNone(
             self.patch.pop_hybrid_apc_authorized_prefix_key(
-                prefix_len=4,
+                prefix_len=2,
                 request_id="req-capped",
                 cache_salt=None,
                 model_revision="rev-a",
@@ -436,6 +461,28 @@ class TestQwen36HybridAPCSchedulerPatch(unittest.TestCase):
                 conv_dtype="bfloat16",
             )
         )
+
+    def test_kv_cache_manager_caps_prefix_hash_lookup_to_backed_len(self):
+        seen_hashes = []
+
+        class FakeKVCacheManager:
+            empty_kv_cache_blocks = "empty"
+
+            def get_computed_blocks(self, request):
+                seen_hashes.append(tuple(request.block_hashes))
+                return "blocks", len(request.block_hashes) * 2
+
+        fake_module = types.SimpleNamespace(KVCacheManager=FakeKVCacheManager)
+        self.assertTrue(self.patch._patch_kv_cache_manager_module(fake_module))
+
+        request = types.SimpleNamespace(block_hashes=[b"a", b"b", b"c", b"d"])
+        setattr(request, self.patch._MAX_PREFIX_CACHE_BLOCKS_ATTR, 2)
+
+        result = FakeKVCacheManager().get_computed_blocks(request)
+
+        self.assertEqual(result, ("blocks", 4))
+        self.assertEqual(seen_hashes, [(b"a", b"b")])
+        self.assertEqual(request.block_hashes, [b"a", b"b", b"c", b"d"])
 
     def test_additional_config_allows_prefix_read_when_hf_config_is_stale(self):
         scheduler = _scheduler(
@@ -698,6 +745,100 @@ class TestQwen36HybridAPCSchedulerPatch(unittest.TestCase):
         self.assertEqual(metadata["req-a"]["request_prefix_len"], 4)
         self.assertEqual(metadata["req-a"]["vllm_attention_hit_len"], 0)
         self.assertEqual(metadata["req-a"]["active_suffix_len"], 4)
+
+    def test_scheduler_output_caps_cached_request_prefix_to_current_chunk(self):
+        class FakeScheduler:
+            def __init__(self):
+                base = _scheduler(block_size=256)
+                self.vllm_config = base.vllm_config
+                self.cache_config = base.cache_config
+                self.scheduler_config = base.scheduler_config
+                self.requests = {
+                    "req-a": types.SimpleNamespace(
+                        request_id="req-a",
+                        prompt_token_ids=list(range(8193)),
+                        all_token_ids=list(range(8193)),
+                        block_hashes=[f"hash-{idx}".encode() for idx in range(32)],
+                        num_tokens=8193,
+                        cache_salt=None,
+                    )
+                }
+
+            def add_request(self, request):
+                del request
+
+            def schedule(self):
+                return types.SimpleNamespace(
+                    scheduled_new_reqs=[],
+                    scheduled_cached_reqs=types.SimpleNamespace(
+                        req_ids=["req-a"],
+                        new_block_ids=[(list(range(13, 25)),)],
+                        num_computed_tokens=[3072],
+                    ),
+                    num_scheduled_tokens={"req-a": 3072},
+                )
+
+        self.patch.patch_scheduler_class(FakeScheduler)
+        scheduler_output = FakeScheduler().schedule()
+        metadata = getattr(
+            scheduler_output,
+            "_qwen36_hybrid_apc_metadata_by_request_id",
+        )["req-a"]
+
+        self.assertEqual(metadata["request_prefix_len"], 6144)
+        self.assertEqual(metadata["vllm_attention_hit_len"], 3072)
+        self.assertEqual(metadata["active_suffix_len"], 3072)
+        self.assertEqual(len(metadata["full_input_ids"]), 6144)
+        self.assertIn(6144, metadata["cumulative_hashes_by_prefix_len"])
+        self.assertNotIn(8192, metadata["cumulative_hashes_by_prefix_len"])
+
+    def test_scheduler_output_excludes_generated_tokens_from_prompt_metadata(self):
+        class FakeScheduler:
+            def __init__(self):
+                base = _scheduler(block_size=256)
+                self.vllm_config = base.vllm_config
+                self.cache_config = base.cache_config
+                self.scheduler_config = base.scheduler_config
+                self.requests = {
+                    "req-a": types.SimpleNamespace(
+                        request_id="req-a",
+                        prompt_token_ids=list(range(8192)),
+                        all_token_ids=list(range(8194)),
+                        block_hashes=[f"hash-{idx}".encode() for idx in range(32)],
+                        num_prompt_tokens=8192,
+                        num_tokens=8194,
+                        cache_salt=None,
+                    )
+                }
+
+            def add_request(self, request):
+                del request
+
+            def schedule(self):
+                return types.SimpleNamespace(
+                    scheduled_new_reqs=[],
+                    scheduled_cached_reqs=types.SimpleNamespace(
+                        req_ids=["req-a"],
+                        new_block_ids=[(list(range(25, 33)),)],
+                        num_computed_tokens=[6144],
+                    ),
+                    num_scheduled_tokens={"req-a": 2050},
+                )
+
+        self.patch.patch_scheduler_class(FakeScheduler)
+        scheduler_output = FakeScheduler().schedule()
+        metadata = getattr(
+            scheduler_output,
+            "_qwen36_hybrid_apc_metadata_by_request_id",
+        )["req-a"]
+
+        self.assertEqual(metadata["request_prefix_len"], 8192)
+        self.assertEqual(metadata["vllm_attention_hit_len"], 6144)
+        self.assertEqual(metadata["active_suffix_len"], 2050)
+        self.assertEqual(len(metadata["full_input_ids"]), 8192)
+        self.assertEqual(metadata["full_input_ids"][-1], 8191)
+        self.assertIn(8192, metadata["cumulative_hashes_by_prefix_len"])
+        self.assertNotIn(8448, metadata["cumulative_hashes_by_prefix_len"])
 
     def test_scheduler_output_authorizes_backed_cached_continuation(self):
         class FakeScheduler:
@@ -1854,6 +1995,255 @@ class TestQwen36HybridAPCSchedulerPatch(unittest.TestCase):
 
         torch.testing.assert_close(sampled, torch.tensor([11, -1], dtype=torch.int32))
         torch.testing.assert_close(hidden_states, torch.tensor([11, 22], dtype=torch.int32))
+
+    def test_runner_patch_masks_sampled_tokens_for_incomplete_prefill_rows(self):
+        class FakeRunner:
+            def __init__(self):
+                self.model = types.SimpleNamespace(model=types.SimpleNamespace())
+
+            def _execute_model_for_text(self, model_input, intermediate_tensors=None):
+                del intermediate_tensors
+                return model_input
+
+            def _sample_on_device(self, hidden_states, model_input):
+                del hidden_states, model_input
+                return types.SimpleNamespace(
+                    sampled_token_ids=torch.tensor([[0], [33]], dtype=torch.int32),
+                    logprobs_tensors=None,
+                )
+
+        self.patch.patch_neuron_model_runner_class(FakeRunner)
+        runner = FakeRunner()
+        sampled = runner._sample_on_device(
+            torch.tensor([[11], [22]], dtype=torch.int32),
+            types.SimpleNamespace(
+                prefill_completion_state=torch.tensor([False, True]),
+            ),
+        )
+
+        torch.testing.assert_close(
+            sampled.sampled_token_ids,
+            torch.tensor([[-1], [33]], dtype=torch.int32),
+        )
+
+    def test_runner_patch_masks_cpu_sampled_tokens_before_output_update(self):
+        class FakeRunner:
+            def __init__(self):
+                self.model = types.SimpleNamespace(model=types.SimpleNamespace())
+
+            def _execute_model_for_text(self, model_input, intermediate_tensors=None):
+                del intermediate_tensors
+                return model_input
+
+            def _generate_model_runner_output(self, sampler_output):
+                return sampler_output.sampled_token_ids
+
+        self.patch.patch_neuron_model_runner_class(FakeRunner)
+        runner = FakeRunner()
+        setattr(
+            runner,
+            self.patch._RUNNER_PREFILL_STATE_FOR_OUTPUT_ATTR,
+            torch.tensor([False, True]),
+        )
+        sampled = runner._generate_model_runner_output(
+            types.SimpleNamespace(
+                sampled_token_ids=torch.tensor([[0], [44]], dtype=torch.int32),
+                logprobs_tensors=None,
+            )
+        )
+
+        torch.testing.assert_close(
+            sampled,
+            torch.tensor([[-1], [44]], dtype=torch.int32),
+        )
+
+    def test_runner_patch_captures_prefill_state_during_sample_tokens(self):
+        seen = []
+
+        class FakeRunner:
+            def __init__(self):
+                self.model = types.SimpleNamespace(model=types.SimpleNamespace())
+                self._cached_logits = torch.tensor([[1.0]])
+                self._cached_model_input = types.SimpleNamespace(
+                    prefill_completion_state=torch.tensor([False, True]),
+                )
+
+            def _execute_model_for_text(self, model_input, intermediate_tensors=None):
+                del intermediate_tensors
+                return model_input
+
+            def sample_tokens(self, grammar_output):
+                del grammar_output
+                seen.append(
+                    getattr(
+                        self,
+                        self_patch._RUNNER_PREFILL_STATE_FOR_OUTPUT_ATTR,
+                    )
+                )
+                return "sampled"
+
+        self_patch = self.patch
+        self.patch.patch_neuron_model_runner_class(FakeRunner)
+        runner = FakeRunner()
+        result = runner.sample_tokens(None)
+
+        self.assertEqual(result, "sampled")
+        torch.testing.assert_close(seen[0], torch.tensor([False, True]))
+        self.assertFalse(
+            hasattr(runner, self.patch._RUNNER_PREFILL_STATE_FOR_OUTPUT_ATTR)
+        )
+
+    def test_runner_patch_returns_no_output_for_initial_async_sample(self):
+        class FakeRunner:
+            def __init__(self):
+                self.model = types.SimpleNamespace(model=types.SimpleNamespace())
+                self._cached_logits = None
+                self._cached_model_input = None
+
+            def _execute_model_for_text(self, model_input, intermediate_tensors=None):
+                del intermediate_tensors
+                return model_input
+
+            def sample_tokens(self, grammar_output):
+                del grammar_output
+                raise RuntimeError(
+                    "sample_tokens() called without prior execute_model(). "
+                    "Logits must be cached first."
+                )
+
+        self.patch.patch_neuron_model_runner_class(FakeRunner)
+
+        self.assertIsNone(FakeRunner().sample_tokens(None))
+
+    def test_runner_patch_uses_hybrid_attention_layers_for_kv_cache_spec(self):
+        class FakeModelConfig:
+            dtype = "bfloat16"
+
+            def __init__(self):
+                self.hf_config = types.SimpleNamespace(
+                    num_hidden_layers=8,
+                    num_attention_heads=24,
+                    num_key_value_heads=4,
+                    layer_types=[
+                        "linear_attention",
+                        "linear_attention",
+                        "linear_attention",
+                        "full_attention",
+                    ]
+                    * 2,
+                )
+
+            def get_sliding_window(self):
+                return None
+
+        class FakeRunner:
+            block_size = 256
+
+            def __init__(self):
+                self.model = types.SimpleNamespace(head_dim=256)
+                self.model_config = FakeModelConfig()
+                self.parallel_config = types.SimpleNamespace(tensor_parallel_size=4)
+
+            def _execute_model_for_text(self, model_input, intermediate_tensors=None):
+                del intermediate_tensors
+                return model_input
+
+            def get_kv_cache_spec(self):
+                return {
+                    f"layers.{idx}.self_attn": FullAttentionSpec(
+                        block_size=1,
+                        num_kv_heads=4,
+                        head_size=1,
+                        dtype="original",
+                    )
+                    for idx in range(8)
+                }
+
+        installed = self.patch.patch_neuron_model_runner_class(FakeRunner)
+        spec = FakeRunner().get_kv_cache_spec()
+
+        self.assertTrue(installed)
+        self.assertEqual(list(spec), ["layers.3.self_attn", "layers.7.self_attn"])
+        self.assertEqual(spec["layers.3.self_attn"].block_size, 256)
+        self.assertEqual(spec["layers.3.self_attn"].num_kv_heads, 1)
+        self.assertEqual(spec["layers.3.self_attn"].head_size, 256)
+        self.assertEqual(spec["layers.3.self_attn"].dtype, "bfloat16")
+
+    def test_runner_patch_uses_full_attention_interval_for_kv_cache_spec(self):
+        class FakeModelConfig:
+            dtype = "bfloat16"
+
+            def __init__(self):
+                self.hf_config = types.SimpleNamespace(
+                    num_hidden_layers=8,
+                    num_attention_heads=24,
+                    num_key_value_heads=4,
+                    full_attention_interval=4,
+                )
+
+            def get_sliding_window(self):
+                return None
+
+        class FakeRunner:
+            block_size = 128
+
+            def __init__(self):
+                self.model = types.SimpleNamespace(head_dim=256)
+                self.model_config = FakeModelConfig()
+                self.parallel_config = types.SimpleNamespace(tensor_parallel_size=4)
+
+            def _execute_model_for_text(self, model_input, intermediate_tensors=None):
+                del intermediate_tensors
+                return model_input
+
+            def get_kv_cache_spec(self):
+                return {"original": FullAttentionSpec(1, 4, 1, "original")}
+
+        self.patch.patch_neuron_model_runner_class(FakeRunner)
+        spec = FakeRunner().get_kv_cache_spec()
+
+        self.assertEqual(list(spec), ["layers.3.self_attn", "layers.7.self_attn"])
+        self.assertEqual(spec["layers.7.self_attn"].block_size, 128)
+        self.assertEqual(spec["layers.7.self_attn"].num_kv_heads, 1)
+
+    def test_runner_patch_keeps_original_kv_cache_spec_for_dense_attention(self):
+        class FakeModelConfig:
+            dtype = "bfloat16"
+
+            def __init__(self):
+                self.hf_config = types.SimpleNamespace(
+                    num_hidden_layers=2,
+                    num_attention_heads=4,
+                    num_key_value_heads=4,
+                    layer_types=["full_attention", "full_attention"],
+                )
+
+            def get_sliding_window(self):
+                return None
+
+        class FakeRunner:
+            block_size = 128
+
+            def __init__(self):
+                self.original_kv_cache_spec_called = False
+                self.model = types.SimpleNamespace(head_dim=256)
+                self.model_config = FakeModelConfig()
+                self.parallel_config = types.SimpleNamespace(tensor_parallel_size=4)
+
+            def _execute_model_for_text(self, model_input, intermediate_tensors=None):
+                del intermediate_tensors
+                return model_input
+
+            def get_kv_cache_spec(self):
+                self.original_kv_cache_spec_called = True
+                return {"original": FullAttentionSpec(1, 4, 1, "original")}
+
+        self.patch.patch_neuron_model_runner_class(FakeRunner)
+        runner = FakeRunner()
+        spec = runner.get_kv_cache_spec()
+
+        self.assertTrue(runner.original_kv_cache_spec_called)
+        self.assertEqual(list(spec), ["original"])
 
     def test_import_hook_patches_already_loaded_neuron_runner_module(self):
         class FakeRunner:

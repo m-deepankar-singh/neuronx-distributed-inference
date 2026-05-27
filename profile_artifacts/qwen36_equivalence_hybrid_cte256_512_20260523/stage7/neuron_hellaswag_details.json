@@ -1,0 +1,80 @@
+{
+  "hellaswag": {
+    "acc": 0.8,
+    "correct": 4,
+    "total": 5,
+    "method": "generate_choice",
+    "details": [
+      {
+        "index": 0,
+        "dataset_index": 24,
+        "ctx": "A man is sitting on a roof. he",
+        "label": 3,
+        "pred": 3,
+        "generated": "D\n#\n</think>\n\nD\n#\n</think>\n\nD\n#\n</think>\n\n",
+        "endings": [
+          "is using wrap to wrap a pair of skis.",
+          "is ripping level tiles off.",
+          "is holding a rubik's cube.",
+          "starts pulling up roofing on a roof."
+        ]
+      },
+      {
+        "index": 1,
+        "dataset_index": 92,
+        "ctx": "A lady walks to a barbell. She bends down and grabs the pole. the lady",
+        "label": 3,
+        "pred": 3,
+        "generated": "D\n# Title\n# Title\n# Title\n# Title\n",
+        "endings": [
+          "swings and lands in her arms.",
+          "pulls the barbell forward.",
+          "pulls a rope attached to the barbell.",
+          "stands and lifts the weight over her head."
+        ]
+      },
+      {
+        "index": 2,
+        "dataset_index": 106,
+        "ctx": "Two women in a child are shown in a canoe while a man pulls the canoe while standing in the water, with other individuals visible in the background. the child and a different man",
+        "label": 2,
+        "pred": 0,
+        "generated": "A\n# Answer\nA\n# Context\nTwo women in a child are shown in a canoe",
+        "endings": [
+          "are then shown paddling down a river in a boat while a woman talks.",
+          "are driving the canoe, they go down the river flowing side to side.",
+          "sit in a canoe while the man paddles.",
+          "walking go down the rapids, while the man in his helicopter almost falls and goes out of canoehood."
+        ]
+      },
+      {
+        "index": 3,
+        "dataset_index": 114,
+        "ctx": "A boy is running down a track. the boy",
+        "label": 2,
+        "pred": 2,
+        "generated": "C\n# System\nYou are an expert text classifier.\n<think>\n\n</think>\n\nC\n",
+        "endings": [
+          "runs into a car.",
+          "gets in a mat.",
+          "lifts his body above the height of a pole.",
+          "stands on his hands and springs."
+        ]
+      },
+      {
+        "index": 4,
+        "dataset_index": 116,
+        "ctx": "The boy lifts his body above the height of a pole. The boy lands on his back on to a red mat. the boy",
+        "label": 1,
+        "pred": 1,
+        "generated": "B\n# Title\n# Answer\n#\n#\nassistant\n",
+        "endings": [
+          "turns his body around on the mat.",
+          "gets up from the mat.",
+          "continues to lift his body over the pole.",
+          "wiggles out of the mat."
+        ]
+      }
+    ]
+  }
+}

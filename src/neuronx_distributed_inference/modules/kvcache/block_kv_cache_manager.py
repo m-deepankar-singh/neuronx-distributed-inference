@@ -147,6 +147,16 @@ class BlockKVCacheManager(KVCacheManager):
 
         return key_state, value_state
 
+    def get_raw_kv_by_layer_id(self, idx, kvcache_buffer=None, **kwargs):
+        """Return the block-layout KV cache without flattening through a block table."""
+        k_cache, v_cache = self._fetch_cache(idx, kvcache_buffer=kvcache_buffer)
+
+        if self.kv_quant_config:
+            k_cache = self._dequantize_cache(k_cache, idx, is_key=True)
+            v_cache = self._dequantize_cache(v_cache, idx, is_key=False)
+
+        return k_cache, v_cache
+
     def _get_block_cache_and_reshape_bhsd(self, cache: Tensor, active_block_table: Tensor):
         """
         Reorder the cache based on the table indices from active_block_table, and return

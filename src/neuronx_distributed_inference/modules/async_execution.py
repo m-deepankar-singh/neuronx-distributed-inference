@@ -441,9 +441,23 @@ def _apply_hybrid_apc_request_record(
         ("cumulative_hashes_by_prefix_len", "cumulative_hashes_by_prefix_len"),
         ("attention_block_refs_by_prefix_len", "attention_block_refs_by_prefix_len"),
         ("active_suffix_len", "hybrid_active_suffix_len"),
+        ("full_input_ids", "hybrid_full_input_ids"),
     ):
         value = record.get(source_key)
         if value is not None:
+            if source_key == "full_input_ids" and not isinstance(value, torch.Tensor):
+                input_ids = row_input.get("input_ids")
+                dtype = (
+                    input_ids.dtype
+                    if isinstance(input_ids, torch.Tensor)
+                    else torch.int64
+                )
+                device = (
+                    input_ids.device
+                    if isinstance(input_ids, torch.Tensor)
+                    else None
+                )
+                value = torch.tensor([list(value)], dtype=dtype, device=device)
             row_input[target_key] = value
 
 

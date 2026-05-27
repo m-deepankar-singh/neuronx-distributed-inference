@@ -20,10 +20,12 @@ from typing import Any, Hashable, NamedTuple
 
 logger = logging.getLogger(__name__)
 _SCHEDULER_MODULE = "vllm.v1.core.sched.scheduler"
+_KV_CACHE_MANAGER_MODULE = "vllm.v1.core.kv_cache_manager"
 _VLLM_NEURON_RUNNER_MODULE = "vllm_neuron.worker.neuronx_distributed_model_runner"
 _VLLM_NEURON_LOADER_MODULE = "vllm_neuron.worker.neuronx_distributed_model_loader"
 _PATCHED_MODULES = {
     _SCHEDULER_MODULE,
+    _KV_CACHE_MANAGER_MODULE,
     _VLLM_NEURON_RUNNER_MODULE,
     _VLLM_NEURON_LOADER_MODULE,
 }
@@ -46,6 +48,11 @@ _AUTHORIZED_PREFIX_READS: dict[int, list[HybridGDNPrefixKey]] = {}
 _AUTHORIZED_PREFIX_READS_BY_REQUEST: dict[Hashable, list[HybridGDNPrefixKey]] = {}
 _SCHEDULER_OUTPUT_METADATA_ATTR = "_qwen36_hybrid_apc_metadata_by_request_id"
 _SCHEDULER_OUTPUT_REQUEST_RECORDS_ATTR = "_qwen36_hybrid_apc_request_records"
+_MAX_PREFIX_CACHE_HIT_LEN_ATTR = "_qwen36_hybrid_apc_max_prefix_cache_hit_len"
+_MAX_PREFIX_CACHE_BLOCKS_ATTR = "_qwen36_hybrid_apc_max_prefix_cache_blocks"
+_RUNNER_PREFILL_STATE_FOR_OUTPUT_ATTR = (
+    "_qwen36_hybrid_apc_prefill_completion_state_for_output"
+)
 _HYBRID_APC_RUNTIME_CONFIG_KEYS = (
     "use_hybrid_apc_manager",
     "use_qwen_hybrid_chunked_prefill",
@@ -81,6 +88,12 @@ _HYBRID_APC_BRIDGE_CONFIG_ATTRS = {
     "hybrid_apc_layout_version": "layout_version",
     "hybrid_recurrent_cache_dtype": "recurrent_dtype",
     "hybrid_conv_cache_dtype": "conv_dtype",
+}
+_KV_CACHE_ATTENTION_LAYER_TYPES = {
+    "attention",
+    "full_attention",
+    "self_attention",
+    "sliding_attention",
 }
 
 
@@ -118,6 +131,87 @@ def _config_flag(config: Any, name: str, default: bool = False) -> bool:
 
 def _config_value(config: Any, name: str, default: Any) -> Any:
     return getattr(config, name, default)
+
+
+def _num_layers_from_hf_config(
+    hf_config: Any,
+    original_get_kv_cache_spec: Any | None = None,
+) -> int | None:
+    if hf_config is None:
+        return None
+    original_globals = getattr(original_get_kv_cache_spec, "__globals__", {})
+    get_num_layers = original_globals.get("get_num_layers_from_hf_config")
+    if get_num_layers is not None:
+        try:
+            return int(get_num_layers(hf_config))
+        except Exception:
+            pass
+    for attr in ("num_hidden_layers", "num_layers", "n_layer"):
+        value = getattr(hf_config, attr, None)
+        if value is not None:
+            return int(value)
+    layer_types = getattr(hf_config, "layer_types", None)
+    if layer_types is not None:
+        try:
+            return len(layer_types)
+        except TypeError:
+            return None
+    return None
+
+
+def _hybrid_kv_attention_layer_indices(
+    hf_config: Any,
+    num_layers: int,
+) -> list[int] | None:
+    layer_types = getattr(hf_config, "layer_types", None)
+    if layer_types is not None:
+        try:
+            layer_types = list(layer_types)
+        except TypeError:
+            layer_types = None
+    if layer_types is not None and len(layer_types) == num_layers:
+        attention_indices = [
+            idx
+            for idx, layer_type in enumerate(layer_types)
+            if str(layer_type).lower() in _KV_CACHE_ATTENTION_LAYER_TYPES
+        ]
+        if 0 < len(attention_indices) < num_layers:
+            return attention_indices
+        return None
+
+    full_attention_interval = getattr(hf_config, "full_attention_interval", None)
+    if full_attention_interval:
+        interval = int(full_attention_interval)
+        if interval > 1:
+            attention_indices = [
+                idx for idx in range(num_layers) if (idx + 1) % interval == 0
+            ]
+            if attention_indices and len(attention_indices) < num_layers:
+                return attention_indices
+    return None
+
+
+def _local_num_kv_heads(hf_config: Any, parallel_config: Any) -> int:
+    tp_size = max(1, int(getattr(parallel_config, "tensor_parallel_size", 1) or 1))
+    total_kv_heads = getattr(hf_config, "num_key_value_heads", None)
+    if total_kv_heads is None:
+        total_kv_heads = getattr(hf_config, "num_attention_heads", None)
+    if total_kv_heads is None:
+        return tp_size
+    return max(1, int(total_kv_heads) // tp_size)
+
+
+def _full_attention_spec_class(original_get_kv_cache_spec: Any) -> Any | None:
+    original_globals = getattr(original_get_kv_cache_spec, "__globals__", {})
+    spec_cls = original_globals.get("FullAttentionSpec")
+    if spec_cls is not None:
+        return spec_cls
+    try:
+        from vllm.v1.kv_cache_interface import FullAttentionSpec  # noqa: WPS433
+
+        return FullAttentionSpec
+    except Exception:
+        return None
 
 
 def _scheduler_config_flag(
@@ -637,7 +731,16 @@ def _scheduler_request_metadata(
     if request is None or block_size <= 0:
         return {}
     token_ids = getattr(request, "prompt_token_ids", None)
-    request_prefix_len = int(getattr(request, "num_tokens", len(token_ids or ())))
+    prompt_token_count = int(
+        getattr(request, "num_prompt_tokens", len(token_ids or ())) or 0
+    )
+    if token_ids is not None:
+        prompt_token_count = min(prompt_token_count, len(token_ids))
+    full_request_prefix_len = prompt_token_count
+    request_prefix_len = full_request_prefix_len
+    if num_computed_tokens is not None and active_suffix_len is not None:
+        scheduled_prefix_len = int(num_computed_tokens) + int(active_suffix_len)
+        request_prefix_len = max(0, min(full_request_prefix_len, scheduled_prefix_len))
     cumulative_hashes = _vllm_cumulative_prefix_hashes(
         request,
         block_size=block_size,
@@ -653,6 +756,17 @@ def _scheduler_request_metadata(
     if refs_by_prefix_len:
         metadata["attention_block_refs_by_prefix_len"] = refs_by_prefix_len
     metadata["request_prefix_len"] = request_prefix_len
+    full_token_ids = token_ids or getattr(request, "all_token_ids", None)
+    has_computed_prefix = (
+        num_computed_tokens is not None and int(num_computed_tokens) > 0
+    )
+    if has_computed_prefix and full_token_ids is not None:
+        full_token_ids = list(full_token_ids)
+        if len(full_token_ids) >= request_prefix_len:
+            metadata["full_input_ids"] = tuple(
+                int(token_id)
+                for token_id in full_token_ids[:request_prefix_len]
+            )
     if num_computed_tokens is not None:
         metadata["vllm_attention_hit_len"] = int(num_computed_tokens)
     if active_suffix_len is not None:
@@ -704,14 +818,16 @@ def _backed_prefix_read_decision(scheduler: Any, request: Any) -> dict[str, Any]
     max_backed_prefix_read_len = _max_backed_prefix_read_len(scheduler)
     exceeds_backed_prefix_cap = (
         max_backed_prefix_read_len > 0
-        and bool(required_prefix_lens)
-        and max_readable_prefix_len > max_backed_prefix_read_len
+        and backed_hit_len > max_backed_prefix_read_len
     )
+    capped_backed_hits = [
+        prefix_len
+        for prefix_len in backed_hits
+        if max_backed_prefix_read_len <= 0 or prefix_len <= max_backed_prefix_read_len
+    ]
+    prefix_read_len = max(capped_backed_hits) if capped_backed_hits else 0
     allowed = (
-        backed_hit_len > 0
-        and backed_hit_len == max_readable_prefix_len
-        and not missing_higher_backed_lens
-        and not exceeds_backed_prefix_cap
+        prefix_read_len > 0
         and supports_backed
     )
     return {
@@ -719,6 +835,7 @@ def _backed_prefix_read_decision(scheduler: Any, request: Any) -> dict[str, Any]
         "backed_hits": backed_hits,
         "required_prefix_lens": required_prefix_lens,
         "backed_hit_len": backed_hit_len,
+        "prefix_read_len": prefix_read_len,
         "missing_backed_lens": tuple(missing_higher_backed_lens),
         "supports_backed": supports_backed,
         "max_backed_prefix_read_len": max_backed_prefix_read_len,
@@ -842,6 +959,27 @@ def _max_backed_prefix_read_len(scheduler: Any) -> int:
     )
 
 
+def _set_request_prefix_cache_cap(
+    request: Any,
+    *,
+    prefix_len: int,
+    block_size: int,
+) -> None:
+    if request is None:
+        return
+    prefix_len = max(0, int(prefix_len))
+    block_size = max(1, int(block_size))
+    try:
+        setattr(request, _MAX_PREFIX_CACHE_HIT_LEN_ATTR, prefix_len)
+        setattr(
+            request,
+            _MAX_PREFIX_CACHE_BLOCKS_ATTR,
+            prefix_len // block_size,
+        )
+    except Exception:
+        return
+
+
 def should_disable_unbacked_prefix_reads(scheduler: Any, request: Any = None) -> bool:
     """Return whether this scheduler should avoid vLLM APC reads.
 
@@ -862,6 +1000,7 @@ def should_disable_unbacked_prefix_reads(scheduler: Any, request: Any = None) ->
             "[hybrid_apc_debug] scheduler-decision "
             f"disable_requested={disable_requested} "
             f"backed_hit_len={decision['backed_hit_len']} "
+            f"prefix_read_len={decision['prefix_read_len']} "
             f"supports_backed={decision['supports_backed']} "
             f"max_num_seqs={_max_num_seqs_for_scheduler(scheduler)} "
             f"prompt_len={prompt_len} "
@@ -874,7 +1013,12 @@ def should_disable_unbacked_prefix_reads(scheduler: Any, request: Any = None) ->
         )
     if decision["allowed"]:
         request_id = _request_id_for_scheduler_request(request)
-        prefix_len = decision["backed_hit_len"]
+        prefix_len = decision["prefix_read_len"]
+        _set_request_prefix_cache_cap(
+            request,
+            prefix_len=prefix_len,
+            block_size=_block_size_for_scheduler(scheduler),
+        )
         authorize_hybrid_apc_prefix_read(
             decision["backed_hits"][prefix_len],
             request_id=request_id,
@@ -963,6 +1107,59 @@ def _patch_scheduler_module(module: Any) -> bool:
     if installed:
         logger.info("Installed Qwen Hybrid APC scheduler fallback patch")
     return installed
+
+
+def _patch_kv_cache_manager_module(module: Any) -> bool:
+    kv_cache_manager_cls = getattr(module, "KVCacheManager", None)
+    if kv_cache_manager_cls is None:
+        return False
+    original_get_computed_blocks = getattr(
+        kv_cache_manager_cls,
+        "get_computed_blocks",
+        None,
+    )
+    if original_get_computed_blocks is None or getattr(
+        original_get_computed_blocks,
+        "_qwen36_hybrid_apc_prefix_cap_patched",
+        False,
+    ):
+        return False
+
+    def get_computed_blocks_with_hybrid_apc_cap(self, request, *args, **kwargs):
+        cap_blocks = getattr(request, _MAX_PREFIX_CACHE_BLOCKS_ATTR, None)
+        try:
+            cap_blocks = None if cap_blocks is None else max(0, int(cap_blocks))
+        except (TypeError, ValueError):
+            cap_blocks = None
+        if cap_blocks is None:
+            return original_get_computed_blocks(self, request, *args, **kwargs)
+        if cap_blocks <= 0:
+            return getattr(self, "empty_kv_cache_blocks"), 0
+
+        block_hashes = getattr(request, "block_hashes", None)
+        if not block_hashes or len(block_hashes) <= cap_blocks:
+            return original_get_computed_blocks(self, request, *args, **kwargs)
+
+        original_block_hashes = block_hashes
+        if isinstance(block_hashes, tuple):
+            capped_block_hashes = block_hashes[:cap_blocks]
+        else:
+            capped_block_hashes = list(block_hashes[:cap_blocks])
+        try:
+            request.block_hashes = capped_block_hashes
+            return original_get_computed_blocks(self, request, *args, **kwargs)
+        finally:
+            request.block_hashes = original_block_hashes
+
+    get_computed_blocks_with_hybrid_apc_cap._qwen36_hybrid_apc_prefix_cap_patched = (
+        True
+    )
+    get_computed_blocks_with_hybrid_apc_cap._qwen36_original_get_computed_blocks = (
+        original_get_computed_blocks
+    )
+    kv_cache_manager_cls.get_computed_blocks = get_computed_blocks_with_hybrid_apc_cap
+    logger.info("Installed Qwen Hybrid APC KV prefix cap patch")
+    return True
 
 
 def _request_ids_from_model_input(model_input: Any) -> tuple[Hashable, ...] | None:
@@ -1103,6 +1300,7 @@ def _hybrid_apc_request_records_from_model_input(
             "cumulative_hashes_by_prefix_len",
             "attention_block_refs_by_prefix_len",
             "request_prefix_len",
+            "full_input_ids",
             "vllm_attention_hit_len",
         ):
             if key in metadata:
@@ -1345,27 +1543,98 @@ def _expand_completed_prefill_logits(hidden_states: Any, model_input: Any) -> An
         return hidden_states
 
 
-def _prefill_completion_has_incomplete_row(prefill_completion_state: Any) -> bool:
+def _prefill_completion_state_values(prefill_completion_state: Any) -> list[bool] | None:
     if prefill_completion_state is None:
-        return False
+        return None
     try:
         if hasattr(prefill_completion_state, "numel"):
             if prefill_completion_state.numel() == 0:
-                return False
-            return not bool(prefill_completion_state.reshape(-1).bool().all().item())
+                return None
+            values = prefill_completion_state.reshape(-1)
+            normalized = []
+            for value in values:
+                try:
+                    normalized.append(bool(value.item()))
+                except AttributeError:
+                    normalized.append(bool(value))
+            return normalized
         values = list(prefill_completion_state)
     except Exception:
-        return False
+        return None
     if not values:
-        return False
+        return None
+    normalized = []
     for value in values:
         try:
-            if not bool(value.item()):
-                return True
+            normalized.append(bool(value.item()))
         except AttributeError:
-            if not bool(value):
-                return True
-    return False
+            normalized.append(bool(value))
+    return normalized
+
+
+def _prefill_completion_has_incomplete_row(prefill_completion_state: Any) -> bool:
+    values = _prefill_completion_state_values(prefill_completion_state)
+    return bool(values) and not all(values)
+
+
+def _mask_incomplete_prefill_sampled_tokens(
+    sampler_output: Any,
+    prefill_completion_state: Any,
+) -> Any:
+    values = _prefill_completion_state_values(prefill_completion_state)
+    if not values or all(values):
+        if _env_flag("QWEN36_HYBRID_APC_DEBUG"):
+            print(
+                "[hybrid_apc_debug] sample-mask skip "
+                f"prefill_completion_state={values}",
+                flush=True,
+            )
+        return sampler_output
+
+    sampled_token_ids = getattr(sampler_output, "sampled_token_ids", None)
+    if sampled_token_ids is None or not hasattr(sampled_token_ids, "clone"):
+        if _env_flag("QWEN36_HYBRID_APC_DEBUG"):
+            print(
+                "[hybrid_apc_debug] sample-mask missing-sampled-token-ids "
+                f"prefill_completion_state={values} "
+                f"sampler_output_type={type(sampler_output).__name__}",
+                flush=True,
+            )
+        return sampler_output
+    shape = getattr(sampled_token_ids, "shape", ())
+    if not shape:
+        if _env_flag("QWEN36_HYBRID_APC_DEBUG"):
+            print(
+                "[hybrid_apc_debug] sample-mask scalar-sampled-token-ids "
+                f"prefill_completion_state={values}",
+                flush=True,
+            )
+        return sampler_output
+    row_count = min(len(values), int(shape[0]))
+    if row_count <= 0:
+        return sampler_output
+
+    masked_token_ids = sampled_token_ids.clone()
+    for row_idx, is_done in enumerate(values[:row_count]):
+        if not is_done:
+            masked_token_ids[row_idx] = -1
+    try:
+        sampler_output.sampled_token_ids = masked_token_ids
+    except Exception:
+        return sampler_output
+    if _env_flag("QWEN36_HYBRID_APC_DEBUG"):
+        try:
+            before = sampled_token_ids.detach().cpu().reshape(-1).tolist()
+            after = masked_token_ids.detach().cpu().reshape(-1).tolist()
+        except Exception:
+            before = "unavailable"
+            after = "unavailable"
+        print(
+            "[hybrid_apc_debug] sample-mask applied "
+            f"prefill_completion_state={values} before={before} after={after}",
+            flush=True,
+        )
+    return sampler_output
 
 
 def _shape_of(value: Any) -> list[int] | None:
@@ -1553,6 +1822,17 @@ def patch_neuron_model_runner_class(runner_cls: type) -> bool:
         "_sample_on_device",
         None,
     )
+    original_get_kv_cache_spec = getattr(
+        runner_cls,
+        "get_kv_cache_spec",
+        None,
+    )
+    original_sample_tokens = getattr(runner_cls, "sample_tokens", None)
+    original_generate_output = getattr(
+        runner_cls,
+        "_generate_model_runner_output",
+        None,
+    )
 
     missing = object()
     installed = False
@@ -1702,6 +1982,10 @@ def patch_neuron_model_runner_class(runner_cls: type) -> bool:
             except Exception as exc:
                 _log_sample_logits_split_error(hidden_states, model_input, exc)
                 raise
+            sampler_output = _mask_incomplete_prefill_sampled_tokens(
+                sampler_output,
+                prefill_state,
+            )
             _log_sample_logits_comparison(hidden_states, model_input, sampler_output)
             return sampler_output
 
@@ -1712,6 +1996,144 @@ def patch_neuron_model_runner_class(runner_cls: type) -> bool:
             original_sample_on_device
         )
         runner_cls._sample_on_device = sample_on_device_with_incomplete_prefill_clone
+        installed = True
+
+    if original_get_kv_cache_spec is not None and not getattr(
+        original_get_kv_cache_spec,
+        "_qwen36_hybrid_kv_cache_spec_patched",
+        False,
+    ):
+
+        def get_kv_cache_spec_with_qwen36_hybrid_layers(self):
+            model_config = getattr(self, "model_config", None)
+            hf_config = getattr(model_config, "hf_config", None)
+            num_layers = _num_layers_from_hf_config(
+                hf_config,
+                original_get_kv_cache_spec,
+            )
+            if num_layers is None:
+                return original_get_kv_cache_spec(self)
+            attention_layer_indices = _hybrid_kv_attention_layer_indices(
+                hf_config,
+                num_layers,
+            )
+            if attention_layer_indices is None:
+                return original_get_kv_cache_spec(self)
+            full_attention_spec_cls = _full_attention_spec_class(
+                original_get_kv_cache_spec
+            )
+            if full_attention_spec_cls is None:
+                return original_get_kv_cache_spec(self)
+
+            parallel_config = getattr(self, "parallel_config", None)
+            model = getattr(self, "model", None)
+            get_sliding_window = getattr(model_config, "get_sliding_window", None)
+            sliding_window = (
+                get_sliding_window() if callable(get_sliding_window) else None
+            )
+            local_kv_heads = _local_num_kv_heads(hf_config, parallel_config)
+            kv_cache_spec = {}
+            for layer_idx in attention_layer_indices:
+                layer_name = f"layers.{layer_idx}.self_attn"
+                kv_cache_spec[layer_name] = full_attention_spec_cls(
+                    block_size=getattr(self, "block_size"),
+                    num_kv_heads=local_kv_heads,
+                    head_size=getattr(model, "head_dim"),
+                    dtype=getattr(model_config, "dtype"),
+                    sliding_window=sliding_window,
+                )
+            logger.info(
+                "Using Qwen hybrid KV-cache spec for %d/%d attention layers "
+                "with %d local KV heads",
+                len(attention_layer_indices),
+                num_layers,
+                local_kv_heads,
+            )
+            return kv_cache_spec
+
+        get_kv_cache_spec_with_qwen36_hybrid_layers._qwen36_hybrid_kv_cache_spec_patched = (
+            True
+        )
+        get_kv_cache_spec_with_qwen36_hybrid_layers._qwen36_original_get_kv_cache_spec = (
+            original_get_kv_cache_spec
+        )
+        runner_cls.get_kv_cache_spec = get_kv_cache_spec_with_qwen36_hybrid_layers
+        installed = True
+
+    if original_generate_output is not None and not getattr(
+        original_generate_output,
+        "_qwen36_mask_incomplete_prefill_output_patched",
+        False,
+    ):
+
+        def generate_model_runner_output_with_prefill_mask(
+            self,
+            sampler_outputs,
+            *args,
+            **kwargs,
+        ):
+            prefill_state = getattr(
+                self,
+                _RUNNER_PREFILL_STATE_FOR_OUTPUT_ATTR,
+                None,
+            )
+            if prefill_state is not None:
+                sampler_outputs = _mask_incomplete_prefill_sampled_tokens(
+                    sampler_outputs,
+                    prefill_state,
+                )
+            return original_generate_output(self, sampler_outputs, *args, **kwargs)
+
+        generate_model_runner_output_with_prefill_mask._qwen36_mask_incomplete_prefill_output_patched = (
+            True
+        )
+        generate_model_runner_output_with_prefill_mask._qwen36_original_generate_model_runner_output = (
+            original_generate_output
+        )
+        runner_cls._generate_model_runner_output = (
+            generate_model_runner_output_with_prefill_mask
+        )
+        installed = True
+
+    if original_sample_tokens is not None and not getattr(
+        original_sample_tokens,
+        "_qwen36_capture_prefill_state_for_output_patched",
+        False,
+    ):
+
+        def sample_tokens_with_prefill_state_for_output(self, *args, **kwargs):
+            model_input = getattr(self, "_cached_model_input", None)
+            if getattr(self, "_cached_logits", None) is None:
+                return None
+            prefill_state = getattr(model_input, "prefill_completion_state", None)
+            previous_value = getattr(
+                self,
+                _RUNNER_PREFILL_STATE_FOR_OUTPUT_ATTR,
+                missing,
+            )
+            setattr(self, _RUNNER_PREFILL_STATE_FOR_OUTPUT_ATTR, prefill_state)
+            try:
+                return original_sample_tokens(self, *args, **kwargs)
+            finally:
+                if previous_value is missing:
+                    try:
+                        delattr(self, _RUNNER_PREFILL_STATE_FOR_OUTPUT_ATTR)
+                    except AttributeError:
+                        pass
+                else:
+                    setattr(
+                        self,
+                        _RUNNER_PREFILL_STATE_FOR_OUTPUT_ATTR,
+                        previous_value,
+                    )
+
+        sample_tokens_with_prefill_state_for_output._qwen36_capture_prefill_state_for_output_patched = (
+            True
+        )
+        sample_tokens_with_prefill_state_for_output._qwen36_original_sample_tokens = (
+            original_sample_tokens
+        )
+        runner_cls.sample_tokens = sample_tokens_with_prefill_state_for_output
         installed = True
 
     if getattr(original_execute, "_qwen36_hybrid_apc_request_ids_patched", False):
@@ -1918,6 +2340,8 @@ def _patch_neuron_loader_module(module: Any) -> bool:
 def _patch_module(module_name: str, module: Any) -> bool:
     if module_name == _SCHEDULER_MODULE:
         return _patch_scheduler_module(module)
+    if module_name == _KV_CACHE_MANAGER_MODULE:
+        return _patch_kv_cache_manager_module(module)
     if module_name == _VLLM_NEURON_RUNNER_MODULE:
         return _patch_neuron_runner_module(module)
     if module_name == _VLLM_NEURON_LOADER_MODULE:
@@ -1983,6 +2407,9 @@ def install() -> bool:
         installed = _patch_scheduler_module(module)
     else:
         installed = patch_scheduler_class(Scheduler)
+    kv_cache_manager_module = sys.modules.get(_KV_CACHE_MANAGER_MODULE)
+    if kv_cache_manager_module is not None:
+        installed = _patch_kv_cache_manager_module(kv_cache_manager_module) or installed
     runner_module = sys.modules.get(_VLLM_NEURON_RUNNER_MODULE)
     if runner_module is not None:
         installed = _patch_neuron_runner_module(runner_module) or installed

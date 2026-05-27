@@ -8,6 +8,7 @@ SEQ_LEN="512"
 CTE_BUCKET="512"
 CTE_BUCKETS=""
 CTE_BUCKET_PROFILE="single"
+CONTEXT_ENCODING_BUCKET_PAIRS=""
 TP_DEGREE="4"
 LNC="2"
 MAX_NUM_SEQS="1"
@@ -53,6 +54,7 @@ while [[ $# -gt 0 ]]; do
     --cte-bucket) CTE_BUCKET="$2"; shift 2 ;;
     --cte-buckets) CTE_BUCKETS="$2"; shift 2 ;;
     --cte-bucket-profile) CTE_BUCKET_PROFILE="$2"; shift 2 ;;
+    --context-encoding-bucket-pairs) CONTEXT_ENCODING_BUCKET_PAIRS="$2"; shift 2 ;;
     --tensor-parallel-size) TP_DEGREE="$2"; shift 2 ;;
     --logical-nc-config) LNC="$2"; shift 2 ;;
     --max-num-seqs) MAX_NUM_SEQS="$2"; shift 2 ;;
@@ -124,7 +126,7 @@ fi
 if [[ "${ENABLE_CHUNKED_PREFILL}" == "1" ]]; then
   export DISABLE_NEURON_CUSTOM_SCHEDULER="1"
 fi
-if [[ "${ENABLE_HYBRID_APC}" == "1" ]]; then
+if [[ "${ENABLE_HYBRID_APC}" == "1" || "${ENABLE_CHUNKED_PREFILL}" == "1" ]]; then
   export QWEN36_HYBRID_APC_INSTALL_PATCH="1"
 fi
 if [[ "${HYBRID_APC_DISABLE_UNBACKED_PREFIX_READS}" == "1" ]]; then
@@ -213,14 +215,16 @@ buckets = json.loads('${CTE_BUCKETS_JSON}')
 max_bucket = buckets[-1]
 checkpoint_interval = int("${GDN_CHECKPOINT_INTERVAL}")
 if "${ENABLE_CHUNKED_PREFILL}" == "1" and "${ENABLE_HYBRID_APC}" == "1":
-    if checkpoint_interval not in buckets:
-        raise SystemExit(
-            "--enable-hybrid-apc with chunked prefill requires a CTE bucket "
-            f"equal to --gdn-checkpoint-interval ({checkpoint_interval})"
-        )
     requested_chunk = int("${HYBRID_APC_PREFILL_CHUNK_TOKENS}" or "0")
     if requested_chunk <= 0:
-        print(min(max_bucket, checkpoint_interval))
+        candidates = [bucket for bucket in buckets if bucket % checkpoint_interval == 0]
+        if not candidates:
+            raise SystemExit(
+                "--enable-hybrid-apc with chunked prefill requires at least one "
+                "compiled CTE bucket that is a multiple of --gdn-checkpoint-interval "
+                f"({checkpoint_interval}); got {buckets}"
+            )
+        print(candidates[0])
     else:
         if requested_chunk % checkpoint_interval != 0:
             raise SystemExit(
@@ -254,11 +258,38 @@ def parse_int_list(name, raw):
             raise SystemExit(f"{name} values must be positive, got {value}")
     return values
 
+
+def parse_bucket_pairs(raw):
+    tokens = raw.replace(",", " ").split()
+    if not tokens:
+        return None
+    pairs = set()
+    for token in tokens:
+        if ":" in token:
+            active, prefix = token.split(":", 1)
+        elif "x" in token:
+            active, prefix = token.split("x", 1)
+        else:
+            raise SystemExit(
+                "CONTEXT_ENCODING_BUCKET_PAIRS entries must use "
+                f"ACTIVE:PREFIX syntax, got {token!r}"
+            )
+        active_tokens = int(active)
+        prefix_tokens = int(prefix)
+        if active_tokens <= 0 or prefix_tokens < 0:
+            raise SystemExit(
+                "CONTEXT_ENCODING_BUCKET_PAIRS must use positive active "
+                f"tokens and non-negative prefix tokens, got {token!r}"
+            )
+        pairs.add((active_tokens, prefix_tokens))
+    return [[active, prefix] for active, prefix in sorted(pairs)]
+
 enable_chunked = "${ENABLE_CHUNKED_PREFILL}" == "1"
 enable_prefix_caching = "${ENABLE_PREFIX_CACHING}" == "1"
 enable_hybrid_apc = "${ENABLE_HYBRID_APC}" == "1"
 async_mode = "${ASYNC_MODE}" == "1"
 cte_buckets = json.loads('${CTE_BUCKETS_JSON}')
+context_encoding_bucket_pairs = parse_bucket_pairs("${CONTEXT_ENCODING_BUCKET_PAIRS}")
 max_cte_bucket = cte_buckets[-1]
 seq_len = int("${SEQ_LEN}")
 max_num_seqs = int("${MAX_NUM_SEQS}")
@@ -281,6 +312,10 @@ if token_generation_batches is not None and token_generation_batches[-1] > max_n
     )
 compiled_artifacts = "${COMPILED_ARTIFACTS}"
 compiled_max_prompt = 0
+compiled_uses_prefix_caching = False
+compiled_prefix_buckets = None
+compiled_prefix_cte_attention_backend = None
+compiled_prefix_cte_attention_segment_size = None
 if compiled_artifacts:
     config_path = Path(compiled_artifacts).expanduser() / "neuron_config.json"
     if config_path.exists():
@@ -294,6 +329,20 @@ if compiled_artifacts:
             or compiled_config.get("max_length")
             or compiled_config.get("seq_len")
             or 0
+        )
+        if context_encoding_bucket_pairs is None:
+            context_encoding_bucket_pairs = compiled_config.get(
+                "context_encoding_bucket_pairs"
+            )
+        compiled_uses_prefix_caching = bool(
+            compiled_config.get("is_prefix_caching")
+        )
+        compiled_prefix_buckets = compiled_config.get("prefix_buckets")
+        compiled_prefix_cte_attention_backend = compiled_config.get(
+            "prefix_cte_attention_backend"
+        )
+        compiled_prefix_cte_attention_segment_size = compiled_config.get(
+            "prefix_cte_attention_segment_size"
         )
 runtime_max_prompt = compiled_max_prompt or max_cte_bucket
 num_gpu_blocks_override = "${NUM_GPU_BLOCKS_OVERRIDE}"
@@ -329,8 +378,23 @@ if token_generation_batches is not None:
     neuron_config["token_generation_batches"] = token_generation_batches
 if enable_prefix_caching or enable_hybrid_apc or enable_chunked:
     neuron_config["is_block_kv_layout"] = True
-if enable_prefix_caching or enable_hybrid_apc:
+uses_prefix_cte_contract = (
+    context_encoding_bucket_pairs is not None or compiled_uses_prefix_caching
+)
+if enable_prefix_caching or enable_hybrid_apc or uses_prefix_cte_contract:
     neuron_config["is_prefix_caching"] = True
+    if context_encoding_bucket_pairs is not None:
+        neuron_config["context_encoding_bucket_pairs"] = context_encoding_bucket_pairs
+    if compiled_prefix_buckets is not None:
+        neuron_config["prefix_buckets"] = compiled_prefix_buckets
+    if compiled_prefix_cte_attention_backend is not None:
+        neuron_config["prefix_cte_attention_backend"] = (
+            compiled_prefix_cte_attention_backend
+        )
+    if compiled_prefix_cte_attention_segment_size is not None:
+        neuron_config["prefix_cte_attention_segment_size"] = (
+            compiled_prefix_cte_attention_segment_size
+        )
 if enable_chunked:
     neuron_config.update({
         "chunked_prefill_config": {
@@ -381,6 +445,7 @@ echo "MAMBA_CACHE_DTYPE=${MAMBA_CACHE_DTYPE:-}"
 echo "MAMBA_SSM_CACHE_DTYPE=${MAMBA_SSM_CACHE_DTYPE:-}"
 echo "BLOCK_SIZE=${BLOCK_SIZE}"
 echo "CTE_BUCKETS=${CTE_BUCKETS_JSON}"
+echo "CONTEXT_ENCODING_BUCKET_PAIRS=${CONTEXT_ENCODING_BUCKET_PAIRS}"
 echo "CTX_BATCH_SIZE=${CTX_BATCH_SIZE}"
 echo "KERNEL_Q_TILE_SIZE=${KERNEL_Q_TILE_SIZE}"
 echo "KERNEL_KV_TILE_SIZE=${KERNEL_KV_TILE_SIZE}"

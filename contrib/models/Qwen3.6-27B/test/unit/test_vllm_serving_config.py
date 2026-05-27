@@ -23,11 +23,15 @@ def _args(**overrides):
         cte_bucket=512,
         cte_buckets=None,
         cte_bucket_profile="single",
+        context_encoding_bucket_pairs=None,
         seq_len=2048,
         tensor_parallel_size=4,
         max_num_seqs=1,
         ctx_batch_size=1,
         logical_nc_config=2,
+        token_generation_buckets=None,
+        token_generation_batches=None,
+        async_mode=False,
         block_size=128,
         enable_prefix_caching=False,
         enable_hybrid_apc=False,
@@ -91,6 +95,38 @@ class TestVllmServingConfig(unittest.TestCase):
         self.assertFalse(config["use_text_only_cte_inputs"])
         self.assertFalse(config["use_compact_cte_attention_mask"])
         self.assertTrue(config["use_cold_zero_conv_fast_path"])
+
+    def test_sparse_context_encoding_bucket_pairs_are_forwarded(self):
+        config = self.runner._override_config(
+            _args(
+                enable_hybrid_apc=True,
+                block_size=256,
+                gdn_checkpoint_interval=256,
+                context_encoding_bucket_pairs=["512:0,512:32768", "3072:131072"],
+            )
+        )
+
+        self.assertEqual(
+            config["override_neuron_config"]["context_encoding_bucket_pairs"],
+            [[512, 0], [512, 32768], [3072, 131072]],
+        )
+
+    def test_sparse_context_pairs_keep_prefix_cte_contract_without_vllm_prefix_cache(self):
+        config = self.runner._override_config(
+            _args(
+                enable_prefix_caching=False,
+                enable_hybrid_apc=False,
+                context_encoding_bucket_pairs=["512:0", "3072:16384"],
+            )
+        )
+        neuron_config = config["override_neuron_config"]
+
+        self.assertFalse(config["use_hybrid_apc_manager"])
+        self.assertTrue(neuron_config["is_prefix_caching"])
+        self.assertEqual(
+            neuron_config["context_encoding_bucket_pairs"],
+            [[512, 0], [3072, 16384]],
+        )
 
     def test_hybrid_apc_requires_checkpoint_interval_equal_block_size(self):
         with self.assertRaisesRegex(ValueError, "gdn-checkpoint-interval"):
@@ -180,20 +216,57 @@ class TestVllmServingConfig(unittest.TestCase):
             256,
         )
 
-    def test_hybrid_apc_chunked_prefill_requires_checkpoint_cte_bucket(self):
+    def test_hybrid_apc_chunked_prefill_uses_smallest_checkpoint_aligned_bucket(self):
         args = _args(
-            cte_buckets=["512"],
+            cte_buckets=["512,768,1536,3072"],
+            seq_len=3072,
             enable_hybrid_apc=True,
             enable_vllm_chunked_prefill=True,
             block_size=256,
             gdn_checkpoint_interval=256,
         )
 
-        with self.assertRaisesRegex(ValueError, "gdn-checkpoint-interval"):
+        self.assertEqual(
+            self.runner._max_num_batched_tokens(
+                args,
+                self.runner._cte_buckets(args),
+            ),
+            512,
+        )
+
+    def test_hybrid_apc_chunked_prefill_requires_checkpoint_aligned_cte_bucket(self):
+        args = _args(
+            cte_buckets=["384"],
+            enable_hybrid_apc=True,
+            enable_vllm_chunked_prefill=True,
+            block_size=256,
+            gdn_checkpoint_interval=256,
+        )
+
+        with self.assertRaisesRegex(ValueError, "multiple"):
             self.runner._max_num_batched_tokens(
                 args,
                 self.runner._cte_buckets(args),
             )
+
+    def test_hybrid_apc_can_use_safe_non_power_of_two_prefill_chunk(self):
+        args = _args(
+            cte_buckets=["512,768,1536,3072"],
+            seq_len=8192,
+            enable_hybrid_apc=True,
+            enable_vllm_chunked_prefill=True,
+            block_size=256,
+            gdn_checkpoint_interval=256,
+            hybrid_apc_prefill_chunk_tokens=3072,
+        )
+
+        self.assertEqual(
+            self.runner._max_num_batched_tokens(
+                args,
+                self.runner._cte_buckets(args),
+            ),
+            3072,
+        )
 
     def test_hybrid_apc_can_use_explicit_larger_prefill_chunk(self):
         args = _args(

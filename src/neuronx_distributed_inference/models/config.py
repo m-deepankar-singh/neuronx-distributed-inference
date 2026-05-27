@@ -188,12 +188,75 @@ class NeuronConfig:
         self.bucket_n_active_tokens = kwargs.pop("bucket_n_active_tokens", False)
         self.context_encoding_buckets = kwargs.pop("context_encoding_buckets", None)
         self.prefix_buckets = kwargs.pop("prefix_buckets", None)
+        self.context_encoding_bucket_pairs = kwargs.pop(
+            "context_encoding_bucket_pairs", None
+        )
         self.token_generation_buckets = kwargs.pop("token_generation_buckets", None)
+        self.prefix_cte_attention_backend = kwargs.pop(
+            "prefix_cte_attention_backend", "attention_cte"
+        )
+        assert self.prefix_cte_attention_backend in (
+            "attention_cte",
+            "segmented_cte",
+        ), (
+            "prefix_cte_attention_backend must be one of "
+            "attention_cte or segmented_cte"
+        )
+        self.prefix_cte_attention_segment_size = kwargs.pop(
+            "prefix_cte_attention_segment_size", None
+        )
+        if self.prefix_cte_attention_segment_size is not None:
+            self.prefix_cte_attention_segment_size = int(
+                self.prefix_cte_attention_segment_size
+            )
+            assert self.prefix_cte_attention_segment_size > 0, (
+                "prefix_cte_attention_segment_size must be positive when set"
+            )
+        self.prefix_cte_attention_chunk_size = kwargs.pop(
+            "prefix_cte_attention_chunk_size", None
+        )
+        if self.prefix_cte_attention_chunk_size is not None:
+            self.prefix_cte_attention_chunk_size = int(
+                self.prefix_cte_attention_chunk_size
+            )
+            assert self.prefix_cte_attention_chunk_size > 0, (
+                "prefix_cte_attention_chunk_size must be positive when set"
+            )
         if self.context_encoding_buckets is not None:
             self.context_encoding_buckets.sort()
             assert (
                 self.context_encoding_buckets[-1] <= self.max_context_length
             ), f"Context bucket {self.context_encoding_buckets[-1]} should be <= {self.max_context_length}"
+        if self.context_encoding_bucket_pairs is not None:
+            bucket_pairs = []
+            for bucket_pair in self.context_encoding_bucket_pairs:
+                assert len(bucket_pair) == 2, (
+                    "Context encoding bucket pairs must be [active_tokens, "
+                    f"prefix_tokens], got {bucket_pair}"
+                )
+                active_tokens, prefix_tokens = int(bucket_pair[0]), int(bucket_pair[1])
+                assert active_tokens > 0, (
+                    f"Context encoding active bucket must be positive, got {active_tokens}"
+                )
+                assert prefix_tokens >= 0, (
+                    f"Context encoding prefix bucket must be non-negative, got {prefix_tokens}"
+                )
+                assert active_tokens <= self.max_context_length, (
+                    f"Context encoding active bucket {active_tokens} should be <= "
+                    f"{self.max_context_length}"
+                )
+                assert prefix_tokens <= self.max_context_length, (
+                    f"Context encoding prefix bucket {prefix_tokens} should be <= "
+                    f"{self.max_context_length}"
+                )
+                bucket_pairs.append([active_tokens, prefix_tokens])
+            self.context_encoding_bucket_pairs = sorted(
+                set(tuple(pair) for pair in bucket_pairs)
+            )
+            self.context_encoding_bucket_pairs = [
+                [active_tokens, prefix_tokens]
+                for active_tokens, prefix_tokens in self.context_encoding_bucket_pairs
+            ]
         if self.token_generation_buckets is not None:
             self.token_generation_buckets.sort()
             assert (

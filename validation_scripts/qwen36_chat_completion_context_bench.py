@@ -88,24 +88,25 @@ def _make_messages(
             + (filler_phrase * max(0, repeats))
         )
 
-    low = 0
-    high = 1
-    set_repeats(high)
-    while _chat_token_count(tokenizer, messages) <= target_tokens:
-        low = high
-        high *= 2
-        set_repeats(high)
+    set_repeats(0)
+    base_count = _chat_token_count(tokenizer, messages)
+    if base_count >= target_tokens:
+        return messages, base_count
 
-    while low + 1 < high:
-        mid = (low + high) // 2
-        set_repeats(mid)
-        if _chat_token_count(tokenizer, messages) <= target_tokens:
-            low = mid
-        else:
-            high = mid
+    set_repeats(1)
+    one_repeat_count = _chat_token_count(tokenizer, messages)
+    filler_delta = max(1, one_repeat_count - base_count)
+    repeats = max(0, (target_tokens - base_count) // filler_delta)
 
-    set_repeats(low)
-    return messages, _chat_token_count(tokenizer, messages)
+    set_repeats(repeats)
+    prompt_tokens = _chat_token_count(tokenizer, messages)
+    while repeats > 0 and prompt_tokens > target_tokens:
+        overshoot = prompt_tokens - target_tokens
+        repeats = max(0, repeats - max(1, (overshoot // filler_delta) + 1))
+        set_repeats(repeats)
+        prompt_tokens = _chat_token_count(tokenizer, messages)
+
+    return messages, prompt_tokens
 
 
 def _post_json(url: str, payload: dict[str, Any], timeout: float) -> tuple[int, dict[str, Any]]:
@@ -127,13 +128,111 @@ def _post_json(url: str, payload: dict[str, Any], timeout: float) -> tuple[int, 
         return exc.code, payload
 
 
+def _completion_tokens_from_usage(usage: Any) -> int | None:
+    if not isinstance(usage, dict):
+        return None
+    completion_tokens = usage.get("completion_tokens")
+    if completion_tokens is None:
+        return None
+    try:
+        return int(completion_tokens)
+    except (TypeError, ValueError):
+        return None
+
+
+def _completion_tokens_from_text(tokenizer: Any, text: str) -> int:
+    if not text:
+        return 0
+    try:
+        return len(tokenizer.encode(text, add_special_tokens=False))
+    except TypeError:
+        encoded = tokenizer(text, add_special_tokens=False)
+        return len(encoded.get("input_ids", []))
+
+
+def _token_latency_metrics(
+    *,
+    total_seconds: float,
+    ttft_seconds: float | None,
+    completion_tokens: int | None,
+    content_chunk_count: int | None,
+) -> dict[str, Any]:
+    content_chunk_tpot_seconds = (
+        (total_seconds - ttft_seconds) / (content_chunk_count - 1)
+        if ttft_seconds is not None
+        and content_chunk_count is not None
+        and content_chunk_count > 1
+        else None
+    )
+    completion_tokens_per_second = (
+        completion_tokens / total_seconds
+        if completion_tokens is not None
+        and completion_tokens > 0
+        and total_seconds > 0
+        else None
+    )
+    decode_elapsed_seconds = (
+        total_seconds - ttft_seconds
+        if ttft_seconds is not None and total_seconds >= ttft_seconds
+        else None
+    )
+    token_tpot_seconds = (
+        decode_elapsed_seconds / (completion_tokens - 1)
+        if decode_elapsed_seconds is not None
+        and completion_tokens is not None
+        and completion_tokens > 1
+        else None
+    )
+    decode_tokens_per_second = (
+        (completion_tokens - 1) / decode_elapsed_seconds
+        if decode_elapsed_seconds is not None
+        and decode_elapsed_seconds > 0
+        and completion_tokens is not None
+        and completion_tokens > 1
+        else None
+    )
+    return {
+        "tpot_seconds": token_tpot_seconds,
+        "token_tpot_seconds": token_tpot_seconds,
+        "content_chunk_tpot_seconds": content_chunk_tpot_seconds,
+        "decode_elapsed_seconds": decode_elapsed_seconds,
+        "decode_tokens_per_second": decode_tokens_per_second,
+        "completion_tokens_per_second": completion_tokens_per_second,
+    }
+
+
+def _response_text(response: dict[str, Any]) -> str:
+    choices = response.get("choices") if isinstance(response, dict) else None
+    if not isinstance(choices, list) or not choices:
+        return ""
+    first = choices[0]
+    if not isinstance(first, dict):
+        return ""
+    message = first.get("message")
+    if isinstance(message, dict):
+        content = message.get("content")
+        return "" if content is None else str(content)
+    text = first.get("text")
+    return "" if text is None else str(text)
+
+
 def _stream_chat(
     url: str,
     payload: dict[str, Any],
     timeout: float,
-) -> tuple[int, float | None, float, list[str], dict[str, Any] | None]:
+) -> tuple[
+    int,
+    float | None,
+    float,
+    list[str],
+    int,
+    str,
+    dict[str, Any] | None,
+    dict[str, Any] | None,
+]:
     payload = dict(payload)
     payload["stream"] = True
+    payload["stream_options"] = {"include_usage": True}
     body = json.dumps(payload).encode("utf-8")
     request = urllib.request.Request(
         url,
@@ -143,7 +242,10 @@ def _stream_chat(
     )
     start = time.perf_counter()
     chunks: list[str] = []
-    first_chunk_seconds = None
+    content_parts: list[str] = []
+    usage_payload = None
+    first_content_seconds = None
+    content_chunk_count = 0
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             status = response.status
@@ -154,18 +256,49 @@ def _stream_chat(
                 data = line[len("data:") :].strip()
                 if data == "[DONE]":
                     break
-                if first_chunk_seconds is None:
-                    first_chunk_seconds = time.perf_counter() - start
+                try:
+                    payload_chunk = json.loads(data)
+                    usage = payload_chunk.get("usage")
+                    if isinstance(usage, dict):
+                        usage_payload = usage
+                    choices = payload_chunk.get("choices") or []
+                    delta = (choices[0].get("delta") or {}) if choices else {}
+                    content = delta.get("content")
+                except Exception:
+                    content = None
+                if content:
+                    content_parts.append(str(content))
+                    content_chunk_count += 1
+                    if first_content_seconds is None:
+                        first_content_seconds = time.perf_counter() - start
                 chunks.append(data)
             total_seconds = time.perf_counter() - start
-            return status, first_chunk_seconds, total_seconds, chunks, None
+            return (
+                status,
+                first_content_seconds,
+                total_seconds,
+                chunks,
+                content_chunk_count,
+                "".join(content_parts),
+                usage_payload,
+                None,
+            )
     except urllib.error.HTTPError as exc:
         total_seconds = time.perf_counter() - start
         try:
             error_payload = json.loads(exc.read().decode("utf-8"))
         except Exception:
             error_payload = {"error": {"message": str(exc)}}
-        return exc.code, first_chunk_seconds, total_seconds, chunks, error_payload
+        return (
+            exc.code,
+            first_content_seconds,
+            total_seconds,
+            chunks,
+            content_chunk_count,
+            "".join(content_parts),
+            usage_payload,
+            error_payload,
+        )
 
 
 def _run_one(
@@ -176,6 +309,8 @@ def _run_one(
     max_tokens: int,
     timeout: float,
     stream: bool,
+    ignore_eos: bool,
+    tokenizer: Any,
 ) -> dict[str, Any]:
     payload = {
         "model": model,
@@ -184,11 +319,33 @@ def _run_one(
         "temperature": 0,
         "chat_template_kwargs": {"enable_thinking": False},
     }
+    if ignore_eos:
+        payload["ignore_eos"] = True
     if stream:
-        status, first_chunk_seconds, total_seconds, chunks, error_payload = _stream_chat(
+        (
+            status,
+            first_chunk_seconds,
+            total_seconds,
+            chunks,
+            content_chunk_count,
+            content_text,
+            usage_payload,
+            error_payload,
+        ) = _stream_chat(
             url,
             payload,
             timeout,
+        )
+        completion_tokens = _completion_tokens_from_usage(usage_payload)
+        completion_token_source = "usage"
+        if completion_tokens is None:
+            completion_tokens = _completion_tokens_from_text(tokenizer, content_text)
+            completion_token_source = "tokenizer"
+        latency_metrics = _token_latency_metrics(
+            total_seconds=total_seconds,
+            ttft_seconds=first_chunk_seconds,
+            completion_tokens=completion_tokens,
+            content_chunk_count=content_chunk_count,
         )
         if status < 400:
             return {
@@ -197,6 +354,12 @@ def _run_one(
                 "ttft_seconds": first_chunk_seconds,
                 "total_seconds": total_seconds,
                 "chunk_count": len(chunks),
+                "content_chunk_count": content_chunk_count,
+                "completion_tokens": completion_tokens,
+                "completion_token_source": completion_token_source,
+                "content_text": content_text,
+                "usage": usage_payload,
+                **latency_metrics,
                 "error": None,
             }
         return {
@@ -205,21 +368,50 @@ def _run_one(
             "ttft_seconds": first_chunk_seconds,
             "total_seconds": total_seconds,
             "chunk_count": len(chunks),
+            "content_chunk_count": content_chunk_count,
+            "completion_tokens": completion_tokens,
+            "completion_token_source": completion_token_source,
+            "content_text": content_text,
+            "usage": usage_payload,
+            **latency_metrics,
             "error": error_payload,
         }
 
     start = time.perf_counter()
     status, response = _post_json(url, payload, timeout)
     total_seconds = time.perf_counter() - start
+    usage_payload = response.get("usage") if isinstance(response, dict) else None
+    content_text = _response_text(response) if isinstance(response, dict) else ""
+    completion_tokens = _completion_tokens_from_usage(usage_payload)
+    completion_token_source = "usage"
+    if completion_tokens is None:
+        completion_tokens = _completion_tokens_from_text(tokenizer, content_text)
+        completion_token_source = "tokenizer"
     return {
         "status": status,
         "stream": False,
         "ttft_seconds": None,
         "total_seconds": total_seconds,
         "chunk_count": None,
+        "content_text": content_text,
+        "completion_tokens": completion_tokens,
+        "completion_token_source": completion_token_source,
+        "completion_tokens_per_second": (
+            completion_tokens / total_seconds
+            if completion_tokens > 0 and total_seconds > 0
+            else None
+        ),
         "error": None if status < 400 else response,
-        "usage": response.get("usage") if isinstance(response, dict) else None,
+        "usage": usage_payload,
     }
+
+
+def _row_passed(row: dict[str, Any], *, max_tokens: int) -> bool:
+    if int(row["status"]) >= 400:
+        return False
+    if row.get("stream") and max_tokens > 0:
+        return int(row.get("content_chunk_count") or 0) > 0
+    return True
 
 
 def main() -> int:
@@ -243,6 +435,7 @@ def main() -> int:
     parser.add_argument("--max-tokens", type=int, default=1)
     parser.add_argument("--timeout", type=float, default=900.0)
     parser.add_argument("--no-stream", action="store_true")
+    parser.add_argument("--ignore-eos", action="store_true")
     parser.add_argument(
         "--unique-per-request",
         action="store_true",
@@ -290,6 +483,8 @@ def main() -> int:
                         max_tokens=args.max_tokens,
                         timeout=args.timeout,
                         stream=not args.no_stream,
+                        ignore_eos=args.ignore_eos,
+                        tokenizer=tokenizer,
                     )
                 ]
             else:
@@ -303,6 +498,8 @@ def main() -> int:
                             max_tokens=args.max_tokens,
                             timeout=args.timeout,
                             stream=not args.no_stream,
+                            ignore_eos=args.ignore_eos,
+                            tokenizer=tokenizer,
                         )
                         for request in requests
                     ]
@@ -339,13 +536,15 @@ def main() -> int:
         "repeats": args.repeats,
         "concurrency": args.concurrency,
         "max_tokens": args.max_tokens,
+        "ignore_eos": args.ignore_eos,
+        "passed": all(_row_passed(row, max_tokens=args.max_tokens) for row in results),
         "results": results,
     }
     output_path = Path(args.output_json)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w") as f:
         json.dump(output, f, indent=2, sort_keys=True)
-    return 0 if all(int(row["status"]) < 400 for row in results) else 1
+    return 0 if output["passed"] else 1
 
 
 if __name__ == "__main__":

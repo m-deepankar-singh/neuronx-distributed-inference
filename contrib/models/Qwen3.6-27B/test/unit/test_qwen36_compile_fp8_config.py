@@ -81,6 +81,8 @@ def _args(**overrides):
         cte_bucket=512,
         cte_buckets=["256,512"],
         prefix_buckets=None,
+        context_encoding_bucket_pairs=None,
+        omit_zero_prefix_pair=False,
         token_generation_buckets=None,
         token_generation_batches=None,
         block_size=256,
@@ -100,6 +102,9 @@ def _args(**overrides):
         output_logits_with_on_device_sampling=False,
         kernel_q_tile_size=128,
         kernel_kv_tile_size=1024,
+        prefix_cte_attention_chunk_size=None,
+        prefix_cte_attention_backend="attention_cte",
+        prefix_cte_attention_segment_size=None,
         disable_static_hybrid_cache=False,
         gdn_checkpoint_interval=256,
         max_gdn_checkpoint_slots=8,
@@ -109,6 +114,7 @@ def _args(**overrides):
         hybrid_apc_require_vllm_metadata=False,
         hybrid_apc_enable_backed_prefix_reads=False,
         quantize_edge_mlp_layers=False,
+        quantize_lm_head=False,
     )
     defaults.update(overrides)
     return argparse.Namespace(**defaults)
@@ -273,12 +279,175 @@ class TestQwen36CompileFp8Config(unittest.TestCase):
         self.assertIn("layers.3.mlp", modules)
         self.assertNotIn("layers.1.mlp", modules)
 
+    def test_fp8_full_quantizes_attention_and_edge_mlp_by_default(self):
+        with patch.object(
+            _COMPILE,
+            "_load_text_config",
+            return_value={"num_hidden_layers": 4},
+        ), patch.dict(
+            sys.modules,
+            {
+                "neuronx_distributed_inference.models.config": _fake_config_module(),
+                "src.modeling_qwen35": _fake_qwen_module(),
+            },
+        ):
+            config, modules = _COMPILE._build_config(
+                _args(disable_on_device_sampling=True, weight_dtype="fp8_full"),
+            )
+
+        self.assertTrue(config.neuron_config.quantized)
+        self.assertNotIn("layers.0.mlp", modules)
+        self.assertNotIn("layers.3.mlp", modules)
+        self.assertNotIn("layers.0.self_attn", modules)
+        self.assertNotIn("layers.0.linear_attn", modules)
+        self.assertIn("layers.0.linear_attn.conv1d_weight", modules)
+        self.assertIn("layers.0.linear_attn.A_log_weight", modules)
+        self.assertIn("layers.0.linear_attn.dt_bias_weight", modules)
+        self.assertIn("lm_head", modules)
+
+    def test_fp8_full_can_quantize_lm_head_when_requested(self):
+        with patch.object(
+            _COMPILE,
+            "_load_text_config",
+            return_value={"num_hidden_layers": 2},
+        ), patch.dict(
+            sys.modules,
+            {
+                "neuronx_distributed_inference.models.config": _fake_config_module(),
+                "src.modeling_qwen35": _fake_qwen_module(),
+            },
+        ):
+            _config, modules = _COMPILE._build_config(
+                _args(
+                    disable_on_device_sampling=True,
+                    weight_dtype="fp8_full",
+                    quantize_lm_head=True,
+                ),
+            )
+
+        self.assertNotIn("lm_head", modules)
+        self.assertNotIn("model.lm_head", modules)
+
     def test_long_prefix_buckets_must_fit_max_context_length(self):
         with self.assertRaisesRegex(ValueError, "Largest prefix bucket"):
             _COMPILE._validate_prefix_buckets_fit_context(
                 _args(enable_prefix_caching=True),
                 max_context_length=512,
                 prefix_buckets=[512, 131072],
+            )
+
+    def test_sparse_context_encoding_bucket_pairs_are_forwarded(self):
+        with patch.object(
+            _COMPILE,
+            "_load_text_config",
+            return_value={"num_hidden_layers": 2},
+        ), patch.dict(
+            sys.modules,
+            {
+                "neuronx_distributed_inference.models.config": _fake_config_module(),
+                "src.modeling_qwen35": _fake_qwen_module(),
+            },
+        ):
+            config, _modules = _COMPILE._build_config(
+                _args(
+                    cte_buckets=["512,1536"],
+                    prefix_buckets=["256,512,65536"],
+                    max_context_length=65536,
+                    seq_len=65536,
+                    pa_num_blocks=256,
+                    context_encoding_bucket_pairs=[
+                        "512:256,512:512",
+                        "1536:256",
+                        "1536:65536",
+                    ],
+                ),
+            )
+
+        self.assertEqual(
+            config.neuron_config.context_encoding_bucket_pairs,
+            [
+                [512, 0],
+                [512, 256],
+                [512, 512],
+                [1536, 0],
+                [1536, 256],
+                [1536, 65536],
+            ],
+        )
+
+    def test_prefix_cte_attention_chunk_size_is_forwarded(self):
+        with patch.object(
+            _COMPILE,
+            "_load_text_config",
+            return_value={"num_hidden_layers": 2},
+        ), patch.dict(
+            sys.modules,
+            {
+                "neuronx_distributed_inference.models.config": _fake_config_module(),
+                "src.modeling_qwen35": _fake_qwen_module(),
+            },
+        ):
+            config, _modules = _COMPILE._build_config(
+                _args(prefix_cte_attention_chunk_size=32768),
+            )
+
+        self.assertEqual(config.neuron_config.prefix_cte_attention_chunk_size, 32768)
+
+    def test_segmented_prefix_cte_attention_config_is_forwarded(self):
+        with patch.object(
+            _COMPILE,
+            "_load_text_config",
+            return_value={"num_hidden_layers": 2},
+        ), patch.dict(
+            sys.modules,
+            {
+                "neuronx_distributed_inference.models.config": _fake_config_module(),
+                "src.modeling_qwen35": _fake_qwen_module(),
+            },
+        ):
+            config, _modules = _COMPILE._build_config(
+                _args(
+                    prefix_cte_attention_backend="segmented_cte",
+                    prefix_cte_attention_segment_size=32768,
+                ),
+            )
+
+        self.assertEqual(
+            config.neuron_config.prefix_cte_attention_backend,
+            "segmented_cte",
+        )
+        self.assertEqual(
+            config.neuron_config.prefix_cte_attention_segment_size,
+            32768,
+        )
+
+    def test_sparse_context_encoding_bucket_pairs_can_omit_zero_pair(self):
+        pairs = _COMPILE._context_encoding_bucket_pairs(
+            _args(
+                cte_buckets=["3072"],
+                prefix_buckets=["131072"],
+                context_encoding_bucket_pairs=["3072:131072"],
+                omit_zero_prefix_pair=True,
+            ),
+            cte_buckets=[3072],
+            prefix_buckets=[131072],
+        )
+
+        self.assertEqual(pairs, [[3072, 131072]])
+
+    def test_sparse_context_encoding_bucket_pairs_validate_config_buckets(self):
+        with self.assertRaisesRegex(ValueError, "active bucket"):
+            _COMPILE._context_encoding_bucket_pairs(
+                _args(context_encoding_bucket_pairs=["768:256"]),
+                cte_buckets=[512],
+                prefix_buckets=[256],
+            )
+
+        with self.assertRaisesRegex(ValueError, "prefix bucket"):
+            _COMPILE._context_encoding_bucket_pairs(
+                _args(context_encoding_bucket_pairs=["512:1024"]),
+                cte_buckets=[512],
+                prefix_buckets=[256],
             )
 
     def test_pa_num_blocks_rejects_user_blocks_below_sequence_requirement(self):

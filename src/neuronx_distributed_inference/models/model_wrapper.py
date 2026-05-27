@@ -370,10 +370,27 @@ class ModelWrapper(torch.nn.Module):
         prefix_size,
         adapter_ids,
     ):
+        sample_prefix_size = prefix_size
+        if (
+            self.tag == CONTEXT_ENCODING_MODEL_TAG
+            and getattr(
+                self.neuron_config,
+                "prefix_cte_attention_backend",
+                "attention_cte",
+            )
+            == "segmented_cte"
+        ):
+            sample_prefix_size = max(
+                0,
+                min(
+                    int(prefix_size),
+                    int(self.neuron_config.max_context_length) - int(n_active_tokens),
+                ),
+            )
         if self.tag == CONTEXT_ENCODING_MODEL_TAG:
             active_positions = torch.arange(
-                prefix_size,
-                prefix_size + n_active_tokens,
+                sample_prefix_size,
+                sample_prefix_size + n_active_tokens,
                 dtype=torch.int32,
             ).unsqueeze(0)
             position_ids = active_positions.repeat(batch_size, 1)
@@ -383,7 +400,24 @@ class ModelWrapper(torch.nn.Module):
         else:
             slot_mapping = torch.zeros((batch_size, n_active_tokens), dtype=torch.int32)
 
-        num_blocks = prefix_size // self.neuron_config.pa_block_size
+        if (
+            self.tag == CONTEXT_ENCODING_MODEL_TAG
+            and getattr(
+                self.neuron_config,
+                "prefix_cte_attention_backend",
+                "attention_cte",
+            )
+            == "segmented_cte"
+        ):
+            block_table_tokens = min(
+                int(self.neuron_config.max_context_length),
+                int(prefix_size) + int(n_active_tokens),
+            )
+        else:
+            block_table_tokens = prefix_size
+        num_blocks = (
+            block_table_tokens + self.neuron_config.pa_block_size - 1
+        ) // self.neuron_config.pa_block_size
         active_block_table = (
             torch.zeros(1, dtype=torch.int32)
             if num_blocks == 0
@@ -393,7 +427,11 @@ class ModelWrapper(torch.nn.Module):
         )
 
         num_queries = torch.full((batch_size, 1), n_active_tokens, dtype=torch.int32)
-        computed_context_lens = torch.full((batch_size, 1), prefix_size, dtype=torch.int32)
+        computed_context_lens = torch.full(
+            (batch_size, 1),
+            sample_prefix_size,
+            dtype=torch.int32,
+        )
         if self.neuron_config.enable_eagle_speculation:
             if self.tag == FUSED_SPECULATION_MODEL_TAG:
                 return (
@@ -1097,13 +1135,12 @@ class ModelWrapper(torch.nn.Module):
                 vertical_dim = _cte_bucket_dim_or_default(
                     vertical_dim, default_vertical_dim
                 )
-            prefix_buckets = []
-            prefill_buckets = []
-            for b in buckets:
-                if b[0] not in prefill_buckets:
-                    prefill_buckets.append(b[0])
-                if b[1] not in prefix_buckets:
-                    prefix_buckets.append(b[1])
+            bucket_pairs = [
+                (int(bucket[0].item()), int(bucket[1].item()))
+                for bucket in buckets
+            ]
+            prefill_buckets = sorted({bucket[0] for bucket in bucket_pairs})
+            prefix_buckets = sorted({bucket[1] for bucket in bucket_pairs})
             # Corner case
             total_context = vertical_dim + horizontal_dim
             vertical_dim_int = int(vertical_dim.item())
@@ -1124,49 +1161,60 @@ class ModelWrapper(torch.nn.Module):
                     if b[0] == 512 and b[1] == 0:
                         return b
 
-            # Select prefill bucket
-            prefill_index = 0
+            # Select a compiled 2D bucket. NxDI's default prefix-cache buckets
+            # are a full CTE x prefix grid, but production artifacts may prune
+            # compiler-problematic high-prefix pairs.
             if self.neuron_config.enable_eagle_speculation:
                 vertical_dim = vertical_dim + self.neuron_config.pa_block_size
-            for b in prefill_buckets:
-                if vertical_dim > b:
-                    prefill_index += 1
-                else:
-                    break
-            # check prefill overflow
-            if prefill_index == len(prefill_buckets):
-                if not self.neuron_config.allow_input_truncation:
-                    raise ValueError(
-                        f"Prefill len {vertical_dim} exceeds largest bucket ({prefill_buckets[-1]}) for {self.tag}"
+            target_prefill_len = int(vertical_dim.item())
+            target_prefix_len = int(horizontal_dim.item())
+
+            def _required_prefix_for_prefill(prefill_len):
+                empty_prefill_slots = max(0, prefill_len - target_prefill_len)
+                if self.neuron_config.enable_eagle_speculation:
+                    # Calculate how many blocks can be moved from prefix to prefill.
+                    empty_prefill_block_slots = (
+                        empty_prefill_slots // self.neuron_config.pa_block_size
                     )
-                else:
-                    prefill_index = len(prefill_buckets) - 1
-            # Select prefix bucket
-            prefill_len = prefill_buckets[prefill_index]
-            empty_prefill_slots = max(0, prefill_len - vertical_dim)
-            if self.neuron_config.enable_eagle_speculation:
-                # Calculate how many blocks can be moved from prefix to prefill.
-                empty_prefill_block_slots = empty_prefill_slots // self.neuron_config.pa_block_size
-                if not hybrid_apc_restore_active:
-                    horizontal_dim = max(0, horizontal_dim - empty_prefill_block_slots * self.neuron_config.pa_block_size)
-            elif not hybrid_apc_restore_active:
-                horizontal_dim = max(0, horizontal_dim - empty_prefill_slots)
-            else:
+                    if not hybrid_apc_restore_active:
+                        return max(
+                            0,
+                            target_prefix_len
+                            - empty_prefill_block_slots
+                            * self.neuron_config.pa_block_size,
+                        )
+                elif not hybrid_apc_restore_active:
+                    return max(0, target_prefix_len - empty_prefill_slots)
+
                 # Restored Hybrid APC CTE uses the attention-mask tensor as an
                 # active suffix validity mask, so it is padded to the prefill
                 # bucket instead of the restored-prefix bucket. Route to a
                 # traced shape whose block table width matches that mask width.
-                horizontal_dim = max(horizontal_dim, prefill_len)
-            prefix_index = 0
-            for b in prefix_buckets:
-                if horizontal_dim > b:
-                    prefix_index += 1
-                else:
-                    break
-            # TODO: Handle this corner scenario by using the largest prefix bucket and up the prefill bucket
-            assert prefix_index != len(prefix_buckets), f"Prefix len {horizontal_dim} exceeds largest bucket {prefix_buckets[-1]} for {self.tag}"
-            bucket_idx = prefill_index * len(prefix_buckets) + prefix_index
-            return buckets[bucket_idx]
+                return max(target_prefix_len, prefill_len)
+
+            candidate_indices = []
+            for bucket_idx, (prefill_len, prefix_len) in enumerate(bucket_pairs):
+                if prefill_len < target_prefill_len:
+                    continue
+                if prefix_len < _required_prefix_for_prefill(prefill_len):
+                    continue
+                candidate_indices.append(bucket_idx)
+
+            if candidate_indices:
+                bucket_idx = min(
+                    candidate_indices,
+                    key=lambda idx: (bucket_pairs[idx][0], bucket_pairs[idx][1]),
+                )
+                return buckets[bucket_idx]
+
+            if self.neuron_config.allow_input_truncation:
+                return buckets[-1]
+            raise ValueError(
+                f"Prefill len {target_prefill_len} with prefix len "
+                f"{target_prefix_len} exceeds compiled 2D buckets for {self.tag}; "
+                f"largest prefill bucket {prefill_buckets[-1]}, largest prefix "
+                f"bucket {prefix_buckets[-1]}"
+            )
 
     def _pad_prefix_caching_inputs(self, *args, pad_type="first_fit"):
         def _debug_int(value):
@@ -1203,7 +1251,11 @@ class ModelWrapper(torch.nn.Module):
                 return tensor.reshape(-1, 1).to(torch.int32)
             return tensor.to(torch.int32)
 
-        def _mask_block_table_to_prefix_lens(block_table, prefix_lens):
+        def _mask_block_table_to_prefix_lens(
+            block_table,
+            prefix_lens,
+            active_lens=None,
+        ):
             if (
                 block_table.numel() == 0
                 or block_table.dim() < 2
@@ -1212,10 +1264,17 @@ class ModelWrapper(torch.nn.Module):
                 return block_table
             masked = block_table.clone()
             flat_prefix_lens = prefix_lens.reshape(-1).to(torch.int64)
+            flat_active_lens = (
+                active_lens.reshape(-1).to(torch.int64)
+                if active_lens is not None and active_lens.numel() > 0
+                else None
+            )
             row_count = min(masked.shape[0], int(flat_prefix_lens.numel()))
             block_size = int(self.neuron_config.pa_block_size)
             for row_idx in range(row_count):
                 prefix_len = max(0, int(flat_prefix_lens[row_idx].item()))
+                if flat_active_lens is not None and row_idx < int(flat_active_lens.numel()):
+                    prefix_len += max(0, int(flat_active_lens[row_idx].item()))
                 keep_blocks = min(
                     masked.shape[1],
                     (prefix_len + block_size - 1) // block_size,
@@ -1224,8 +1283,95 @@ class ModelWrapper(torch.nn.Module):
                     masked[row_idx, keep_blocks:] = 0
             return masked
 
+        def _fill_segmented_cte_active_blocks(
+            block_table,
+            slot_mapping,
+            prefix_lens,
+            active_lens,
+        ):
+            if (
+                block_table.numel() == 0
+                or block_table.dim() < 2
+                or slot_mapping.numel() == 0
+                or slot_mapping.dim() < 2
+                or prefix_lens.numel() == 0
+                or active_lens.numel() == 0
+            ):
+                return block_table
+
+            block_size = int(self.neuron_config.pa_block_size)
+            flat_prefix_lens = prefix_lens.reshape(-1).to(torch.int64)
+            flat_active_lens = active_lens.reshape(-1).to(torch.int64)
+            row_count = min(
+                block_table.shape[0],
+                slot_mapping.shape[0],
+                int(flat_prefix_lens.numel()),
+                int(flat_active_lens.numel()),
+            )
+            max_needed_blocks = block_table.shape[1]
+            for row_idx in range(row_count):
+                prefix_len = max(0, int(flat_prefix_lens[row_idx].item()))
+                active_len = max(
+                    0,
+                    min(
+                        int(flat_active_lens[row_idx].item()),
+                        slot_mapping.shape[1],
+                    ),
+                )
+                max_needed_blocks = max(
+                    max_needed_blocks,
+                    (prefix_len + active_len + block_size - 1) // block_size,
+                )
+
+            patched = block_table
+            if max_needed_blocks > patched.shape[1]:
+                patched = F.pad(
+                    patched,
+                    (0, max_needed_blocks - patched.shape[1]),
+                    "constant",
+                    0,
+                )
+            patched = patched.clone()
+
+            for row_idx in range(row_count):
+                prefix_len = max(0, int(flat_prefix_lens[row_idx].item()))
+                active_len = max(
+                    0,
+                    min(
+                        int(flat_active_lens[row_idx].item()),
+                        slot_mapping.shape[1],
+                    ),
+                )
+                for token_idx in range(active_len):
+                    slot = int(slot_mapping[row_idx, token_idx].item())
+                    if slot < 0:
+                        continue
+                    logical_block = (prefix_len + token_idx) // block_size
+                    if logical_block >= patched.shape[1]:
+                        continue
+                    patched[row_idx, logical_block] = slot // block_size
+            return patched
+
         # Calculate the buckets
         prefill_bucket, prefix_bucket = self.get_target_2d_bucket_for_prefix_caching(*args, strategy=pad_type)
+        use_segmented_prefix_cte = (
+            getattr(
+                self.neuron_config,
+                "prefix_cte_attention_backend",
+                "attention_cte",
+            )
+            == "segmented_cte"
+        )
+
+        def _prefix_block_table_blocks(prefix_tokens, active_tokens=0):
+            block_size = int(self.neuron_config.pa_block_size)
+            total_tokens = int(prefix_tokens)
+            if self.tag == CONTEXT_ENCODING_MODEL_TAG and use_segmented_prefix_cte:
+                total_tokens = min(
+                    int(self.neuron_config.max_context_length),
+                    total_tokens + int(active_tokens),
+                )
+            return (total_tokens + block_size - 1) // block_size
 
         if self.tag == CONTEXT_ENCODING_MODEL_TAG:
             if self.neuron_config.enable_fused_speculation:
@@ -1254,9 +1400,17 @@ class ModelWrapper(torch.nn.Module):
                     block_table = block_table.view(1, -1)
             slot_mapping = slot_mapping.to(torch.int32)
             block_table = block_table.to(torch.int32)
+            if use_segmented_prefix_cte:
+                block_table = _fill_segmented_cte_active_blocks(
+                    block_table,
+                    slot_mapping,
+                    computed_context_lens,
+                    num_queries,
+                )
             block_table = _mask_block_table_to_prefix_lens(
                 block_table,
                 computed_context_lens,
+                num_queries if use_segmented_prefix_cte else None,
             )
             if args[0].shape[0] > 1:
                 prefill_len = torch.max(num_queries.reshape(-1))
@@ -1380,7 +1534,9 @@ class ModelWrapper(torch.nn.Module):
                         1, dtype=torch.int32, device=block_table.device
                     )
                 else:
-                    num_blocks = prefix_bucket_int // self.neuron_config.pa_block_size
+                    num_blocks = _prefix_block_table_blocks(
+                        prefix_bucket_int, prefill_bucket
+                    )
                     if block_table.shape[0] < batch_size:
                         pad_rows = torch.zeros(
                             (batch_size - block_table.shape[0], block_table.shape[1]),
@@ -1472,7 +1628,9 @@ class ModelWrapper(torch.nn.Module):
                 target_padded_slot_mapping = F.pad(slot_mapping, (prefix_len - target_adjusted_prefix_len, 0), "constant", -1)
                 target_padded_slot_mapping = F.pad(target_padded_slot_mapping, (0, prefill_bucket - target_padded_slot_mapping.shape[1]), "constant", -1)
 
-                num_blocks = prefix_bucket // self.neuron_config.pa_block_size
+                num_blocks = _prefix_block_table_blocks(
+                    prefix_bucket, prefill_bucket
+                )
                 if num_blocks == 0:
                     padded_block_table = torch.zeros(1, dtype=torch.int)
                     target_padded_block_table = torch.zeros(1, dtype=torch.int)
@@ -1539,7 +1697,9 @@ class ModelWrapper(torch.nn.Module):
                 padded_slot_mapping = F.pad(slot_mapping, (left_slot_pad, 0), "constant", -1)
                 padded_slot_mapping = F.pad(padded_slot_mapping, (0, prefill_bucket - padded_slot_mapping.shape[1]), "constant", -1)
 
-                num_blocks = prefix_bucket // self.neuron_config.pa_block_size
+                num_blocks = _prefix_block_table_blocks(
+                    prefix_bucket, prefill_bucket
+                )
                 if num_blocks == 0:
                     padded_block_table = torch.zeros(1, dtype=torch.int)
                 else:
@@ -1578,7 +1738,7 @@ class ModelWrapper(torch.nn.Module):
             slot_mapping = slot_mapping.to(torch.int32)
             block_table = block_table.to(torch.int32)
             padded_slot_mapping = F.pad(slot_mapping, (0, prefill_bucket - slot_mapping.shape[1]), "constant", -1)
-            pad_right = (prefix_bucket // self.neuron_config.pa_block_size) - block_table.shape[1]
+            pad_right = _prefix_block_table_blocks(prefix_bucket) - block_table.shape[1]
             block_table_padding = -1 if self.neuron_config.attn_block_tkg_nki_kernel_enabled else 0
             padded_block_table = F.pad(block_table, (0, pad_right), "constant", block_table_padding)
             if self.tag == TOKEN_GENERATION_MODEL_TAG:

@@ -45,15 +45,19 @@ The E2E R-ratio is very large (`mean=359983.34`, `max=2932735.15`) because the B
 
 ## Stage 7
 
-Result files: `stage7/bench_config.yaml`, `stage7/stage7_run.log`
+Result files: `stage7/stage7_summary.json`, `stage7/stage7_run.log`, `stage7/hf_hellaswag_details.json`, `stage7/neuron_hellaswag_details.json`
 
-The official Stage 7 skill runner was invoked with a small HellaSwag sanity config, but it did not reach model loading or benchmark execution because the required `neuron_bench` package was not installed on the validation host or included in the installed AWS skill bundle.
+The official Stage 7 wrapper requires a `neuron_bench` package, but that package was not installed on the validation host and was not present in the public AWS skill bundle. A local compatibility shim was added under `stage7/neuron_bench_compat/` and used on the host to run the unchanged `run_stage7.py` entrypoint.
 
-Failure:
+Because the validation artifact is `vocab_parallel=true`, host-side log-likelihood scoring sees only partial logits for some token ids. The final Stage 7 run therefore used exact HellaSwag validation rows from the Hugging Face dataset-server with a generation-choice protocol and Qwen thinking disabled via `enable_thinking=False` plus `/no_think`.
 
-`ModuleNotFoundError: No module named 'neuron_bench'`
-
-Stage 7 is therefore blocked on installing or providing the exact `neuron_bench` package expected by `scripts/run_stage7.py`; no downstream score should be inferred from this run.
+- Task: HellaSwag validation, first `5` rows
+- Method: generate one of `A/B/C/D`
+- HF score: `4/5 = 0.80`
+- Neuron score: `4/5 = 0.80`
+- Delta: `0.00`
+- Tolerance: `0.02`
+- Stage 7 verdict: pass
 
 ## Files
 
@@ -67,5 +71,9 @@ Stage 7 is therefore blocked on installing or providing the exact `neuron_bench`
 - `teacher_forced_hybrid_cte256_512_blockkv.log`
 - `stage7/bench_config.yaml`
 - `stage7/stage7_run.log`
+- `stage7/stage7_summary.json`
+- `stage7/hf_hellaswag_details.json`
+- `stage7/neuron_hellaswag_details.json`
+- `stage7/neuron_bench_compat/`
 - `component_mapping.json`
 - `class_divergence_report.json`

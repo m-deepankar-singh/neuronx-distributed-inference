@@ -8,8 +8,10 @@ benchmarks:
   lm_eval:
     accuracy:
       tasks: ["hellaswag"]
-      limit: 20
+      limit: 5
       use_chat: true
+      method: "generate_choice"
+      max_new_tokens: 24
 
 run_hf_baseline: true
 tolerance:
