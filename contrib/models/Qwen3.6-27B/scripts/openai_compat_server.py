@@ -42,11 +42,29 @@ def _error(handler: BaseHTTPRequestHandler, status: int, message: str):
     )
 
 
-def _first_text_prompt(prompt: Any) -> str:
+def _is_token_id(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _completion_prompt(prompt: Any) -> str | list[int]:
     if isinstance(prompt, str):
         return prompt
-    if isinstance(prompt, list) and prompt:
-        return str(prompt[0])
+    if isinstance(prompt, list):
+        if not prompt:
+            raise ValueError("prompt list must not be empty")
+        first = prompt[0]
+        if _is_token_id(first):
+            if not all(_is_token_id(item) for item in prompt):
+                raise ValueError("token-id prompt lists must contain only integers")
+            return [int(item) for item in prompt]
+        if isinstance(first, list) and first and all(_is_token_id(item) for item in first):
+            return [int(item) for item in first]
+        if isinstance(first, str):
+            return first
+        raise ValueError(
+            "unsupported prompt list shape; use a string, list[int], list[str], "
+            "or list[list[int]]"
+        )
     return str(prompt)
 
 
@@ -202,7 +220,7 @@ class QwenOpenAIServer:
             lines.append("assistant:")
             return "\n".join(lines)
 
-    def _generate(self, prompt: str, body: Dict[str, Any]) -> Dict[str, Any]:
+    def _generate(self, prompt: str | list[int], body: Dict[str, Any]) -> Dict[str, Any]:
         max_tokens = int(body.get("max_tokens", body.get("max_completion_tokens", 128)) or 128)
         if max_tokens <= 0:
             raise ValueError("max_tokens must be positive")
@@ -211,13 +229,24 @@ class QwenOpenAIServer:
                 f"max_tokens={max_tokens} exceeds server limit {self.args.max_new_tokens_limit}"
             )
 
-        input_ids = torch.tensor(
-            [self.tokenizer(prompt, add_special_tokens=False).input_ids],
-            dtype=torch.long,
-        )
+        if isinstance(prompt, list):
+            input_ids = torch.tensor([prompt], dtype=torch.long)
+        else:
+            input_ids = torch.tensor(
+                [self.tokenizer(prompt, add_special_tokens=False).input_ids],
+                dtype=torch.long,
+            )
         prompt_tokens = int(input_ids.shape[1])
         if prompt_tokens <= 0:
             raise ValueError("prompt must contain at least one token")
+        vocab_size = len(self.tokenizer)
+        invalid_prompt_ids = [
+            int(tok)
+            for tok in input_ids.reshape(-1).tolist()
+            if int(tok) < 0 or int(tok) >= vocab_size
+        ]
+        if invalid_prompt_ids:
+            raise ValueError(f"prompt contains invalid token ids: {invalid_prompt_ids[:8]}")
         if prompt_tokens + max_tokens > self.args.seq_len:
             raise ValueError(
                 f"prompt_tokens + max_tokens = {prompt_tokens + max_tokens} exceeds "
@@ -276,7 +305,6 @@ class QwenOpenAIServer:
 
             new_ids = []
             current_token = first_token
-            vocab_size = len(self.tokenizer)
             raw_eos_id = self.tokenizer.eos_token_id
             eos_ids = (
                 set(raw_eos_id)
@@ -375,7 +403,10 @@ def make_handler(server_state: QwenOpenAIServer):
                     raise ValueError("stream=true is not supported by this minimal server yet")
 
                 if self.path == "/v1/completions":
-                    result = server_state._generate(_first_text_prompt(body.get("prompt", "")), body)
+                    result = server_state._generate(
+                        _completion_prompt(body.get("prompt", "")),
+                        body,
+                    )
                     _json_response(
                         self,
                         200,

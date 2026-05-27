@@ -7,7 +7,7 @@ Custom NKI kernel for cross-attention with a 1D additive mask over K positions.
 K_seq = 1024, d = 128, Q_seq = 6144 (or 24576 for Stage 2).
 Mask: [batch_heads, 1024] additive bias {0, -10000} (2D, flat).
 
-Uses ONLY nisa.* (ISA-level) APIs for mode='torchxla' compatibility.
+Uses ONLY nisa.* (ISA-level) APIs for PyTorch XLA compatibility.
 All loads/stores via nisa.dma_copy, transposes via nisa.nc_transpose,
 math via nisa.tensor_tensor / nisa.tensor_scalar / nisa.tensor_reduce /
 nisa.activation_reduce / nisa.nc_matmul.
@@ -26,7 +26,7 @@ _XATTN_K_CHUNK = 128  # K chunk size (= V tile)
 _XATTN_D = 128  # head_dim
 
 
-@nki.jit(mode="torchxla")
+@nki.jit
 def cross_attn_kernel(q_ref, k_ref, v_ref, mask_ref):
     """NKI masked cross-attention: softmax(Q@K^T + mask) @ V.
 
@@ -42,7 +42,7 @@ def cross_attn_kernel(q_ref, k_ref, v_ref, mask_ref):
 
     # Allocate output in HBM (returned to XLA)
     out_ref = nl.ndarray(
-        (batch_heads, q_seq, _XATTN_D), dtype=q_ref.dtype, buffer=nl.hbm
+        (batch_heads, q_seq, _XATTN_D), dtype=q_ref.dtype, buffer=nl.shared_hbm
     )
 
     # Ones column for mask broadcasting via outer product

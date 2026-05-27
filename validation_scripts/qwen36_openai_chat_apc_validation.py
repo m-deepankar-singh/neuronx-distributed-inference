@@ -295,6 +295,25 @@ def _successful_elapsed(rows: list[dict[str, Any]]) -> list[float]:
     ]
 
 
+def _speedup_passes(value: float | None, minimum: float) -> bool:
+    return minimum <= 0 or (value is not None and value >= minimum)
+
+
+def _apc_gate_failures(summary: dict[str, Any]) -> list[str]:
+    checks = {
+        "all_status_ok": bool(summary["all_status_ok"]),
+        "warm_full_exact_text": bool(summary["warm_full_exact_text"]),
+        "partial_repeat_exact_text": bool(summary["partial_repeat_exact_text"]),
+        "multi_turn_repeat_exact_text": bool(summary["multi_turn_repeat_exact_text"]),
+        "semantic_smoke_passed": bool(summary["semantic_smoke_passed"]),
+        "warm_full_speedup_passed": bool(summary["warm_full_speedup_passed"]),
+        "partial_reference_speedup_passed": bool(
+            summary["partial_reference_speedup_passed"]
+        ),
+    }
+    return [name for name, passed in checks.items() if not passed]
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--base-url", default="http://127.0.0.1:8000")
@@ -310,6 +329,24 @@ def main() -> int:
     parser.add_argument("--mixed-repeats", type=int, default=3)
     parser.add_argument("--timeout", type=float, default=180.0)
     parser.add_argument("--output-json", required=True)
+    parser.add_argument(
+        "--min-warm-full-speedup",
+        type=float,
+        default=1.5,
+        help=(
+            "Minimum warm-full repeat speedup over the initial request. "
+            "Set to 0 to disable this speed gate."
+        ),
+    )
+    parser.add_argument(
+        "--min-partial-speedup",
+        type=float,
+        default=1.2,
+        help=(
+            "Minimum partial-prefix warm speedup over its cold reference. "
+            "Set to 0 to disable this speed gate."
+        ),
+    )
     args = parser.parse_args()
 
     from transformers import AutoTokenizer  # noqa: WPS433
@@ -534,14 +571,28 @@ def main() -> int:
     mixed_cold = [row for row in mixed_rows if row["label"].startswith("mixed_cold")]
     all_ok = all(int(row.get("status", 500)) < 400 for row in rows)
     warm_full_exact = len({row["content"] for row in warm_full_rows}) == 1
-    partial_repeat_exact = len({row["content"] for row in partial_warm}) <= 1
-    multi_repeat_exact = len({row["content"] for row in multi_rows}) <= 1
+    partial_repeat_exact = bool(partial_warm) and len(
+        {row["content"] for row in partial_warm}
+    ) == 1
+    multi_repeat_exact = bool(multi_rows) and len(
+        {row["content"] for row in multi_rows}
+    ) == 1
     semantic_passed = all(bool(row.get("semantic_passed")) for row in semantic_rows)
 
     warm_initial_elapsed = float(warm_initial["elapsed_seconds"])
     warm_repeat_avg = _avg(_successful_elapsed(warm_repeats))
     partial_cold_elapsed = float(partial_rows[0]["elapsed_seconds"])
     partial_warm_avg = _avg(_successful_elapsed(partial_warm))
+    warm_full_speedup = (
+        warm_initial_elapsed / warm_repeat_avg
+        if warm_repeat_avg and warm_repeat_avg > 0
+        else None
+    )
+    partial_reference_speedup = (
+        partial_cold_elapsed / partial_warm_avg
+        if partial_warm_avg and partial_warm_avg > 0
+        else None
+    )
     summary = {
         "all_status_ok": all_ok,
         "base_url": base_url,
@@ -553,22 +604,27 @@ def main() -> int:
         "semantic_smoke_passed": semantic_passed,
         "warm_full_initial_seconds": warm_initial_elapsed,
         "warm_full_repeat_avg_seconds": warm_repeat_avg,
-        "warm_full_speedup": (
-            warm_initial_elapsed / warm_repeat_avg
-            if warm_repeat_avg and warm_repeat_avg > 0
-            else None
+        "warm_full_speedup": warm_full_speedup,
+        "min_warm_full_speedup": args.min_warm_full_speedup,
+        "warm_full_speedup_passed": _speedup_passes(
+            warm_full_speedup,
+            args.min_warm_full_speedup,
         ),
         "partial_cold_reference_seconds": partial_cold_elapsed,
         "partial_warm_beta_avg_seconds": partial_warm_avg,
-        "partial_reference_speedup": (
-            partial_cold_elapsed / partial_warm_avg
-            if partial_warm_avg and partial_warm_avg > 0
-            else None
+        "partial_reference_speedup": partial_reference_speedup,
+        "min_partial_speedup": args.min_partial_speedup,
+        "partial_reference_speedup_passed": _speedup_passes(
+            partial_reference_speedup,
+            args.min_partial_speedup,
         ),
         "mixed_warm_avg_seconds": _avg(_successful_elapsed(mixed_warm)),
         "mixed_cold_avg_seconds": _avg(_successful_elapsed(mixed_cold)),
         "multi_turn_avg_seconds": _avg(_successful_elapsed(multi_rows)),
     }
+    failures = _apc_gate_failures(summary)
+    summary["apc_validation_passed"] = not failures
+    summary["apc_gate_failures"] = failures
     output = {
         "summary": summary,
         "results": rows,
@@ -578,7 +634,7 @@ def main() -> int:
     with output_path.open("w") as f:
         json.dump(output, f, indent=2, sort_keys=True)
     print(json.dumps({"summary": summary, "output_json": str(output_path)}, sort_keys=True))
-    return 0 if all_ok and semantic_passed else 1
+    return 0 if summary["apc_validation_passed"] else 1
 
 
 if __name__ == "__main__":

@@ -50,28 +50,36 @@ def _detect_model(base_url: str, fallback: str, timeout: float) -> str:
 
 
 def _metric_snapshot(base_url: str, timeout: float) -> dict[str, float]:
-    data = urllib.request.urlopen(
-        base_url.rstrip("/") + "/metrics",
-        timeout=timeout,
-    ).read().decode("utf-8")
+    try:
+        data = urllib.request.urlopen(
+            base_url.rstrip("/") + "/metrics",
+            timeout=timeout,
+        ).read().decode("utf-8")
+    except (OSError, TimeoutError, urllib.error.HTTPError, urllib.error.URLError):
+        return {}
+
     wanted: dict[str, float] = {}
     for line in data.splitlines():
+        try:
+            value = float(line.rsplit(" ", 1)[1])
+        except (IndexError, ValueError):
+            continue
         if line.startswith("vllm:prefix_cache_queries_total"):
-            wanted["prefix_cache_queries_total"] = float(line.rsplit(" ", 1)[1])
+            wanted["prefix_cache_queries_total"] = value
         elif line.startswith("vllm:prefix_cache_hits_total"):
-            wanted["prefix_cache_hits_total"] = float(line.rsplit(" ", 1)[1])
+            wanted["prefix_cache_hits_total"] = value
         elif line.startswith("vllm:prompt_tokens_cached_total"):
-            wanted["prompt_tokens_cached_total"] = float(line.rsplit(" ", 1)[1])
+            wanted["prompt_tokens_cached_total"] = value
         elif (
             line.startswith("vllm:prompt_tokens_by_source_total")
             and 'source="local_compute"' in line
         ):
-            wanted["local_compute"] = float(line.rsplit(" ", 1)[1])
+            wanted["local_compute"] = value
         elif (
             line.startswith("vllm:prompt_tokens_by_source_total")
             and 'source="local_cache_hit"' in line
         ):
-            wanted["local_cache_hit"] = float(line.rsplit(" ", 1)[1])
+            wanted["local_cache_hit"] = value
     return wanted
 
 

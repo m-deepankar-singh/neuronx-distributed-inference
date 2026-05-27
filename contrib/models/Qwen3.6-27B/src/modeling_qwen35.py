@@ -172,11 +172,9 @@ if USE_NKILIB_KERNEL:
         )
 
         _raw_fn = _peel_decorations(_attention_cte_raw)
-        _platform = _get_platform_target()
+        os.environ.setdefault("NEURON_PLATFORM_TARGET_OVERRIDE", _get_platform_target())
         _nkilib_flash_attn = _nki.jit(
             _raw_fn,
-            mode="torchxla",
-            platform_target=_platform,
             show_compiler_tb=True,
             debug_kernel=True,
         )
