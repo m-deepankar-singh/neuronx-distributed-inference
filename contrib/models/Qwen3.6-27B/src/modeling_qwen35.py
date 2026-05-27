@@ -74,7 +74,7 @@ from src.nki_kernels.nki_deltanet import (
     deltanet_recurrent_fwd_state as _deltanet_nki_kernel_state,
 )
 from src.nki_kernels.nki_deltanet import (
-    deltanet_recurrent_step as _deltanet_nki_step_kernel,
+    deltanet_recurrent_step_batched as _deltanet_nki_step_batched,
 )
 from src.nki_kernels.nki_deltanet_chunked import (
     deltanet_chunk_step as _deltanet_nki_chunk_step,
@@ -564,42 +564,24 @@ class NeuronGatedDeltaNet(nn.Module):
         query = query * scale
 
         BH = B * H
-        query_flat = query.reshape(BH, S, k_dim).contiguous()
-        key_flat = key.reshape(BH, S, k_dim).contiguous()
-        value_flat = value.reshape(BH, S, v_dim).contiguous()
-        g_flat = (
-            g.reshape(BH, S)
-            .unsqueeze(-1)
-            .expand(-1, -1, v_dim)
-            .contiguous()
+        query_flat = query.reshape(BH, S, k_dim)[:, 0, :].contiguous()
+        key_flat = key.reshape(BH, S, k_dim)[:, 0, :].contiguous()
+        value_flat = value.reshape(BH, S, v_dim)[:, 0, :].contiguous()
+        g_flat = g.reshape(BH, S)[:, 0:1].contiguous()
+        beta_flat = beta.reshape(BH, S)[:, 0:1].contiguous()
+        state_flat = recurrent_state.reshape(BH * k_dim, v_dim).float().contiguous()
+
+        output_flat, state_flat_out = _deltanet_nki_step_batched(
+            query_flat,
+            key_flat,
+            value_flat,
+            g_flat,
+            beta_flat,
+            state_flat,
         )
-        beta_flat = (
-            beta.reshape(BH, S)
-            .unsqueeze(-1)
-            .expand(-1, -1, v_dim)
-            .contiguous()
-        )
-        state_flat = recurrent_state.reshape(BH, k_dim, v_dim).float().contiguous()
 
-        outputs = []
-        states = []
-        for bh in range(BH):
-            out_bh, state_bh = _deltanet_nki_step_kernel(
-                query_flat[bh],
-                key_flat[bh],
-                value_flat[bh],
-                g_flat[bh],
-                beta_flat[bh],
-                state_flat[bh],
-            )
-            outputs.append(out_bh)
-            states.append(state_bh)
-
-        output = torch.stack(outputs, dim=0)
-        output = output.reshape(B, H, S, v_dim)
-
-        new_state = torch.stack(states, dim=0)
-        new_state = new_state.reshape(B, H, k_dim, v_dim)
+        output = output_flat.reshape(B, H, S, v_dim)
+        new_state = state_flat_out.reshape(B, H, k_dim, v_dim)
 
         return output, new_state
 

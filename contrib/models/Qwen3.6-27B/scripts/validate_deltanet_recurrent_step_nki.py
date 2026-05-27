@@ -26,6 +26,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--runs", type=int, default=1)
+    parser.add_argument("--batch-heads", type=int, default=4)
     parser.add_argument("--target", default="trn2")
     parser.add_argument("--lnc", type=int, default=1)
     parser.add_argument("--visible-cores", default="0")
@@ -84,29 +85,32 @@ def load_step_kernel():
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(module)
-    return module.deltanet_recurrent_step
+    return module.deltanet_recurrent_step_batched
 
 
 def make_inputs(torch: Any, args: argparse.Namespace) -> dict[str, Any]:
     generator = torch.Generator(device="cpu")
     generator.manual_seed(args.seed)
+    if args.batch_heads <= 0:
+        raise ValueError("--batch-heads must be positive")
 
     def randn(shape: tuple[int, ...], scale: float) -> Any:
         return torch.randn(shape, generator=generator, dtype=torch.float32) * scale
 
-    query = randn((1, P_MAX), args.value_scale)
-    key = randn((1, P_MAX), args.value_scale)
-    value = randn((1, P_MAX), args.value_scale)
-    state_in = randn((P_MAX, P_MAX), args.state_scale)
+    query = randn((args.batch_heads, P_MAX), args.value_scale)
+    key = randn((args.batch_heads, P_MAX), args.value_scale)
+    value = randn((args.batch_heads, P_MAX), args.value_scale)
+    state_in = randn((args.batch_heads * P_MAX, P_MAX), args.state_scale)
 
     query = torch.nn.functional.normalize(query, p=2, dim=-1) / math.sqrt(P_MAX)
     key = torch.nn.functional.normalize(key, p=2, dim=-1)
 
-    beta_scalar = torch.sigmoid(randn((1, 1), 1.0))
-    beta = beta_scalar.expand(1, P_MAX).contiguous()
+    beta = torch.sigmoid(randn((args.batch_heads, 1), 1.0)).contiguous()
 
-    g_scalar = -torch.nn.functional.softplus(randn((1, 1), 1.0))
-    g = (g_scalar * args.gate_scale).expand(1, P_MAX).contiguous()
+    g = (
+        -torch.nn.functional.softplus(randn((args.batch_heads, 1), 1.0))
+        * args.gate_scale
+    ).contiguous()
 
     return {
         "query": query.contiguous(),
@@ -119,19 +123,27 @@ def make_inputs(torch: Any, args: argparse.Namespace) -> dict[str, Any]:
 
 
 def reference_math(torch: Any, inputs: dict[str, Any]) -> tuple[Any, Any]:
-    q = inputs["query"].reshape(P_MAX)
-    k = inputs["key"].reshape(P_MAX)
-    v = inputs["value"].reshape(P_MAX)
-    g = inputs["g"].reshape(P_MAX, 1)
-    beta = inputs["beta"].reshape(P_MAX)
-    state = inputs["state_in"]
+    outputs = []
+    states = []
+    batch_heads = inputs["query"].shape[0]
 
-    state_decayed = state * torch.exp(g)
-    kv_mem = (state_decayed * k.unsqueeze(-1)).sum(dim=0)
-    delta = (v - kv_mem) * beta
-    state_out = state_decayed + k.unsqueeze(-1) * delta.unsqueeze(0)
-    output = (state_out * q.unsqueeze(-1)).sum(dim=0).reshape(1, P_MAX)
-    return output.contiguous(), state_out.contiguous()
+    for bh in range(batch_heads):
+        q = inputs["query"][bh]
+        k = inputs["key"][bh]
+        v = inputs["value"][bh]
+        g = inputs["g"][bh].reshape(1, 1)
+        beta = inputs["beta"][bh]
+        state = inputs["state_in"][bh * P_MAX : (bh + 1) * P_MAX]
+
+        state_decayed = state * torch.exp(g)
+        kv_mem = (state_decayed * k.unsqueeze(-1)).sum(dim=0)
+        delta = (v - kv_mem) * beta
+        state_out = state_decayed + k.unsqueeze(-1) * delta.unsqueeze(0)
+        output = (state_out * q.unsqueeze(-1)).sum(dim=0)
+        outputs.append(output)
+        states.append(state_out)
+
+    return torch.stack(outputs, dim=0).contiguous(), torch.cat(states, dim=0).contiguous()
 
 
 def tensor_metrics(torch: Any, actual: Any, expected: Any) -> dict[str, float | bool]:
@@ -167,7 +179,7 @@ def main() -> int:
     import torch
     import torch_xla.core.xla_model as xm
 
-    deltanet_recurrent_step = load_step_kernel()
+    deltanet_recurrent_step_batched = load_step_kernel()
 
     inputs = make_inputs(torch, args)
     ref_out, ref_state = reference_math(torch, inputs)
@@ -177,7 +189,7 @@ def main() -> int:
 
     out_cpu = state_cpu = None
     for _ in range(args.runs):
-        out_dev, state_dev = deltanet_recurrent_step(
+        out_dev, state_dev = deltanet_recurrent_step_batched(
             xla_inputs["query"],
             xla_inputs["key"],
             xla_inputs["value"],
@@ -202,6 +214,7 @@ def main() -> int:
         "passed": passed,
         "seed": args.seed,
         "runs": args.runs,
+        "batch_heads": args.batch_heads,
         "atol": args.atol,
         "rtol": args.rtol,
         "inspect": args.inspect,
