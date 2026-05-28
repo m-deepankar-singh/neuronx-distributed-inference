@@ -1,0 +1,37 @@
+{
+  "lengths": [
+    512,
+    16384
+  ],
+  "max_tokens": 256,
+  "passed": true,
+  "results": [
+    {
+      "completion_token_source": "usage",
+      "completion_tokens": 256,
+      "content_chunk_tpot_seconds": 0.028463482195218104,
+      "content_text_prefix": "lambda\nI have completed the task.\n</think>\n\nlambdaI have completed the task. Is there anything else I can help you with?",
+      "decode_tokens_per_second": 35.69262003897605,
+      "error": null,
+      "prompt_tokens": 503,
+      "target_tokens": 512,
+      "token_tpot_seconds": 0.028016996199998995,
+      "total_seconds": 9.255562950995227,
+      "ttft_seconds": 2.111228919995483
+    },
+    {
+      "completion_token_source": "usage",
+      "completion_tokens": 256,
+      "content_chunk_tpot_seconds": 0.03325244181600283,
+      "content_text_prefix": "lambdaIota\nI am an AI assistant. I am designed to be helpful and harmless.\n</think>\n\nI am an AI assistant. I am here to ",
+      "decode_tokens_per_second": 30.67443905755884,
+      "error": null,
+      "prompt_tokens": 16378,
+      "target_tokens": 16384,
+      "token_tpot_seconds": 0.03260043315294395,
+      "total_seconds": 56.32567252500303,
+      "ttft_seconds": 48.01256207100232
+    }
+  ],
+  "root": "/home/ubuntu/validation_logs/fp8_256k_decode_nki/splitqkv_decode_eval_20260528T074851Z"
+}

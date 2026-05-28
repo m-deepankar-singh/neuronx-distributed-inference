@@ -483,6 +483,19 @@ class NeuronConfig:
         self.strided_context_parallel_kernel_enabled = kwargs.pop("strided_context_parallel_kernel_enabled", False)
         self.qkv_kernel_enabled = kwargs.pop("qkv_kernel_enabled", False)
         self.qkv_nki_kernel_enabled = kwargs.pop("qkv_nki_kernel_enabled", False)
+        self.qkv_tkg_nki_kernel_enabled = kwargs.pop("qkv_tkg_nki_kernel_enabled", False)
+        if self.qkv_tkg_nki_kernel_enabled:
+            assert not self.fused_qkv, (
+                "qkv_tkg_nki_kernel_enabled uses split Q/K/V projections and "
+                "cannot be combined with fused_qkv."
+            )
+            assert not (
+                self.qkv_kernel_enabled or self.qkv_nki_kernel_enabled
+            ), (
+                "qkv_tkg_nki_kernel_enabled intentionally bypasses the stock "
+                "QKV CTE/TKG wrapper; do not combine it with qkv_kernel_enabled "
+                "or qkv_nki_kernel_enabled."
+            )
         self.qkv_cte_nki_kernel_fuse_rope = kwargs.pop("qkv_cte_nki_kernel_fuse_rope", False)
         if self.qkv_cte_nki_kernel_fuse_rope:
             assert self.qkv_kernel_enabled and self.qkv_nki_kernel_enabled, \

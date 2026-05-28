@@ -78,6 +78,7 @@ _HYBRID_APC_RUNTIME_CONFIG_KEYS = (
     "hybrid_apc_disable_unbacked_prefix_reads",
     "hybrid_apc_enable_backed_prefix_reads",
     "hybrid_apc_max_backed_prefix_read_len",
+    "hybrid_apc_allow_mixed_prefill_decode",
 )
 _HYBRID_APC_BRIDGE_CONFIG_ATTRS = {
     "hybrid_apc_allow_local_hash_fallback": "allow_local_hash_fallback",
@@ -246,6 +247,11 @@ def _max_num_seqs_for_scheduler(scheduler: Any) -> int:
 
 def _should_defer_waiting_prefills_while_running(scheduler: Any) -> bool:
     if _env_flag("QWEN36_HYBRID_APC_ALLOW_MIXED_PREFILL_DECODE"):
+        return False
+    if _scheduler_config_flag(
+        scheduler,
+        "hybrid_apc_allow_mixed_prefill_decode",
+    ):
         return False
     if _env_flag("QWEN36_HYBRID_APC_DEFER_WAITING_WHILE_RUNNING"):
         return True

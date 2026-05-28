@@ -5,6 +5,7 @@ import argparse
 import importlib.util
 import os
 import sys
+import tempfile
 import types
 import unittest
 from pathlib import Path
@@ -103,6 +104,17 @@ def _args(**overrides):
         output_logits_with_on_device_sampling=False,
         kernel_q_tile_size=128,
         kernel_kv_tile_size=1024,
+        enable_fused_qkv=False,
+        enable_qkv_nki_kernels=False,
+        enable_split_qkv_tkg_nki_kernel=False,
+        enable_attn_block_tkg_nki_kernel=False,
+        enable_attn_block_tkg_cascaded_attention=False,
+        enable_attn_block_tkg_cache_update=False,
+        enable_out_proj_nki_kernel=False,
+        enable_mlp_tkg_nki_kernel=False,
+        enable_quantized_mlp_kernel=False,
+        enable_k_cache_transposed=False,
+        enable_kv_cache_quant=False,
         prefix_cte_attention_chunk_size=None,
         prefix_cte_attention_backend="attention_cte",
         prefix_cte_attention_segment_size=None,
@@ -114,6 +126,7 @@ def _args(**overrides):
         hybrid_cache_mode="all",
         hybrid_apc_require_vllm_metadata=False,
         hybrid_apc_enable_backed_prefix_reads=False,
+        hybrid_apc_commit_during_token_generation=False,
         quantize_edge_mlp_layers=False,
         quantize_lm_head=False,
     )
@@ -190,6 +203,154 @@ class TestQwen36CompileFp8Config(unittest.TestCase):
         self.assertEqual(config.neuron_config.tkg_batch_size, 2)
         self.assertEqual(config.neuron_config.pa_num_blocks, 16)
         self.assertTrue(config.neuron_config.skip_warmup)
+
+    def test_compile_can_enable_block_tkg_attention_kernel_flags(self):
+        with patch.object(
+            _COMPILE,
+            "_load_text_config",
+            return_value={"num_hidden_layers": 2},
+        ), patch.dict(
+            sys.modules,
+            {
+                "neuronx_distributed_inference.models.config": _fake_config_module(),
+                "src.modeling_qwen35": _fake_qwen_module(),
+            },
+        ):
+            config, _modules = _COMPILE._build_config(
+                _args(
+                    enable_qkv_nki_kernels=True,
+                    enable_attn_block_tkg_nki_kernel=True,
+                    enable_attn_block_tkg_cascaded_attention=True,
+                    enable_attn_block_tkg_cache_update=True,
+                ),
+            )
+
+        self.assertTrue(config.neuron_config.qkv_kernel_enabled)
+        self.assertTrue(config.neuron_config.qkv_nki_kernel_enabled)
+        self.assertTrue(config.neuron_config.fused_qkv)
+        self.assertTrue(config.neuron_config.attn_block_tkg_nki_kernel_enabled)
+        self.assertTrue(
+            config.neuron_config.attn_block_tkg_nki_kernel_cascaded_attention,
+        )
+        self.assertTrue(config.neuron_config.attn_block_tkg_nki_kernel_cache_update)
+
+    def test_compile_can_enable_fused_qkv_without_qkv_kernel(self):
+        with patch.object(
+            _COMPILE,
+            "_load_text_config",
+            return_value={"num_hidden_layers": 2},
+        ), patch.dict(
+            sys.modules,
+            {
+                "neuronx_distributed_inference.models.config": _fake_config_module(),
+                "src.modeling_qwen35": _fake_qwen_module(),
+            },
+        ):
+            config, _modules = _COMPILE._build_config(
+                _args(enable_fused_qkv=True),
+            )
+
+        self.assertTrue(config.neuron_config.fused_qkv)
+        self.assertFalse(
+            getattr(config.neuron_config, "qkv_kernel_enabled", False),
+        )
+        self.assertFalse(
+            getattr(config.neuron_config, "qkv_nki_kernel_enabled", False),
+        )
+
+    def test_compile_can_enable_split_qkv_tkg_kernel_without_stock_qkv(self):
+        with patch.object(
+            _COMPILE,
+            "_load_text_config",
+            return_value={"num_hidden_layers": 2},
+        ), patch.dict(
+            sys.modules,
+            {
+                "neuronx_distributed_inference.models.config": _fake_config_module(),
+                "src.modeling_qwen35": _fake_qwen_module(),
+            },
+        ):
+            config, _modules = _COMPILE._build_config(
+                _args(enable_split_qkv_tkg_nki_kernel=True),
+            )
+
+        self.assertTrue(config.neuron_config.qkv_tkg_nki_kernel_enabled)
+        self.assertFalse(getattr(config.neuron_config, "fused_qkv", False))
+        self.assertFalse(
+            getattr(config.neuron_config, "qkv_kernel_enabled", False),
+        )
+        self.assertFalse(
+            getattr(config.neuron_config, "qkv_nki_kernel_enabled", False),
+        )
+
+    def test_compile_can_enable_output_projection_kernel(self):
+        with patch.object(
+            _COMPILE,
+            "_load_text_config",
+            return_value={"num_hidden_layers": 2},
+        ), patch.dict(
+            sys.modules,
+            {
+                "neuronx_distributed_inference.models.config": _fake_config_module(),
+                "src.modeling_qwen35": _fake_qwen_module(),
+            },
+        ):
+            config, _modules = _COMPILE._build_config(
+                _args(enable_out_proj_nki_kernel=True),
+            )
+
+        self.assertTrue(config.neuron_config.out_proj_kernel_enabled)
+
+    def test_compile_can_enable_quantized_mlp_tkg_kernel(self):
+        with patch.object(
+            _COMPILE,
+            "_load_text_config",
+            return_value={"num_hidden_layers": 2},
+        ), patch.dict(
+            sys.modules,
+            {
+                "neuronx_distributed_inference.models.config": _fake_config_module(),
+                "src.modeling_qwen35": _fake_qwen_module(),
+            },
+        ):
+            config, _modules = _COMPILE._build_config(
+                _args(
+                    weight_dtype="fp8_full",
+                    enable_mlp_tkg_nki_kernel=True,
+                    enable_quantized_mlp_kernel=True,
+                ),
+            )
+
+        self.assertTrue(config.neuron_config.mlp_kernel_enabled)
+        self.assertTrue(config.neuron_config.mlp_tkg_nki_kernel_enabled)
+        self.assertTrue(config.neuron_config.quantized_mlp_kernel_enabled)
+
+    def test_decode_memory_flags_are_forwarded(self):
+        with patch.object(
+            _COMPILE,
+            "_load_text_config",
+            return_value={"num_hidden_layers": 2},
+        ), patch.dict(
+            sys.modules,
+            {
+                "neuronx_distributed_inference.models.config": _fake_config_module(),
+                "src.modeling_qwen35": _fake_qwen_module(),
+            },
+        ):
+            config, _modules = _COMPILE._build_config(
+                _args(
+                    enable_k_cache_transposed=True,
+                    enable_kv_cache_quant=True,
+                    hybrid_apc_commit_during_token_generation=True,
+                ),
+            )
+
+        self.assertTrue(config.neuron_config.k_cache_transposed)
+        self.assertTrue(config.neuron_config.kv_cache_quant)
+        self.assertEqual(config.neuron_config.kv_quant_config, {"direct_cast": True})
+        self.assertTrue(
+            config.config_dict["hybrid_apc_commit_during_token_generation"],
+        )
 
     def test_on_device_sampling_compile_uses_sampler_config(self):
         with patch.object(
@@ -602,6 +763,52 @@ class TestQwen36CompileFp8Config(unittest.TestCase):
             )
 
         self.assertTrue(config.config_dict["use_qwen_deltanet_decode_nki"])
+
+    def test_checkpoint_bank_weights_are_added_for_reload(self):
+        from safetensors import safe_open
+        from safetensors.torch import save_file
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            compiled_path = Path(tmpdir)
+            weights_dir = compiled_path / "weights"
+            weights_dir.mkdir()
+            shard_path = weights_dir / "tp0_sharded_checkpoint.safetensors"
+            save_file(
+                {"existing.weight": _COMPILE.torch.ones(1)},
+                shard_path,
+                metadata={"format": "pt"},
+            )
+
+            inf_config = types.SimpleNamespace(
+                layer_types=["linear_attention", "full_attention", "linear_attention"],
+                linear_num_value_heads=48,
+                linear_num_key_heads=16,
+                linear_key_head_dim=128,
+                linear_value_head_dim=128,
+                linear_conv_kernel_dim=4,
+                max_gdn_checkpoint_slots=64,
+                neuron_config=types.SimpleNamespace(
+                    tp_degree=4,
+                    torch_dtype=_COMPILE.torch.bfloat16,
+                ),
+            )
+
+            _COMPILE._ensure_hybrid_checkpoint_weights(compiled_path, inf_config)
+
+            with safe_open(shard_path, framework="pt", device="cpu") as handle:
+                keys = set(handle.keys())
+                recurrent = handle.get_tensor(
+                    "hybrid_gdn_checkpoint_cache.recurrent_slots.0",
+                )
+                conv = handle.get_tensor("hybrid_gdn_checkpoint_cache.conv_slots.0")
+
+            self.assertIn("existing.weight", keys)
+            self.assertIn("hybrid_gdn_checkpoint_cache.recurrent_slots.1", keys)
+            self.assertIn("hybrid_gdn_checkpoint_cache.conv_slots.1", keys)
+            self.assertEqual(recurrent.dtype, _COMPILE.torch.bfloat16)
+            self.assertEqual(tuple(recurrent.shape), (64, 12, 128, 128))
+            self.assertEqual(conv.dtype, _COMPILE.torch.bfloat16)
+            self.assertEqual(tuple(conv.shape), (64, 2560, 3))
 
 
 if __name__ == "__main__":

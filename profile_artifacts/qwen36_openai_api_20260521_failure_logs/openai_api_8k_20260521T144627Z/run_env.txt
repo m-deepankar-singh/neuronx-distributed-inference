@@ -1,0 +1,9 @@
+RUN_ID=20260521T144627Z
+LOG_DIR=/home/ubuntu/validation_logs/fp8_128k/openai_api_8k_20260521T144627Z
+REPO_DIR=/home/ubuntu/inferentia-gdn-experimental-test
+VENV=/opt/aws_neuronx_venv_pytorch_inference_vllm_0_16
+MODEL_PATH=/home/ubuntu/models/Qwen3.6-27B
+ARTIFACT=/mnt/trainium_artifacts/qwen_artifacts/LATEST_FP8_128K_8K
+SERVER_PID=9567
+NEURON_MONITOR_PID=9568
+HOST_MONITOR_PID=9569

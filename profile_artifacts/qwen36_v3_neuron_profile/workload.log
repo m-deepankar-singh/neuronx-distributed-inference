@@ -1,0 +1,129 @@
+time="2026-05-14T07:30:05Z" level=info msg="Successfully initialized OpenAPI server configuration." basePath=/api/v2 version=v2
+INFO 05-14 07:30:12 [__init__.py:43] Available plugins for group vllm.platform_plugins:
+INFO 05-14 07:30:12 [__init__.py:45] - neuron -> vllm_neuron:register
+INFO 05-14 07:30:12 [__init__.py:57] Loading plugin neuron
+INFO 05-14 07:30:12 [__init__.py:212] Platform plugin neuron is activated
+INFO 05-14 07:30:13 [importing.py:44] Triton is installed but 0 active driver(s) found (expected 1). Disabling Triton to prevent runtime errors.
+INFO 05-14 07:30:13 [importing.py:68] Triton not installed or not compatible; certain GPU-related functions will not be available.
+PROFILE_WORKLOAD_CONFIG {"max_prompt_length": 512, "override_neuron_config": {"batch_size": 1, "chunked_prefill_config": {"kernel_kv_tile_size": 1024, "kernel_q_tile_size": 128, "max_num_seqs": 1, "tkg_model_enabled": true}, "context_encoding_buckets": [512], "ctx_batch_size": 1, "enable_bucketing": false, "is_block_kv_layout": true, "logical_nc_config": 2, "max_context_length": 512, "max_length": 131072, "save_sharded_checkpoint": true, "seq_len": 131072, "tkg_batch_size": 1, "token_generation_buckets": [131072], "torch_dtype": "bfloat16", "tp_degree": 4}}
+PROFILE_PROMPT_TOKENS 3445
+INFO 05-14 07:30:14 [utils.py:223] non-default args: {'trust_remote_code': True, 'dtype': 'bfloat16', 'max_model_len': 131072, 'tensor_parallel_size': 4, 'block_size': 256, 'enable_prefix_caching': True, 'max_num_batched_tokens': 512, 'max_num_seqs': 1, 'disable_log_stats': True, 'enable_chunked_prefill': True, 'mamba_cache_mode': 'align', 'additional_config': {'max_prompt_length': 512, 'override_neuron_config': {'tp_degree': 4, 'batch_size': 1, 'ctx_batch_size': 1, 'tkg_batch_size': 1, 'seq_len': 131072, 'max_length': 131072, 'max_context_length': 512, 'context_encoding_buckets': [512], 'token_generation_buckets': [131072], 'enable_bucketing': False, 'logical_nc_config': 2, 'torch_dtype': 'bfloat16', 'save_sharded_checkpoint': True, 'is_block_kv_layout': True, 'chunked_prefill_config': {'max_num_seqs': 1, 'tkg_model_enabled': True, 'kernel_q_tile_size': 128, 'kernel_kv_tile_size': 1024}}}, 'model': '/opt/dlami/nvme/models/Qwen3.6-27B'}
+INFO:vllm_neuron.platform:Applying Neuron config overrides
+INFO:vllm_neuron.platform:Neuron config overrides applied successfully
+The argument `trust_remote_code` is to be used with Auto classes. It has no effect here and is ignored.
+The argument `trust_remote_code` is to be used with Auto classes. It has no effect here and is ignored.
+INFO 05-14 07:30:14 [model.py:529] Resolved architecture: Qwen3_5ForConditionalGeneration
+INFO 05-14 07:30:14 [scheduler.py:224] Chunked prefill is enabled with max_num_batched_tokens=512.
+INFO:vllm_neuron.platform_overrides:Skipping attention head divisibility check for Neuron platform
+WARNING 05-14 07:30:14 [vllm.py:680] Async scheduling is not compatible with prefix caching for Mamba models and will be disabled.
+INFO 05-14 07:30:14 [vllm.py:689] Asynchronous scheduling is disabled.
+WARNING:vllm_neuron.platform:Could not import OpenAI serving modules for overrides: No module named 'vllm.entrypoints.openai.serving_engine'
+INFO:vllm_neuron.platform:Neuron engine client override applied successfully
+WARNING:vllm_neuron.platform:The vLLM V1 native scheduler will be used with chunked prefill enabled. This may lead to suboptimal performance on Neuron devices.
+WARNING:vllm_neuron.platform:Pin memory is not supported on Neuron.
+INFO 05-14 07:30:18 [__init__.py:43] Available plugins for group vllm.platform_plugins:
+INFO 05-14 07:30:18 [__init__.py:45] - neuron -> vllm_neuron:register
+INFO 05-14 07:30:18 [__init__.py:57] Loading plugin neuron
+INFO 05-14 07:30:18 [__init__.py:212] Platform plugin neuron is activated
+INFO 05-14 07:30:23 [importing.py:44] Triton is installed but 0 active driver(s) found (expected 1). Disabling Triton to prevent runtime errors.
+INFO 05-14 07:30:23 [importing.py:68] Triton not installed or not compatible; certain GPU-related functions will not be available.
+(EngineCore_DP0 pid=42959) INFO 05-14 07:30:24 [core.py:97] Initializing a V1 LLM engine (v0.16.0) with config: model='/opt/dlami/nvme/models/Qwen3.6-27B', speculative_config=None, tokenizer='/opt/dlami/nvme/models/Qwen3.6-27B', skip_tokenizer_init=False, tokenizer_mode=auto, revision=None, tokenizer_revision=None, trust_remote_code=True, dtype=torch.bfloat16, max_seq_len=131072, download_dir=None, load_format=auto, tensor_parallel_size=4, pipeline_parallel_size=1, data_parallel_size=1, disable_custom_all_reduce=True, quantization=None, enforce_eager=False, enable_return_routed_experts=False, kv_cache_dtype=auto, device_config=cpu, structured_outputs_config=StructuredOutputsConfig(backend='auto', disable_fallback=False, disable_any_whitespace=False, disable_additional_properties=False, reasoning_parser='', reasoning_parser_plugin='', enable_in_reasoning=False), observability_config=ObservabilityConfig(show_hidden_metrics_for_version=None, otlp_traces_endpoint=None, collect_detailed_traces=None, kv_cache_metrics=False, kv_cache_metrics_sample=0.01, cudagraph_metrics=False, enable_layerwise_nvtx_tracing=False, enable_mfu_metrics=False, enable_mm_processor_stats=False, enable_logging_iteration_details=False), seed=0, served_model_name=/opt/dlami/nvme/models/Qwen3.6-27B, enable_prefix_caching=True, enable_chunked_prefill=True, pooler_config=None, compilation_config={'level': None, 'mode': <CompilationMode.VLLM_COMPILE: 3>, 'debug_dump_path': None, 'cache_dir': '', 'compile_cache_save_format': 'binary', 'backend': 'inductor', 'custom_ops': ['none'], 'splitting_ops': ['vllm::unified_attention', 'vllm::unified_attention_with_output', 'vllm::unified_mla_attention', 'vllm::unified_mla_attention_with_output', 'vllm::mamba_mixer2', 'vllm::mamba_mixer', 'vllm::short_conv', 'vllm::linear_attention', 'vllm::plamo2_mamba_mixer', 'vllm::gdn_attention_core', 'vllm::kda_attention', 'vllm::sparse_attn_indexer', 'vllm::rocm_aiter_sparse_attn_indexer', 'vllm::unified_kv_cache_update'], 'compile_mm_encoder': False, 'compile_sizes': None, 'compile_ranges_split_points': [512], 'inductor_compile_config': {'enable_auto_functionalized_v2': False, 'combo_kernels': True, 'benchmark_combo_kernel': True}, 'inductor_passes': {}, 'cudagraph_mode': <CUDAGraphMode.NONE: 0>, 'cudagraph_num_of_warmups': 0, 'cudagraph_capture_sizes': None, 'cudagraph_copy_inputs': False, 'cudagraph_specialize_lora': True, 'use_inductor_graph_partition': False, 'pass_config': {'fuse_norm_quant': False, 'fuse_act_quant': False, 'fuse_attn_quant': False, 'eliminate_noops': True, 'enable_sp': False, 'fuse_gemm_comms': False, 'fuse_allreduce_rms': False, 'fuse_act_padding': False}, 'max_cudagraph_capture_size': None, 'dynamic_shapes_config': {'type': <DynamicShapesType.BACKED: 'backed'>, 'evaluate_guards': False, 'assume_32_bit_indexing': False}, 'local_cache_dir': None, 'fast_moe_cold_start': True, 'static_all_moe_layers': []}
+(EngineCore_DP0 pid=42959) INFO:vllm_neuron.platform:Applying Neuron config overrides
+(EngineCore_DP0 pid=42959) INFO:vllm_neuron.platform:Neuron config overrides applied successfully
+(EngineCore_DP0 pid=42959) /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed/parallel_layers/layers.py:16: DeprecationWarning: torch_neuronx.nki_jit is deprecated, use nki.jit instead.
+(EngineCore_DP0 pid=42959)   from .mappings import (
+(EngineCore_DP0 pid=42959) /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed/parallel_layers/layers.py:16: DeprecationWarning: torch_neuronx.nki_jit is deprecated, use nki.jit instead.
+(EngineCore_DP0 pid=42959)   from .mappings import (
+(EngineCore_DP0 pid=42959) /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed/parallel_layers/layers.py:16: DeprecationWarning: torch_neuronx.nki_jit is deprecated, use nki.jit instead.
+(EngineCore_DP0 pid=42959)   from .mappings import (
+(EngineCore_DP0 pid=42959) /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed/modules/moe/blockwise.py:74: DeprecationWarning: torch_neuronx.nki_jit is deprecated, use nki.jit instead.
+(EngineCore_DP0 pid=42959)   component, error = import_nki(config)
+(EngineCore_DP0 pid=42959) /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed/modules/moe/blockwise.py:74: DeprecationWarning: torch_neuronx.nki_jit is deprecated, use nki.jit instead.
+(EngineCore_DP0 pid=42959)   component, error = import_nki(config)
+(EngineCore_DP0 pid=42959) /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed/modules/moe/blockwise.py:74: DeprecationWarning: torch_neuronx.nki_jit is deprecated, use nki.jit instead.
+(EngineCore_DP0 pid=42959)   component, error = import_nki(config)
+(EngineCore_DP0 pid=42959) /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed/modules/moe/blockwise.py:74: DeprecationWarning: torch_neuronx.nki_jit is deprecated, use nki.jit instead.
+(EngineCore_DP0 pid=42959)   component, error = import_nki(config)
+(EngineCore_DP0 pid=42959) /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronxcc/nki/_pre_prod_kernels/bwmm_mxfp4.py:564: SyntaxWarning: assertion is always true, perhaps remove parentheses?
+(EngineCore_DP0 pid=42959)   assert(token_indices_2D.shape==(128, 1), f"Expect token_indices_2D to have shape (128, 1), got {token_indices_2D.shape}")
+(EngineCore_DP0 pid=42959) /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed/modules/moe/blockwise.py:74: DeprecationWarning: torch_neuronx.nki_jit is deprecated, use nki.jit instead.
+(EngineCore_DP0 pid=42959)   component, error = import_nki(config)
+(EngineCore_DP0 pid=42959) /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed/modules/moe/blockwise.py:74: DeprecationWarning: torch_neuronx.nki_jit is deprecated, use nki.jit instead.
+(EngineCore_DP0 pid=42959)   component, error = import_nki(config)
+(EngineCore_DP0 pid=42959) /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed/modules/moe/blockwise.py:76: UserWarning: Warning: Failed to import blockwise_mm_baseline_shard_n_k1_while_2loops: No module named 'neuronxcc.nki._private.blockwise_matmul_while'
+(EngineCore_DP0 pid=42959)   warnings.warn(f"Warning: {error}")
+(EngineCore_DP0 pid=42959) /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed/modules/moe/moe_fused_tkg.py:49: DeprecationWarning: torch_neuronx.nki_jit is deprecated, use nki.jit instead.
+(EngineCore_DP0 pid=42959)   component, error = import_nki(config)
+(EngineCore_DP0 pid=42959) /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed/modules/moe/moe_fused_tkg.py:49: DeprecationWarning: torch_neuronx.nki_jit is deprecated, use nki.jit instead.
+(EngineCore_DP0 pid=42959)   component, error = import_nki(config)
+(EngineCore_DP0 pid=42959) /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed/modules/moe/moe_fused_tkg.py:49: DeprecationWarning: torch_neuronx.nki_jit is deprecated, use nki.jit instead.
+(EngineCore_DP0 pid=42959)   component, error = import_nki(config)
+(EngineCore_DP0 pid=42959) /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed_inference/modules/attention/utils.py:13: DeprecationWarning: torch_neuronx.nki_jit is deprecated, use nki.jit instead.
+(EngineCore_DP0 pid=42959)   from neuronx_distributed_inference.modules.custom_calls import neuron_cumsum
+(EngineCore_DP0 pid=42959) /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed_inference/modules/lora_serving/lora_checkpoint.py:9: DeprecationWarning: torch_neuronx.nki_jit is deprecated, use nki.jit instead.
+(EngineCore_DP0 pid=42959)   from neuronx_distributed_inference.modules.attention.gqa import replicate_kv
+(EngineCore_DP0 pid=42959) /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed_inference/modules/lora_serving/lora_checkpoint.py:9: DeprecationWarning: torch_neuronx.nki_jit is deprecated, use nki.jit instead.
+(EngineCore_DP0 pid=42959)   from neuronx_distributed_inference.modules.attention.gqa import replicate_kv
+(EngineCore_DP0 pid=42959) /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed_inference/modules/lora_serving/lora_checkpoint.py:9: DeprecationWarning: torch_neuronx.nki_jit is deprecated, use nki.jit instead.
+(EngineCore_DP0 pid=42959)   from neuronx_distributed_inference.modules.attention.gqa import replicate_kv
+(EngineCore_DP0 pid=42959) WARNING 05-14 07:30:25 [interface.py:225] Failed to import from vllm._C: ImportError('libcuda.so.1: cannot open shared object file: No such file or directory')
+(EngineCore_DP0 pid=42959) WARNING:vllm_neuron.platform:Pin memory is not supported on Neuron.
+(EngineCore_DP0 pid=42959) /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed_inference/models/dbrx/modeling_dbrx.py:38: DeprecationWarning: torch_neuronx.nki_jit is deprecated, use nki.jit instead.
+(EngineCore_DP0 pid=42959)   from neuronx_distributed_inference.modules.attention.attention_base import NeuronAttentionBase
+(EngineCore_DP0 pid=42959) /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed_inference/models/dbrx/modeling_dbrx.py:38: DeprecationWarning: torch_neuronx.nki_jit is deprecated, use nki.jit instead.
+(EngineCore_DP0 pid=42959)   from neuronx_distributed_inference.modules.attention.attention_base import NeuronAttentionBase
+(EngineCore_DP0 pid=42959) /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed_inference/models/dbrx/modeling_dbrx.py:38: DeprecationWarning: torch_neuronx.nki_jit is deprecated, use nki.jit instead.
+(EngineCore_DP0 pid=42959)   from neuronx_distributed_inference.modules.attention.attention_base import NeuronAttentionBase
+(EngineCore_DP0 pid=42959) /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed_inference/models/dbrx/modeling_dbrx.py:38: DeprecationWarning: torch_neuronx.nki_jit is deprecated, use nki.jit instead.
+(EngineCore_DP0 pid=42959)   from neuronx_distributed_inference.modules.attention.attention_base import NeuronAttentionBase
+(EngineCore_DP0 pid=42959) /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed_inference/utils/constants.py:1: DeprecationWarning: torch_neuronx.nki_jit is deprecated, use nki.jit instead.
+(EngineCore_DP0 pid=42959)   from neuronx_distributed_inference.models.dbrx.modeling_dbrx import NeuronDbrxForCausalLM
+(EngineCore_DP0 pid=42959) /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed_inference/models/llama4/modeling_llama4_vision.py:62: DeprecationWarning: torch_neuronx.nki_jit is deprecated, use nki.jit instead.
+(EngineCore_DP0 pid=42959)   from neuronx_distributed_inference.models.mllama.modeling_mllama_vision import (
+(EngineCore_DP0 pid=42959) /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed_inference/utils/constants.py:5: DeprecationWarning: torch_neuronx.nki_jit is deprecated, use nki.jit instead.
+(EngineCore_DP0 pid=42959)   from neuronx_distributed_inference.models.mixtral.modeling_mixtral import NeuronMixtralForCausalLM
+(EngineCore_DP0 pid=42959) /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/neuronx_distributed_inference/utils/constants.py:11: DeprecationWarning: torch_neuronx.nki_jit is deprecated, use nki.jit instead.
+(EngineCore_DP0 pid=42959)   from neuronx_distributed_inference.models.qwen3_moe.modeling_qwen3_moe import NeuronQwen3MoeForCausalLM
+(EngineCore_DP0 pid=42959) /opt/dlami/nvme/qwen36_v3_profile/inferentia-gdn/contrib/models/Qwen3.6-27B/src/__init__.py:4: DeprecationWarning: torch_neuronx.nki_jit is deprecated, use nki.jit instead.
+(EngineCore_DP0 pid=42959)   from src.modeling_qwen35 import (
+(EngineCore_DP0 pid=42959) INFO 05-14 07:30:26 [parallel_state.py:1234] world_size=1 rank=0 local_rank=0 distributed_init_method=tcp://172.31.20.199:50157 backend=gloo
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+(EngineCore_DP0 pid=42959) INFO 05-14 07:30:26 [parallel_state.py:1445] rank 0 in world size 1 is assigned as DP rank 0, PP rank 0, PCP rank 0, TP rank 0, EP rank N/A
+(EngineCore_DP0 pid=42959) INFO:vllm_neuron.worker.neuronx_distributed_model_loader:Retrieved override_neuron_config from additional_config: {'tp_degree': 4, 'batch_size': 1, 'ctx_batch_size': 1, 'tkg_batch_size': 1, 'seq_len': 131072, 'max_length': 131072, 'max_context_length': 512, 'context_encoding_buckets': [512], 'token_generation_buckets': [131072], 'enable_bucketing': False, 'logical_nc_config': 2, 'torch_dtype': 'bfloat16', 'save_sharded_checkpoint': True, 'is_block_kv_layout': True, 'chunked_prefill_config': {'max_num_seqs': 1, 'tkg_model_enabled': True, 'kernel_q_tile_size': 128, 'kernel_kv_tile_size': 1024}}
+(EngineCore_DP0 pid=42959) WARNING:root:NeuronConfig init: Unexpected keyword arguments: {'enable_long_context_mode': False, 'enable_token_tree': False, 'is_chunked_prefill': False, 'is_hidden_dim_shuffled': False, 'is_intermediate_dim_shuffled': False, 'is_prefill_stage': None, 'kv_cache_tiling': False, 'kv_cache_update_with_kernel': False, 'tile_cc': False, 'weights_to_skip_layout_optimization': []}
+(EngineCore_DP0 pid=42959) INFO:Neuron:Loading presharded checkpoints for ranks: 0...3
+(EngineCore_DP0 pid=42959) INFO:Neuron:Finished weights loading in 28.91952668700833 seconds
+(EngineCore_DP0 pid=42959) INFO:Neuron:Warming up the model.
+2026-May-14 07:30:56.0373 42959:43483 [2] int nccl_net_ofi_create_plugin(nccl_net_ofi_plugin_t**):219 CCOM WARN NET/OFI Failed to initialize rdma protocol
+2026-May-14 07:30:56.0376 42959:43483 [2] int nccl_net_ofi_create_plugin(nccl_net_ofi_plugin_t**):354 CCOM WARN NET/OFI aws-ofi-nccl initialization failed
+2026-May-14 07:30:56.0378 42959:43483 [2] ncclResult_t nccl_net_ofi_init_no_atexit_fini_v6(ncclDebugLogger_t):183 CCOM WARN NET/OFI Initializing plugin failed
+2026-May-14 07:30:56.0381 42959:43483 [2] net_plugin.cc:97 CCOM WARN OFI plugin initNet() failed is EFA enabled?
+(EngineCore_DP0 pid=42959) INFO:Neuron:Warmup completed in 1.835325002670288 seconds.
+(EngineCore_DP0 pid=42959) INFO:vllm_neuron.worker.neuronx_distributed_model_loader:Successfully loaded pre-compiled model artifacts from /opt/dlami/nvme/qwen_artifacts/qwen36_27b_v3_profile
+(EngineCore_DP0 pid=42959) WARNING:vllm_neuron.worker.neuronx_distributed_model_loader:Using pre-compiled artifacts, override_neuron_config will be ignored
+(EngineCore_DP0 pid=42959) INFO:vllm_neuron.worker.neuronx_distributed_model_runner:Hardware sampling enabled: config=<neuronx_distributed_inference.models.config.OnDeviceSamplingConfig object at 0x7b8fc8702450>
+(EngineCore_DP0 pid=42959) INFO 05-14 07:30:58 [kv_cache_utils.py:1307] GPU KV cache size: 6,074,624 tokens
+(EngineCore_DP0 pid=42959) INFO 05-14 07:30:58 [kv_cache_utils.py:1312] Maximum concurrency for 131,072 tokens per request: 46.35x
+(EngineCore_DP0 pid=42959) INFO 05-14 07:30:58 [core.py:278] init engine (profile, create kv cache, warmup model) took 0.00 seconds
+(EngineCore_DP0 pid=42959) INFO:vllm_neuron.platform_overrides:Skipping attention head divisibility check for Neuron platform
+(EngineCore_DP0 pid=42959) INFO 05-14 07:30:58 [vllm.py:689] Asynchronous scheduling is disabled.
+(EngineCore_DP0 pid=42959) WARNING:vllm_neuron.platform:Could not import OpenAI serving modules for overrides: No module named 'vllm.entrypoints.openai.serving_engine'
+(EngineCore_DP0 pid=42959) INFO:vllm_neuron.platform:Neuron engine client override applied successfully
+(EngineCore_DP0 pid=42959) WARNING:vllm_neuron.platform:The vLLM V1 native scheduler will be used with chunked prefill enabled. This may lead to suboptimal performance on Neuron devices.
+INFO 05-14 07:30:59 [llm.py:355] Supported tasks: ['generate']
+Adding requests:   0%|          | 0/1 [00:00<?, ?it/s]Adding requests: 100%|██████████| 1/1 [00:00<00:00, 1764.54it/s]
+Processed prompts:   0%|          | 0/1 [00:00<?, ?it/s, est. speed input: 0.00 toks/s, output: 0.00 toks/s]Processed prompts: 100%|██████████| 1/1 [00:11<00:00, 11.23s/it, est. speed input: 306.77 toks/s, output: 2.85 toks/s]Processed prompts: 100%|██████████| 1/1 [00:11<00:00, 11.23s/it, est. speed input: 306.77 toks/s, output: 2.85 toks/s]Processed prompts: 100%|██████████| 1/1 [00:11<00:00, 11.23s/it, est. speed input: 306.77 toks/s, output: 2.85 toks/s]
+PROFILE_RUN cold elapsed=11.238878 output_tokens=32
+PROFILE_TEXT_COLD '* Neuron runtime profiling captures key performance metrics, specifically measuring dispatch gaps, device activity, HBM traffic, and scheduler behavior.\n* The provided notes consist'
+Adding requests:   0%|          | 0/1 [00:00<?, ?it/s]Adding requests: 100%|██████████| 1/1 [00:00<00:00, 2414.68it/s]
+Processed prompts:   0%|          | 0/1 [00:00<?, ?it/s, est. speed input: 0.00 toks/s, output: 0.00 toks/s]Processed prompts: 100%|██████████| 1/1 [00:02<00:00,  2.45s/it, est. speed input: 1406.21 toks/s, output: 13.06 toks/s]Processed prompts: 100%|██████████| 1/1 [00:02<00:00,  2.45s/it, est. speed input: 1406.21 toks/s, output: 13.06 toks/s]Processed prompts: 100%|██████████| 1/1 [00:02<00:00,  2.45s/it, est. speed input: 1406.21 toks/s, output: 13.06 toks/s]
+PROFILE_RUN warm elapsed=2.457338 output_tokens=32
+PROFILE_TEXT_WARM '*   Neuron runtime profiling captures key performance metrics, specifically measuring dispatch gaps and device activity.\n*   The profiling process also monitors HBM traffic and scheduler'
+PROFILE_APC_SPEEDUP 4.574
+2026-May-14 07:31:12.919617 42959:42959 ERROR   NRT:nrt_inspect_signal_handler              Interrupt signal (15) received. Finishing saving profiling data...

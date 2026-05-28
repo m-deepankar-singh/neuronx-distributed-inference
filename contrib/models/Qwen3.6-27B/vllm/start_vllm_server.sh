@@ -37,6 +37,7 @@ HYBRID_CACHE_VALIDATE_EXACT="0"
 HYBRID_APC_REQUIRE_VLLM_METADATA="1"
 HYBRID_APC_DISABLE_UNBACKED_PREFIX_READS="0"
 HYBRID_APC_ENABLE_BACKED_PREFIX_READS="0"
+HYBRID_APC_ALLOW_MIXED_PREFILL_DECODE="0"
 HYBRID_APC_PREFILL_CHUNK_TOKENS="0"
 NUM_GPU_BLOCKS_OVERRIDE=""
 KERNEL_Q_TILE_SIZE="128"
@@ -87,6 +88,8 @@ while [[ $# -gt 0 ]]; do
     --no-hybrid-apc-disable-unbacked-prefix-reads) HYBRID_APC_DISABLE_UNBACKED_PREFIX_READS="0"; shift ;;
     --hybrid-apc-enable-backed-prefix-reads) HYBRID_APC_ENABLE_BACKED_PREFIX_READS="1"; shift ;;
     --no-hybrid-apc-enable-backed-prefix-reads) HYBRID_APC_ENABLE_BACKED_PREFIX_READS="0"; shift ;;
+    --hybrid-apc-allow-mixed-prefill-decode) HYBRID_APC_ALLOW_MIXED_PREFILL_DECODE="1"; shift ;;
+    --no-hybrid-apc-allow-mixed-prefill-decode) HYBRID_APC_ALLOW_MIXED_PREFILL_DECODE="0"; shift ;;
     --hybrid-apc-prefill-chunk-tokens) HYBRID_APC_PREFILL_CHUNK_TOKENS="$2"; shift 2 ;;
     --num-gpu-blocks-override) NUM_GPU_BLOCKS_OVERRIDE="$2"; shift 2 ;;
     --kernel-q-tile-size) KERNEL_Q_TILE_SIZE="$2"; shift 2 ;;
@@ -163,8 +166,27 @@ if [[ "${ENABLE_PREFIX_CACHING}" == "1" && -z "${MAMBA_CACHE_MODE}" ]]; then
   MAMBA_CACHE_MODE="all"
 fi
 if [[ "${ENABLE_PREFIX_CACHING}" == "1" && -z "${MAMBA_SSM_CACHE_DTYPE}" ]]; then
-  MAMBA_SSM_CACHE_DTYPE="${HYBRID_GDN_RECURRENT_CACHE_DTYPE}"
+  case "${HYBRID_GDN_RECURRENT_CACHE_DTYPE}" in
+    auto|float16|float32)
+      MAMBA_SSM_CACHE_DTYPE="${HYBRID_GDN_RECURRENT_CACHE_DTYPE}"
+      ;;
+    *)
+      MAMBA_SSM_CACHE_DTYPE="auto"
+      ;;
+  esac
 fi
+case "${MAMBA_SSM_CACHE_DTYPE}" in
+  ""|auto|float16|float32)
+    ;;
+  bfloat16|bf16)
+    echo "WARNING: vLLM --mamba-ssm-cache-dtype does not accept ${MAMBA_SSM_CACHE_DTYPE}; using auto while preserving hybrid GDN cache dtype in Neuron config." >&2
+    MAMBA_SSM_CACHE_DTYPE="auto"
+    ;;
+  *)
+    echo "ERROR: unsupported --mamba-ssm-cache-dtype ${MAMBA_SSM_CACHE_DTYPE}; expected auto, float16, or float32" >&2
+    exit 2
+    ;;
+esac
 
 CTE_BUCKETS_JSON="$(
   python3 - <<PY
@@ -293,14 +315,10 @@ context_encoding_bucket_pairs = parse_bucket_pairs("${CONTEXT_ENCODING_BUCKET_PA
 max_cte_bucket = cte_buckets[-1]
 seq_len = int("${SEQ_LEN}")
 max_num_seqs = int("${MAX_NUM_SEQS}")
-token_generation_buckets = (
-    parse_int_list("TOKEN_GENERATION_BUCKETS", "${TOKEN_GENERATION_BUCKETS}")
-    or [seq_len]
+token_generation_buckets = parse_int_list(
+    "TOKEN_GENERATION_BUCKETS",
+    "${TOKEN_GENERATION_BUCKETS}",
 )
-if token_generation_buckets[-1] > seq_len:
-    raise SystemExit(
-        f"TOKEN_GENERATION_BUCKETS cannot contain values greater than SEQ_LEN ({seq_len})"
-    )
 token_generation_batches = parse_int_list(
     "TOKEN_GENERATION_BATCHES",
     "${TOKEN_GENERATION_BATCHES}",
@@ -316,6 +334,12 @@ compiled_uses_prefix_caching = False
 compiled_prefix_buckets = None
 compiled_prefix_cte_attention_backend = None
 compiled_prefix_cte_attention_segment_size = None
+compiled_ctx_batch_size = 0
+compiled_tkg_batch_size = 0
+compiled_token_generation_buckets = None
+compiled_token_generation_batches = None
+compiled_kernel_flags = {}
+compiled_decode_memory_flags = {}
 if compiled_artifacts:
     config_path = Path(compiled_artifacts).expanduser() / "neuron_config.json"
     if config_path.exists():
@@ -344,7 +368,84 @@ if compiled_artifacts:
         compiled_prefix_cte_attention_segment_size = compiled_config.get(
             "prefix_cte_attention_segment_size"
         )
+        compiled_ctx_batch_size = int(
+            compiled_config.get("ctx_batch_size")
+            or compiled_config.get("batch_size")
+            or compiled_config.get("max_batch_size")
+            or 0
+        )
+        compiled_tkg_batch_size = int(
+            compiled_config.get("tkg_batch_size")
+            or compiled_config.get("batch_size")
+            or compiled_config.get("max_batch_size")
+            or 0
+        )
+        compiled_token_generation_batches = compiled_config.get(
+            "token_generation_batches"
+        )
+        compiled_token_generation_buckets = compiled_config.get(
+            "token_generation_buckets"
+        )
+        for flag_name in (
+            "fused_qkv",
+            "qkv_kernel_enabled",
+            "qkv_nki_kernel_enabled",
+            "qkv_tkg_nki_kernel_enabled",
+            "attn_block_tkg_nki_kernel_enabled",
+            "attn_block_tkg_nki_kernel_cascaded_attention",
+            "attn_block_tkg_nki_kernel_cache_update",
+            "attn_block_tkg_nki_kernel_use_online_softmax",
+            "attn_block_tkg_nki_kernel_disable_gpsimd_sb2sb",
+            "out_proj_kernel_enabled",
+        ):
+            if flag_name in compiled_config:
+                compiled_kernel_flags[flag_name] = compiled_config[flag_name]
+        for flag_name in (
+            "k_cache_transposed",
+            "kv_cache_quant",
+            "kv_quant_config",
+        ):
+            if flag_name in compiled_config:
+                compiled_decode_memory_flags[flag_name] = compiled_config[flag_name]
 runtime_max_prompt = compiled_max_prompt or max_cte_bucket
+if compiled_artifacts and max_num_seqs > 1:
+    if compiled_tkg_batch_size and max_num_seqs > compiled_tkg_batch_size:
+        raise SystemExit(
+            "compiled artifact cannot serve requested continuous batching: "
+            f"MAX_NUM_SEQS={max_num_seqs} but compiled tkg_batch_size="
+            f"{compiled_tkg_batch_size}"
+        )
+    if compiled_ctx_batch_size and int("${CTX_BATCH_SIZE}") > compiled_ctx_batch_size:
+        raise SystemExit(
+            "compiled artifact cannot serve requested CTE batch: "
+            f"CTX_BATCH_SIZE=${CTX_BATCH_SIZE} but compiled ctx_batch_size="
+            f"{compiled_ctx_batch_size}"
+        )
+
+def normalize_int_list(values):
+    if values is None:
+        return None
+    if isinstance(values, str):
+        return parse_int_list("compiled int list", values)
+    normalized = sorted(set(int(value) for value in values))
+    return normalized or None
+
+if token_generation_batches is None:
+    token_generation_batches = normalize_int_list(compiled_token_generation_batches)
+if token_generation_buckets is None:
+    token_generation_buckets = (
+        normalize_int_list(compiled_token_generation_buckets) or [seq_len]
+    )
+if token_generation_buckets[-1] > seq_len:
+    raise SystemExit(
+        f"TOKEN_GENERATION_BUCKETS cannot contain values greater than SEQ_LEN ({seq_len})"
+    )
+if token_generation_batches is not None:
+    token_generation_batches = [
+        batch for batch in token_generation_batches if batch <= max_num_seqs
+    ]
+    if not token_generation_batches:
+        token_generation_batches = None
 num_gpu_blocks_override = "${NUM_GPU_BLOCKS_OVERRIDE}"
 pa_num_blocks = (
     int(num_gpu_blocks_override)
@@ -376,6 +477,8 @@ if async_mode:
     neuron_config["async_mode"] = True
 if token_generation_batches is not None:
     neuron_config["token_generation_batches"] = token_generation_batches
+neuron_config.update(compiled_kernel_flags)
+neuron_config.update(compiled_decode_memory_flags)
 if enable_prefix_caching or enable_hybrid_apc or enable_chunked:
     neuron_config["is_block_kv_layout"] = True
 uses_prefix_cte_contract = (
@@ -395,7 +498,13 @@ if enable_prefix_caching or enable_hybrid_apc or uses_prefix_cte_contract:
         neuron_config["prefix_cte_attention_segment_size"] = (
             compiled_prefix_cte_attention_segment_size
         )
-if enable_chunked:
+# NeuronConfig.chunked_prefill_config trips the built-in block TKG attention
+# kernel validation. Qwen Hybrid APC chunking still uses the top-level
+# use_qwen_hybrid_chunked_prefill flags below.
+if enable_chunked and not compiled_kernel_flags.get(
+    "attn_block_tkg_nki_kernel_enabled",
+    False,
+):
     neuron_config.update({
         "chunked_prefill_config": {
             "max_num_seqs": int("${MAX_NUM_SEQS}"),
@@ -425,6 +534,7 @@ print(json.dumps({
     "hybrid_apc_require_attention_block_refs": enable_hybrid_apc and "${HYBRID_APC_REQUIRE_VLLM_METADATA}" == "1",
     "hybrid_apc_disable_unbacked_prefix_reads": enable_hybrid_apc and "${HYBRID_APC_DISABLE_UNBACKED_PREFIX_READS}" == "1",
     "hybrid_apc_enable_backed_prefix_reads": enable_hybrid_apc and "${HYBRID_APC_ENABLE_BACKED_PREFIX_READS}" == "1",
+    "hybrid_apc_allow_mixed_prefill_decode": enable_hybrid_apc and "${HYBRID_APC_ALLOW_MIXED_PREFILL_DECODE}" == "1",
     "use_qwen_hybrid_chunked_prefill": enable_chunked,
     "use_qwen_hybrid_chunked_prefill_nki": enable_chunked,
     "override_neuron_config": neuron_config,
@@ -459,6 +569,7 @@ echo "HYBRID_GDN_CONV_CACHE_DTYPE=${HYBRID_GDN_CONV_CACHE_DTYPE}"
 echo "HYBRID_APC_REQUIRE_VLLM_METADATA=${HYBRID_APC_REQUIRE_VLLM_METADATA}"
 echo "HYBRID_APC_DISABLE_UNBACKED_PREFIX_READS=${HYBRID_APC_DISABLE_UNBACKED_PREFIX_READS}"
 echo "HYBRID_APC_ENABLE_BACKED_PREFIX_READS=${HYBRID_APC_ENABLE_BACKED_PREFIX_READS}"
+echo "HYBRID_APC_ALLOW_MIXED_PREFILL_DECODE=${HYBRID_APC_ALLOW_MIXED_PREFILL_DECODE}"
 echo "HYBRID_APC_PREFILL_CHUNK_TOKENS=${HYBRID_APC_PREFILL_CHUNK_TOKENS}"
 echo "ADDITIONAL_CONFIG=${ADDITIONAL_CONFIG}"
 

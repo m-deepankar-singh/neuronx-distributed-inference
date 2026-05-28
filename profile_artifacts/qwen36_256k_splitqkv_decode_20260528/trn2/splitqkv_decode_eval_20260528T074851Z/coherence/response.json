@@ -1,0 +1,36 @@
+{
+  "choices": [
+    {
+      "finish_reason": "stop",
+      "index": 0,
+      "logprobs": null,
+      "message": {
+        "annotations": null,
+        "audio": null,
+        "content": "Smaller batch sizes reduce memory bandwidth pressure and improve cache locality during inference. This approach minimizes memory bandwidth bottlenecks while maintaining high throughput for concurrent requests. Additionally, it reduces memory bandwidth pressure by limiting the data transferred per cycle.",
+        "function_call": null,
+        "reasoning": null,
+        "refusal": null,
+        "role": "assistant",
+        "tool_calls": []
+      },
+      "stop_reason": 248044,
+      "token_ids": null
+    }
+  ],
+  "created": 1779957948,
+  "id": "chatcmpl-b9c91b14a99f87c3",
+  "kv_transfer_params": null,
+  "model": "/home/ubuntu/models/Qwen3.6-27B",
+  "object": "chat.completion",
+  "prompt_logprobs": null,
+  "prompt_token_ids": null,
+  "service_tier": null,
+  "system_fingerprint": null,
+  "usage": {
+    "completion_tokens": 48,
+    "prompt_tokens": 45,
+    "prompt_tokens_details": null,
+    "total_tokens": 93
+  }
+}

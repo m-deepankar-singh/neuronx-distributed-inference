@@ -68,6 +68,104 @@ def _load_text_config(model_path: Path) -> dict:
     return config_dict
 
 
+def _sanitize_reloadable_neuron_config(compiled_path: Path) -> None:
+    """Keep direct-cast KV quant config reloadable after JSON serialization."""
+    config_path = compiled_path / "neuron_config.json"
+    if not config_path.exists():
+        return
+
+    config = json.loads(config_path.read_text())
+    neuron_config = config.get("neuron_config", config)
+    kv_quant_config = neuron_config.get("kv_quant_config")
+    if not isinstance(kv_quant_config, dict):
+        return
+    if not kv_quant_config.get("direct_cast", True):
+        return
+
+    # Neuron serializes QuantizationType enum defaults as nested JSON objects.
+    # KVQuantizationConfig expects real enum values on reload, so omit those
+    # fields and let the constructor restore its per-tensor symmetric defaults.
+    neuron_config["kv_quant_config"] = {"direct_cast": True}
+    config_path.write_text(json.dumps(config, indent=2, sort_keys=True) + "\n")
+
+
+def _compiled_parameter_dtype(inf_config) -> torch.dtype:
+    dtype = getattr(inf_config.neuron_config, "torch_dtype", torch.bfloat16)
+    if isinstance(dtype, torch.dtype):
+        return dtype
+    if isinstance(dtype, str):
+        dtype_name = dtype.removeprefix("torch.")
+        return {
+            "bfloat16": torch.bfloat16,
+            "float16": torch.float16,
+            "float32": torch.float32,
+        }.get(dtype_name, torch.bfloat16)
+    return torch.bfloat16
+
+
+def _ensure_hybrid_checkpoint_weights(compiled_path: Path, inf_config) -> None:
+    """Add reloadable zero checkpoint-bank tensors when NxD omits them."""
+    gdn_layer_ids = [
+        idx
+        for idx, layer_type in enumerate(getattr(inf_config, "layer_types", ()))
+        if layer_type == "linear_attention"
+    ]
+    weights_dir = compiled_path / "weights"
+    if not gdn_layer_ids or not weights_dir.exists():
+        return
+
+    from safetensors import safe_open  # noqa: WPS433
+    from safetensors.torch import load_file, save_file  # noqa: WPS433
+
+    tp_degree = int(inf_config.neuron_config.tp_degree)
+    local_num_value_heads = int(inf_config.linear_num_value_heads) // tp_degree
+    local_num_key_heads = int(inf_config.linear_num_key_heads) // tp_degree
+    key_dim = int(inf_config.linear_key_head_dim)
+    value_dim = int(inf_config.linear_value_head_dim)
+    slots = int(inf_config.max_gdn_checkpoint_slots)
+    conv_dim = 2 * local_num_key_heads * key_dim + local_num_value_heads * value_dim
+    conv_state_len = int(inf_config.linear_conv_kernel_dim) - 1
+    param_dtype = _compiled_parameter_dtype(inf_config)
+
+    recurrent_shape = (slots, local_num_value_heads, key_dim, value_dim)
+    conv_shape = (slots, conv_dim, conv_state_len)
+    recurrent_keys = [
+        f"hybrid_gdn_checkpoint_cache.recurrent_slots.{idx}"
+        for idx in range(len(gdn_layer_ids))
+    ]
+    conv_keys = [
+        f"hybrid_gdn_checkpoint_cache.conv_slots.{idx}"
+        for idx in range(len(gdn_layer_ids))
+    ]
+
+    for shard in sorted(weights_dir.glob("tp*_sharded_checkpoint.safetensors")):
+        with safe_open(shard, framework="pt", device="cpu") as handle:
+            existing = set(handle.keys())
+            metadata = handle.metadata()
+        missing_recurrent = [key for key in recurrent_keys if key not in existing]
+        missing_conv = [key for key in conv_keys if key not in existing]
+        if not missing_recurrent and not missing_conv:
+            continue
+
+        tensors = load_file(shard, device="cpu")
+        for key in missing_recurrent:
+            tensors[key] = torch.zeros(recurrent_shape, dtype=param_dtype)
+        for key in missing_conv:
+            tensors[key] = torch.zeros(conv_shape, dtype=param_dtype)
+
+        tmp_path = shard.with_suffix(shard.suffix + ".tmp")
+        save_file(tensors, tmp_path, metadata=metadata)
+        os.replace(tmp_path, shard)
+        print(
+            "CHECKPOINT_BANK_WEIGHTS_ADDED",
+            shard.name,
+            len(missing_recurrent),
+            len(missing_conv),
+            str(param_dtype),
+            flush=True,
+        )
+
+
 def _parse_int_list(values: list[str] | None) -> list[int] | None:
     if values is None:
         return None
@@ -627,6 +725,35 @@ def _build_config(args: argparse.Namespace):
         neuron_config_kwargs["async_mode"] = True
     if token_generation_batches is not None:
         neuron_config_kwargs["token_generation_batches"] = token_generation_batches
+    if (
+        args.enable_fused_qkv
+        or args.enable_qkv_nki_kernels
+        or args.enable_attn_block_tkg_nki_kernel
+    ):
+        neuron_config_kwargs["fused_qkv"] = True
+    if (
+        args.enable_qkv_nki_kernels
+        or args.enable_attn_block_tkg_nki_kernel
+    ):
+        neuron_config_kwargs["qkv_kernel_enabled"] = True
+        neuron_config_kwargs["qkv_nki_kernel_enabled"] = True
+    if args.enable_split_qkv_tkg_nki_kernel:
+        neuron_config_kwargs["qkv_tkg_nki_kernel_enabled"] = True
+    if args.enable_attn_block_tkg_nki_kernel:
+        neuron_config_kwargs["attn_block_tkg_nki_kernel_enabled"] = True
+    if args.enable_attn_block_tkg_cascaded_attention:
+        neuron_config_kwargs["attn_block_tkg_nki_kernel_cascaded_attention"] = True
+    if args.enable_attn_block_tkg_cache_update:
+        neuron_config_kwargs["attn_block_tkg_nki_kernel_cache_update"] = True
+    if args.enable_out_proj_nki_kernel:
+        neuron_config_kwargs["out_proj_kernel_enabled"] = True
+    if args.enable_mlp_tkg_nki_kernel:
+        neuron_config_kwargs["mlp_kernel_enabled"] = True
+        neuron_config_kwargs["mlp_tkg_nki_kernel_enabled"] = True
+    if args.enable_quantized_mlp_kernel:
+        neuron_config_kwargs["quantized_mlp_kernel_enabled"] = True
+    if args.enable_k_cache_transposed:
+        neuron_config_kwargs["k_cache_transposed"] = True
     if args.weight_dtype in (_WEIGHT_DTYPE_FP8_MLP_ONLY, _WEIGHT_DTYPE_FP8_FULL):
         neuron_config_kwargs.update(
             {
@@ -638,12 +765,17 @@ def _build_config(args: argparse.Namespace):
                 "quantization_dtype": "f8e4m3",
                 "modules_to_not_convert": modules_to_not_convert,
                 "kv_cache_quant": False,
-                "quantized_mlp_kernel_enabled": False,
+                "quantized_mlp_kernel_enabled": bool(
+                    args.enable_quantized_mlp_kernel
+                ),
                 "activation_quantization_type": None,
             }
         )
     else:
         neuron_config_kwargs["quantized"] = False
+    if args.enable_kv_cache_quant:
+        neuron_config_kwargs["kv_cache_quant"] = True
+        neuron_config_kwargs["kv_quant_config"] = {"direct_cast": True}
     if args.disable_on_device_sampling:
         # vLLM/host-side sampling consumes logits from the Neuron trace. Without
         # logits, the serving path can only surface placeholder token ids.
@@ -715,12 +847,14 @@ def _build_config(args: argparse.Namespace):
         "hybrid_apc_enable_backed_prefix_reads",
         False,
     )
+    config_dict["hybrid_apc_commit_during_token_generation"] = (
+        args.hybrid_apc_commit_during_token_generation
+    )
     config_dict["use_qwen_hybrid_chunked_prefill"] = args.enable_vllm_chunked_prefill
     config_dict["use_qwen_hybrid_chunked_prefill_nki"] = args.enable_vllm_chunked_prefill
     config_dict["use_qwen_deltanet_decode_nki"] = getattr(
         args, "enable_deltanet_decode_nki", False
     )
-
     inf_config = Qwen35InferenceConfig(neuron_config=neuron_config, **config_dict)
     return inf_config, modules_to_not_convert
 
@@ -847,6 +981,98 @@ def main() -> int:
     parser.add_argument("--kernel-q-tile-size", type=int, default=128)
     parser.add_argument("--kernel-kv-tile-size", type=int, default=1024)
     parser.add_argument(
+        "--enable-fused-qkv",
+        action="store_true",
+        help=(
+            "Fuse Q/K/V projection weights in the NxDI attention module. This "
+            "is required by the QKV NKI kernels and the block TKG decode kernel."
+        ),
+    )
+    parser.add_argument(
+        "--enable-qkv-nki-kernels",
+        action="store_true",
+        help=(
+            "Enable NxDI QKV kernels required by the block token-generation "
+            "attention kernel."
+        ),
+    )
+    parser.add_argument(
+        "--enable-split-qkv-tkg-nki-kernel",
+        action="store_true",
+        help=(
+            "Enable Qwen's split Q/K/V token-generation NKI projection path. "
+            "This is TKG-only and intentionally does not enable fused_qkv or "
+            "the stock QKV CTE wrapper."
+        ),
+    )
+    parser.add_argument(
+        "--enable-attn-block-tkg-nki-kernel",
+        action="store_true",
+        help=(
+            "Enable the NxDI token-generation attention NKI kernel for block "
+            "KV layout. This targets decode speed when prefix caching is used."
+        ),
+    )
+    parser.add_argument(
+        "--enable-attn-block-tkg-cascaded-attention",
+        action="store_true",
+        help=(
+            "Enable cascaded attention for the block token-generation NKI "
+            "attention kernel."
+        ),
+    )
+    parser.add_argument(
+        "--enable-attn-block-tkg-cache-update",
+        action="store_true",
+        help=(
+            "Update KV cache inside the block token-generation attention "
+            "kernel instead of through the separate cache update path."
+        ),
+    )
+    parser.add_argument(
+        "--enable-out-proj-nki-kernel",
+        action="store_true",
+        help=(
+            "Enable NxDI's NKI output-projection kernel for attention output. "
+            "Block TKG enables this internally; this flag exposes it for "
+            "non-block-TKG decode experiments."
+        ),
+    )
+    parser.add_argument(
+        "--enable-mlp-tkg-nki-kernel",
+        action="store_true",
+        help=(
+            "Use NxDI/NKILib's MLP kernel for token generation. The Qwen3.6 "
+            "custom decoder keeps this behind a flag because it changes the "
+            "dense FFN lowering path."
+        ),
+    )
+    parser.add_argument(
+        "--enable-quantized-mlp-kernel",
+        action="store_true",
+        help=(
+            "Enable the quantized FP8 MLP kernel path. Pair this with "
+            "--enable-mlp-tkg-nki-kernel for FP8 full-weight decode "
+            "experiments."
+        ),
+    )
+    parser.add_argument(
+        "--enable-k-cache-transposed",
+        action="store_true",
+        help=(
+            "Store the K cache in the transposed layout used by the Neuron "
+            "decode attention path. Best paired with block TKG cache update."
+        ),
+    )
+    parser.add_argument(
+        "--enable-kv-cache-quant",
+        action="store_true",
+        help=(
+            "Use the NxDI FP8 direct-cast KV cache quantization path to reduce "
+            "decode KV-cache HBM traffic."
+        ),
+    )
+    parser.add_argument(
         "--prefix-cte-attention-chunk-size",
         type=int,
         default=None,
@@ -891,6 +1117,16 @@ def main() -> int:
         default=False,
     )
     parser.add_argument(
+        "--hybrid-apc-commit-during-token-generation",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Keep the legacy Hybrid APC checkpoint-bank commit outputs on "
+            "token generation traces. The default commits checkpoint banks only "
+            "during context encoding."
+        ),
+    )
+    parser.add_argument(
         "--quantize-edge-mlp-layers",
         action="store_true",
         help=(
@@ -918,6 +1154,16 @@ def main() -> int:
         parser.error("--quantized-checkpoints-path is required for FP8 weight modes")
     if args.quantize_lm_head and args.weight_dtype != _WEIGHT_DTYPE_FP8_FULL:
         parser.error("--quantize-lm-head is only valid with --weight-dtype fp8_full")
+    if args.enable_split_qkv_tkg_nki_kernel and (
+        args.enable_fused_qkv
+        or args.enable_qkv_nki_kernels
+        or args.enable_attn_block_tkg_nki_kernel
+    ):
+        parser.error(
+            "--enable-split-qkv-tkg-nki-kernel cannot be combined with "
+            "--enable-fused-qkv, --enable-qkv-nki-kernels, "
+            "or --enable-attn-block-tkg-nki-kernel"
+        )
     if (
         args.context_encoding_bucket_pairs is not None
         and not (args.enable_prefix_caching or args.enable_hybrid_apc)
@@ -1029,6 +1275,25 @@ def main() -> int:
                 "enable_hybrid_apc": args.enable_hybrid_apc,
                 "enable_vllm_chunked_prefill": args.enable_vllm_chunked_prefill,
                 "enable_deltanet_decode_nki": args.enable_deltanet_decode_nki,
+                "enable_fused_qkv": args.enable_fused_qkv,
+                "enable_qkv_nki_kernels": args.enable_qkv_nki_kernels,
+                "enable_split_qkv_tkg_nki_kernel": (
+                    args.enable_split_qkv_tkg_nki_kernel
+                ),
+                "enable_attn_block_tkg_nki_kernel": (
+                    args.enable_attn_block_tkg_nki_kernel
+                ),
+                "enable_attn_block_tkg_cascaded_attention": (
+                    args.enable_attn_block_tkg_cascaded_attention
+                ),
+                "enable_attn_block_tkg_cache_update": (
+                    args.enable_attn_block_tkg_cache_update
+                ),
+                "enable_out_proj_nki_kernel": args.enable_out_proj_nki_kernel,
+                "enable_mlp_tkg_nki_kernel": args.enable_mlp_tkg_nki_kernel,
+                "enable_quantized_mlp_kernel": args.enable_quantized_mlp_kernel,
+                "enable_k_cache_transposed": args.enable_k_cache_transposed,
+                "enable_kv_cache_quant": args.enable_kv_cache_quant,
                 "block_size": args.block_size,
                 "pa_min_blocks": _pa_min_blocks(args),
                 "pa_requested_blocks": _pa_requested_blocks(args),
@@ -1041,6 +1306,9 @@ def main() -> int:
                 "pa_num_blocks": _pa_num_blocks(args),
                 "gdn_checkpoint_interval": args.gdn_checkpoint_interval,
                 "max_gdn_checkpoint_slots": args.max_gdn_checkpoint_slots,
+                "hybrid_apc_commit_during_token_generation": (
+                    args.hybrid_apc_commit_during_token_generation
+                ),
             },
             sort_keys=True,
         ),
@@ -1068,6 +1336,8 @@ def main() -> int:
     print("COMPILE_START", flush=True)
     model = NeuronQwen35ForCausalLM(str(model_path), inf_config)
     model.compile(str(compiled_path))
+    _ensure_hybrid_checkpoint_weights(compiled_path, inf_config)
+    _sanitize_reloadable_neuron_config(compiled_path)
     del model
     gc.collect()
     print("COMPILE_DONE", flush=True)

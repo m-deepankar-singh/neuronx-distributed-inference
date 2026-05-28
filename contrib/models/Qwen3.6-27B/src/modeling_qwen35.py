@@ -97,16 +97,19 @@ from neuronx_distributed_inference.models.config import (
     InferenceConfig,
     NeuronConfig,
 )
+from neuronx_distributed_inference.models.llama.modeling_llama import NeuronLlamaMLP
 from neuronx_distributed_inference.models.model_wrapper import (
     CONTEXT_ENCODING_MODEL_TAG,
     TOKEN_GENERATION_MODEL_TAG,
     DecoderModelInstance,
     ModelWrapper,
 )
-from neuronx_distributed_inference.modules.attention.attention_base import (
-    NeuronAttentionBase,
+from neuronx_distributed_inference.modules.attention.attention_base import NeuronAttentionBase
+from neuronx_distributed_inference.modules.attention.utils import (
+    RotaryEmbedding,
+    move_heads_front,
+    transpose_parallel_linear_layer,
 )
-from neuronx_distributed_inference.modules.attention.utils import RotaryEmbedding
 from neuronx_distributed_inference.modules.kvcache.block_kv_cache_manager import (
     BlockKVCacheManager,
 )
@@ -117,6 +120,21 @@ from neuronx_distributed_inference.models.layer_boundary_marker import (
 )
 
 logger = logging.getLogger(__name__)
+
+try:
+    from neuronxcc.nki._pre_prod_kernels import (
+        NormType as _QKVNormType,
+        QKVOutputLayout as _QKVOutputLayout,
+        QuantizationType as _QKVQuantizationType,
+    )
+    from neuronxcc.nki._pre_prod_kernels.qkv_tkg_impl import (
+        nki_qkv_projection_tkg_impl as _qkv_tkg_nki_kernel,
+    )
+except ImportError:
+    _QKVNormType = None
+    _QKVOutputLayout = None
+    _QKVQuantizationType = None
+    _qkv_tkg_nki_kernel = None
 
 try:
     _flash_fwd_call = nki_jit()(attention_isa_kernel)
@@ -569,7 +587,7 @@ class NeuronGatedDeltaNet(nn.Module):
         value_flat = value.reshape(BH, S, v_dim)[:, 0, :].contiguous()
         g_flat = g.reshape(BH, S)[:, 0:1].contiguous()
         beta_flat = beta.reshape(BH, S)[:, 0:1].contiguous()
-        state_flat = recurrent_state.reshape(BH * k_dim, v_dim).float().contiguous()
+        state_flat = recurrent_state.reshape(BH * k_dim, v_dim).contiguous()
 
         output_flat, state_flat_out = _deltanet_nki_step_batched(
             query_flat,
@@ -1247,13 +1265,13 @@ class NeuronGatedDeltaNet(nn.Module):
         if is_decode:
             # TKG: single-step recurrent update
             if recurrent_state_cache is not None:
-                recurrent_state = recurrent_state_cache[:batch_size].float()
+                recurrent_state = recurrent_state_cache[:batch_size]
             elif seq_ids is not None:
                 recurrent_state = torch.index_select(
                     self.recurrent_state_buffer, 0, seq_ids
-                ).float()
+                )
             else:
-                recurrent_state = self.recurrent_state_buffer[:batch_size].float()
+                recurrent_state = self.recurrent_state_buffer[:batch_size]
 
             use_nki_decode = (
                 self.use_qwen_deltanet_decode_nki
@@ -1265,7 +1283,7 @@ class NeuronGatedDeltaNet(nn.Module):
                 )
             else:
                 output, new_state = self._recurrent_step(
-                    query, key, value, g, beta, recurrent_state
+                    query, key, value, g, beta, recurrent_state.float()
                 )
             new_state_bf16 = new_state.to(self.recurrent_state_buffer.dtype)
             alloc_bs = self.recurrent_state_buffer.shape[0]
@@ -1825,6 +1843,160 @@ class NeuronQwen35Attention(NeuronAttentionBase):
             gather_output=False,
         )
 
+        self.qkv_tkg_nki_kernel_enabled = bool(
+            getattr(config.neuron_config, "qkv_tkg_nki_kernel_enabled", False)
+        ) and not bool(getattr(config.neuron_config, "is_prefill_stage", False))
+        if self.qkv_tkg_nki_kernel_enabled:
+            if _qkv_tkg_nki_kernel is None:
+                raise ImportError(
+                    "qkv_tkg_nki_kernel_enabled requires "
+                    "neuronxcc.nki._pre_prod_kernels.qkv_tkg_impl"
+                )
+            if self.fused_qkv:
+                raise ValueError(
+                    "qkv_tkg_nki_kernel_enabled uses split q/k/v projections "
+                    "and must not be combined with fused_qkv"
+                )
+            if self.qkv_proj_sp_enabled:
+                raise ValueError(
+                    "qkv_tkg_nki_kernel_enabled does not support sequence-parallel "
+                    "QKV projection"
+                )
+            qkv_proj = self.get_qkv_proj()
+            for projection_name in ("q_proj", "k_proj", "v_proj", "output_gate_proj"):
+                projection = getattr(qkv_proj, projection_name)
+                projection.weight = transpose_parallel_linear_layer(projection.weight)
+
+    @staticmethod
+    def _apply_projection_scale(output, projection):
+        scale = getattr(projection, "scale", None)
+        if scale is None:
+            return output
+        scale_tensor = scale.data if hasattr(scale, "data") else scale
+        if (
+            scale_tensor.ndim == 2
+            and scale_tensor.shape[0] == 128
+            and scale_tensor.shape[1] == output.shape[-1]
+        ):
+            scale_tensor = scale_tensor[0]
+        else:
+            scale_tensor = scale_tensor.reshape(-1)
+        if scale_tensor.numel() != output.shape[-1]:
+            raise ValueError(
+                "QKV TKG projection scale shape does not match output width: "
+                f"scale={tuple(scale.shape)}, output={tuple(output.shape)}"
+            )
+        return output * scale_tensor.reshape(1, 1, output.shape[-1]).to(output.dtype)
+
+    def _run_split_qkv_tkg_projection(self, hidden_states, projection, local_heads):
+        bias = (
+            projection.bias.data.unsqueeze(0)
+            if getattr(projection, "bias", None) is not None
+            else None
+        )
+        weight = projection.weight.data
+        if weight.shape[0] != self.hidden_size and weight.shape[1] == self.hidden_size:
+            weight = weight.transpose(0, 1).contiguous()
+        # The preprod QKV TKG kernel's LNC2 path reduces across pi0 and then
+        # stores both programs to the same shared-HBM slice, which the current
+        # NKI verifier rejects as an output dependency. Use the single-LNC
+        # variant for this split projection until that kernel store is fixed.
+        kernel = _qkv_tkg_nki_kernel[1]
+        output = kernel(
+            hidden=hidden_states,
+            qkv_w=weight,
+            norm_w=None,
+            fused_add=False,
+            mlp_prev=None,
+            attn_prev=None,
+            d_head=self.head_dim,
+            output_layout=_QKVOutputLayout.BSD,
+            eps=self.rms_norm_eps,
+            norm_type=_QKVNormType.NO_NORM,
+            qkvInSB=False,
+            qkv_bias=bias,
+            norm_bias=None,
+            hidden_actual=self.hidden_size,
+            B=hidden_states.shape[0],
+            S=hidden_states.shape[1],
+            H=self.hidden_size,
+            num_q_heads=local_heads,
+            num_kv_heads=local_heads,
+            quantization_type=_QKVQuantizationType.NONE,
+            qkv_w_scales=None,
+            qkv_in_scales=None,
+        )
+        return self._apply_projection_scale(output, projection)
+
+    def _prep_split_qkv_tkg_tensors(
+        self,
+        position_ids,
+        hidden_states,
+        past_key_value,
+        adapter_ids=None,
+        cos_cache=None,
+        sin_cache=None,
+        use_polar_compatible_rope=False,
+    ):
+        # NxDI traces a placeholder adapter_ids tensor even when no LoRA
+        # adapters are active. Qwen3.6 serving here is non-LoRA, so the split
+        # projection path intentionally ignores the placeholder.
+        qkv_proj = self.get_qkv_proj()
+        Q = self._run_split_qkv_tkg_projection(
+            hidden_states,
+            qkv_proj.q_proj,
+            self.num_heads,
+        )
+        K = self._run_split_qkv_tkg_projection(
+            hidden_states,
+            qkv_proj.k_proj,
+            self.num_key_value_heads,
+        )
+        V = self._run_split_qkv_tkg_projection(
+            hidden_states,
+            qkv_proj.v_proj,
+            self.num_key_value_heads,
+        )
+
+        bsz, q_len, _ = hidden_states.size()
+        Q = move_heads_front(
+            Q,
+            bsz,
+            q_len,
+            self.num_heads,
+            self.head_dim,
+            layernorm=self.q_layernorm,
+            post_transpose_layernorm=self.post_transpose_layernorm,
+        )
+        K = move_heads_front(
+            K,
+            bsz,
+            q_len,
+            self.num_key_value_heads,
+            self.head_dim,
+            layernorm=self.k_layernorm,
+            post_transpose_layernorm=self.post_transpose_layernorm,
+        )
+        V = move_heads_front(
+            V,
+            bsz,
+            q_len,
+            self.num_key_value_heads,
+            self.head_dim,
+            layernorm=None,
+        )
+
+        Q, K, cos_cache, sin_cache = self.apply_rotary_embedding(
+            Q,
+            K,
+            V,
+            position_ids,
+            cos_cache,
+            sin_cache,
+            use_polar_compatible_rope,
+        )
+        return Q, K, V, cos_cache, sin_cache, None
+
     def apply_rotary_embedding(
         self, Q, K, V, position_ids, cos_cache, sin_cache, use_polar_compatible_rope
     ):
@@ -2101,19 +2273,47 @@ class NeuronQwen35Attention(NeuronAttentionBase):
         # Use standard 2D position_ids for prep_qkv_tensors.
         rope_pos_ids = position_ids
 
-        # Compute gate from input hidden states (before QKV projection)
-        gate = self.output_gate_proj(hidden_states)  # (B, S, num_heads * head_dim)
-
-        # Standard QKV prep (projections, QK norm, RoPE)
-        Q, K, V, cos_cache, sin_cache, _residual = self.prep_qkv_tensors(
-            rope_pos_ids,
-            hidden_states,
-            past_key_value,
-            adapter_ids=adapter_ids,
-            cos_cache=cos_cache,
-            sin_cache=sin_cache,
-            rmsnorm=rmsnorm,
+        use_split_qkv_tkg = (
+            self.qkv_tkg_nki_kernel_enabled
+            and past_key_value is not None
+            and q_len == 1
         )
+        if use_split_qkv_tkg:
+            gate = self._run_split_qkv_tkg_projection(
+                hidden_states,
+                self.output_gate_proj,
+                self.num_heads,
+            )
+            Q, K, V, cos_cache, sin_cache, _residual = (
+                self._prep_split_qkv_tkg_tensors(
+                    rope_pos_ids,
+                    hidden_states,
+                    past_key_value,
+                    adapter_ids=adapter_ids,
+                    cos_cache=cos_cache,
+                    sin_cache=sin_cache,
+                )
+            )
+        elif self.qkv_tkg_nki_kernel_enabled:
+            raise ValueError(
+                "qkv_tkg_nki_kernel_enabled is only valid for single-token "
+                f"decode, got past_key_value={past_key_value is not None}, "
+                f"q_len={q_len}"
+            )
+        else:
+            # Compute gate from input hidden states (before QKV projection).
+            gate = self.output_gate_proj(hidden_states)  # (B, S, num_heads * head_dim)
+
+            # Standard QKV prep (projections, QK norm, RoPE)
+            Q, K, V, cos_cache, sin_cache, _residual = self.prep_qkv_tensors(
+                rope_pos_ids,
+                hidden_states,
+                past_key_value,
+                adapter_ids=adapter_ids,
+                cos_cache=cos_cache,
+                sin_cache=sin_cache,
+                rmsnorm=rmsnorm,
+            )
 
         qwen_chunked_prefill_active = (
             past_key_value is not None
@@ -2238,7 +2438,23 @@ class NeuronQwen35DecoderLayer(nn.Module):
             self.self_attn = NeuronQwen35Attention(config=config)
 
         # Dense MLP (all layers)
-        self.mlp = Qwen35MLP(config)
+        self.mlp_kernel_enabled = (
+            bool(config.neuron_config.mlp_kernel_enabled)
+            and int(getattr(config.neuron_config, "n_active_tokens", 0) or 0) == 1
+        )
+        self.mlp_kernel_fused_rmsnorm = (
+            self.mlp_kernel_enabled
+            and not config.neuron_config.sequence_parallel_enabled
+        )
+        if self.mlp_kernel_enabled:
+            tensor_model_parallel_group = (
+                parallel_state.get_tensor_model_parallel_group()
+                if parallel_state.model_parallel_is_initialized()
+                else None
+            )
+            self.mlp = NeuronLlamaMLP(config, tensor_model_parallel_group)
+        else:
+            self.mlp = Qwen35MLP(config)
 
         self.input_layernorm = get_rmsnorm_cls()(
             config.hidden_size, eps=config.rms_norm_eps
@@ -2295,8 +2511,21 @@ class NeuronQwen35DecoderLayer(nn.Module):
 
         # Dense MLP FFN
         residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
+        use_mlp_kernel = (
+            self.mlp_kernel_enabled
+            and not bool(kwargs.get("is_for_context_encoding", False))
+            and hidden_states.shape[1] == 1
+        )
+        if use_mlp_kernel:
+            if self.mlp_kernel_fused_rmsnorm:
+                mlp_fused_rmsnorm = self.post_attention_layernorm
+            else:
+                hidden_states = self.post_attention_layernorm(hidden_states)
+                mlp_fused_rmsnorm = None
+            hidden_states, _ = self.mlp(hidden_states, rmsnorm=mlp_fused_rmsnorm)
+        else:
+            hidden_states = self.post_attention_layernorm(hidden_states)
+            hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
         hidden_states = ModuleMarkerEndWrapper()(hidden_states)
@@ -4382,14 +4611,20 @@ class NeuronQwen35Model(NeuronBaseModel):
         if getattr(self.config, "use_hybrid_apc_manager", False) and hasattr(
             self, "hybrid_gdn_checkpoint_cache"
         ):
-            self._hybrid_gdn_checkpoint_updated_states = (
-                self.hybrid_gdn_checkpoint_cache.commit_from_active_rows(
-                    layer_state_pairs=deltanet_layer_state_pairs,
-                    seq_ids=seq_ids,
-                    checkpoint_slot_ids=hybrid_commit_slot_ids,
-                    commit_mask=hybrid_commit_mask,
-                )
+            commit_during_tkg = bool(
+                getattr(self.config, "hybrid_apc_commit_during_token_generation", False)
             )
+            if not is_for_context_encoding and not commit_during_tkg:
+                self._hybrid_gdn_checkpoint_updated_states = []
+            else:
+                self._hybrid_gdn_checkpoint_updated_states = (
+                    self.hybrid_gdn_checkpoint_cache.commit_from_active_rows(
+                        layer_state_pairs=deltanet_layer_state_pairs,
+                        seq_ids=seq_ids,
+                        checkpoint_slot_ids=hybrid_commit_slot_ids,
+                        commit_mask=hybrid_commit_mask,
+                    )
+                )
 
         _debug_logits_stage("before_final_norm", hidden_states)
         hidden_states = self.norm(hidden_states)
@@ -4969,8 +5204,22 @@ class Qwen35DecoderModelInstance(DecoderModelInstance):
                 input_output_aliases[param] = state_start_idx + i
 
             checkpoint_start_idx = state_start_idx + len(module._deltanet_state_params)
-            for i, param in enumerate(getattr(module, "_hybrid_gdn_checkpoint_params", [])):
-                input_output_aliases[param] = checkpoint_start_idx + i
+            include_checkpoint_aliases = not (
+                getattr(module.config, "use_hybrid_apc_manager", False)
+                and int(getattr(module, "n_active_tokens", 0) or 0) == 1
+                and not bool(
+                    getattr(
+                        module.config,
+                        "hybrid_apc_commit_during_token_generation",
+                        False,
+                    )
+                )
+            )
+            if include_checkpoint_aliases:
+                for i, param in enumerate(
+                    getattr(module, "_hybrid_gdn_checkpoint_params", [])
+                ):
+                    input_output_aliases[param] = checkpoint_start_idx + i
 
         return module, input_output_aliases
 

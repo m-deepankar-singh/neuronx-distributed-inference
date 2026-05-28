@@ -1168,6 +1168,44 @@ class TestQwen36HybridAPCSchedulerPatch(unittest.TestCase):
             ["prefill"],
         )
 
+    def test_scheduler_allows_mixed_prefill_decode_when_configured(self):
+        class FakeScheduler:
+            def __init__(self):
+                base = _scheduler(
+                    use_hybrid_apc=True,
+                    use_qwen_hybrid_chunked_prefill=True,
+                    max_num_seqs=2,
+                    additional_config={
+                        "hybrid_apc_allow_mixed_prefill_decode": True,
+                    },
+                )
+                self.vllm_config = base.vllm_config
+                self.cache_config = base.cache_config
+                self.scheduler_config = base.scheduler_config
+                self.running = [types.SimpleNamespace(request_id="decode")]
+                self.waiting = [types.SimpleNamespace(request_id="prefill")]
+                self.waiting_seen_by_schedule = None
+
+            def add_request(self, request):
+                self.waiting.append(request)
+
+            def schedule(self):
+                self.waiting_seen_by_schedule = [
+                    request.request_id for request in self.waiting
+                ]
+                self.waiting = []
+                return types.SimpleNamespace(
+                    scheduled_new_reqs=[],
+                    scheduled_cached_reqs=None,
+                )
+
+        self.patch.patch_scheduler_class(FakeScheduler)
+        scheduler = FakeScheduler()
+        scheduler.schedule()
+
+        self.assertEqual(scheduler.waiting_seen_by_schedule, ["prefill"])
+        self.assertEqual(scheduler.waiting, [])
+
     def test_scheduler_keeps_waiting_prefills_when_no_decode_running(self):
         class FakeScheduler:
             def __init__(self):
