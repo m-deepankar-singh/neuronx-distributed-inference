@@ -1864,8 +1864,13 @@ class NeuronQwen35Attention(NeuronAttentionBase):
                     "QKV projection"
                 )
             qkv_proj = self.get_qkv_proj()
-            for projection_name in ("q_proj", "k_proj", "v_proj", "output_gate_proj"):
-                projection = getattr(qkv_proj, projection_name)
+            split_qkv_projections = (
+                qkv_proj.q_proj,
+                qkv_proj.k_proj,
+                qkv_proj.v_proj,
+                self.output_gate_proj,
+            )
+            for projection in split_qkv_projections:
                 if getattr(config.neuron_config, "quantized", False):
                     setattr(
                         projection,
