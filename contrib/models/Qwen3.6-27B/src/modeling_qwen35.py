@@ -108,6 +108,7 @@ from neuronx_distributed_inference.modules.attention.attention_base import Neuro
 from neuronx_distributed_inference.modules.attention.utils import (
     RotaryEmbedding,
     move_heads_front,
+    preprocess_quantized_linear_layer,
     transpose_parallel_linear_layer,
 )
 from neuronx_distributed_inference.modules.kvcache.block_kv_cache_manager import (
@@ -1865,7 +1866,14 @@ class NeuronQwen35Attention(NeuronAttentionBase):
             qkv_proj = self.get_qkv_proj()
             for projection_name in ("q_proj", "k_proj", "v_proj", "output_gate_proj"):
                 projection = getattr(qkv_proj, projection_name)
-                projection.weight = transpose_parallel_linear_layer(projection.weight)
+                if getattr(config.neuron_config, "quantized", False):
+                    setattr(
+                        projection,
+                        "post_create_quantized_module_hook",
+                        preprocess_quantized_linear_layer,
+                    )
+                else:
+                    projection.weight = transpose_parallel_linear_layer(projection.weight)
 
     @staticmethod
     def _apply_projection_scale(output, projection):
@@ -1902,6 +1910,19 @@ class NeuronQwen35Attention(NeuronAttentionBase):
         # NKI verifier rejects as an output dependency. Use the single-LNC
         # variant for this split projection until that kernel store is fixed.
         kernel = _qkv_tkg_nki_kernel[1]
+        scale = getattr(projection, "scale", None)
+        if scale is not None:
+            qkv_w_scales = scale.data if hasattr(scale, "data") else scale
+            quantization_type = getattr(_QKVQuantizationType, "ROW", None)
+            if quantization_type is None:
+                raise ValueError(
+                    "qkv_tkg_nki_kernel_enabled requires ROW quantization support "
+                    "when running quantized split-QKV projections"
+                )
+        else:
+            qkv_w_scales = None
+            quantization_type = _QKVQuantizationType.NONE
+
         output = kernel(
             hidden=hidden_states,
             qkv_w=weight,
@@ -1922,10 +1943,12 @@ class NeuronQwen35Attention(NeuronAttentionBase):
             H=self.hidden_size,
             num_q_heads=local_heads,
             num_kv_heads=local_heads,
-            quantization_type=_QKVQuantizationType.NONE,
-            qkv_w_scales=None,
+            quantization_type=quantization_type,
+            qkv_w_scales=qkv_w_scales,
             qkv_in_scales=None,
         )
+        if qkv_w_scales is not None:
+            return output
         return self._apply_projection_scale(output, projection)
 
     def _prep_split_qkv_tkg_tensors(
