@@ -108,7 +108,6 @@ from neuronx_distributed_inference.modules.attention.attention_base import Neuro
 from neuronx_distributed_inference.modules.attention.utils import (
     RotaryEmbedding,
     move_heads_front,
-    preprocess_quantized_linear_layer,
     transpose_parallel_linear_layer,
 )
 from neuronx_distributed_inference.modules.kvcache.block_kv_cache_manager import (
@@ -1871,13 +1870,7 @@ class NeuronQwen35Attention(NeuronAttentionBase):
                 self.output_gate_proj,
             )
             for projection in split_qkv_projections:
-                if getattr(config.neuron_config, "quantized", False):
-                    setattr(
-                        projection,
-                        "post_create_quantized_module_hook",
-                        preprocess_quantized_linear_layer,
-                    )
-                else:
+                if not getattr(config.neuron_config, "quantized", False):
                     projection.weight = transpose_parallel_linear_layer(projection.weight)
 
     @staticmethod
@@ -1901,6 +1894,39 @@ class NeuronQwen35Attention(NeuronAttentionBase):
             )
         return output * scale_tensor.reshape(1, 1, output.shape[-1]).to(output.dtype)
 
+    @staticmethod
+    def _prepare_qkv_tkg_scale(scale_tensor, output_width):
+        if (
+            scale_tensor.ndim == 2
+            and scale_tensor.shape[0] == 128
+            and scale_tensor.shape[1] == output_width
+        ):
+            return scale_tensor.contiguous()
+        if (
+            scale_tensor.ndim == 2
+            and scale_tensor.shape[0] == output_width
+            and scale_tensor.shape[1] == 1
+        ):
+            return torch.broadcast_to(
+                scale_tensor.transpose(0, 1),
+                (128, output_width),
+            ).contiguous()
+        if (
+            scale_tensor.ndim == 2
+            and scale_tensor.shape[0] == 1
+            and scale_tensor.shape[1] == output_width
+        ):
+            return torch.broadcast_to(scale_tensor, (128, output_width)).contiguous()
+        if scale_tensor.numel() == output_width:
+            return torch.broadcast_to(
+                scale_tensor.reshape(1, output_width),
+                (128, output_width),
+            ).contiguous()
+        raise ValueError(
+            "QKV TKG projection scale shape does not match output width: "
+            f"scale={tuple(scale_tensor.shape)}, output_width={output_width}"
+        )
+
     def _run_split_qkv_tkg_projection(self, hidden_states, projection, local_heads):
         bias = (
             projection.bias.data.unsqueeze(0)
@@ -1917,7 +1943,11 @@ class NeuronQwen35Attention(NeuronAttentionBase):
         kernel = _qkv_tkg_nki_kernel[1]
         scale = getattr(projection, "scale", None)
         if scale is not None:
-            qkv_w_scales = scale.data if hasattr(scale, "data") else scale
+            scale_tensor = scale.data if hasattr(scale, "data") else scale
+            qkv_w_scales = self._prepare_qkv_tkg_scale(
+                scale_tensor,
+                weight.shape[1],
+            )
             quantization_type = getattr(_QKVQuantizationType, "ROW", None)
             if quantization_type is None:
                 raise ValueError(

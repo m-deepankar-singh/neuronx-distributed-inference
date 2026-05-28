@@ -213,6 +213,13 @@ def _override_config(args: argparse.Namespace) -> dict:
         "logical_nc_config": args.logical_nc_config,
         "torch_dtype": "bfloat16",
         "save_sharded_checkpoint": True,
+        "gdn_checkpoint_interval": args.gdn_checkpoint_interval,
+        "max_gdn_checkpoint_slots": args.max_gdn_checkpoint_slots,
+        "gdn_recurrent_cache_dtype": recurrent_cache_dtype,
+        "gdn_conv_cache_dtype": conv_cache_dtype,
+        "hybrid_recurrent_cache_dtype": recurrent_cache_dtype,
+        "hybrid_conv_cache_dtype": conv_cache_dtype,
+        "hybrid_cache_mode": args.hybrid_cache_mode,
     }
     if args.async_mode:
         neuron_config["async_mode"] = True

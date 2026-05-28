@@ -218,6 +218,13 @@ def _additional_config(args: argparse.Namespace) -> dict[str, Any]:
         "save_sharded_checkpoint": True,
         "pa_block_size": args.block_size,
         "pa_num_blocks": args.pa_num_blocks,
+        "gdn_checkpoint_interval": args.gdn_checkpoint_interval,
+        "max_gdn_checkpoint_slots": args.max_gdn_checkpoint_slots,
+        "gdn_recurrent_cache_dtype": args.gdn_recurrent_cache_dtype,
+        "gdn_conv_cache_dtype": args.gdn_conv_cache_dtype,
+        "hybrid_recurrent_cache_dtype": args.gdn_recurrent_cache_dtype,
+        "hybrid_conv_cache_dtype": args.gdn_conv_cache_dtype,
+        "hybrid_cache_mode": "all",
         "is_block_kv_layout": True,
         "is_prefix_caching": True,
         "chunked_prefill_config": {

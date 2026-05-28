@@ -472,6 +472,13 @@ neuron_config = {
     "save_sharded_checkpoint": True,
     "pa_block_size": int("${BLOCK_SIZE}"),
     "pa_num_blocks": pa_num_blocks,
+    "gdn_checkpoint_interval": int("${GDN_CHECKPOINT_INTERVAL}"),
+    "max_gdn_checkpoint_slots": int("${MAX_GDN_CHECKPOINT_SLOTS}"),
+    "gdn_recurrent_cache_dtype": "${HYBRID_GDN_RECURRENT_CACHE_DTYPE}",
+    "gdn_conv_cache_dtype": "${HYBRID_GDN_CONV_CACHE_DTYPE}",
+    "hybrid_recurrent_cache_dtype": "${HYBRID_GDN_RECURRENT_CACHE_DTYPE}",
+    "hybrid_conv_cache_dtype": "${HYBRID_GDN_CONV_CACHE_DTYPE}",
+    "hybrid_cache_mode": "${HYBRID_CACHE_MODE}",
 }
 if async_mode:
     neuron_config["async_mode"] = True
