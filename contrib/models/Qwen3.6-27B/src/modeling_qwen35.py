@@ -1867,7 +1867,6 @@ class NeuronQwen35Attention(NeuronAttentionBase):
                 qkv_proj.q_proj,
                 qkv_proj.k_proj,
                 qkv_proj.v_proj,
-                self.output_gate_proj,
             )
             for projection in split_qkv_projections:
                 if not getattr(config.neuron_config, "quantized", False):
@@ -2337,11 +2336,10 @@ class NeuronQwen35Attention(NeuronAttentionBase):
             and q_len == 1
         )
         if use_split_qkv_tkg:
-            gate = self._run_split_qkv_tkg_projection(
-                hidden_states,
-                self.output_gate_proj,
-                self.num_heads,
-            )
+            # The preprod split-QKV TKG kernel assumes Q/K/V projection metadata.
+            # Keep the non-QKV output gate on the standard projection path to
+            # avoid runtime indirect-DMA OOBs in token generation.
+            gate = self.output_gate_proj(hidden_states)
             Q, K, V, cos_cache, sin_cache, _residual = (
                 self._prep_split_qkv_tkg_tensors(
                     rope_pos_ids,

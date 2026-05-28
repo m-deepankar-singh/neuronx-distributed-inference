@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import importlib.util
+import inspect
 import os
 import sys
 import types
@@ -104,6 +105,7 @@ def _fake_modules():
             "src.nki_kernels.nki_deltanet",
             deltanet_recurrent_fwd=lambda *args, **kwargs: None,
             deltanet_recurrent_fwd_state=lambda *args, **kwargs: None,
+            deltanet_recurrent_step_batched=lambda *args, **kwargs: None,
         ),
         "src.nki_kernels.nki_deltanet_chunked": _module(
             "src.nki_kernels.nki_deltanet_chunked",
@@ -130,6 +132,13 @@ def _fake_modules():
             "neuronx_distributed_inference.models.config",
             InferenceConfig=object,
             NeuronConfig=object,
+        ),
+        "neuronx_distributed_inference.models.llama": _package(
+            "neuronx_distributed_inference.models.llama"
+        ),
+        "neuronx_distributed_inference.models.llama.modeling_llama": _module(
+            "neuronx_distributed_inference.models.llama.modeling_llama",
+            NeuronLlamaMLP=nn.Module,
         ),
         "neuronx_distributed_inference.models.model_base": _module(
             "neuronx_distributed_inference.models.model_base",
@@ -175,6 +184,8 @@ def _fake_modules():
         "neuronx_distributed_inference.modules.attention.utils": _module(
             "neuronx_distributed_inference.modules.attention.utils",
             RotaryEmbedding=object,
+            move_heads_front=lambda tensor, *_args, **_kwargs: tensor,
+            transpose_parallel_linear_layer=lambda weight: weight,
         ),
         "neuronx_distributed_inference.modules.kvcache": _package(
             "neuronx_distributed_inference.modules.kvcache"
@@ -321,6 +332,23 @@ class TestQwen36ModelAliases(unittest.TestCase):
     def test_fused_deltanet_does_not_clamp_cumulative_decay(self):
         self.assertFalse(
             hasattr(self.qwen_module, "_bound_fused_deltanet_log_decay")
+        )
+
+    def test_split_qkv_tkg_keeps_output_gate_on_standard_projection(self):
+        init_source = inspect.getsource(self.qwen_module.NeuronQwen35Attention.__init__)
+        split_tuple_source = init_source.split("split_qkv_projections = (", 1)[1].split(
+            ")",
+            1,
+        )[0]
+        self.assertNotIn("output_gate_proj", split_tuple_source)
+
+        forward_source = inspect.getsource(self.qwen_module.NeuronQwen35Attention.forward)
+        self.assertIn("gate = self.output_gate_proj(hidden_states)", forward_source)
+        self.assertNotIn(
+            "self._run_split_qkv_tkg_projection(\n"
+            "                hidden_states,\n"
+            "                self.output_gate_proj,",
+            forward_source,
         )
 
     def test_hybrid_checkpoint_commit_ignores_inactive_duplicate_slot_rows(self):
