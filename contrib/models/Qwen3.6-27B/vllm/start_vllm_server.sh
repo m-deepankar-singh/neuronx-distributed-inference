@@ -246,7 +246,7 @@ if "${ENABLE_CHUNKED_PREFILL}" == "1" and "${ENABLE_HYBRID_APC}" == "1":
                 "compiled CTE bucket that is a multiple of --gdn-checkpoint-interval "
                 f"({checkpoint_interval}); got {buckets}"
             )
-        print(candidates[0])
+        print(candidates[-1])
     else:
         if requested_chunk % checkpoint_interval != 0:
             raise SystemExit(
@@ -267,6 +267,7 @@ PY
 ADDITIONAL_CONFIG="$(
   python3 - <<PY
 import json
+import os
 from pathlib import Path
 
 
@@ -340,14 +341,26 @@ compiled_token_generation_buckets = None
 compiled_token_generation_batches = None
 compiled_kernel_flags = {}
 compiled_decode_memory_flags = {}
+compiled_weights_to_skip_layout_optimization = None
+compiled_disable_token_generation_wlo = (
+    os.environ.get("QWEN36_DISABLE_TOKEN_GENERATION_WLO") == "1"
+)
 if compiled_artifacts:
     config_path = Path(compiled_artifacts).expanduser() / "neuron_config.json"
     if config_path.exists():
         with config_path.open(encoding="utf-8") as handle:
             compiled_config = json.load(handle)
+        compiled_disable_token_generation_wlo = (
+            compiled_disable_token_generation_wlo
+            or bool(compiled_config.get("disable_token_generation_wlo"))
+        )
         nested_config = compiled_config.get("neuron_config")
         if isinstance(nested_config, dict):
             compiled_config = nested_config
+            compiled_disable_token_generation_wlo = (
+                compiled_disable_token_generation_wlo
+                or bool(compiled_config.get("disable_token_generation_wlo"))
+            )
         compiled_max_prompt = int(
             compiled_config.get("max_context_length")
             or compiled_config.get("max_length")
@@ -386,6 +399,9 @@ if compiled_artifacts:
         compiled_token_generation_buckets = compiled_config.get(
             "token_generation_buckets"
         )
+        compiled_weights_to_skip_layout_optimization = compiled_config.get(
+            "weights_to_skip_layout_optimization"
+        )
         for flag_name in (
             "fused_qkv",
             "qkv_kernel_enabled",
@@ -397,6 +413,11 @@ if compiled_artifacts:
             "attn_block_tkg_nki_kernel_use_online_softmax",
             "attn_block_tkg_nki_kernel_disable_gpsimd_sb2sb",
             "out_proj_kernel_enabled",
+            "mlp_kernel_enabled",
+            "mlp_tkg_nki_kernel_enabled",
+            "quantized_mlp_kernel_enabled",
+            "rmsnorm_quantize_kernel_enabled",
+            "quantize_clamp_bound",
         ):
             if flag_name in compiled_config:
                 compiled_kernel_flags[flag_name] = compiled_config[flag_name]
@@ -484,6 +505,10 @@ if async_mode:
     neuron_config["async_mode"] = True
 if token_generation_batches is not None:
     neuron_config["token_generation_batches"] = token_generation_batches
+if compiled_weights_to_skip_layout_optimization is not None:
+    neuron_config["weights_to_skip_layout_optimization"] = (
+        compiled_weights_to_skip_layout_optimization
+    )
 neuron_config.update(compiled_kernel_flags)
 neuron_config.update(compiled_decode_memory_flags)
 if enable_prefix_caching or enable_hybrid_apc or enable_chunked:
@@ -542,8 +567,11 @@ print(json.dumps({
     "hybrid_apc_disable_unbacked_prefix_reads": enable_hybrid_apc and "${HYBRID_APC_DISABLE_UNBACKED_PREFIX_READS}" == "1",
     "hybrid_apc_enable_backed_prefix_reads": enable_hybrid_apc and "${HYBRID_APC_ENABLE_BACKED_PREFIX_READS}" == "1",
     "hybrid_apc_allow_mixed_prefill_decode": enable_hybrid_apc and "${HYBRID_APC_ALLOW_MIXED_PREFILL_DECODE}" == "1",
+    "hybrid_apc_prefill_chunk_tokens": int("${MAX_BATCHED_TOKENS}") if enable_hybrid_apc and enable_chunked else 0,
+    "qwen_prefill_group_size": int("${MAX_BATCHED_TOKENS}") if enable_chunked else max_cte_bucket,
     "use_qwen_hybrid_chunked_prefill": enable_chunked,
     "use_qwen_hybrid_chunked_prefill_nki": enable_chunked,
+    "disable_token_generation_wlo": compiled_disable_token_generation_wlo,
     "override_neuron_config": neuron_config,
 }))
 PY
@@ -554,6 +582,7 @@ echo "MODEL_PATH=${MODEL_PATH}"
 echo "NEURON_COMPILED_ARTIFACTS=${NEURON_COMPILED_ARTIFACTS:-}"
 echo "XLA_HANDLE_SPECIAL_SCALAR=${XLA_HANDLE_SPECIAL_SCALAR:-}"
 echo "UNSAFE_FP8FNCAST=${UNSAFE_FP8FNCAST:-}"
+echo "QWEN36_DISABLE_TOKEN_GENERATION_WLO=${QWEN36_DISABLE_TOKEN_GENERATION_WLO:-}"
 echo "PYTHONPATH=${PYTHONPATH}"
 echo "ENABLE_PREFIX_CACHING=${ENABLE_PREFIX_CACHING}"
 echo "ENABLE_HYBRID_APC=${ENABLE_HYBRID_APC}"

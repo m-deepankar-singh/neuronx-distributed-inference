@@ -39,6 +39,17 @@ def _chat_token_count(tokenizer: Any, messages: list[dict[str, str]]) -> int:
             tokenize=True,
             add_generation_prompt=True,
         )
+    if isinstance(token_ids, dict):
+        token_ids = token_ids.get("input_ids", token_ids)
+    elif hasattr(token_ids, "input_ids"):
+        token_ids = token_ids.input_ids
+
+    if (
+        isinstance(token_ids, list)
+        and token_ids
+        and isinstance(token_ids[0], list)
+    ):
+        return len(token_ids[0])
     return len(token_ids)
 
 

@@ -46,6 +46,10 @@ class _FakeNeuronConfig:
         self.__dict__.update(kwargs)
         self.output_logits = kwargs.get("output_logits", False)
         self.on_device_sampling_config = kwargs.get("on_device_sampling_config")
+        self.disable_argmax_kernel = kwargs.get("disable_argmax_kernel", False)
+        self.disable_context_encoding_argmax_kernel = kwargs.get(
+            "disable_context_encoding_argmax_kernel", False
+        )
 
 
 class _FakeOnDeviceSamplingConfig:
@@ -86,6 +90,8 @@ def _args(**overrides):
         omit_zero_prefix_pair=False,
         token_generation_buckets=None,
         token_generation_batches=None,
+        disable_token_generation_wlo=False,
+        weights_to_skip_layout_optimization=None,
         block_size=256,
         pa_num_blocks=8,
         pa_headroom_blocks=0,
@@ -98,19 +104,30 @@ def _args(**overrides):
         enable_prefix_caching=True,
         enable_hybrid_apc=True,
         enable_vllm_chunked_prefill=False,
+        text_only_cte=True,
+        compact_cte_attention_mask=True,
+        cold_zero_conv_fast_path=False,
         enable_deltanet_decode_nki=False,
         deltanet_cte_backend="env",
         disable_on_device_sampling=True,
+        disable_argmax_kernel=False,
+        disable_context_encoding_argmax_kernel=False,
         output_logits_with_on_device_sampling=False,
         kernel_q_tile_size=128,
         kernel_kv_tile_size=1024,
         enable_fused_qkv=False,
         enable_qkv_nki_kernels=False,
+        enable_qkv_cte_nki_kernel_fuse_rope=False,
+        enable_qwen_qk_norm_rope_nki_kernel=False,
+        enable_qwen_output_gate_nki_kernel=False,
+        enable_qwen_qkv_gate_packed_kernel=False,
+        enable_qwen_gated_o_proj_nki_kernel=False,
         enable_split_qkv_tkg_nki_kernel=False,
         enable_attn_block_tkg_nki_kernel=False,
         enable_attn_block_tkg_cascaded_attention=False,
         enable_attn_block_tkg_cache_update=False,
         enable_out_proj_nki_kernel=False,
+        enable_mlp_cte_nki_kernel=False,
         enable_mlp_tkg_nki_kernel=False,
         enable_quantized_mlp_kernel=False,
         enable_k_cache_transposed=False,
@@ -258,6 +275,129 @@ class TestQwen36CompileFp8Config(unittest.TestCase):
             getattr(config.neuron_config, "qkv_nki_kernel_enabled", False),
         )
 
+    def test_compile_can_enable_qkv_cte_rope_fusion_flag(self):
+        with patch.object(
+            _COMPILE,
+            "_load_text_config",
+            return_value={
+                "num_hidden_layers": 2,
+                "head_dim": 256,
+                "rope_dim": 256,
+            },
+        ), patch.dict(
+            sys.modules,
+            {
+                "neuronx_distributed_inference.models.config": _fake_config_module(),
+                "src.modeling_qwen35": _fake_qwen_module(),
+            },
+        ):
+            config, _modules = _COMPILE._build_config(
+                _args(
+                    enable_qkv_nki_kernels=True,
+                    enable_qkv_cte_nki_kernel_fuse_rope=True,
+                ),
+            )
+
+        self.assertTrue(config.neuron_config.qkv_kernel_enabled)
+        self.assertTrue(config.neuron_config.qkv_nki_kernel_enabled)
+        self.assertTrue(config.neuron_config.qkv_cte_nki_kernel_fuse_rope)
+
+    def test_compile_rejects_qkv_cte_rope_fusion_for_partial_rope(self):
+        with patch.object(
+            _COMPILE,
+            "_load_text_config",
+            return_value={
+                "num_hidden_layers": 2,
+                "head_dim": 256,
+                "rope_dim": 64,
+            },
+        ), patch.dict(
+            sys.modules,
+            {
+                "neuronx_distributed_inference.models.config": _fake_config_module(),
+                "src.modeling_qwen35": _fake_qwen_module(),
+            },
+        ):
+            with self.assertRaisesRegex(ValueError, "partial-RoPE Qwen3.6"):
+                _COMPILE._build_config(
+                    _args(
+                        enable_qkv_nki_kernels=True,
+                        enable_qkv_cte_nki_kernel_fuse_rope=True,
+                    ),
+                )
+
+    def test_compile_can_enable_qwen_qk_norm_rope_nki_kernel(self):
+        with patch.object(
+            _COMPILE,
+            "_load_text_config",
+            return_value={"num_hidden_layers": 2},
+        ), patch.dict(
+            sys.modules,
+            {
+                "neuronx_distributed_inference.models.config": _fake_config_module(),
+                "src.modeling_qwen35": _fake_qwen_module(),
+            },
+        ):
+            config, _modules = _COMPILE._build_config(
+                _args(enable_qwen_qk_norm_rope_nki_kernel=True),
+            )
+
+        self.assertTrue(config.config_dict["use_qwen_qk_norm_rope_nki"])
+
+    def test_compile_can_enable_qwen_output_gate_nki_kernel(self):
+        with patch.object(
+            _COMPILE,
+            "_load_text_config",
+            return_value={"num_hidden_layers": 2},
+        ), patch.dict(
+            sys.modules,
+            {
+                "neuronx_distributed_inference.models.config": _fake_config_module(),
+                "src.modeling_qwen35": _fake_qwen_module(),
+            },
+        ):
+            config, _modules = _COMPILE._build_config(
+                _args(enable_qwen_output_gate_nki_kernel=True),
+            )
+
+        self.assertTrue(config.config_dict["use_qwen_output_gate_nki"])
+
+    def test_compile_can_enable_qwen_qkv_gate_packed_kernel(self):
+        with patch.object(
+            _COMPILE,
+            "_load_text_config",
+            return_value={"num_hidden_layers": 2},
+        ), patch.dict(
+            sys.modules,
+            {
+                "neuronx_distributed_inference.models.config": _fake_config_module(),
+                "src.modeling_qwen35": _fake_qwen_module(),
+            },
+        ):
+            config, _modules = _COMPILE._build_config(
+                _args(enable_qwen_qkv_gate_packed_kernel=True),
+            )
+
+        self.assertTrue(config.config_dict["use_qwen_qkv_gate_packed"])
+
+    def test_compile_can_enable_qwen_gated_o_proj_nki_kernel(self):
+        with patch.object(
+            _COMPILE,
+            "_load_text_config",
+            return_value={"num_hidden_layers": 2},
+        ), patch.dict(
+            sys.modules,
+            {
+                "neuronx_distributed_inference.models.config": _fake_config_module(),
+                "src.modeling_qwen35": _fake_qwen_module(),
+            },
+        ):
+            config, _modules = _COMPILE._build_config(
+                _args(enable_qwen_gated_o_proj_nki_kernel=True),
+            )
+
+        self.assertTrue(config.config_dict["use_qwen_gated_o_proj_nki"])
+
     def test_compile_can_enable_split_qkv_tkg_kernel_without_stock_qkv(self):
         with patch.object(
             _COMPILE,
@@ -325,6 +465,32 @@ class TestQwen36CompileFp8Config(unittest.TestCase):
         self.assertTrue(config.neuron_config.mlp_tkg_nki_kernel_enabled)
         self.assertTrue(config.neuron_config.quantized_mlp_kernel_enabled)
 
+    def test_compile_can_enable_quantized_mlp_cte_kernel_without_tkg_flag(self):
+        with patch.object(
+            _COMPILE,
+            "_load_text_config",
+            return_value={"num_hidden_layers": 2},
+        ), patch.dict(
+            sys.modules,
+            {
+                "neuronx_distributed_inference.models.config": _fake_config_module(),
+                "src.modeling_qwen35": _fake_qwen_module(),
+            },
+        ):
+            config, _modules = _COMPILE._build_config(
+                _args(
+                    weight_dtype="fp8_full",
+                    enable_mlp_cte_nki_kernel=True,
+                    enable_quantized_mlp_kernel=True,
+                ),
+            )
+
+        self.assertTrue(config.neuron_config.mlp_kernel_enabled)
+        self.assertFalse(
+            getattr(config.neuron_config, "mlp_tkg_nki_kernel_enabled", False)
+        )
+        self.assertTrue(config.neuron_config.quantized_mlp_kernel_enabled)
+
     def test_decode_memory_flags_are_forwarded(self):
         with patch.object(
             _COMPILE,
@@ -372,6 +538,53 @@ class TestQwen36CompileFp8Config(unittest.TestCase):
         self.assertFalse(config.neuron_config.output_logits)
         self.assertTrue(config.neuron_config.vocab_parallel)
         self.assertEqual(config.neuron_config.pa_num_blocks, 8)
+
+    def test_on_device_sampling_can_disable_custom_argmax_kernel(self):
+        with patch.object(
+            _COMPILE,
+            "_load_text_config",
+            return_value={"num_hidden_layers": 2},
+        ), patch.dict(
+            sys.modules,
+            {
+                "neuronx_distributed_inference.models.config": _fake_config_module(),
+                "src.modeling_qwen35": _fake_qwen_module(),
+            },
+        ):
+            config, _modules = _COMPILE._build_config(
+                _args(
+                    disable_on_device_sampling=False,
+                    disable_argmax_kernel=True,
+                ),
+            )
+
+        self.assertIsNotNone(config.neuron_config.on_device_sampling_config)
+        self.assertTrue(config.neuron_config.vocab_parallel)
+        self.assertTrue(config.neuron_config.disable_argmax_kernel)
+
+    def test_on_device_sampling_can_disable_context_encoding_argmax_kernel(self):
+        with patch.object(
+            _COMPILE,
+            "_load_text_config",
+            return_value={"num_hidden_layers": 2},
+        ), patch.dict(
+            sys.modules,
+            {
+                "neuronx_distributed_inference.models.config": _fake_config_module(),
+                "src.modeling_qwen35": _fake_qwen_module(),
+            },
+        ):
+            config, _modules = _COMPILE._build_config(
+                _args(
+                    disable_on_device_sampling=False,
+                    disable_context_encoding_argmax_kernel=True,
+                ),
+            )
+
+        self.assertIsNotNone(config.neuron_config.on_device_sampling_config)
+        self.assertTrue(config.neuron_config.vocab_parallel)
+        self.assertFalse(config.neuron_config.disable_argmax_kernel)
+        self.assertTrue(config.neuron_config.disable_context_encoding_argmax_kernel)
 
     def test_on_device_sampling_can_also_return_logits_for_debug(self):
         with patch.object(
@@ -458,6 +671,18 @@ class TestQwen36CompileFp8Config(unittest.TestCase):
             )
 
         self.assertTrue(config.neuron_config.quantized)
+        self.assertIn(
+            r".*\.scale$",
+            config.neuron_config.weights_to_skip_layout_optimization,
+        )
+        self.assertIn(
+            r".*\.weight_scale$",
+            config.neuron_config.weights_to_skip_layout_optimization,
+        )
+        self.assertIn(
+            r".*linear_attn\.conv1d_weight\.weight$",
+            config.neuron_config.weights_to_skip_layout_optimization,
+        )
         self.assertNotIn("layers.0.mlp", modules)
         self.assertNotIn("layers.3.mlp", modules)
         self.assertNotIn("layers.0.self_attn", modules)
@@ -489,6 +714,124 @@ class TestQwen36CompileFp8Config(unittest.TestCase):
 
         self.assertNotIn("lm_head", modules)
         self.assertNotIn("model.lm_head", modules)
+
+    def test_user_wlo_skip_patterns_are_appended_and_deduplicated(self):
+        with patch.object(
+            _COMPILE,
+            "_load_text_config",
+            return_value={"num_hidden_layers": 2},
+        ), patch.dict(
+            sys.modules,
+            {
+                "neuronx_distributed_inference.models.config": _fake_config_module(),
+                "src.modeling_qwen35": _fake_qwen_module(),
+            },
+        ):
+            config, _modules = _COMPILE._build_config(
+                _args(
+                    disable_on_device_sampling=True,
+                    weight_dtype="fp8_full",
+                    weights_to_skip_layout_optimization=[
+                        r".*\.scale$",
+                        r".*custom_skip.*",
+                    ],
+                ),
+            )
+
+        self.assertEqual(
+            config.neuron_config.weights_to_skip_layout_optimization,
+            [
+                r".*\.scale$",
+                r".*\.weight_scale$",
+                r".*linear_attn\.conv1d_weight\.weight$",
+                r".*custom_skip.*",
+            ],
+        )
+
+    def test_bf16_control_does_not_add_fp8_wlo_skips_by_default(self):
+        with patch.object(
+            _COMPILE,
+            "_load_text_config",
+            return_value={"num_hidden_layers": 2},
+        ), patch.dict(
+            sys.modules,
+            {
+                "neuronx_distributed_inference.models.config": _fake_config_module(),
+                "src.modeling_qwen35": _fake_qwen_module(),
+            },
+        ):
+            config, _modules = _COMPILE._build_config(
+                _args(
+                    disable_on_device_sampling=True,
+                    weight_dtype="bf16_control",
+                    quantized_checkpoints_path=None,
+                ),
+            )
+
+        self.assertFalse(
+            hasattr(config.neuron_config, "weights_to_skip_layout_optimization"),
+        )
+
+    def test_compile_can_disable_token_generation_wlo(self):
+        with patch.object(
+            _COMPILE,
+            "_load_text_config",
+            return_value={"num_hidden_layers": 2},
+        ), patch.dict(
+            sys.modules,
+            {
+                "neuronx_distributed_inference.models.config": _fake_config_module(),
+                "src.modeling_qwen35": _fake_qwen_module(),
+            },
+        ):
+            config, _modules = _COMPILE._build_config(
+                _args(disable_token_generation_wlo=True),
+            )
+
+        self.assertTrue(config.config_dict["disable_token_generation_wlo"])
+
+    def test_compile_can_disable_token_generation_wlo_from_env(self):
+        with patch.object(
+            _COMPILE,
+            "_load_text_config",
+            return_value={"num_hidden_layers": 2},
+        ), patch.dict(
+            os.environ,
+            {"QWEN36_DISABLE_TOKEN_GENERATION_WLO": "1"},
+        ), patch.dict(
+            sys.modules,
+            {
+                "neuronx_distributed_inference.models.config": _fake_config_module(),
+                "src.modeling_qwen35": _fake_qwen_module(),
+            },
+        ):
+            config, _modules = _COMPILE._build_config(_args())
+
+        self.assertTrue(config.config_dict["disable_token_generation_wlo"])
+
+    def test_compile_forwards_cold_cte_fast_path_flags(self):
+        with patch.object(
+            _COMPILE,
+            "_load_text_config",
+            return_value={"num_hidden_layers": 2},
+        ), patch.dict(
+            sys.modules,
+            {
+                "neuronx_distributed_inference.models.config": _fake_config_module(),
+                "src.modeling_qwen35": _fake_qwen_module(),
+            },
+        ):
+            config, _modules = _COMPILE._build_config(
+                _args(
+                    text_only_cte=False,
+                    compact_cte_attention_mask=False,
+                    cold_zero_conv_fast_path=True,
+                ),
+            )
+
+        self.assertFalse(config.config_dict["use_text_only_cte_inputs"])
+        self.assertFalse(config.config_dict["use_compact_cte_attention_mask"])
+        self.assertTrue(config.config_dict["use_cold_zero_conv_fast_path"])
 
     def test_long_prefix_buckets_must_fit_max_context_length(self):
         with self.assertRaisesRegex(ValueError, "Largest prefix bucket"):

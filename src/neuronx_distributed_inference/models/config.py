@@ -178,6 +178,9 @@ class NeuronConfig:
         # Expose argmax kernel flag at top-level for easier configuration with
         # models like EAGLE
         self.disable_argmax_kernel = kwargs.pop("disable_argmax_kernel", False)
+        self.disable_context_encoding_argmax_kernel = kwargs.pop(
+            "disable_context_encoding_argmax_kernel", False
+        )
 
         # async
         self.async_mode = kwargs.pop("async_mode", False)

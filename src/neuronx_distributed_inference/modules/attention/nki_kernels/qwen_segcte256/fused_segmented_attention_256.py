@@ -1159,16 +1159,16 @@ def fused_segmented_attention_impl(
     """
     orig_addr = allocator.get_current_address()
 
-    if kvp_offset != None:
-        raise ValueError(
-            "qwen_segcte256 KVP mode is not production validated; use the "
-            "non-KVP segmented CTE path"
-        )
-    if k_pre_transposed:
-        raise ValueError(
-            "qwen_segcte256 supports only k_pre_transposed=False; "
-            "the transposed-K path has not been production validated"
-        )
+    kernel_assert(
+        kvp_offset == None,
+        "qwen_segcte256 KVP mode is not production validated; use the "
+        "non-KVP segmented CTE path",
+    )
+    kernel_assert(
+        not k_pre_transposed,
+        "qwen_segcte256 supports only k_pre_transposed=False; "
+        "the transposed-K path has not been production validated",
+    )
 
     is_kvp = False
     # KVP: compute kvp_offset_active = kvp_offset - prior_tokens_sbuf (for active segment cp_offset)

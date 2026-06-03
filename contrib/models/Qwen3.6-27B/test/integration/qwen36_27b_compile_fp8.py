@@ -34,6 +34,12 @@ _FP8_ENV_DEFAULTS = {
 _WEIGHT_DTYPE_FP8_MLP_ONLY = "fp8_mlp_only"
 _WEIGHT_DTYPE_FP8_FULL = "fp8_full"
 _WEIGHT_DTYPE_BF16_CONTROL = "bf16_control"
+_FP8_WLO_SKIP_PATTERNS = [
+    r".*\.scale$",
+    r".*\.weight_scale$",
+    r".*linear_attn\.conv1d_weight\.weight$",
+]
+_DISABLE_TOKEN_GENERATION_WLO_ENV = "QWEN36_DISABLE_TOKEN_GENERATION_WLO"
 _DELTANET_CTE_BACKEND_ENV = {
     "USE_NKI_FUSED",
     "USE_NKI_CHUNKED",
@@ -314,6 +320,20 @@ def _token_generation_batches(args: argparse.Namespace) -> list[int] | None:
                 f"{args.max_num_seqs}"
             )
     return batches
+
+
+def _weights_to_skip_layout_optimization(args: argparse.Namespace) -> list[str]:
+    patterns: list[str] = []
+    if args.weight_dtype in (_WEIGHT_DTYPE_FP8_MLP_ONLY, _WEIGHT_DTYPE_FP8_FULL):
+        patterns.extend(_FP8_WLO_SKIP_PATTERNS)
+    patterns.extend(getattr(args, "weights_to_skip_layout_optimization", None) or [])
+    return list(dict.fromkeys(patterns))
+
+
+def _disable_token_generation_wlo(args: argparse.Namespace) -> bool:
+    return bool(getattr(args, "disable_token_generation_wlo", False)) or (
+        os.environ.get(_DISABLE_TOKEN_GENERATION_WLO_ENV) == "1"
+    )
 
 
 def _validate_prefix_buckets_fit_context(
@@ -737,6 +757,17 @@ def _build_config(args: argparse.Namespace):
     ):
         neuron_config_kwargs["qkv_kernel_enabled"] = True
         neuron_config_kwargs["qkv_nki_kernel_enabled"] = True
+    if args.enable_qkv_cte_nki_kernel_fuse_rope:
+        rope_dim = config_dict.get("rope_dim")
+        head_dim = config_dict.get("head_dim")
+        if rope_dim is not None and head_dim is not None and int(rope_dim) != int(head_dim):
+            raise ValueError(
+                "--enable-qkv-cte-nki-kernel-fuse-rope is not valid for "
+                f"partial-RoPE Qwen3.6 configs: rope_dim={rope_dim}, "
+                f"head_dim={head_dim}. The stock fused-RoPE QKV kernel expects "
+                "cos/sin to cover the full head dimension."
+            )
+        neuron_config_kwargs["qkv_cte_nki_kernel_fuse_rope"] = True
     if args.enable_split_qkv_tkg_nki_kernel:
         neuron_config_kwargs["qkv_tkg_nki_kernel_enabled"] = True
     if args.enable_attn_block_tkg_nki_kernel:
@@ -747,8 +778,9 @@ def _build_config(args: argparse.Namespace):
         neuron_config_kwargs["attn_block_tkg_nki_kernel_cache_update"] = True
     if args.enable_out_proj_nki_kernel:
         neuron_config_kwargs["out_proj_kernel_enabled"] = True
-    if args.enable_mlp_tkg_nki_kernel:
+    if args.enable_mlp_cte_nki_kernel or args.enable_mlp_tkg_nki_kernel:
         neuron_config_kwargs["mlp_kernel_enabled"] = True
+    if args.enable_mlp_tkg_nki_kernel:
         neuron_config_kwargs["mlp_tkg_nki_kernel_enabled"] = True
     if args.enable_quantized_mlp_kernel:
         neuron_config_kwargs["quantized_mlp_kernel_enabled"] = True
@@ -773,6 +805,9 @@ def _build_config(args: argparse.Namespace):
         )
     else:
         neuron_config_kwargs["quantized"] = False
+    wlo_skip_patterns = _weights_to_skip_layout_optimization(args)
+    if wlo_skip_patterns:
+        neuron_config_kwargs["weights_to_skip_layout_optimization"] = wlo_skip_patterns
     if args.enable_kv_cache_quant:
         neuron_config_kwargs["kv_cache_quant"] = True
         neuron_config_kwargs["kv_quant_config"] = {"direct_cast": True}
@@ -793,6 +828,10 @@ def _build_config(args: argparse.Namespace):
         neuron_config_kwargs["vocab_parallel"] = True
         if args.output_logits_with_on_device_sampling:
             neuron_config_kwargs["output_logits"] = True
+    if args.disable_argmax_kernel:
+        neuron_config_kwargs["disable_argmax_kernel"] = True
+    if args.disable_context_encoding_argmax_kernel:
+        neuron_config_kwargs["disable_context_encoding_argmax_kernel"] = True
     if args.enable_prefix_caching or args.enable_hybrid_apc or args.enable_vllm_chunked_prefill:
         neuron_config_kwargs["is_block_kv_layout"] = True
         neuron_config_kwargs["pa_block_size"] = args.block_size
@@ -855,6 +894,14 @@ def _build_config(args: argparse.Namespace):
     config_dict["use_qwen_deltanet_decode_nki"] = getattr(
         args, "enable_deltanet_decode_nki", False
     )
+    config_dict["use_text_only_cte_inputs"] = args.text_only_cte
+    config_dict["use_compact_cte_attention_mask"] = args.compact_cte_attention_mask
+    config_dict["use_cold_zero_conv_fast_path"] = args.cold_zero_conv_fast_path
+    config_dict["use_qwen_qk_norm_rope_nki"] = args.enable_qwen_qk_norm_rope_nki_kernel
+    config_dict["use_qwen_output_gate_nki"] = args.enable_qwen_output_gate_nki_kernel
+    config_dict["use_qwen_qkv_gate_packed"] = args.enable_qwen_qkv_gate_packed_kernel
+    config_dict["use_qwen_gated_o_proj_nki"] = args.enable_qwen_gated_o_proj_nki_kernel
+    config_dict["disable_token_generation_wlo"] = _disable_token_generation_wlo(args)
     inf_config = Qwen35InferenceConfig(neuron_config=neuron_config, **config_dict)
     return inf_config, modules_to_not_convert
 
@@ -921,6 +968,25 @@ def main() -> int:
     )
     parser.add_argument("--token-generation-buckets", nargs="+", default=None)
     parser.add_argument("--token-generation-batches", nargs="+", default=None)
+    parser.add_argument(
+        "--disable-token-generation-wlo",
+        action="store_true",
+        help=(
+            "Disable NxDI token-generation weight layout optimization. Use this "
+            "when the generated layout_opt graph fails runtime validation."
+        ),
+    )
+    parser.add_argument(
+        "--weights-to-skip-layout-optimization",
+        nargs="+",
+        default=None,
+        help=(
+            "Regex patterns for checkpoint tensors that must not go through "
+            "weight layout optimization. FP8 modes always add Qwen3.6-safe "
+            "defaults for per-channel scale tensors and the tiny DeltaNet "
+            "conv1d weight."
+        ),
+    )
     parser.add_argument("--block-size", type=int, default=256)
     parser.add_argument("--pa-num-blocks", type=int, default=None)
     parser.add_argument(
@@ -943,6 +1009,25 @@ def main() -> int:
     parser.add_argument("--enable-prefix-caching", action="store_true")
     parser.add_argument("--enable-hybrid-apc", action="store_true")
     parser.add_argument("--enable-vllm-chunked-prefill", action="store_true")
+    parser.add_argument(
+        "--text-only-cte",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--compact-cte-attention-mask",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--cold-zero-conv-fast-path",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Trace the DeltaNet conv path for cold context encoding that always "
+            "starts at position 0. Do not use for APC or partial-prefix suffix CTE."
+        ),
+    )
     parser.add_argument(
         "--enable-deltanet-decode-nki",
         action="store_true",
@@ -970,6 +1055,25 @@ def main() -> int:
     )
     parser.add_argument("--disable-on-device-sampling", action="store_true")
     parser.add_argument(
+        "--disable-argmax-kernel",
+        action="store_true",
+        help=(
+            "Use the non-custom distributed argmax path for on-device greedy "
+            "sampling. This is slower but avoids the NKI argmax output path "
+            "when validating sampled-token correctness."
+        ),
+    )
+    parser.add_argument(
+        "--disable-context-encoding-argmax-kernel",
+        action="store_true",
+        help=(
+            "Use the non-custom distributed argmax path only for context-encoding "
+            "greedy sampling. Token generation keeps the configured argmax path, "
+            "which limits decode-performance impact while isolating prefill "
+            "sampled-token correctness."
+        ),
+    )
+    parser.add_argument(
         "--output-logits-with-on-device-sampling",
         action="store_true",
         help=(
@@ -994,6 +1098,51 @@ def main() -> int:
         help=(
             "Enable NxDI QKV kernels required by the block token-generation "
             "attention kernel."
+        ),
+    )
+    parser.add_argument(
+        "--enable-qkv-cte-nki-kernel-fuse-rope",
+        action="store_true",
+        help=(
+            "Pass CTE RoPE cos/sin into the NxDI QKV NKI kernel so Q/K RoPE "
+            "is fused into the projection kernel. For Qwen3.6 this must be "
+            "validated with partial-RoPE coverage before compiling a perf artifact."
+        ),
+    )
+    parser.add_argument(
+        "--enable-qwen-qk-norm-rope-nki-kernel",
+        action="store_true",
+        help=(
+            "Use the Qwen3.6-specific NKI kernel that fuses Q/K per-head "
+            "RMSNorm with partial RoPE during multi-token context encoding."
+        ),
+    )
+    parser.add_argument(
+        "--enable-qwen-output-gate-nki-kernel",
+        action="store_true",
+        help=(
+            "Use the Qwen3.6-specific output-gate projection path that routes "
+            "the multi-token attention gate matmul through the NKI QKV CTE "
+            "projection kernel."
+        ),
+    )
+    parser.add_argument(
+        "--enable-qwen-qkv-gate-packed-kernel",
+        action="store_true",
+        help=(
+            "Use the Qwen3.6-specific packed QKV+gate projection path. This "
+            "packs full-attention Wqkv as [Q | output_gate | K | V] and "
+            "splits the gate from the QKV NKI output instead of running a "
+            "separate output_gate_proj."
+        ),
+    )
+    parser.add_argument(
+        "--enable-qwen-gated-o-proj-nki-kernel",
+        action="store_true",
+        help=(
+            "Use the Qwen3.6-specific ROW FP8 output-projection kernel that "
+            "applies sigmoid(output_gate) to attention output inside the "
+            "projection kernel for multi-token context encoding."
         ),
     )
     parser.add_argument(
@@ -1045,6 +1194,15 @@ def main() -> int:
             "Use NxDI/NKILib's MLP kernel for token generation. The Qwen3.6 "
             "custom decoder keeps this behind a flag because it changes the "
             "dense FFN lowering path."
+        ),
+    )
+    parser.add_argument(
+        "--enable-mlp-cte-nki-kernel",
+        action="store_true",
+        help=(
+            "Use NxDI/NKILib's MLP kernel for context encoding. This targets "
+            "cold-prefill dense SwiGLU cost and keeps Qwen CTE RMSNorm on the "
+            "separate high-precision path before FP8 GEMM quantization."
         ),
     )
     parser.add_argument(
@@ -1245,6 +1403,16 @@ def main() -> int:
         print("QUANTIZED_CHECKPOINTS_PATH", str(quantized_path), flush=True)
     for env_name in _FP8_ENV_DEFAULTS:
         print(env_name, os.environ.get(env_name), flush=True)
+    print(
+        "WEIGHTS_TO_SKIP_LAYOUT_OPTIMIZATION",
+        json.dumps(inf_config.neuron_config.weights_to_skip_layout_optimization),
+        flush=True,
+    )
+    print(
+        "DISABLE_TOKEN_GENERATION_WLO",
+        bool(inf_config.disable_token_generation_wlo),
+        flush=True,
+    )
     print("MODULES_TO_NOT_CONVERT_COUNT", len(modules_to_not_convert), flush=True)
     print(
         "CONTEXT_TRACE_SHAPE",
@@ -1277,6 +1445,15 @@ def main() -> int:
                 "enable_deltanet_decode_nki": args.enable_deltanet_decode_nki,
                 "enable_fused_qkv": args.enable_fused_qkv,
                 "enable_qkv_nki_kernels": args.enable_qkv_nki_kernels,
+                "enable_qwen_qk_norm_rope_nki_kernel": (
+                    args.enable_qwen_qk_norm_rope_nki_kernel
+                ),
+                "enable_qwen_qkv_gate_packed_kernel": (
+                    args.enable_qwen_qkv_gate_packed_kernel
+                ),
+                "enable_qwen_gated_o_proj_nki_kernel": (
+                    args.enable_qwen_gated_o_proj_nki_kernel
+                ),
                 "enable_split_qkv_tkg_nki_kernel": (
                     args.enable_split_qkv_tkg_nki_kernel
                 ),
@@ -1290,6 +1467,7 @@ def main() -> int:
                     args.enable_attn_block_tkg_cache_update
                 ),
                 "enable_out_proj_nki_kernel": args.enable_out_proj_nki_kernel,
+                "enable_mlp_cte_nki_kernel": args.enable_mlp_cte_nki_kernel,
                 "enable_mlp_tkg_nki_kernel": args.enable_mlp_tkg_nki_kernel,
                 "enable_quantized_mlp_kernel": args.enable_quantized_mlp_kernel,
                 "enable_k_cache_transposed": args.enable_k_cache_transposed,

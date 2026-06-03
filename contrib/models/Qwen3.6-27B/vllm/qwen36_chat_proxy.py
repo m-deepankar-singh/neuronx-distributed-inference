@@ -63,6 +63,63 @@ def _json_response(handler: BaseHTTPRequestHandler, status: int, payload: dict[s
     handler.wfile.write(body)
 
 
+def _replace_sse_data_payload(event: bytes, payload: str) -> bytes:
+    lines = event.decode("utf-8").splitlines()
+    replaced = False
+    for index, line in enumerate(lines):
+        if line.startswith("data:") and not replaced:
+            lines[index] = "data: " + payload
+            replaced = True
+            break
+    return ("\n".join(lines) + "\n\n").encode("utf-8")
+
+
+def _prepend_think_start_to_sse_event(event: bytes) -> tuple[bytes, bool, bool]:
+    """Return event, whether a decision was made, and whether it was changed."""
+    try:
+        text = event.decode("utf-8")
+    except UnicodeDecodeError:
+        return event, False, False
+
+    for line in text.splitlines():
+        if not line.startswith("data:"):
+            continue
+
+        payload = line[len("data:") :].strip()
+        if not payload or payload == "[DONE]":
+            return event, False, False
+
+        try:
+            obj = json.loads(payload)
+        except json.JSONDecodeError:
+            return event, False, False
+
+        choices = obj.get("choices") or []
+        for choice in choices:
+            if not isinstance(choice, dict):
+                continue
+            delta = choice.get("delta") or {}
+            if not isinstance(delta, dict):
+                continue
+            content = delta.get("content")
+            if not isinstance(content, str) or not content:
+                continue
+            if content.lstrip().startswith("<think>"):
+                return event, True, False
+
+            delta["content"] = "<think>\n" + content
+            return (
+                _replace_sse_data_payload(
+                    event,
+                    json.dumps(obj, ensure_ascii=False, separators=(",", ":")),
+                ),
+                True,
+                True,
+            )
+
+    return event, False, False
+
+
 def _message_text(content: Any) -> str:
     if isinstance(content, str):
         return content
@@ -181,7 +238,12 @@ def _requested_thinking_enabled(payload: dict[str, Any]) -> bool | None:
     return None
 
 
-def _apply_thinking_policy(payload: dict[str, Any], *, allow_thinking: bool) -> bool:
+def _apply_thinking_policy(
+    payload: dict[str, Any],
+    *,
+    allow_thinking: bool,
+    default_thinking: bool = False,
+) -> bool:
     template_kwargs = payload.get("chat_template_kwargs")
     if not isinstance(template_kwargs, dict):
         template_kwargs = {}
@@ -189,7 +251,10 @@ def _apply_thinking_policy(payload: dict[str, Any], *, allow_thinking: bool) -> 
         template_kwargs = dict(template_kwargs)
 
     requested = _requested_thinking_enabled(payload)
-    enable_thinking = bool(requested) if allow_thinking and requested is not None else False
+    if allow_thinking:
+        enable_thinking = bool(requested) if requested is not None else default_thinking
+    else:
+        enable_thinking = False
     template_kwargs["enable_thinking"] = enable_thinking
     payload["chat_template_kwargs"] = template_kwargs
 
@@ -204,12 +269,45 @@ def _apply_thinking_policy(payload: dict[str, Any], *, allow_thinking: bool) -> 
 class Qwen36ProxyHandler(BaseHTTPRequestHandler):
     backend_url: str = "http://127.0.0.1:8001"
     force_disable_thinking: bool = True
+    default_thinking: bool = False
     allow_completions: bool = False
 
     def log_message(self, fmt: str, *args):  # noqa: D401
         print(f"{self.address_string()} - {fmt % args}", flush=True)
 
-    def _forward(self, method: str, body: bytes | None = None):
+    def _write_stream_response(self, resp, *, inject_thinking_start: bool):
+        thinking_start_decided = not inject_thinking_start
+        buffer = b""
+
+        while True:
+            chunk = resp.read(8192)
+            if not chunk:
+                break
+
+            if thinking_start_decided:
+                self.wfile.write(chunk)
+                self.wfile.flush()
+                continue
+
+            buffer += chunk
+            while b"\n\n" in buffer:
+                event, buffer = buffer.split(b"\n\n", 1)
+                event += b"\n\n"
+                event, decided, _changed = _prepend_think_start_to_sse_event(event)
+                thinking_start_decided = thinking_start_decided or decided
+                self.wfile.write(event)
+                self.wfile.flush()
+                if thinking_start_decided and buffer:
+                    self.wfile.write(buffer)
+                    self.wfile.flush()
+                    buffer = b""
+                    break
+
+        if buffer:
+            self.wfile.write(buffer)
+            self.wfile.flush()
+
+    def _forward(self, method: str, body: bytes | None = None, *, inject_thinking_start: bool = False):
         headers = {
             key: value
             for key, value in self.headers.items()
@@ -227,12 +325,7 @@ class Qwen36ProxyHandler(BaseHTTPRequestHandler):
                             continue
                         self.send_header(key, value)
                     self.end_headers()
-                    while True:
-                        chunk = resp.read(8192)
-                        if not chunk:
-                            break
-                        self.wfile.write(chunk)
-                        self.wfile.flush()
+                    self._write_stream_response(resp, inject_thinking_start=inject_thinking_start)
                 else:
                     response_body = resp.read()
                     self.send_response(resp.status)
@@ -288,11 +381,17 @@ class Qwen36ProxyHandler(BaseHTTPRequestHandler):
                 self._forward("POST", raw_body)
                 return
 
-            _apply_thinking_policy(payload, allow_thinking=not self.force_disable_thinking)
+            thinking_enabled = _apply_thinking_policy(
+                payload,
+                allow_thinking=not self.force_disable_thinking,
+                default_thinking=self.default_thinking,
+            )
             payload["messages"] = _normalize_messages_for_qwen(payload.get("messages"))
             raw_body = json.dumps(payload).encode("utf-8")
+        else:
+            thinking_enabled = False
 
-        self._forward("POST", raw_body)
+        self._forward("POST", raw_body, inject_thinking_start=thinking_enabled)
 
 
 def main() -> int:
@@ -314,18 +413,29 @@ def main() -> int:
             "chat_template_kwargs.enable_thinking=true."
         ),
     )
+    parser.add_argument(
+        "--default-thinking",
+        action="store_true",
+        help=(
+            "Enable Qwen thinking by default when --allow-thinking is set and "
+            "the request does not explicitly provide a thinking toggle. "
+            "Explicit enable_thinking=false still disables it."
+        ),
+    )
     args = parser.parse_args()
 
     Qwen36ProxyHandler.backend_url = args.backend_url
     Qwen36ProxyHandler.allow_completions = args.allow_completions
     Qwen36ProxyHandler.force_disable_thinking = not args.allow_thinking
+    Qwen36ProxyHandler.default_thinking = args.default_thinking
 
     server = ThreadingHTTPServer((args.host, args.port), Qwen36ProxyHandler)
     print(
         "Qwen3.6 proxy listening on "
         f"{args.host}:{args.port}, backend={args.backend_url}, "
         f"allow_completions={args.allow_completions}, "
-        f"force_disable_thinking={not args.allow_thinking}",
+        f"force_disable_thinking={not args.allow_thinking}, "
+        f"default_thinking={args.default_thinking}",
         flush=True,
     )
     server.serve_forever()

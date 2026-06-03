@@ -1177,7 +1177,19 @@ class NeuronBaseModel(nn.Module):
         ):
             sampling_inputs = logits[:, -1, :]
             res = self.sampler(
-                sampling_inputs, sampling_params, rank_id=self.rank_util.get_rank()
+                sampling_inputs,
+                sampling_params,
+                rank_id=self.rank_util.get_rank(),
+                disable_argmax_kernel_override=(
+                    True
+                    if is_for_context_encoding
+                    and getattr(
+                        self.neuron_config,
+                        "disable_context_encoding_argmax_kernel",
+                        False,
+                    )
+                    else None
+                ),
             )
             res = res.to(torch.int32)
         # Otherwise we return the full logits for multinomial sampling in spec decoding

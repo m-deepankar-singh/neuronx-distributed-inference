@@ -1,4 +1,5 @@
 import os
+import time
 from typing import TYPE_CHECKING, Any, Dict, List, Tuple, Union
 
 import torch
@@ -2033,6 +2034,87 @@ def _is_chunked_prefill_execution(
     )
 
 
+def _format_token_id(value: int) -> str:
+    if value < 0:
+        return str(value)
+    return f"{value} (0x{value & 0xFFFFFFFF:08x})"
+
+
+def _model_vocab_size(neuron_base_instance: "NeuronBaseForCausalLM") -> int | None:
+    for owner in (
+        neuron_base_instance,
+        getattr(neuron_base_instance, "config", None),
+        getattr(neuron_base_instance, "model", None),
+        getattr(getattr(neuron_base_instance, "model", None), "config", None),
+    ):
+        vocab_size = getattr(owner, "vocab_size", None)
+        if vocab_size is not None:
+            try:
+                return int(vocab_size)
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def _summarize_tensor_minmax(value: Any) -> str:
+    if not isinstance(value, torch.Tensor) or value.numel() == 0:
+        return "empty"
+    try:
+        flat = value.detach().reshape(-1)
+        return f"{int(flat.min().item())}:{int(flat.max().item())}"
+    except Exception as exc:
+        return f"unavailable:{type(exc).__name__}"
+
+
+def _validate_token_generation_input_ids(
+    neuron_base_instance: "NeuronBaseForCausalLM",
+    model_to_execute: "ModelWrapper",
+    input_dict: Dict[str, Any],
+) -> None:
+    if getattr(model_to_execute, "tag", None) != "token_generation_model":
+        return
+    input_ids = input_dict.get("input_ids")
+    if not isinstance(input_ids, torch.Tensor):
+        return
+    if input_ids.numel() == 0:
+        raise ValueError("Token generation input_ids must be non-empty")
+    if input_ids.dtype not in (torch.int32, torch.int64):
+        raise ValueError(
+            "Token generation input_ids must be int32 or int64 before Neuron "
+            f"execution, got {input_ids.dtype}"
+        )
+
+    min_id = int(input_ids.min().item())
+    max_id = int(input_ids.max().item())
+    vocab_size = _model_vocab_size(neuron_base_instance)
+    invalid_id = None
+    reason = None
+    if min_id < 0:
+        invalid_id = min_id
+        reason = "negative"
+    elif vocab_size is not None and max_id >= vocab_size:
+        invalid_id = max_id
+        reason = f"out-of-vocab for vocab_size={vocab_size}"
+    if invalid_id is None:
+        return
+
+    request_ids = getattr(neuron_base_instance, "_qwen36_vllm_request_ids", None)
+    if request_ids is None:
+        request_ids = input_dict.get("request_ids", input_dict.get("request_id"))
+    raise ValueError(
+        "Token generation input_ids contract violated before Neuron execution: "
+        f"{reason}; token_id={_format_token_id(invalid_id)}; "
+        f"request_ids={request_ids}; "
+        f"input_shape={tuple(input_ids.shape)} dtype={input_ids.dtype}; "
+        f"position_minmax={_summarize_tensor_minmax(input_dict.get('position_ids'))}; "
+        f"slot_minmax={_summarize_tensor_minmax(input_dict.get('slot_mapping'))}; "
+        f"block_minmax={_summarize_tensor_minmax(input_dict.get('block_table'))}; "
+        f"num_queries={_summarize_tensor_minmax(input_dict.get('num_queries'))}; "
+        "computed_context_lens="
+        f"{_summarize_tensor_minmax(input_dict.get('computed_context_lens'))}"
+    )
+
+
 def _with_disabled_hybrid_apc_controls(input_dict: Dict[str, Any]) -> Dict[str, Any]:
     output = dict(input_dict)
     _zero_mask_if_present(output, "hybrid_restore_mask")
@@ -2177,6 +2259,11 @@ def execute_model_prefix_caching(
                     hybrid_apc_owner, input_dict
                 )
             else:
+                _validate_token_generation_input_ids(
+                    neuron_base_instance,
+                    model_to_execute,
+                    input_dict,
+                )
                 hybrid_apc_args = prepare_disabled_hybrid_apc_model_inputs(
                     hybrid_apc_owner, input_dict
                 )
@@ -2309,18 +2396,45 @@ def causal_lm_async_execution(
     is_run_on_neuron = None
     if is_prefill:
         try:
+            timing_enabled = os.environ.get("QWEN36_PREFILL_TIMING") == "1"
+            execute_start = time.perf_counter() if timing_enabled else None
             prefill_outputs, is_run_on_neuron = execute_model(
                 neuron_base_instance, neuron_base_instance.context_encoding_model, inputs
             )
+            if timing_enabled and execute_start is not None:
+                input_ids = inputs.get("input_ids")
+                position_ids = inputs.get("position_ids")
+                computed_context_lens = inputs.get("computed_context_lens")
+                num_queries = inputs.get("num_queries")
+                print(
+                    "[qwen36_perf] async_execute_model "
+                    f"elapsed_ms={(time.perf_counter() - execute_start) * 1000.0:.3f} "
+                    f"is_run_on_neuron={is_run_on_neuron} "
+                    f"input_shape={tuple(input_ids.shape) if isinstance(input_ids, torch.Tensor) else None} "
+                    f"position_shape={tuple(position_ids.shape) if isinstance(position_ids, torch.Tensor) else None} "
+                    f"num_queries={num_queries.reshape(-1).tolist() if isinstance(num_queries, torch.Tensor) and num_queries.numel() else []} "
+                    f"computed={computed_context_lens.reshape(-1).tolist() if isinstance(computed_context_lens, torch.Tensor) and computed_context_lens.numel() else []} "
+                    f"request_ids={_async_request_ids_signature(neuron_base_instance)}",
+                    flush=True,
+                )
 
             # Sequence IDs from vLLM will be in sorted order, but the maximum range of sequence IDs is
             # not [0, num_requested_prefills] but [0, max_num_seqs]. To prevent out-of-bound accesses,
             # we convert the sequence IDs to their argsorted values.
             _seq_ids = torch.argsort(inputs["seq_ids"])
 
+            sync_start = time.perf_counter() if timing_enabled else None
             outputs = prefill_outputs.sync_async_result_to_cpu(
                 _seq_ids, is_fused_speculation=is_fused_speculation, is_prefix_caching=is_prefix_caching
             )
+            if timing_enabled and sync_start is not None:
+                print(
+                    "[qwen36_perf] async_sync_result "
+                    f"elapsed_ms={(time.perf_counter() - sync_start) * 1000.0:.3f} "
+                    f"is_run_on_neuron={is_run_on_neuron} "
+                    f"request_ids={_async_request_ids_signature(neuron_base_instance)}",
+                    flush=True,
+                )
             pending_hybrid_apc = getattr(
                 neuron_base_instance,
                 "_hybrid_apc_pending_input_dict",

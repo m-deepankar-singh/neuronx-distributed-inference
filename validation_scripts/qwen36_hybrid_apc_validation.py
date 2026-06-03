@@ -332,7 +332,10 @@ def _build_llm(args, *, enable_hybrid_apc: bool):
         llm_kwargs["block_size"] = args.block_size
     if enable_hybrid_apc:
         llm_kwargs["mamba_cache_mode"] = "all"
-        llm_kwargs["mamba_ssm_cache_dtype"] = args.gdn_recurrent_cache_dtype
+        recurrent_cache_dtype = str(args.gdn_recurrent_cache_dtype).lower()
+        if recurrent_cache_dtype in {"bfloat16", "bf16"}:
+            recurrent_cache_dtype = "auto"
+        llm_kwargs["mamba_ssm_cache_dtype"] = recurrent_cache_dtype
     if args.enable_vllm_chunked_prefill:
         llm_kwargs["max_num_batched_tokens"] = runner._max_num_batched_tokens(
             runner_args,

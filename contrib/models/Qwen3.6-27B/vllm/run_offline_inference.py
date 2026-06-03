@@ -160,7 +160,7 @@ def _max_num_batched_tokens(args: argparse.Namespace, cte_buckets: list[int]) ->
         )
     requested_chunk = int(getattr(args, "hybrid_apc_prefill_chunk_tokens", 0) or 0)
     if requested_chunk <= 0:
-        return min(max_cte_bucket, checkpoint_aligned_buckets[0])
+        return min(max_cte_bucket, checkpoint_aligned_buckets[-1])
     if requested_chunk % checkpoint_interval != 0:
         raise ValueError(
             "--hybrid-apc-prefill-chunk-tokens must be a multiple of "
@@ -172,6 +172,15 @@ def _max_num_batched_tokens(args: argparse.Namespace, cte_buckets: list[int]) ->
             f"got {requested_chunk} with buckets {cte_buckets}"
         )
     return min(max_cte_bucket, requested_chunk)
+
+
+def _effective_prefill_group_size(
+    args: argparse.Namespace,
+    cte_buckets: list[int],
+) -> int:
+    if args.enable_vllm_chunked_prefill:
+        return _max_num_batched_tokens(args, cte_buckets)
+    return cte_buckets[-1]
 
 
 def _pa_num_blocks(args: argparse.Namespace) -> int:
@@ -189,6 +198,7 @@ def _override_config(args: argparse.Namespace) -> dict:
     _validate_hybrid_apc_args(args)
     cte_buckets = _cte_buckets(args)
     max_cte_bucket = cte_buckets[-1]
+    prefill_group_size = _effective_prefill_group_size(args, cte_buckets)
     context_encoding_bucket_pairs = _parse_bucket_pairs(
         args.context_encoding_bucket_pairs
     )
@@ -290,6 +300,12 @@ def _override_config(args: argparse.Namespace) -> dict:
             "hybrid_apc_max_backed_prefix_read_len",
             0,
         ),
+        "hybrid_apc_prefill_chunk_tokens": (
+            prefill_group_size
+            if args.enable_hybrid_apc and args.enable_vllm_chunked_prefill
+            else 0
+        ),
+        "qwen_prefill_group_size": prefill_group_size,
         "use_qwen_hybrid_chunked_prefill": args.enable_vllm_chunked_prefill,
         "use_qwen_hybrid_chunked_prefill_nki": args.enable_vllm_chunked_prefill,
         "override_neuron_config": neuron_config,
@@ -514,9 +530,8 @@ def main() -> int:
     ):
         llm_kwargs["block_size"] = args.block_size
     if args.enable_vllm_chunked_prefill:
-        llm_kwargs["max_num_batched_tokens"] = _max_num_batched_tokens(
-            args,
-            cte_buckets,
+        llm_kwargs["max_num_batched_tokens"] = _effective_prefill_group_size(
+            args, cte_buckets
         )
     llm = LLM(**llm_kwargs)
 

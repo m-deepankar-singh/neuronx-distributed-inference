@@ -30,6 +30,7 @@ def _add_runtime_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--max-model-len", type=int)
     parser.add_argument("--seq-len", type=int)
     parser.add_argument("--cte-buckets")
+    parser.add_argument("--context-encoding-bucket-pairs")
     parser.add_argument("--token-generation-buckets")
     parser.add_argument("--token-generation-batches")
     parser.add_argument("--async-mode", action="store_true")
@@ -56,6 +57,9 @@ def _prepare_args(args: argparse.Namespace, bench: Any) -> None:
     args.seq_len = resolved["seq_len"]
     args.max_model_len = resolved["max_model_len"]
     args.resolved_cte_buckets = resolved["cte_buckets"]
+    args.resolved_context_encoding_bucket_pairs = resolved[
+        "context_encoding_bucket_pairs"
+    ]
     args.resolved_token_generation_buckets = resolved["token_generation_buckets"]
     args.resolved_token_generation_batches = resolved["token_generation_batches"]
     args.pa_num_blocks = resolved["pa_num_blocks"]
@@ -123,7 +127,10 @@ def main() -> int:
         rows = []
         start_all = time.perf_counter()
         for case in cases:
-            expected = [int(item) for item in case["hf_generated_tokens"]]
+            expected = [
+                int(item)
+                for item in case["hf_generated_tokens"][: args.max_tokens]
+            ]
             start = time.perf_counter()
             outputs = llm.generate([case["prompt"]], sampling)
             elapsed = time.perf_counter() - start
@@ -182,6 +189,7 @@ def main() -> int:
             ),
             "pa_num_blocks": args.pa_num_blocks,
             "cte_buckets": args.resolved_cte_buckets,
+            "context_encoding_bucket_pairs": args.resolved_context_encoding_bucket_pairs,
             "token_generation_buckets": args.resolved_token_generation_buckets,
             "async_mode": args.async_mode,
             "cases": rows,

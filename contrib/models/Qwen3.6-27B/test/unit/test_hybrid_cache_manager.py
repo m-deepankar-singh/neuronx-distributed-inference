@@ -14,9 +14,11 @@ if _CONTRIB_ROOT not in sys.path:
     sys.path.insert(0, _CONTRIB_ROOT)
 
 from neuronx_distributed_inference.models.config import NeuronConfig
+from neuronx_distributed.quantization.quantization_config import KVQuantizationConfig
 from src.modeling_qwen35 import (
     HybridDeltaNetCacheManager,
     Qwen35InferenceConfig,
+    QwenHybridBlockKVCacheManager,
     plan_gdn_apc_reuse,
 )
 
@@ -109,6 +111,68 @@ def _recurrent_shape(config, batch_size):
 
 def _conv_shape(config, batch_size):
     return [batch_size, _conv_dim(config), config.linear_conv_kernel_dim - 1]
+
+
+class TestQwenHybridBlockKVCacheManager(unittest.TestCase):
+    def test_hybrid_apc_block_cache_dequantizes_selected_attention_blocks_only(self):
+        kv_quant_config = KVQuantizationConfig(
+            quant_dtype=torch.bfloat16,
+            direct_cast=True,
+        )
+        config = _make_config(
+            tp_degree=1,
+            hidden_size=32,
+            num_hidden_layers=4,
+            num_attention_heads=8,
+            num_key_value_heads=4,
+            head_dim=4,
+            linear_num_value_heads=4,
+            linear_num_key_heads=4,
+            linear_key_head_dim=4,
+            linear_value_head_dim=4,
+            gdn_checkpoint_interval=128,
+            use_hybrid_cache_manager=False,
+            use_hybrid_apc_manager=True,
+            neuron_overrides={
+                "batch_size": 1,
+                "max_batch_size": 1,
+                "kv_cache_batch_size": 1,
+                "is_block_kv_layout": True,
+                "is_prefix_caching": True,
+                "max_length": 9600,
+                "pa_num_blocks": 16,
+                "pa_block_size": 128,
+                "torch_dtype": torch.float32,
+                "kv_quant_config": kv_quant_config,
+            },
+        )
+        mgr = QwenHybridBlockKVCacheManager(
+            config,
+            num_kv_head=config.num_key_value_heads,
+        )
+        seen_shapes = []
+        original_dequantize = mgr._dequantize_cache
+
+        def record_dequantize(cache_tensor, layer_idx, is_key=True):
+            seen_shapes.append((layer_idx, is_key, tuple(cache_tensor.shape)))
+            return original_dequantize(cache_tensor, layer_idx, is_key=is_key)
+
+        mgr._dequantize_cache = record_dequantize
+
+        cache = mgr.get_cache(active_block_table=torch.tensor([[0, 2]], dtype=torch.int64))
+
+        self.assertEqual(cache[0][0].shape, mgr._LINEAR_PLACEHOLDER_SHAPE)
+        self.assertEqual(cache[1][0].shape, mgr._LINEAR_PLACEHOLDER_SHAPE)
+        self.assertEqual(cache[2][0].shape, mgr._LINEAR_PLACEHOLDER_SHAPE)
+        self.assertEqual(cache[3][0].dtype, torch.float32)
+        self.assertEqual(cache[3][1].dtype, torch.float32)
+        self.assertEqual(
+            seen_shapes,
+            [
+                (3, True, (1, 4, 256, 4)),
+                (3, False, (1, 4, 256, 4)),
+            ],
+        )
 
 
 class TestHybridDeltaNetCacheManager(unittest.TestCase):

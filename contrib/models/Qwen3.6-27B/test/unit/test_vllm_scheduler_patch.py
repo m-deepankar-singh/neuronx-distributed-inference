@@ -2064,6 +2064,161 @@ class TestQwen36HybridAPCSchedulerPatch(unittest.TestCase):
             torch.tensor([[-1], [33]], dtype=torch.int32),
         )
 
+    def test_runner_patch_repairs_invalid_completed_prefill_sampled_token_from_logits(self):
+        class FakeRunner:
+            def __init__(self):
+                self.model = types.SimpleNamespace(
+                    model=types.SimpleNamespace(
+                        config=types.SimpleNamespace(vocab_size=3)
+                    )
+                )
+
+            def _execute_model_for_text(self, model_input, intermediate_tensors=None):
+                del intermediate_tensors
+                return model_input
+
+            def _sample_on_device(self, hidden_states, model_input):
+                del hidden_states, model_input
+                return types.SimpleNamespace(
+                    sampled_token_ids=torch.tensor(
+                        [[2147483647]], dtype=torch.int32
+                    ),
+                    logprobs_tensors=None,
+                )
+
+        self.patch.patch_neuron_model_runner_class(FakeRunner)
+        runner = FakeRunner()
+
+        sampled = runner._sample_on_device(
+            [
+                torch.tensor([[2147483647]], dtype=torch.int32),
+                torch.tensor([[[0.1, 3.0, 0.2]]], dtype=torch.float32),
+            ],
+            types.SimpleNamespace(
+                prefill_completion_state=torch.tensor([True]),
+            ),
+        )
+
+        torch.testing.assert_close(
+            sampled.sampled_token_ids,
+            torch.tensor([[1]], dtype=torch.int32),
+        )
+
+    def test_runner_patch_repairs_completed_only_output_row_from_logits(self):
+        class FakeRunner:
+            def __init__(self):
+                self.model = types.SimpleNamespace(
+                    model=types.SimpleNamespace(
+                        config=types.SimpleNamespace(vocab_size=4)
+                    )
+                )
+
+            def _execute_model_for_text(self, model_input, intermediate_tensors=None):
+                del intermediate_tensors
+                return model_input
+
+            def _sample_on_device(self, hidden_states, model_input):
+                del hidden_states, model_input
+                return types.SimpleNamespace(
+                    sampled_token_ids=torch.tensor(
+                        [[2147483647]], dtype=torch.int32
+                    ),
+                    logprobs_tensors=None,
+                )
+
+        self.patch.patch_neuron_model_runner_class(FakeRunner)
+        runner = FakeRunner()
+
+        sampled = runner._sample_on_device(
+            [
+                torch.tensor([[2147483647]], dtype=torch.int32),
+                torch.tensor([[[0.1, 0.2, 0.3, 4.0]]], dtype=torch.float32),
+            ],
+            types.SimpleNamespace(
+                prefill_completion_state=torch.tensor([False, True]),
+            ),
+        )
+
+        torch.testing.assert_close(
+            sampled.sampled_token_ids,
+            torch.tensor([[3]], dtype=torch.int32),
+        )
+
+    def test_runner_patch_rejects_invalid_completed_prefill_without_logits(self):
+        class FakeRunner:
+            def __init__(self):
+                self.model = types.SimpleNamespace(
+                    model=types.SimpleNamespace(
+                        config=types.SimpleNamespace(vocab_size=248320)
+                    )
+                )
+
+            def _execute_model_for_text(self, model_input, intermediate_tensors=None):
+                del intermediate_tensors
+                return model_input
+
+            def _sample_on_device(self, hidden_states, model_input):
+                del hidden_states, model_input
+                return types.SimpleNamespace(
+                    sampled_token_ids=torch.tensor(
+                        [[2147483647]], dtype=torch.int32
+                    ),
+                    logprobs_tensors=None,
+                )
+
+        self.patch.patch_neuron_model_runner_class(FakeRunner)
+        runner = FakeRunner()
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "--output-logits-with-on-device-sampling",
+        ):
+            runner._sample_on_device(
+                torch.tensor([[2147483647]], dtype=torch.int32),
+                types.SimpleNamespace(
+                    prefill_completion_state=torch.tensor([True]),
+                ),
+            )
+
+    def test_runner_patch_rejects_invalid_completed_prefill_with_sharded_logits(self):
+        class FakeRunner:
+            def __init__(self):
+                self.model = types.SimpleNamespace(
+                    model=types.SimpleNamespace(
+                        config=types.SimpleNamespace(vocab_size=16)
+                    )
+                )
+
+            def _execute_model_for_text(self, model_input, intermediate_tensors=None):
+                del intermediate_tensors
+                return model_input
+
+            def _sample_on_device(self, hidden_states, model_input):
+                del hidden_states, model_input
+                return types.SimpleNamespace(
+                    sampled_token_ids=torch.tensor(
+                        [[2147483647]], dtype=torch.int32
+                    ),
+                    logprobs_tensors=None,
+                )
+
+        self.patch.patch_neuron_model_runner_class(FakeRunner)
+        runner = FakeRunner()
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "gathers vocab-parallel output logits",
+        ):
+            runner._sample_on_device(
+                [
+                    torch.tensor([[2147483647]], dtype=torch.int32),
+                    torch.tensor([[[0.1, 0.2, 4.0, 0.3]]], dtype=torch.float32),
+                ],
+                types.SimpleNamespace(
+                    prefill_completion_state=torch.tensor([True]),
+                ),
+            )
+
     def test_runner_patch_masks_cpu_sampled_tokens_before_output_update(self):
         class FakeRunner:
             def __init__(self):

@@ -328,6 +328,7 @@ class NeuronAttentionBase(nn.Module):
             fused_rmsnorm_skip_gamma=self.neuron_config.fused_rmsnorm_skip_gamma,
             logical_nc_config=self.neuron_config.logical_nc_config,
             qkv_kernel_nbsd_layout=self.neuron_config.qkv_kernel_nbsd_layout,
+            quantized=self.neuron_config.quantized,
             on_cpu=self.neuron_config.on_cpu,
             rank_ordering=rank_ordering,
         )
@@ -350,6 +351,7 @@ class NeuronAttentionBase(nn.Module):
             out_proj_kernel_enabled=self.attn_block_tkg_nki_kernel_enabled or self.neuron_config.out_proj_kernel_enabled,
             logical_nc_config=self.neuron_config.logical_nc_config,
             rank_ordering=rank_ordering,
+            quantized=self.neuron_config.quantized,
         )
         if self.learned_sinks_size is not None:
             self.tkg_learned_sinks = LearnedSink(self.learned_sinks_size, self.num_attention_heads, self.torch_dtype, process_group.size(), rank_ordering)
@@ -383,6 +385,7 @@ class NeuronAttentionBase(nn.Module):
             fused_rmsnorm_skip_gamma=self.neuron_config.fused_rmsnorm_skip_gamma,
             logical_nc_config=self.neuron_config.logical_nc_config,
             qkv_kernel_nbsd_layout=self.neuron_config.qkv_kernel_nbsd_layout,
+            quantized=self.neuron_config.quantized,
             on_cpu=self.neuron_config.on_cpu,
             tiling_factor=self.neuron_config.cc_pipeline_tiling_factor if self.neuron_config.tile_cc else 1,
             seq_len_threshold_for_cc_tiling=self.neuron_config.seq_len_threshold_for_cc_tiling,
@@ -408,6 +411,7 @@ class NeuronAttentionBase(nn.Module):
             logical_nc_config=self.neuron_config.logical_nc_config,
             tiling_factor=self.neuron_config.cc_pipeline_tiling_factor if self.neuron_config.tile_cc else 1,
             rank_ordering=cte_rank_ordering,
+            quantized=self.neuron_config.quantized,
         )
         self.learned_sinks = None
         if self.learned_sinks_size is not None:

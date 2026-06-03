@@ -31,7 +31,9 @@ import json
 import math
 import logging
 import os
+import re
 import sys
+import time
 from typing import Any, Hashable, List, NamedTuple, Optional, Tuple
 
 import torch
@@ -61,6 +63,7 @@ from neuronx_distributed.parallel_layers.layers import (
     ParallelEmbedding,
     RowParallelLinear,
 )
+from neuronx_distributed.parallel_layers.mappings import _gather_along_dim
 from neuronx_distributed.utils import cpu_mode
 
 try:
@@ -80,18 +83,207 @@ from src.nki_kernels.nki_deltanet_chunked import (
     deltanet_chunk_step as _deltanet_nki_chunk_step,
 )
 from src.nki_kernels.nki_deltanet_fused import (
+    deltanet_autocp_affine_sequence as _deltanet_autocp_affine_sequence,
+    deltanet_autocp_apply_output as _deltanet_autocp_apply_output,
+    deltanet_autocp_prefix_apply_output as _deltanet_autocp_prefix_apply_output,
+    deltanet_autocp_state_summary_sequence as _deltanet_autocp_state_summary_sequence,
+    deltanet_autocp_state_prefix as _deltanet_autocp_state_prefix,
     deltanet_fused_chunked_fwd as _deltanet_fused_kernel,
+    deltanet_fused_chunked_fwd_multihead as _deltanet_fused_multihead_kernel,
 )
 from src.nki_kernels.nki_deltanet_fused import (
     _make_lower_mask,
     _make_lower_mask_diag,
     _make_identity,
 )
+try:
+    import nki as _nkilib_nki
+    from nkilib.core.qkv.qkv import qkv as _nkilib_qkv
+    from nkilib.core.utils.common_types import (
+        NormType as _NkilibNormType,
+        QKVOutputLayout as _NkilibQKVOutputLayout,
+        QuantizationType as _NkilibQuantizationType,
+    )
+
+    _qwen_gate_projection_kernel = _nkilib_nki.jit(_nkilib_qkv)
+except Exception:
+    _NkilibNormType = None
+    _NkilibQKVOutputLayout = None
+    _NkilibQuantizationType = None
+    _qwen_gate_projection_kernel = None
+
+try:
+    from src.nki_kernels.qwen_qk_norm_rope import (
+        qwen_qk_norm_partial_rope_kernel as _qwen_qk_norm_partial_rope_kernel,
+    )
+except Exception:
+    _qwen_qk_norm_partial_rope_kernel = None
 from src.hybrid_apc import (
     HybridAPCMetadataStore,
     HybridAPCSchedulerBridge,
     HybridAPCSlotAllocator,
 )
+
+
+def _infer_neuron_lnc(default: int = 1) -> int:
+    flags = os.environ.get("NEURON_CC_FLAGS", "")
+    match = re.search(r"(?:^|\s)--lnc(?:=|\s+)(\d+)", flags)
+    if match is None:
+        return default
+    return max(1, int(match.group(1)))
+
+
+def _resolve_deltanet_multihead_group_size(total_heads: int) -> int:
+    lnc = _infer_neuron_lnc()
+    raw_group_size = os.environ.get("QWEN36_DELTANET_MULTIHEAD_GROUP_SIZE")
+    if raw_group_size is None:
+        requested_group_size = 2 if lnc >= 2 else 1
+    else:
+        requested_group_size = max(1, int(raw_group_size))
+        if requested_group_size > lnc:
+            raise ValueError(
+                f"QWEN36_DELTANET_MULTIHEAD_GROUP_SIZE={requested_group_size} "
+                f"requires NEURON_CC_FLAGS --lnc >= {requested_group_size}; "
+                f"inferred lnc={lnc}"
+            )
+    return max(1, min(total_heads, requested_group_size))
+
+
+def _deltanet_multihead_launch_spec(num_heads: int):
+    """Return the launch spec for a grouped multihead DeltaNet CTE kernel.
+
+    The legacy ``kernel[2]`` launch only covers two programs.  For larger
+    grouped launches we need an SPMD axis distributed over the available NCs,
+    while each program still handles exactly one flattened (batch, head) row.
+    """
+    lnc = _infer_neuron_lnc()
+    if num_heads <= lnc:
+        return num_heads
+    if os.environ.get("QWEN36_DELTANET_MULTIHEAD_SPMD", "1") == "0":
+        raise ValueError(
+            "QWEN36_DELTANET_MULTIHEAD_GROUP_SIZE exceeds inferred LNC but "
+            "QWEN36_DELTANET_MULTIHEAD_SPMD=0; "
+            f"group_size={num_heads}, inferred_lnc={lnc}"
+        )
+
+    import nki.language as _nl  # Imported lazily so CPU-only unit stubs still load.
+
+    if not hasattr(_nl, "spmd_dim") or not hasattr(_nl, "nc"):
+        if os.environ.get("QWEN36_DELTANET_MULTIHEAD_GRID_FALLBACK", "0") == "1":
+            return (num_heads, 1)
+        raise ValueError(
+            "QWEN36_DELTANET_MULTIHEAD_GROUP_SIZE exceeds inferred LNC, but "
+            "this NKI runtime does not expose spmd_dim/nc; "
+            f"group_size={num_heads}, inferred_lnc={lnc}"
+        )
+    return (_nl.spmd_dim(num_heads, _nl.nc(lnc)),)
+
+
+def _qwen35_grouped_prefix_attention(
+    Q,
+    K_cache,
+    V_cache,
+    query_positions,
+    cache_positions,
+    key_valid_mask=None,
+):
+    """GQA-native prefix attention without materializing repeated KV heads."""
+    B, q_heads, q_len, head_dim = Q.shape
+    kv_heads = K_cache.shape[1]
+    if q_heads % kv_heads != 0:
+        raise ValueError(
+            "Qwen grouped prefix attention requires q_heads to be divisible "
+            f"by kv_heads, got q_heads={q_heads}, kv_heads={kv_heads}."
+        )
+
+    q_per_kv = q_heads // kv_heads
+    if cache_positions.ndim == 4:
+        cache_positions = cache_positions.reshape(B, -1)
+    elif cache_positions.ndim != 2:
+        raise ValueError(
+            "cache_positions must have shape (B, K) or (B, 1, 1, K), "
+            f"got {tuple(cache_positions.shape)}."
+        )
+
+    if key_valid_mask is not None:
+        if key_valid_mask.ndim == 4:
+            key_valid_mask = key_valid_mask.reshape(B, -1)
+        elif key_valid_mask.ndim != 2:
+            raise ValueError(
+                "key_valid_mask must have shape (B, K) or (B, 1, 1, K), "
+                f"got {tuple(key_valid_mask.shape)}."
+            )
+
+    q_grouped = Q.reshape(B, kv_heads, q_per_kv, q_len, head_dim)
+    k_grouped = K_cache.transpose(-1, -2).unsqueeze(2)
+    attn_weights = torch.matmul(q_grouped, k_grouped) / math.sqrt(head_dim)
+
+    causal_mask = cache_positions[:, None, None, None, :] <= query_positions[
+        :, None, None, :, None
+    ]
+    if key_valid_mask is not None:
+        causal_mask = causal_mask & key_valid_mask[:, None, None, None, :]
+    attn_weights = attn_weights.masked_fill(~causal_mask, -65504.0)
+    attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(Q.dtype)
+
+    attn_output = torch.matmul(attn_weights, V_cache.unsqueeze(2))
+    return attn_output.reshape(B, q_heads, q_len, head_dim)
+
+
+def _resolve_deltanet_autocp_lnc(num_chunks: int) -> int:
+    lnc = _infer_neuron_lnc()
+    raw_lnc = os.environ.get("QWEN36_DELTANET_AUTOCP_LNC")
+    if raw_lnc is None:
+        launch_lnc = 2 if lnc >= 2 and num_chunks % 2 == 0 else 1
+    else:
+        launch_lnc = max(1, int(raw_lnc))
+        if launch_lnc > lnc:
+            raise ValueError(
+                f"QWEN36_DELTANET_AUTOCP_LNC={launch_lnc} requires "
+                f"NEURON_CC_FLAGS --lnc >= {launch_lnc}; inferred lnc={lnc}"
+            )
+    if launch_lnc not in (1, 2):
+        raise ValueError(
+            f"QWEN36_DELTANET_AUTOCP_LNC must be 1 or 2, got {launch_lnc}"
+        )
+    if num_chunks % launch_lnc != 0:
+        raise ValueError(
+            "QWEN36_DELTANET_AUTOCP_CTE requires the number of 128-token "
+            f"chunks to be divisible by launch LNC; chunks={num_chunks}, "
+            f"launch_lnc={launch_lnc}"
+        )
+    return launch_lnc
+
+
+def _deltanet_autocp_affine_launch_spec(num_chunks: int, launch_lnc: int):
+    """Return a SPMD affine launch grid, falling back to legacy LNC split.
+
+    Bare ``kernel[2]`` launches only two logical cores. For AutoCP affine
+    generation we need one independent program per 128-token chunk, sharded
+    across those logical cores. NKI represents that as a SPMD grid dimension
+    with an attached NC distribution.
+    """
+    if os.environ.get("QWEN36_DELTANET_AUTOCP_SPMD_AFFINE", "1") == "0":
+        return launch_lnc
+    import nki.language as _nl  # Imported lazily so CPU-only unit stubs still load.
+
+    if not hasattr(_nl, "spmd_dim") or not hasattr(_nl, "nc"):
+        return launch_lnc
+
+    if launch_lnc == 2:
+        return (_nl.spmd_dim(num_chunks, _nl.nc(2)), 1)
+    return (num_chunks, 1)
+
+
+def _resolve_deltanet_autocp_cp_chunks(num_chunks: int) -> int:
+    cp_chunks = max(1, int(os.environ.get("QWEN36_DELTANET_AUTOCP_CP_CHUNKS", "4")))
+    if num_chunks % cp_chunks != 0:
+        raise ValueError(
+            "QWEN36_DELTANET_COMPACT_AUTOCP_CTE requires the number of "
+            "128-token chunks to be divisible by QWEN36_DELTANET_AUTOCP_CP_CHUNKS; "
+            f"chunks={num_chunks}, cp_chunks={cp_chunks}"
+        )
+    return cp_chunks
 
 from neuronx_distributed_inference.models.config import (
     InferenceConfig,
@@ -110,6 +302,14 @@ from neuronx_distributed_inference.modules.attention.utils import (
     move_heads_front,
     transpose_parallel_linear_layer,
 )
+try:
+    from neuronx_distributed_inference.modules.attention.utils import (
+        preprocess_quantized_linear_layer,
+    )
+except (ImportError, AttributeError):
+    def preprocess_quantized_linear_layer(layer):
+        return layer
+
 from neuronx_distributed_inference.modules.kvcache.block_kv_cache_manager import (
     BlockKVCacheManager,
 )
@@ -775,14 +975,17 @@ class NeuronGatedDeltaNet(nn.Module):
         initial_state is the restored GDN recurrent checkpoint for warm or
         partial-prefix suffix prefill. Cold prefill passes zeros.
         """
-        chunk_size = 128
+        chunk_size = int(os.environ.get("QWEN36_DELTANET_CHUNK_SIZE", "128"))
+        if chunk_size not in (64, 128):
+            raise ValueError(
+                "QWEN36_DELTANET_CHUNK_SIZE must be 64 or 128 for fused CTE; "
+                f"got {chunk_size}"
+            )
 
-        query = l2norm(query, dim=-1)
-        key = l2norm(key, dim=-1)
+        # The fused CTE kernel owns Q/K l2-normalization and Q scaling so
+        # those vector ops stay fused with the DeltaNet chunk work.
         B, H, S, k_dim = query.shape
         v_dim = value.shape[-1]
-        scale = 1.0 / (k_dim**0.5)
-        query = query * scale
 
         # Pad sequence to multiple of chunk_size
         pad_size = (chunk_size - S % chunk_size) % chunk_size
@@ -795,7 +998,8 @@ class NeuronGatedDeltaNet(nn.Module):
         total_seq_len = S + pad_size
 
         BH = B * H
-        # Flatten to (BH, S, dim) for per-(b,h) kernel calls
+        # Flatten to (BH, S, dim). Grouped multihead launches are opt-in
+        # because isolated validation must pass before using them in artifacts.
         query_flat = query.reshape(BH, total_seq_len, k_dim).contiguous()
         key_flat = key.reshape(BH, total_seq_len, k_dim).contiguous()
         value_flat = value.reshape(BH, total_seq_len, v_dim).contiguous()
@@ -822,22 +1026,283 @@ class NeuronGatedDeltaNet(nn.Module):
             _make_lower_mask_diag(), dtype=torch.float32, device=device
         )
 
+        use_multihead_cte = os.environ.get("QWEN36_DELTANET_MULTIHEAD_CTE", "1") != "0"
+        if use_multihead_cte:
+            pair_outputs = []
+            pair_states = []
+            head_group_size = _resolve_deltanet_multihead_group_size(BH)
+            for bh_start in range(0, BH, head_group_size):
+                bh_end = min(bh_start + head_group_size, BH)
+                launch_heads = bh_end - bh_start
+                launch_spec = _deltanet_multihead_launch_spec(launch_heads)
+                out_pair, state_pair = _deltanet_fused_multihead_kernel[launch_spec](
+                    query_flat[bh_start:bh_end],  # (G, S, 128)
+                    key_flat[bh_start:bh_end],  # (G, S, 128)
+                    value_flat[bh_start:bh_end],  # (G, S, 128)
+                    g_flat[bh_start:bh_end],  # (G, S, 1) — RAW g, not cumsum
+                    beta_flat[bh_start:bh_end],  # (G, S, 1) — sigmoid(b)
+                    initial_state_flat[bh_start:bh_end],
+                    lower_mask,  # (128, 128)
+                    identity_mat,  # (128, 128)
+                    lower_mask_diag,  # (128, 128)
+                )
+                pair_outputs.append(out_pair)
+                pair_states.append(state_pair)
+
+            output = torch.cat(pair_outputs, dim=0)
+            final_state = torch.cat(pair_states, dim=0)
+        else:
+            all_outputs = []
+            all_states = []
+            for bh in range(BH):
+                out_bh, state_bh = _deltanet_fused_kernel(
+                    query_flat[bh],  # (S, 128)
+                    key_flat[bh],  # (S, 128)
+                    value_flat[bh],  # (S, 128)
+                    g_flat[bh],  # (S, 1) — RAW g, not cumsum
+                    beta_flat[bh],  # (S, 1) — sigmoid(b)
+                    initial_state_flat[bh],  # (128, 128) recurrent checkpoint
+                    lower_mask,  # (128, 128)
+                    identity_mat,  # (128, 128)
+                    lower_mask_diag,  # (128, 128)
+                )
+                all_outputs.append(out_bh)
+                all_states.append(state_bh)
+
+            output = torch.stack(all_outputs, dim=0)
+            final_state = torch.stack(all_states, dim=0)
+
+        output = output.reshape(B, H, total_seq_len, v_dim)
+        output = output[:, :, :S]
+
+        if output_final_state:
+            last_recurrent_state = final_state.reshape(B, H, k_dim, v_dim)
+        else:
+            last_recurrent_state = None
+
+        return output, last_recurrent_state
+
+    def _compact_autocp_chunked_forward(
+        self, query, key, value, g, beta, output_final_state=False, initial_state=None
+    ):
+        """Compact AutoCP CTE probe: prefix segment state summaries, replay segments.
+
+        Compared with ``_autocp_chunked_forward``, this avoids materializing
+        per-chunk output-affine tensors. It is intentionally opt-in because the
+        first version reuses the existing recurrent fused kernel for segment
+        replay; a later NKI replay kernel can collapse the segment loop.
+        """
+        chunk_size = 128
+
+        B, H, S, k_dim = query.shape
+        v_dim = value.shape[-1]
+        if k_dim != 128 or v_dim != 128:
+            raise ValueError(
+                "QWEN36_DELTANET_COMPACT_AUTOCP_CTE requires 128-wide "
+                f"key/value heads; got k_dim={k_dim}, v_dim={v_dim}"
+            )
+
+        pad_size = (chunk_size - S % chunk_size) % chunk_size
+        if pad_size > 0:
+            query = F.pad(query, (0, 0, 0, pad_size))
+            key = F.pad(key, (0, 0, 0, pad_size))
+            value = F.pad(value, (0, 0, 0, pad_size))
+            beta = F.pad(beta, (0, pad_size))
+            g = F.pad(g, (0, pad_size))
+        total_seq_len = S + pad_size
+        num_chunks = total_seq_len // chunk_size
+        if num_chunks <= 0:
+            raise ValueError("QWEN36_DELTANET_COMPACT_AUTOCP_CTE requires chunks")
+        cp_chunks = _resolve_deltanet_autocp_cp_chunks(num_chunks)
+        num_segments = num_chunks // cp_chunks
+        launch_lnc = _resolve_deltanet_autocp_lnc(num_segments)
+        summary_launch_spec = _deltanet_autocp_affine_launch_spec(
+            num_segments,
+            launch_lnc,
+        )
+
+        BH = B * H
+        query_flat = query.reshape(BH, total_seq_len, k_dim).contiguous()
+        key_flat = key.reshape(BH, total_seq_len, k_dim).contiguous()
+        value_flat = value.reshape(BH, total_seq_len, v_dim).contiguous()
+        g_flat = g.reshape(BH, total_seq_len).unsqueeze(-1).contiguous()
+        beta_flat = beta.reshape(BH, total_seq_len).unsqueeze(-1).contiguous()
+        if initial_state is None:
+            initial_state_flat = torch.zeros(
+                BH, k_dim, v_dim, dtype=torch.float32, device=query.device
+            )
+        else:
+            initial_state_flat = initial_state.reshape(BH, k_dim, v_dim).float().contiguous()
+
+        device = query.device
+        lower_mask = torch.tensor(
+            _make_lower_mask(), dtype=torch.float32, device=device
+        )
+        identity_mat = torch.tensor(
+            _make_identity(), dtype=torch.float32, device=device
+        )
+        lower_mask_diag = torch.tensor(
+            _make_lower_mask_diag(), dtype=torch.float32, device=device
+        )
+
+        segment_len = cp_chunks * chunk_size
         all_outputs = []
         all_states = []
         for bh in range(BH):
-            out_bh, state_bh = _deltanet_fused_kernel(
-                query_flat[bh],  # (S, 128)
-                key_flat[bh],  # (S, 128)
-                value_flat[bh],  # (S, 128)
-                g_flat[bh],  # (S, 1) — RAW g, not cumsum
-                beta_flat[bh],  # (S, 1) — sigmoid(b)
-                initial_state_flat[bh],  # (128, 128) recurrent checkpoint
-                lower_mask,  # (128, 128)
-                identity_mat,  # (128, 128)
-                lower_mask_diag,  # (128, 128)
+            segment_matrix, segment_bias = (
+                _deltanet_autocp_state_summary_sequence[summary_launch_spec](
+                    key_flat[bh],
+                    value_flat[bh],
+                    g_flat[bh],
+                    beta_flat[bh],
+                    lower_mask,
+                    identity_mat,
+                )
             )
+            segment_states, final_state = _deltanet_autocp_state_prefix(
+                segment_matrix,
+                segment_bias,
+                initial_state_flat[bh],
+            )
+
+            q_segments = query_flat[bh].reshape(num_segments, segment_len, k_dim).contiguous()
+            k_segments = key_flat[bh].reshape(num_segments, segment_len, k_dim).contiguous()
+            v_segments = value_flat[bh].reshape(num_segments, segment_len, v_dim).contiguous()
+            g_segments = g_flat[bh].reshape(num_segments, segment_len, 1).contiguous()
+            beta_segments = beta_flat[bh].reshape(num_segments, segment_len, 1).contiguous()
+
+            replay_group_size = _resolve_deltanet_multihead_group_size(num_segments)
+            replay_outputs = []
+            for segment_start in range(0, num_segments, replay_group_size):
+                segment_end = min(segment_start + replay_group_size, num_segments)
+                launch_segments = segment_end - segment_start
+                replay_launch_spec = _deltanet_multihead_launch_spec(launch_segments)
+                out_group, _ = _deltanet_fused_multihead_kernel[replay_launch_spec](
+                    q_segments[segment_start:segment_end],
+                    k_segments[segment_start:segment_end],
+                    v_segments[segment_start:segment_end],
+                    g_segments[segment_start:segment_end],
+                    beta_segments[segment_start:segment_end],
+                    segment_states[segment_start:segment_end],
+                    lower_mask,
+                    identity_mat,
+                    lower_mask_diag,
+                )
+                replay_outputs.append(out_group)
+            out_segments = torch.cat(replay_outputs, dim=0)
+
+            all_outputs.append(out_segments.reshape(total_seq_len, v_dim))
+            all_states.append(final_state)
+
+        output = torch.stack(all_outputs, dim=0)
+        output = output.reshape(B, H, total_seq_len, v_dim)
+        output = output[:, :, :S]
+
+        if output_final_state:
+            final_state = torch.stack(all_states, dim=0)
+            last_recurrent_state = final_state.reshape(B, H, k_dim, v_dim)
+        else:
+            last_recurrent_state = None
+
+        return output, last_recurrent_state
+
+    def _autocp_chunked_forward(
+        self, query, key, value, g, beta, output_final_state=False, initial_state=None
+    ):
+        """FlashQLA-style AutoCP CTE path for exact GDN prefill probes.
+
+        This path decomposes each 128-token chunk into an affine state transform,
+        scans chunk states, then applies the per-chunk initial state to outputs.
+        It is gated by QWEN36_DELTANET_AUTOCP_CTE while we measure whether the
+        extra custom-call/HBM traffic beats the recurrent fused path.
+        """
+        chunk_size = 128
+
+        B, H, S, k_dim = query.shape
+        v_dim = value.shape[-1]
+        if k_dim != 128 or v_dim != 128:
+            raise ValueError(
+                "QWEN36_DELTANET_AUTOCP_CTE requires 128-wide key/value heads; "
+                f"got k_dim={k_dim}, v_dim={v_dim}"
+            )
+
+        pad_size = (chunk_size - S % chunk_size) % chunk_size
+        if pad_size > 0:
+            query = F.pad(query, (0, 0, 0, pad_size))
+            key = F.pad(key, (0, 0, 0, pad_size))
+            value = F.pad(value, (0, 0, 0, pad_size))
+            beta = F.pad(beta, (0, pad_size))
+            g = F.pad(g, (0, pad_size))
+        total_seq_len = S + pad_size
+        num_chunks = total_seq_len // chunk_size
+        if num_chunks <= 0:
+            raise ValueError("QWEN36_DELTANET_AUTOCP_CTE requires at least one chunk")
+        launch_lnc = _resolve_deltanet_autocp_lnc(num_chunks)
+
+        BH = B * H
+        query_flat = query.reshape(BH, total_seq_len, k_dim).contiguous()
+        key_flat = key.reshape(BH, total_seq_len, k_dim).contiguous()
+        value_flat = value.reshape(BH, total_seq_len, v_dim).contiguous()
+        g_flat = g.reshape(BH, total_seq_len).unsqueeze(-1).contiguous()
+        beta_flat = beta.reshape(BH, total_seq_len).unsqueeze(-1).contiguous()
+        if initial_state is None:
+            initial_state_flat = torch.zeros(
+                BH, k_dim, v_dim, dtype=torch.float32, device=query.device
+            )
+        else:
+            initial_state_flat = initial_state.reshape(BH, k_dim, v_dim).float().contiguous()
+
+        device = query.device
+        lower_mask = torch.tensor(
+            _make_lower_mask(), dtype=torch.float32, device=device
+        )
+        identity_mat = torch.tensor(
+            _make_identity(), dtype=torch.float32, device=device
+        )
+        lower_mask_diag = torch.tensor(
+            _make_lower_mask_diag(), dtype=torch.float32, device=device
+        )
+        affine_launch_spec = _deltanet_autocp_affine_launch_spec(
+            num_chunks,
+            launch_lnc,
+        )
+
+        all_outputs = []
+        all_states = []
+        for bh in range(BH):
+            output_base, output_state, state_matrix, state_bias = (
+                _deltanet_autocp_affine_sequence[affine_launch_spec](
+                    query_flat[bh],
+                    key_flat[bh],
+                    value_flat[bh],
+                    g_flat[bh],
+                    beta_flat[bh],
+                    lower_mask,
+                    identity_mat,
+                    lower_mask_diag,
+                )
+            )
+            if os.environ.get("QWEN36_DELTANET_AUTOCP_SPLIT_APPLY") == "1":
+                chunk_states, final_state = _deltanet_autocp_state_prefix(
+                    state_matrix,
+                    state_bias,
+                    initial_state_flat[bh],
+                )
+                out_bh = _deltanet_autocp_apply_output(
+                    output_base,
+                    output_state,
+                    chunk_states,
+                )
+            else:
+                out_bh, final_state = _deltanet_autocp_prefix_apply_output(
+                    output_base,
+                    output_state,
+                    state_matrix,
+                    state_bias,
+                    initial_state_flat[bh],
+                )
             all_outputs.append(out_bh)
-            all_states.append(state_bh)
+            all_states.append(final_state)
 
         output = torch.stack(all_outputs, dim=0)
         output = output.reshape(B, H, total_seq_len, v_dim)
@@ -1314,6 +1779,10 @@ class NeuronGatedDeltaNet(nn.Module):
             use_nki = os.environ.get("USE_NKI") == "1"
             use_sequential = os.environ.get("DELTANET_SEQUENTIAL") == "1"
             use_pytorch_chunk = os.environ.get("USE_PYTORCH_CHUNK") == "1"
+            use_autocp_cte = os.environ.get("QWEN36_DELTANET_AUTOCP_CTE") == "1"
+            use_compact_autocp_cte = (
+                os.environ.get("QWEN36_DELTANET_COMPACT_AUTOCP_CTE") == "1"
+            )
 
             if recurrent_state_cache is not None and (
                 qwen_chunked_prefill_active or is_for_context_encoding
@@ -1324,7 +1793,27 @@ class NeuronGatedDeltaNet(nn.Module):
                         dtype=initial_state.dtype, device=initial_state.device
                     )
                     initial_state = initial_state * (1.0 - reset_mask[:, :, None, None])
-                if use_nki_chunked or (
+                if use_autocp_cte and use_compact_autocp_cte:
+                    output, final_state = self._compact_autocp_chunked_forward(
+                        query,
+                        key,
+                        value,
+                        g,
+                        beta,
+                        output_final_state=True,
+                        initial_state=initial_state,
+                    )
+                elif use_autocp_cte:
+                    output, final_state = self._autocp_chunked_forward(
+                        query,
+                        key,
+                        value,
+                        g,
+                        beta,
+                        output_final_state=True,
+                        initial_state=initial_state,
+                    )
+                elif use_nki_chunked or (
                     self.use_qwen_hybrid_chunked_prefill_nki
                     and os.environ.get("USE_NKI_FUSED", "1") == "0"
                 ):
@@ -1359,6 +1848,14 @@ class NeuronGatedDeltaNet(nn.Module):
                     )
             elif use_pytorch_chunk:
                 output, final_state = self._chunk_forward(
+                    query, key, value, g, beta, output_final_state=True
+                )
+            elif use_autocp_cte and use_compact_autocp_cte:
+                output, final_state = self._compact_autocp_chunked_forward(
+                    query, key, value, g, beta, output_final_state=True
+                )
+            elif use_autocp_cte:
+                output, final_state = self._autocp_chunked_forward(
                     query, key, value, g, beta, output_final_state=True
                 )
             elif use_nki_chunked:
@@ -1596,6 +2093,7 @@ class Qwen35InferenceConfig(InferenceConfig):
         kwargs.setdefault("use_text_only_cte_inputs", True)
         kwargs.setdefault("use_compact_cte_attention_mask", True)
         kwargs.setdefault("use_cold_zero_conv_fast_path", False)
+        kwargs.setdefault("disable_token_generation_wlo", False)
 
         super().__init__(*args, **kwargs)
 
@@ -1843,6 +2341,67 @@ class NeuronQwen35Attention(NeuronAttentionBase):
             gather_output=False,
         )
 
+        self.qwen_output_gate_nki_kernel_enabled = bool(
+            getattr(config, "use_qwen_output_gate_nki", False)
+            or os.environ.get("QWEN36_OUTPUT_GATE_NKI", "0") == "1"
+        )
+        self.qwen_qkv_gate_packed_enabled = bool(
+            getattr(config, "use_qwen_qkv_gate_packed", False)
+            or os.environ.get("QWEN36_QKV_GATE_PACKED", "0") == "1"
+        )
+        self.qwen_gated_o_proj_nki_kernel_enabled = bool(
+            getattr(config, "use_qwen_gated_o_proj_nki", False)
+            or os.environ.get("QWEN36_GATED_OUT_PROJ_NKI", "0") == "1"
+        )
+        if (
+            self.qwen_output_gate_nki_kernel_enabled
+            and self.qwen_qkv_gate_packed_enabled
+        ):
+            raise ValueError(
+                "Qwen output-gate NKI and packed QKV+gate are mutually exclusive."
+            )
+        if self.qwen_output_gate_nki_kernel_enabled:
+            if _qwen_gate_projection_kernel is None:
+                raise ImportError(
+                    "QWEN36_OUTPUT_GATE_NKI requires nkilib.core.qkv.qkv"
+                )
+            if getattr(config.neuron_config, "quantized", False):
+                setattr(
+                    self.output_gate_proj,
+                    "post_create_quantized_module_hook",
+                    preprocess_quantized_linear_layer,
+                )
+            else:
+                self.output_gate_proj.weight = transpose_parallel_linear_layer(
+                    self.output_gate_proj.weight
+                )
+
+        if self.qwen_qkv_gate_packed_enabled:
+            if _qwen_gate_projection_kernel is None:
+                raise ImportError(
+                    "QWEN36_QKV_GATE_PACKED requires nkilib.core.qkv.qkv"
+                )
+            if not self.fused_qkv:
+                raise ValueError("QWEN36_QKV_GATE_PACKED requires fused_qkv=True")
+            self._enable_qwen_qkv_gate_packed_projection(config)
+
+        self.qwen_qk_norm_rope_nki_kernel_enabled = bool(
+            getattr(config, "use_qwen_qk_norm_rope_nki", False)
+            or os.environ.get("QWEN36_QK_NORM_ROPE_NKI", "0") == "1"
+        )
+        if self.qwen_qk_norm_rope_nki_kernel_enabled:
+            if _qwen_qk_norm_partial_rope_kernel is None:
+                raise ImportError(
+                    "QWEN36_QK_NORM_ROPE_NKI requires src.nki_kernels."
+                    "qwen_qk_norm_rope"
+                )
+            if self.head_dim != 256 or self.rope_dim != 64:
+                raise ValueError(
+                    "Qwen Q/K norm+RoPE NKI kernel currently supports only "
+                    f"head_dim=256 and rope_dim=64, got head_dim={self.head_dim}, "
+                    f"rope_dim={self.rope_dim}"
+                )
+
         self.qkv_tkg_nki_kernel_enabled = bool(
             getattr(config.neuron_config, "qkv_tkg_nki_kernel_enabled", False)
         ) and not bool(getattr(config.neuron_config, "is_prefill_stage", False))
@@ -1871,6 +2430,66 @@ class NeuronQwen35Attention(NeuronAttentionBase):
             for projection in split_qkv_projections:
                 if not getattr(config.neuron_config, "quantized", False):
                     projection.weight = transpose_parallel_linear_layer(projection.weight)
+
+    def _enable_qwen_qkv_gate_packed_projection(self, config):
+        for attr_name in ("qkv_proj", "cte_qkv_proj", "tkg_qkv_proj"):
+            qkv_proj = getattr(self, attr_name, None)
+            if qkv_proj is not None and getattr(qkv_proj, "fused_qkv", False):
+                self._replace_qkv_projection_with_qwen_qkvgate(qkv_proj, config)
+
+    def _replace_qkv_projection_with_qwen_qkvgate(self, qkv_proj, config):
+        if not hasattr(qkv_proj, "Wqkv"):
+            raise ValueError("QWEN36_QKV_GATE_PACKED requires a fused Wqkv module")
+        if not isinstance(qkv_proj.Wqkv, ColumnParallelLinear):
+            raise ValueError(
+                "QWEN36_QKV_GATE_PACKED currently supports ColumnParallelLinear Wqkv"
+            )
+
+        packed_q_heads = qkv_proj.num_attention_heads * 2
+        packed_output_size = (
+            packed_q_heads + 2 * qkv_proj.num_key_value_heads
+        ) * qkv_proj.head_dim
+        packed_wqkv = ColumnParallelLinear(
+            qkv_proj.hidden_size,
+            packed_output_size,
+            bias=qkv_proj.bias,
+            gather_output=qkv_proj.gather_output,
+            dtype=qkv_proj.dtype,
+            sequence_parallel_enabled=False,
+            tensor_model_parallel_group=qkv_proj.tensor_model_parallel_group,
+            rank_ordering=qkv_proj.rank_ordering,
+        )
+        if (
+            (qkv_proj.qkv_kernel_enabled or qkv_proj.qkv_nki_kernel_enabled)
+            and getattr(config.neuron_config, "quantized", False)
+        ):
+            setattr(
+                packed_wqkv,
+                "post_create_quantized_module_hook",
+                preprocess_quantized_linear_layer,
+            )
+        elif qkv_proj.qkv_kernel_enabled or qkv_proj.qkv_nki_kernel_enabled:
+            packed_wqkv.weight = transpose_parallel_linear_layer(packed_wqkv.weight)
+
+        for param in (
+            [packed_wqkv.weight, packed_wqkv.scale]
+            if hasattr(packed_wqkv, "scale")
+            else [packed_wqkv.weight]
+        ):
+            setattr(param, "fused_qkv", True)
+            setattr(param, "num_attention_heads", packed_q_heads)
+            setattr(param, "num_key_value_heads", qkv_proj.num_key_value_heads)
+            setattr(param, "head_dim", qkv_proj.head_dim)
+        if qkv_proj.bias:
+            setattr(packed_wqkv.bias, "fused_qkv", True)
+            setattr(packed_wqkv.bias, "num_attention_heads", packed_q_heads)
+            setattr(packed_wqkv.bias, "num_key_value_heads", qkv_proj.num_key_value_heads)
+            setattr(packed_wqkv.bias, "head_dim", qkv_proj.head_dim)
+
+        qkv_proj.Wqkv = packed_wqkv
+        qkv_proj.qwen_qkv_gate_packed = True
+        qkv_proj.qwen_real_num_attention_heads = qkv_proj.num_attention_heads
+        qkv_proj.qwen_packed_num_attention_heads = packed_q_heads
 
     @staticmethod
     def _apply_projection_scale(output, projection):
@@ -2053,6 +2672,229 @@ class NeuronQwen35Attention(NeuronAttentionBase):
             use_polar_compatible_rope,
         )
         return Q, K, V, cos_cache, sin_cache, None
+
+    def _should_use_qwen_output_gate_nki(self, q_len):
+        return self.qwen_output_gate_nki_kernel_enabled
+
+    def _should_use_qwen_qkv_gate_packed(self, q_len):
+        return (
+            self.qwen_qkv_gate_packed_enabled
+            and not self.qkv_proj_sp_enabled
+            and _qwen_gate_projection_kernel is not None
+        )
+
+    def _should_use_qwen_gated_o_proj_nki(self, q_len):
+        o_proj = self.get_o_proj()
+        return (
+            self.qwen_gated_o_proj_nki_kernel_enabled
+            and q_len > 1
+            and hasattr(o_proj, "forward_gated")
+        )
+
+    def _output_gate_proj_nki(self, hidden_states):
+        weight = self.output_gate_proj.weight.data
+        bias = (
+            self.output_gate_proj.bias.data.unsqueeze(0)
+            if getattr(self.output_gate_proj, "bias", None) is not None
+            else None
+        )
+
+        qkv_w_scale = None
+        qkv_in_scale = None
+        quantization_type = _NkilibQuantizationType.NONE
+        gate_scale = getattr(self.output_gate_proj, "scale", None)
+        if gate_scale is not None:
+            qkv_w_scale = gate_scale.data
+            gate_input_scale = getattr(self.output_gate_proj, "input_scale", None)
+            qkv_in_scale = gate_input_scale.data if gate_input_scale is not None else None
+            quantization_type = _NkilibQuantizationType.ROW
+        elif getattr(self.config.neuron_config, "quantized", False):
+            raise RuntimeError(
+                "Qwen output-gate NKI path requires output_gate_proj.scale "
+                "when running a quantized artifact."
+            )
+
+        return _qwen_gate_projection_kernel[self.logical_nc_config](
+            input=hidden_states,
+            fused_qkv_weights=weight,
+            output_layout=_NkilibQKVOutputLayout.BSD,
+            bias=bias,
+            quantization_type=quantization_type,
+            qkv_w_scale=qkv_w_scale,
+            qkv_in_scale=qkv_in_scale,
+        )
+
+    def _qkv_gate_packed_projection_nki(self, hidden_states):
+        qkv_proj = self.get_qkv_proj()
+        weight = qkv_proj.Wqkv.weight.data
+        bias = (
+            qkv_proj.Wqkv.bias.data.unsqueeze(0)
+            if getattr(qkv_proj.Wqkv, "bias", None) is not None
+            else None
+        )
+
+        qkv_w_scale = None
+        qkv_in_scale = None
+        quantization_type = _NkilibQuantizationType.NONE
+        qkv_scale = getattr(qkv_proj.Wqkv, "scale", None)
+        if qkv_scale is not None:
+            qkv_w_scale = qkv_scale.data
+            qkv_input_scale = getattr(qkv_proj.Wqkv, "input_scale", None)
+            qkv_in_scale = qkv_input_scale.data if qkv_input_scale is not None else None
+            quantization_type = _NkilibQuantizationType.ROW
+        elif getattr(self.config.neuron_config, "quantized", False):
+            raise RuntimeError(
+                "Qwen packed QKV+gate path requires Wqkv.scale when running "
+                "a quantized artifact."
+            )
+
+        packed = _qwen_gate_projection_kernel[self.logical_nc_config](
+            input=hidden_states,
+            fused_qkv_weights=weight,
+            output_layout=_NkilibQKVOutputLayout.BSD,
+            bias=bias,
+            fused_residual_add=False,
+            mlp_prev=None,
+            attention_prev=None,
+            fused_norm_type=_NkilibNormType.NO_NORM,
+            gamma_norm_weights=None,
+            norm_eps=self.rms_norm_eps,
+            fused_rope=False,
+            cos_cache=None,
+            sin_cache=None,
+            quantization_type=quantization_type,
+            qkv_w_scale=qkv_w_scale,
+            qkv_in_scale=qkv_in_scale,
+            d_head=self.head_dim,
+            num_q_heads=self.num_heads * 2,
+            num_kv_heads=self.num_key_value_heads,
+        )
+
+        q_width = self.num_heads * self.head_dim
+        gate_end = q_width * 2
+        k_end = gate_end + self.num_key_value_heads * self.head_dim
+        Q, gate, K, V = torch.tensor_split(
+            packed,
+            (q_width, gate_end, k_end),
+            dim=2,
+        )
+        return Q, gate, K, V
+
+    def _prep_qkv_gate_packed_tensors(
+        self,
+        position_ids,
+        hidden_states,
+        past_key_value,
+        adapter_ids=None,
+        cos_cache=None,
+        sin_cache=None,
+        use_polar_compatible_rope=False,
+    ):
+        Q, gate, K, V = self._qkv_gate_packed_projection_nki(hidden_states)
+
+        bsz, q_len, _ = hidden_states.size()
+        V = move_heads_front(
+            V,
+            bsz,
+            q_len,
+            self.num_key_value_heads,
+            self.head_dim,
+            layernorm=None,
+        )
+        if cos_cache is None or sin_cache is None:
+            cos_cache, sin_cache = self.rotary_emb(V, position_ids)
+        if (
+            self._should_use_qwen_qk_norm_rope_nki(q_len)
+            and cos_cache is not None
+            and sin_cache is not None
+        ):
+            Q, K = _qwen_qk_norm_partial_rope_kernel[self.logical_nc_config](
+                Q,
+                K,
+                self.q_layernorm.weight.data,
+                self.k_layernorm.weight.data,
+                cos_cache,
+                sin_cache,
+                self.rms_norm_eps,
+            )
+        else:
+            Q = move_heads_front(
+                Q,
+                bsz,
+                q_len,
+                self.num_heads,
+                self.head_dim,
+                layernorm=self.q_layernorm,
+                post_transpose_layernorm=self.post_transpose_layernorm,
+            )
+            K = move_heads_front(
+                K,
+                bsz,
+                q_len,
+                self.num_key_value_heads,
+                self.head_dim,
+                layernorm=self.k_layernorm,
+                post_transpose_layernorm=self.post_transpose_layernorm,
+            )
+            Q, K, cos_cache, sin_cache = self.apply_rotary_embedding(
+                Q,
+                K,
+                V,
+                position_ids,
+                cos_cache,
+                sin_cache,
+                use_polar_compatible_rope,
+            )
+        return Q, K, V, gate, cos_cache, sin_cache, None
+
+    def _should_use_qwen_qk_norm_rope_nki(self, q_len):
+        return (
+            self.qwen_qk_norm_rope_nki_kernel_enabled
+            and q_len > 1
+            and self.q_layernorm is not None
+            and self.k_layernorm is not None
+            and not self.qkv_proj_sp_enabled
+        )
+
+    def _prep_qkv_tensors_qwen_qk_norm_rope_nki(
+        self,
+        position_ids,
+        hidden_states,
+        past_key_value,
+        adapter_ids=None,
+        cos_cache=None,
+        sin_cache=None,
+        rmsnorm=None,
+    ):
+        Q, K, V, residual = self.get_qkv_proj()(
+            hidden_states=hidden_states,
+            rmsnorm=rmsnorm,
+            adapter_ids=adapter_ids,
+            residual=None,
+        )
+
+        bsz, q_len, _ = hidden_states.size()
+        V = move_heads_front(
+            V,
+            bsz,
+            q_len,
+            self.num_key_value_heads,
+            self.head_dim,
+            layernorm=None,
+        )
+        if cos_cache is None or sin_cache is None:
+            cos_cache, sin_cache = self.rotary_emb(V, position_ids)
+
+        Q, K = _qwen_qk_norm_partial_rope_kernel[self.logical_nc_config](
+            Q,
+            K,
+            self.q_layernorm.weight.data,
+            self.k_layernorm.weight.data,
+            cos_cache,
+            sin_cache,
+            self.rms_norm_eps,
+        )
+        return Q, K, V, cos_cache, sin_cache, residual
 
     def apply_rotary_embedding(
         self, Q, K, V, position_ids, cos_cache, sin_cache, use_polar_compatible_rope
@@ -2280,29 +3122,17 @@ class NeuronQwen35Attention(NeuronAttentionBase):
             ).view(1, 1, 1, -1)
             key_valid_mask = None
 
-        if q_heads != kv_heads:
-            kv_rep = q_heads // kv_heads
-            K_full = (
-                k_cache.unsqueeze(2)
-                .expand(-1, -1, kv_rep, -1, -1)
-                .reshape(B, q_heads, cache_len, head_dim)
-            )
-            V_full = (
-                v_cache.unsqueeze(2)
-                .expand(-1, -1, kv_rep, -1, -1)
-                .reshape(B, q_heads, cache_len, head_dim)
-            )
-        else:
-            K_full = k_cache
-            V_full = v_cache
-
-        attn_weights = torch.matmul(Q, K_full.transpose(-1, -2)) / math.sqrt(head_dim)
-        causal_mask = cache_positions <= pos[:, None, :, None]
-        if key_valid_mask is not None:
-            causal_mask = causal_mask & key_valid_mask
-        attn_weights = attn_weights.masked_fill(~causal_mask, -65504.0)
-        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(Q.dtype)
-        return torch.matmul(attn_weights, V_full), None
+        return (
+            _qwen35_grouped_prefix_attention(
+                Q,
+                k_cache,
+                v_cache,
+                pos,
+                cache_positions,
+                key_valid_mask,
+            ),
+            None,
+        )
 
     def forward(
         self,
@@ -2335,11 +3165,23 @@ class NeuronQwen35Attention(NeuronAttentionBase):
             and past_key_value is not None
             and q_len == 1
         )
-        if use_split_qkv_tkg:
-            # The preprod split-QKV TKG kernel assumes Q/K/V projection metadata.
-            # Keep the non-QKV output gate on the standard projection path to
-            # avoid runtime indirect-DMA OOBs in token generation.
-            gate = self.output_gate_proj(hidden_states)
+        if self._should_use_qwen_qkv_gate_packed(q_len):
+            Q, K, V, gate, cos_cache, sin_cache, _residual = (
+                self._prep_qkv_gate_packed_tensors(
+                    rope_pos_ids,
+                    hidden_states,
+                    past_key_value,
+                    adapter_ids=adapter_ids,
+                    cos_cache=cos_cache,
+                    sin_cache=sin_cache,
+                )
+            )
+        elif use_split_qkv_tkg:
+            gate = (
+                self._output_gate_proj_nki(hidden_states)
+                if self._should_use_qwen_output_gate_nki(q_len)
+                else self.output_gate_proj(hidden_states)
+            )
             Q, K, V, cos_cache, sin_cache, _residual = (
                 self._prep_split_qkv_tkg_tensors(
                     rope_pos_ids,
@@ -2358,18 +3200,34 @@ class NeuronQwen35Attention(NeuronAttentionBase):
             )
         else:
             # Compute gate from input hidden states (before QKV projection).
-            gate = self.output_gate_proj(hidden_states)  # (B, S, num_heads * head_dim)
+            if self._should_use_qwen_output_gate_nki(q_len):
+                gate = self._output_gate_proj_nki(hidden_states)
+            else:
+                gate = self.output_gate_proj(hidden_states)
 
             # Standard QKV prep (projections, QK norm, RoPE)
-            Q, K, V, cos_cache, sin_cache, _residual = self.prep_qkv_tensors(
-                rope_pos_ids,
-                hidden_states,
-                past_key_value,
-                adapter_ids=adapter_ids,
-                cos_cache=cos_cache,
-                sin_cache=sin_cache,
-                rmsnorm=rmsnorm,
-            )
+            if self._should_use_qwen_qk_norm_rope_nki(q_len):
+                Q, K, V, cos_cache, sin_cache, _residual = (
+                    self._prep_qkv_tensors_qwen_qk_norm_rope_nki(
+                        rope_pos_ids,
+                        hidden_states,
+                        past_key_value,
+                        adapter_ids=adapter_ids,
+                        cos_cache=cos_cache,
+                        sin_cache=sin_cache,
+                        rmsnorm=rmsnorm,
+                    )
+                )
+            else:
+                Q, K, V, cos_cache, sin_cache, _residual = self.prep_qkv_tensors(
+                    rope_pos_ids,
+                    hidden_states,
+                    past_key_value,
+                    adapter_ids=adapter_ids,
+                    cos_cache=cos_cache,
+                    sin_cache=sin_cache,
+                    rmsnorm=rmsnorm,
+                )
 
         qwen_chunked_prefill_active = (
             past_key_value is not None
@@ -2410,11 +3268,13 @@ class NeuronQwen35Attention(NeuronAttentionBase):
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.head_dim)
 
-        # Apply sigmoid output gate BEFORE o_proj (matching HF reference)
-        attn_output = attn_output * torch.sigmoid(gate)
-
-        # Apply o_proj
-        attn_output = self.get_o_proj()(attn_output, adapter_ids=adapter_ids)
+        o_proj = self.get_o_proj()
+        if self._should_use_qwen_gated_o_proj_nki(q_len):
+            attn_output = o_proj.forward_gated(attn_output, gate, adapter_ids=adapter_ids)
+        else:
+            # Apply sigmoid output gate BEFORE o_proj (matching HF reference)
+            attn_output = attn_output * torch.sigmoid(gate)
+            attn_output = o_proj(attn_output, adapter_ids=adapter_ids)
 
         # Ensure K, V are in model dtype (bf16) for KV cache update
         # (prevents mixed-precision dynamic-update-slice in neuronx-cc)
@@ -2493,11 +3353,10 @@ class NeuronQwen35DecoderLayer(nn.Module):
         else:
             self.self_attn = NeuronQwen35Attention(config=config)
 
-        # Dense MLP (all layers)
-        self.mlp_kernel_enabled = (
-            bool(config.neuron_config.mlp_kernel_enabled)
-            and int(getattr(config.neuron_config, "n_active_tokens", 0) or 0) == 1
-        )
+        # Dense MLP (all layers).  The reusable NxDI Llama MLP kernel supports
+        # both CTE and TKG; keep RMSNorm separate for CTE so normalization stays
+        # on the conservative high-precision path before FP8 GEMM quantization.
+        self.mlp_kernel_enabled = bool(config.neuron_config.mlp_kernel_enabled)
         self.mlp_kernel_fused_rmsnorm = (
             self.mlp_kernel_enabled
             and not config.neuron_config.sequence_parallel_enabled
@@ -2567,13 +3426,13 @@ class NeuronQwen35DecoderLayer(nn.Module):
 
         # Dense MLP FFN
         residual = hidden_states
-        use_mlp_kernel = (
-            self.mlp_kernel_enabled
-            and not bool(kwargs.get("is_for_context_encoding", False))
-            and hidden_states.shape[1] == 1
-        )
-        if use_mlp_kernel:
-            if self.mlp_kernel_fused_rmsnorm:
+        if self.mlp_kernel_enabled:
+            use_fused_mlp_rmsnorm = (
+                self.mlp_kernel_fused_rmsnorm
+                and not bool(kwargs.get("is_for_context_encoding", False))
+                and hidden_states.shape[1] == 1
+            )
+            if use_fused_mlp_rmsnorm:
                 mlp_fused_rmsnorm = self.post_attention_layernorm
             else:
                 hidden_states = self.post_attention_layernorm(hidden_states)
@@ -3162,8 +4021,41 @@ class HybridGDNCheckpointCache(nn.Module):
         conv_bytes = 4 if self.conv_dtype == torch.float32 else 2
         return recurrent_numel * recurrent_bytes + conv_numel * conv_bytes
 
-    def _safe_slot_ids(self, slot_ids: torch.Tensor) -> torch.Tensor:
-        return slot_ids.long().clamp(min=0, max=self.num_checkpoint_slots - 1)
+    def _safe_slot_ids(
+        self,
+        slot_ids: torch.Tensor,
+        batch_size: int | None = None,
+    ) -> torch.Tensor:
+        slot_ids = slot_ids.reshape(-1).long().clamp(
+            min=0,
+            max=self.num_checkpoint_slots - 1,
+        )
+        if batch_size is None:
+            return slot_ids
+        if slot_ids.shape[0] >= batch_size:
+            return slot_ids[:batch_size]
+        pad = torch.zeros(
+            (batch_size - slot_ids.shape[0],),
+            dtype=slot_ids.dtype,
+            device=slot_ids.device,
+        )
+        return torch.cat([slot_ids, pad], dim=0)
+
+    @staticmethod
+    def _safe_bool_vector(
+        mask: torch.Tensor,
+        batch_size: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        mask = mask.reshape(-1).to(device=device, dtype=torch.bool)
+        if mask.shape[0] >= batch_size:
+            return mask[:batch_size]
+        pad = torch.zeros(
+            (batch_size - mask.shape[0],),
+            dtype=torch.bool,
+            device=device,
+        )
+        return torch.cat([mask, pad], dim=0)
 
     @staticmethod
     def _active_rows(
@@ -3190,9 +4082,19 @@ class HybridGDNCheckpointCache(nn.Module):
     ) -> dict[int, tuple[torch.Tensor, torch.Tensor]] | None:
         if checkpoint_slot_ids is None or restore_mask is None:
             return None
-        batch_size = int(checkpoint_slot_ids.shape[0])
-        slot_ids = self._safe_slot_ids(checkpoint_slot_ids)
-        restore_mask = restore_mask.to(torch.bool)
+        batch_size = max(
+            int(checkpoint_slot_ids.reshape(-1).shape[0]),
+            int(restore_mask.reshape(-1).shape[0]),
+        )
+        if batch_size <= 0:
+            return None
+        slot_ids = self._safe_slot_ids(checkpoint_slot_ids, batch_size)
+        restore_mask = self._safe_bool_vector(
+            restore_mask,
+            batch_size,
+            slot_ids.device,
+        )
+        slot_ids = torch.where(restore_mask, slot_ids, torch.zeros_like(slot_ids))
         rec_mask = restore_mask.view(batch_size, 1, 1, 1)
         conv_mask = restore_mask.view(batch_size, 1, 1)
 
@@ -3227,9 +4129,19 @@ class HybridGDNCheckpointCache(nn.Module):
     ) -> list[torch.Tensor]:
         if checkpoint_slot_ids is None or commit_mask is None:
             return self.identity_outputs()
-        batch_size = int(checkpoint_slot_ids.shape[0])
-        slot_ids = self._safe_slot_ids(checkpoint_slot_ids)
-        commit_mask = commit_mask.to(torch.bool)
+        batch_size = max(
+            int(checkpoint_slot_ids.reshape(-1).shape[0]),
+            int(commit_mask.reshape(-1).shape[0]),
+        )
+        if batch_size <= 0:
+            return self.identity_outputs()
+        slot_ids = self._safe_slot_ids(checkpoint_slot_ids, batch_size)
+        commit_mask = self._safe_bool_vector(
+            commit_mask,
+            batch_size,
+            slot_ids.device,
+        )
+        slot_ids = torch.where(commit_mask, slot_ids, torch.zeros_like(slot_ids))
         rec_mask = commit_mask.view(batch_size, 1, 1, 1)
         conv_mask = commit_mask.view(batch_size, 1, 1)
 
@@ -4322,6 +5234,20 @@ def _debug_logits_stage(stage: str, tensor) -> None:
         )
 
 
+def _qwen36_output_logits_for_return(logits, lm_head, neuron_config):
+    if not (
+        getattr(neuron_config, "output_logits", False)
+        and getattr(neuron_config, "on_device_sampling_config", None) is not None
+        and not getattr(lm_head, "gather_output", True)
+    ):
+        return logits
+    return _gather_along_dim(
+        logits,
+        partition_dim=2,
+        process_group=getattr(lm_head, "tensor_parallel_group", None),
+    )
+
+
 class NeuronQwen35Model(NeuronBaseModel):
     def setup_attr_for_model(self, config: Qwen35InferenceConfig):
         self.on_device_sampling = (
@@ -4890,7 +5816,13 @@ class NeuronQwen35Model(NeuronBaseModel):
         _debug_logits_stage("before_return_logits", logits)
         outputs = [res]
         if self.neuron_config.output_logits and self.on_device_sampling:
-            outputs += [logits]
+            outputs += [
+                _qwen36_output_logits_for_return(
+                    logits,
+                    self.lm_head,
+                    self.neuron_config,
+                )
+            ]
         outputs += updated_kv_cache
 
         # Append DeltaNet state tensors (for input_output_aliases)
@@ -5169,18 +6101,32 @@ def convert_qwen35_hf_to_neuron_state_dict(neuron_state_dict, config):
                 q_key = f"layers.{l}.self_attn.q_proj.weight"
                 k_key = f"layers.{l}.self_attn.k_proj.weight"
                 v_key = f"layers.{l}.self_attn.v_proj.weight"
+                gate_key = f"layers.{l}.self_attn.output_gate_proj.weight"
+                pack_gate_in_qkv = bool(
+                    getattr(config, "use_qwen_qkv_gate_packed", False)
+                )
                 if q_key in neuron_state_dict:
+                    qkv_weight_parts = [neuron_state_dict[q_key]]
+                    if pack_gate_in_qkv:
+                        if gate_key not in neuron_state_dict:
+                            raise ValueError(
+                                f"Missing output-gate tensor for packed QKV: {gate_key}"
+                            )
+                        qkv_weight_parts.append(neuron_state_dict[gate_key])
+                    qkv_weight_parts.extend(
+                        [neuron_state_dict[k_key], neuron_state_dict[v_key]]
+                    )
                     neuron_state_dict[f"layers.{l}.self_attn.Wqkv.weight"] = _qwen36_cat(
-                        [
-                            neuron_state_dict[q_key],
-                            neuron_state_dict[k_key],
-                            neuron_state_dict[v_key],
-                        ]
+                        qkv_weight_parts
                     )
                     q_scale_key = f"layers.{l}.self_attn.q_proj.scale"
+                    gate_scale_key = f"layers.{l}.self_attn.output_gate_proj.scale"
                     k_scale_key = f"layers.{l}.self_attn.k_proj.scale"
                     v_scale_key = f"layers.{l}.self_attn.v_proj.scale"
-                    scale_keys = [q_scale_key, k_scale_key, v_scale_key]
+                    scale_keys = [q_scale_key]
+                    if pack_gate_in_qkv:
+                        scale_keys.append(gate_scale_key)
+                    scale_keys.extend([k_scale_key, v_scale_key])
                     scale_keys_present = [key in neuron_state_dict for key in scale_keys]
                     if any(scale_keys_present):
                         if not all(scale_keys_present):
@@ -5193,11 +6139,7 @@ def convert_qwen35_hf_to_neuron_state_dict(neuron_state_dict, config):
                                 f"Missing FP8 fused-QKV scale tensor(s): {missing}"
                             )
                         neuron_state_dict[f"layers.{l}.self_attn.Wqkv.scale"] = _qwen36_cat(
-                            [
-                                neuron_state_dict[q_scale_key],
-                                neuron_state_dict[k_scale_key],
-                                neuron_state_dict[v_scale_key],
-                            ]
+                            [neuron_state_dict[key] for key in scale_keys]
                         )
                         del neuron_state_dict[q_scale_key]
                         del neuron_state_dict[k_scale_key]
@@ -5912,7 +6854,10 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
 
     def enable_token_generation(self):
         self.compile_tag = TOKEN_GENERATION_MODEL_TAG
-        super().enable_token_generation()
+        disable_wlo = bool(
+            getattr(self.config, "disable_token_generation_wlo", False)
+        ) or os.environ.get("QWEN36_DISABLE_TOKEN_GENERATION_WLO") == "1"
+        super().enable_token_generation(enable_wlt_optimization=not disable_wlo)
 
     def _copy_past_key_values(self, outputs):
         """Override to also copy DeltaNet state buffers on CPU."""
@@ -6511,6 +7456,8 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
                     self.config,
                     cte_args,
                 )
+                _qwen36_prefill_timing = os.environ.get("QWEN36_PREFILL_TIMING") == "1"
+                _qwen36_cte_start = time.perf_counter() if _qwen36_prefill_timing else None
                 try:
                     chunk_out = self.context_encoding_model(*cte_args)
                 except Exception:
@@ -6518,6 +7465,18 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
                         cancel_hybrid_apc_request(hybrid_apc_request_dict)
                         hybrid_apc_request_dict = None
                     raise
+                if _qwen36_prefill_timing and _qwen36_cte_start is not None:
+                    print(
+                        "[qwen36_perf] qwen_cte_call "
+                        f"elapsed_ms={(time.perf_counter() - _qwen36_cte_start) * 1000.0:.3f} "
+                        f"actual_chunk={actual_chunk} ctx_bs={ctx_bs} "
+                        f"input_shape={tuple(chunk_input_ids.shape)} "
+                        f"num_queries={chunk_num_queries.reshape(-1).tolist() if hasattr(chunk_num_queries, 'numel') and chunk_num_queries.numel() else []} "
+                        f"computed={chunk_computed_context_lens.reshape(-1).tolist() if hasattr(chunk_computed_context_lens, 'numel') and chunk_computed_context_lens.numel() else []} "
+                        f"restore_mask={chunk_restore_mask.reshape(-1).tolist()} "
+                        f"commit_mask={chunk_commit_mask.reshape(-1).tolist()}",
+                        flush=True,
+                    )
                 if actual_chunk < ctx_bs:
                     chunk_out = chunk_out[:actual_chunk]
                 output_logits.append(chunk_out)

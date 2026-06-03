@@ -283,6 +283,10 @@ def _build_llm(args: argparse.Namespace):
 
     from vllm import LLM, SamplingParams  # noqa: WPS433
 
+    recurrent_cache_dtype = str(args.gdn_recurrent_cache_dtype).lower()
+    if recurrent_cache_dtype in {"bfloat16", "bf16"}:
+        recurrent_cache_dtype = "auto"
+
     llm = LLM(
         model=str(args.model_path),
         trust_remote_code=True,
@@ -295,7 +299,7 @@ def _build_llm(args: argparse.Namespace):
         block_size=args.block_size,
         num_gpu_blocks_override=args.pa_num_blocks,
         mamba_cache_mode="all",
-        mamba_ssm_cache_dtype=args.gdn_recurrent_cache_dtype,
+        mamba_ssm_cache_dtype=recurrent_cache_dtype,
         max_num_batched_tokens=max(args.resolved_cte_buckets),
         max_num_seqs=args.max_num_seqs,
     )

@@ -3,6 +3,7 @@
 
 import importlib.util
 import inspect
+import math
 import os
 import sys
 import types
@@ -113,7 +114,13 @@ def _fake_modules():
         ),
         "src.nki_kernels.nki_deltanet_fused": _module(
             "src.nki_kernels.nki_deltanet_fused",
+            deltanet_autocp_affine_sequence=lambda *args, **kwargs: None,
+            deltanet_autocp_apply_output=lambda *args, **kwargs: None,
+            deltanet_autocp_prefix_apply_output=lambda *args, **kwargs: None,
+            deltanet_autocp_state_summary_sequence=lambda *args, **kwargs: None,
+            deltanet_autocp_state_prefix=lambda *args, **kwargs: None,
             deltanet_fused_chunked_fwd=lambda *args, **kwargs: None,
+            deltanet_fused_chunked_fwd_multihead=lambda *args, **kwargs: None,
             _make_lower_mask=lambda *args, **kwargs: None,
             _make_lower_mask_diag=lambda *args, **kwargs: None,
             _make_identity=lambda *args, **kwargs: None,
@@ -268,10 +275,246 @@ def _make_wrapper(qwen_module, *, tag, use_hybrid_apc_manager=True):
     return wrapper
 
 
+class _IdentityMarker:
+    def __call__(self, tensor):
+        return tensor
+
+
+class _RecordingNorm(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.calls = 0
+
+    def forward(self, tensor):
+        self.calls += 1
+        return tensor + 1
+
+
+class _RecordingMlp:
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, tensor, rmsnorm=None):
+        self.calls.append((tensor.clone(), rmsnorm))
+        return tensor + 2, None
+
+
+class _FakeDeltaNetAttention:
+    def __call__(self, hidden_states, **_kwargs):
+        return torch.zeros_like(hidden_states), ("k", "v"), None, None
+
+
+def _make_decoder_layer_for_mlp_test(qwen_module):
+    qwen_module.ModuleMarkerStartWrapper = _IdentityMarker
+    qwen_module.ModuleMarkerEndWrapper = _IdentityMarker
+    layer = qwen_module.NeuronQwen35DecoderLayer.__new__(
+        qwen_module.NeuronQwen35DecoderLayer
+    )
+    nn.Module.__init__(layer)
+    layer.layer_type = "linear_attention"
+    layer.config = SimpleNamespace(use_hybrid_cache_manager=False)
+    layer.linear_attn = _FakeDeltaNetAttention()
+    layer.input_layernorm = nn.Identity()
+    layer.post_attention_layernorm = _RecordingNorm()
+    layer.mlp = _RecordingMlp()
+    layer.mlp_kernel_enabled = True
+    layer.mlp_kernel_fused_rmsnorm = True
+    return layer
+
+
+def _expanded_prefix_attention_reference(
+    Q,
+    K_cache,
+    V_cache,
+    query_positions,
+    cache_positions,
+    key_valid_mask=None,
+):
+    B, q_heads, q_len, head_dim = Q.shape
+    kv_heads = K_cache.shape[1]
+    kv_rep = q_heads // kv_heads
+    K_full = (
+        K_cache.unsqueeze(2)
+        .expand(-1, -1, kv_rep, -1, -1)
+        .reshape(B, q_heads, K_cache.shape[2], head_dim)
+    )
+    V_full = (
+        V_cache.unsqueeze(2)
+        .expand(-1, -1, kv_rep, -1, -1)
+        .reshape(B, q_heads, V_cache.shape[2], head_dim)
+    )
+    if cache_positions.ndim == 4:
+        cache_positions = cache_positions.reshape(B, -1)
+    if key_valid_mask is not None and key_valid_mask.ndim == 4:
+        key_valid_mask = key_valid_mask.reshape(B, -1)
+
+    attn_weights = torch.matmul(Q, K_full.transpose(-1, -2)) / math.sqrt(head_dim)
+    causal_mask = cache_positions[:, None, None, :] <= query_positions[
+        :, None, :, None
+    ]
+    if key_valid_mask is not None:
+        causal_mask = causal_mask & key_valid_mask[:, None, None, :]
+    attn_weights = attn_weights.masked_fill(~causal_mask, -65504.0)
+    attn_weights = torch.softmax(attn_weights, dim=-1, dtype=torch.float32).to(
+        Q.dtype
+    )
+    return torch.matmul(attn_weights, V_full)
+
+
 class TestQwen36ModelAliases(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.qwen_module = _load_qwen_module()
+
+    def test_deltanet_multihead_group_defaults_to_lnc2_when_available(self):
+        with patch.dict(
+            os.environ,
+            {"NEURON_CC_FLAGS": "--target trn2 --lnc 2"},
+            clear=True,
+        ):
+            self.assertEqual(
+                self.qwen_module._resolve_deltanet_multihead_group_size(4),
+                2,
+            )
+
+    def test_deltanet_multihead_group_clamps_to_lnc1_by_default(self):
+        with patch.dict(
+            os.environ,
+            {"NEURON_CC_FLAGS": "--target trn2 --lnc 1"},
+            clear=True,
+        ):
+            self.assertEqual(
+                self.qwen_module._resolve_deltanet_multihead_group_size(4),
+                1,
+            )
+
+    def test_deltanet_multihead_group_rejects_explicit_size_above_lnc(self):
+        with patch.dict(
+            os.environ,
+            {
+                "NEURON_CC_FLAGS": "--target trn2 --lnc 1",
+                "QWEN36_DELTANET_MULTIHEAD_GROUP_SIZE": "2",
+            },
+            clear=True,
+        ):
+            with self.assertRaisesRegex(ValueError, "requires NEURON_CC_FLAGS --lnc"):
+                self.qwen_module._resolve_deltanet_multihead_group_size(4)
+
+    def test_deltanet_autocp_lnc_defaults_to_lnc2_for_even_chunks(self):
+        with patch.dict(
+            os.environ,
+            {"NEURON_CC_FLAGS": "--target trn2 --lnc 2"},
+            clear=True,
+        ):
+            self.assertEqual(self.qwen_module._resolve_deltanet_autocp_lnc(128), 2)
+
+    def test_deltanet_autocp_lnc_falls_back_to_lnc1_for_odd_chunks(self):
+        with patch.dict(
+            os.environ,
+            {"NEURON_CC_FLAGS": "--target trn2 --lnc 2"},
+            clear=True,
+        ):
+            self.assertEqual(self.qwen_module._resolve_deltanet_autocp_lnc(3), 1)
+
+    def test_deltanet_autocp_lnc_rejects_explicit_uneven_chunks(self):
+        with patch.dict(
+            os.environ,
+            {
+                "NEURON_CC_FLAGS": "--target trn2 --lnc 2",
+                "QWEN36_DELTANET_AUTOCP_LNC": "2",
+            },
+            clear=True,
+        ):
+            with self.assertRaisesRegex(ValueError, "chunks to be divisible"):
+                self.qwen_module._resolve_deltanet_autocp_lnc(3)
+
+    def test_grouped_prefix_attention_matches_expanded_gqa_reference(self):
+        torch.manual_seed(123)
+        batch_size = 2
+        q_heads = 6
+        kv_heads = 2
+        q_len = 5
+        cache_len = 12
+        head_dim = 8
+        Q = torch.randn(batch_size, q_heads, q_len, head_dim)
+        K_cache = torch.randn(batch_size, kv_heads, cache_len, head_dim)
+        V_cache = torch.randn(batch_size, kv_heads, cache_len, head_dim)
+        query_positions = (
+            torch.arange(cache_len - q_len, cache_len)
+            .view(1, q_len)
+            .expand(batch_size, -1)
+        )
+        cache_positions = torch.arange(cache_len).view(1, cache_len).expand(
+            batch_size,
+            -1,
+        )
+        key_valid_mask = torch.ones(batch_size, cache_len, dtype=torch.bool)
+        key_valid_mask[1, -2:] = False
+
+        actual = self.qwen_module._qwen35_grouped_prefix_attention(
+            Q,
+            K_cache,
+            V_cache,
+            query_positions,
+            cache_positions.view(batch_size, 1, 1, cache_len),
+            key_valid_mask.view(batch_size, 1, 1, cache_len),
+        )
+        expected = _expanded_prefix_attention_reference(
+            Q,
+            K_cache,
+            V_cache,
+            query_positions,
+            cache_positions,
+            key_valid_mask,
+        )
+
+        torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-5)
+
+    def test_grouped_prefix_attention_matches_mha_reference(self):
+        torch.manual_seed(456)
+        batch_size = 1
+        q_heads = 4
+        q_len = 4
+        cache_len = 7
+        head_dim = 8
+        Q = torch.randn(batch_size, q_heads, q_len, head_dim)
+        K_cache = torch.randn(batch_size, q_heads, cache_len, head_dim)
+        V_cache = torch.randn(batch_size, q_heads, cache_len, head_dim)
+        query_positions = torch.arange(cache_len - q_len, cache_len).view(1, q_len)
+        cache_positions = torch.arange(cache_len).view(1, cache_len)
+
+        actual = self.qwen_module._qwen35_grouped_prefix_attention(
+            Q,
+            K_cache,
+            V_cache,
+            query_positions,
+            cache_positions,
+        )
+        expected = _expanded_prefix_attention_reference(
+            Q,
+            K_cache,
+            V_cache,
+            query_positions,
+            cache_positions,
+        )
+
+        torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-5)
+
+    def test_grouped_prefix_attention_rejects_invalid_gqa_shape(self):
+        Q = torch.zeros(1, 5, 2, 4)
+        K_cache = torch.zeros(1, 2, 3, 4)
+        V_cache = torch.zeros(1, 2, 3, 4)
+        query_positions = torch.arange(2).view(1, 2)
+        cache_positions = torch.arange(3).view(1, 3)
+
+        with self.assertRaisesRegex(ValueError, "q_heads to be divisible"):
+            self.qwen_module._qwen35_grouped_prefix_attention(
+                Q,
+                K_cache,
+                V_cache,
+                query_positions,
+                cache_positions,
+            )
 
     def test_host_logits_aliases_after_single_trace_output(self):
         instance, (kv0, kv1, state, checkpoint) = _make_instance(
@@ -328,6 +571,76 @@ class TestQwen36ModelAliases(unittest.TestCase):
             ),
             128,
         )
+
+    def test_on_device_output_logits_are_gathered_before_return(self):
+        logits = torch.arange(6, dtype=torch.float32).reshape(1, 1, 6)
+        gathered = torch.arange(24, dtype=torch.float32).reshape(1, 1, 24)
+        lm_head = SimpleNamespace(
+            gather_output=False,
+            tensor_parallel_group="tp_group",
+        )
+        neuron_config = SimpleNamespace(
+            output_logits=True,
+            on_device_sampling_config=object(),
+        )
+
+        with patch.object(
+            self.qwen_module,
+            "_gather_along_dim",
+            return_value=gathered,
+        ) as gather:
+            actual = self.qwen_module._qwen36_output_logits_for_return(
+                logits,
+                lm_head,
+                neuron_config,
+            )
+
+        self.assertIs(actual, gathered)
+        gather.assert_called_once_with(
+            logits,
+            partition_dim=2,
+            process_group="tp_group",
+        )
+
+    def test_output_logits_skip_gather_when_not_vocab_sharded(self):
+        logits = torch.arange(6, dtype=torch.float32).reshape(1, 1, 6)
+        lm_head = SimpleNamespace(gather_output=True)
+        neuron_config = SimpleNamespace(
+            output_logits=True,
+            on_device_sampling_config=object(),
+        )
+
+        actual = self.qwen_module._qwen36_output_logits_for_return(
+            logits,
+            lm_head,
+            neuron_config,
+        )
+
+        self.assertIs(actual, logits)
+
+    def test_mlp_kernel_cte_keeps_rmsnorm_separate(self):
+        layer = _make_decoder_layer_for_mlp_test(self.qwen_module)
+        hidden = torch.zeros((1, 4, 4), dtype=torch.float32)
+
+        outputs = layer.forward(hidden, is_for_context_encoding=True)
+
+        self.assertEqual(layer.post_attention_layernorm.calls, 1)
+        self.assertEqual(len(layer.mlp.calls), 1)
+        mlp_input, fused_rmsnorm = layer.mlp.calls[0]
+        self.assertIsNone(fused_rmsnorm)
+        self.assertTrue(torch.allclose(mlp_input, torch.ones_like(mlp_input)))
+        self.assertEqual(outputs[0].shape, hidden.shape)
+
+    def test_mlp_kernel_tkg_can_fuse_rmsnorm(self):
+        layer = _make_decoder_layer_for_mlp_test(self.qwen_module)
+        hidden = torch.zeros((1, 1, 4), dtype=torch.float32)
+
+        layer.forward(hidden, is_for_context_encoding=False)
+
+        self.assertEqual(layer.post_attention_layernorm.calls, 0)
+        self.assertEqual(len(layer.mlp.calls), 1)
+        _mlp_input, fused_rmsnorm = layer.mlp.calls[0]
+        self.assertIs(fused_rmsnorm, layer.post_attention_layernorm)
 
     def test_fused_deltanet_does_not_clamp_cumulative_decay(self):
         self.assertFalse(
@@ -399,6 +712,62 @@ class TestQwen36ModelAliases(unittest.TestCase):
         self.assertTrue(torch.equal(conv_out[0], conv_state[0]))
         self.assertTrue(torch.equal(recurrent_out[1:], old_recurrent[1:]))
         self.assertTrue(torch.equal(conv_out[1:], old_conv[1:]))
+
+    def test_hybrid_checkpoint_restore_clamps_slots_and_ignores_inactive_rows(self):
+        config = SimpleNamespace(
+            layer_types=["linear_attention"],
+            max_gdn_checkpoint_slots=3,
+            linear_num_value_heads=1,
+            linear_num_key_heads=1,
+            linear_key_head_dim=2,
+            linear_value_head_dim=2,
+            linear_conv_kernel_dim=3,
+            hybrid_recurrent_cache_dtype="float32",
+            hybrid_conv_cache_dtype="bfloat16",
+            neuron_config=SimpleNamespace(tp_degree=1),
+        )
+        cache = self.qwen_module.HybridGDNCheckpointCache(config)
+        with torch.no_grad():
+            cache.recurrent_slots[0][0].fill_(10)
+            cache.recurrent_slots[0][1].fill_(20)
+            cache.recurrent_slots[0][2].fill_(30)
+            cache.conv_slots[0][0].fill_(1)
+            cache.conv_slots[0][1].fill_(2)
+            cache.conv_slots[0][2].fill_(3)
+
+        recurrent_state_buffer = torch.stack(
+            [
+                torch.full((1, 2, 2), 101.0),
+                torch.full((1, 2, 2), 202.0),
+            ]
+        )
+        conv_state_buffer = torch.stack(
+            [
+                torch.full((6, 2), 11.0, dtype=torch.bfloat16),
+                torch.full((6, 2), 22.0, dtype=torch.bfloat16),
+            ]
+        )
+        layers = [
+            SimpleNamespace(
+                linear_attn=SimpleNamespace(
+                    recurrent_state_buffer=recurrent_state_buffer,
+                    conv_state_buffer=conv_state_buffer,
+                )
+            )
+        ]
+
+        restored = cache.restore_to_active_rows(
+            layers=layers,
+            seq_ids=torch.tensor([1, -1], dtype=torch.int32),
+            checkpoint_slot_ids=torch.tensor([999, 999], dtype=torch.int32),
+            restore_mask=torch.tensor([1, 0], dtype=torch.int32),
+        )
+        recurrent_out, conv_out = restored[0]
+
+        self.assertTrue(torch.equal(recurrent_out[0], cache.recurrent_slots[0][2]))
+        self.assertTrue(torch.equal(conv_out[0], cache.conv_slots[0][2]))
+        self.assertTrue(torch.equal(recurrent_out[1], recurrent_state_buffer[0]))
+        self.assertTrue(torch.equal(conv_out[1], conv_state_buffer[0]))
 
     def test_legacy_tkg_args_are_env_gated(self):
         with patch.dict(os.environ, {}, clear=True):

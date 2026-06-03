@@ -199,7 +199,38 @@ class TestVllmServingConfig(unittest.TestCase):
         self.assertTrue(config["use_qwen_hybrid_chunked_prefill"])
         self.assertTrue(config["use_qwen_hybrid_chunked_prefill_nki"])
 
-    def test_hybrid_apc_chunked_prefill_uses_checkpoint_interval_batch_tokens(self):
+    def test_grouped_prefill_defaults_to_largest_compiled_bucket(self):
+        config = self.runner._override_config(
+            _args(
+                cte_buckets=["512,1024"],
+                seq_len=2048,
+                enable_hybrid_apc=True,
+                enable_vllm_chunked_prefill=True,
+                block_size=256,
+                gdn_checkpoint_interval=256,
+            )
+        )
+
+        self.assertEqual(config["qwen_prefill_group_size"], 1024)
+        self.assertEqual(config["hybrid_apc_prefill_chunk_tokens"], 1024)
+
+    def test_grouped_prefill_records_explicit_four_chunk_group(self):
+        config = self.runner._override_config(
+            _args(
+                cte_buckets=["512,1024,2048"],
+                seq_len=4096,
+                enable_hybrid_apc=True,
+                enable_vllm_chunked_prefill=True,
+                block_size=256,
+                gdn_checkpoint_interval=256,
+                hybrid_apc_prefill_chunk_tokens=2048,
+            )
+        )
+
+        self.assertEqual(config["qwen_prefill_group_size"], 2048)
+        self.assertEqual(config["hybrid_apc_prefill_chunk_tokens"], 2048)
+
+    def test_hybrid_apc_chunked_prefill_defaults_to_largest_aligned_bucket(self):
         args = _args(
             cte_buckets=["256,512"],
             enable_hybrid_apc=True,
@@ -213,10 +244,10 @@ class TestVllmServingConfig(unittest.TestCase):
                 args,
                 self.runner._cte_buckets(args),
             ),
-            256,
+            512,
         )
 
-    def test_hybrid_apc_chunked_prefill_uses_smallest_checkpoint_aligned_bucket(self):
+    def test_hybrid_apc_chunked_prefill_uses_largest_checkpoint_aligned_bucket(self):
         args = _args(
             cte_buckets=["512,768,1536,3072"],
             seq_len=3072,
@@ -231,7 +262,7 @@ class TestVllmServingConfig(unittest.TestCase):
                 args,
                 self.runner._cte_buckets(args),
             ),
-            512,
+            3072,
         )
 
     def test_hybrid_apc_chunked_prefill_requires_checkpoint_aligned_cte_bucket(self):

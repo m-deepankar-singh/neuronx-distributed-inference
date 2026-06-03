@@ -649,6 +649,42 @@ class TestHybridAPCAsyncBridge(unittest.TestCase):
             torch.equal(model.calls[0][-1], torch.tensor([0], dtype=torch.int32))
         )
 
+    def test_prefix_caching_generation_rejects_invalid_token_before_neuron(self):
+        base = SimpleNamespace(
+            config=SimpleNamespace(
+                use_hybrid_apc_manager=True,
+                vocab_size=248320,
+            ),
+            neuron_config=SimpleNamespace(
+                enable_fused_speculation=False,
+                enable_eagle_speculation=False,
+            ),
+            _qwen36_vllm_request_ids=("req-invalid",),
+        )
+        model = _FakePrefixModel(tag="token_generation_model")
+        input_dict = _prefix_input_dict()
+        input_dict.update(
+            {
+                "input_ids": torch.tensor([[1065353216]], dtype=torch.int32),
+                "attention_mask": torch.ones((1, 1280), dtype=torch.int32),
+                "position_ids": torch.tensor([[1024]], dtype=torch.int32),
+                "slot_mapping": torch.tensor([[2560]], dtype=torch.int32),
+                "block_table": torch.tensor([[6, 7, 8, 9, 10]], dtype=torch.int32),
+                "full_context_lens": torch.tensor([[1025]], dtype=torch.int32),
+                "computed_context_lens": torch.tensor([[1024]], dtype=torch.int32),
+                "num_queries": torch.tensor([[1]], dtype=torch.int32),
+            }
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "Token generation input_ids contract violated before Neuron execution",
+        ) as cm:
+            execute_model_prefix_caching(base, model, input_dict)
+
+        self.assertIn("0x3f800000", str(cm.exception))
+        self.assertEqual(model.calls, [])
+
     def test_chunked_prefill_with_nonzero_positions_still_uses_context_execution(self):
         base = SimpleNamespace(
             neuron_config=SimpleNamespace(

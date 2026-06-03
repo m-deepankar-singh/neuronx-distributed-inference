@@ -24,6 +24,31 @@ class TestQwen36ChatProxy(unittest.TestCase):
         self.assertFalse(enabled)
         self.assertEqual(payload["chat_template_kwargs"], {"enable_thinking": False})
 
+    def test_default_thinking_enables_when_no_request_toggle(self):
+        payload = {"messages": [{"role": "user", "content": "hello"}]}
+
+        enabled = _PROXY._apply_thinking_policy(
+            payload,
+            allow_thinking=True,
+            default_thinking=True,
+        )
+
+        self.assertTrue(enabled)
+        self.assertEqual(payload["chat_template_kwargs"], {"enable_thinking": True})
+
+    def test_default_thinking_allows_explicit_disable(self):
+        payload = {"enable_thinking": False}
+
+        enabled = _PROXY._apply_thinking_policy(
+            payload,
+            allow_thinking=True,
+            default_thinking=True,
+        )
+
+        self.assertFalse(enabled)
+        self.assertEqual(payload["chat_template_kwargs"], {"enable_thinking": False})
+        self.assertNotIn("enable_thinking", payload)
+
     def test_force_disabled_policy_overrides_request(self):
         payload = {
             "enable_thinking": True,
@@ -106,6 +131,35 @@ class TestQwen36ChatProxy(unittest.TestCase):
             _PROXY._request_path("/v1/chat/completions?api-version=1"),
             "/v1/chat/completions",
         )
+
+    def test_streaming_thinking_start_is_injected_when_missing(self):
+        event = (
+            b'data: {"choices":[{"delta":{"content":"Here is the thought"}}]}\n\n'
+        )
+
+        patched, decided, changed = _PROXY._prepend_think_start_to_sse_event(event)
+
+        self.assertTrue(decided)
+        self.assertTrue(changed)
+        self.assertIn(b'"content":"<think>\\nHere is the thought"', patched)
+
+    def test_streaming_thinking_start_is_not_duplicated(self):
+        event = b'data: {"choices":[{"delta":{"content":"\\n\\n<think>\\nThought"}}]}\n\n'
+
+        patched, decided, changed = _PROXY._prepend_think_start_to_sse_event(event)
+
+        self.assertTrue(decided)
+        self.assertFalse(changed)
+        self.assertEqual(patched, event)
+
+    def test_streaming_usage_chunk_does_not_decide_thinking_start(self):
+        event = b'data: {"choices":[],"usage":{"completion_tokens":1}}\n\n'
+
+        patched, decided, changed = _PROXY._prepend_think_start_to_sse_event(event)
+
+        self.assertFalse(decided)
+        self.assertFalse(changed)
+        self.assertEqual(patched, event)
 
 
 if __name__ == "__main__":

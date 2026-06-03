@@ -63,6 +63,390 @@ class TestFusedDeltaNetDecayMath(unittest.TestCase):
         self.assertTrue(torch.isfinite(output).all())
         self.assertTrue(torch.isfinite(state).all())
 
+    def test_autocp_affine_chunk_matches_current_reference(self):
+        args = types.SimpleNamespace(
+            seed=20260602,
+            seq_len=128,
+            value_scale=0.05,
+            state_scale=0.01,
+            gate_scale=1.0,
+        )
+
+        inputs = self.validator.make_inputs(torch, args)
+        expected_output, expected_state = self.validator.reference_math(torch, inputs)
+        parts = self.validator.deltanet_chunk_affine_parts(torch, inputs, 0)
+        actual_output, actual_state = self.validator.apply_deltanet_chunk_affine(
+            torch,
+            parts,
+            inputs["state_in"],
+        )
+
+        torch.testing.assert_close(
+            actual_output,
+            expected_output,
+            atol=2.0e-5,
+            rtol=2.0e-5,
+        )
+        torch.testing.assert_close(
+            actual_state,
+            expected_state,
+            atol=2.0e-5,
+            rtol=2.0e-5,
+        )
+
+    def test_autocp_reference_matches_current_reference(self):
+        args = types.SimpleNamespace(
+            seed=20260602,
+            seq_len=1024,
+            value_scale=0.05,
+            state_scale=0.01,
+            gate_scale=1.0,
+        )
+
+        inputs = self.validator.make_inputs(torch, args)
+        expected_output, expected_state = self.validator.reference_math(torch, inputs)
+        for cp_chunks in (1, 2, 4, 8):
+            actual_output, actual_state = self.validator.autocp_reference_math(
+                torch,
+                inputs,
+                cp_chunks=cp_chunks,
+            )
+
+            torch.testing.assert_close(
+                actual_output,
+                expected_output,
+                atol=2.0e-5,
+                rtol=2.0e-5,
+            )
+            torch.testing.assert_close(
+                actual_state,
+                expected_state,
+                atol=2.0e-5,
+                rtol=2.0e-5,
+            )
+
+    def test_autocp_reference_matches_current_reference_multihead(self):
+        args = types.SimpleNamespace(
+            seed=20260602,
+            seq_len=512,
+            heads=3,
+            multihead=True,
+            value_scale=0.05,
+            state_scale=0.01,
+            gate_scale=1.0,
+        )
+
+        inputs = self.validator.make_inputs(torch, args)
+        expected_output, expected_state = self.validator.reference_math(torch, inputs)
+        actual_output, actual_state = self.validator.autocp_reference_math(
+            torch,
+            inputs,
+            cp_chunks=2,
+        )
+
+        torch.testing.assert_close(
+            actual_output,
+            expected_output,
+            atol=2.0e-5,
+            rtol=2.0e-5,
+        )
+        torch.testing.assert_close(
+            actual_state,
+            expected_state,
+            atol=2.0e-5,
+            rtol=2.0e-5,
+        )
+
+    def test_compact_autocp_reference_matches_current_reference(self):
+        args = types.SimpleNamespace(
+            seed=20260602,
+            seq_len=1024,
+            value_scale=0.05,
+            state_scale=0.01,
+            gate_scale=1.0,
+        )
+
+        inputs = self.validator.make_inputs(torch, args)
+        expected_output, expected_state = self.validator.reference_math(torch, inputs)
+        for cp_chunks in (1, 2, 4, 8):
+            actual_output, actual_state = self.validator.compact_autocp_reference_math(
+                torch,
+                inputs,
+                cp_chunks=cp_chunks,
+            )
+
+            torch.testing.assert_close(
+                actual_output,
+                expected_output,
+                atol=2.0e-5,
+                rtol=2.0e-5,
+            )
+            torch.testing.assert_close(
+                actual_state,
+                expected_state,
+                atol=2.0e-5,
+                rtol=2.0e-5,
+            )
+
+    def test_compact_autocp_reference_matches_current_reference_multihead(self):
+        args = types.SimpleNamespace(
+            seed=20260602,
+            seq_len=512,
+            heads=3,
+            multihead=True,
+            value_scale=0.05,
+            state_scale=0.01,
+            gate_scale=1.0,
+        )
+
+        inputs = self.validator.make_inputs(torch, args)
+        expected_output, expected_state = self.validator.reference_math(torch, inputs)
+        for cp_chunks in (1, 2, 4):
+            actual_output, actual_state = self.validator.compact_autocp_reference_math(
+                torch,
+                inputs,
+                cp_chunks=cp_chunks,
+            )
+
+            torch.testing.assert_close(
+                actual_output,
+                expected_output,
+                atol=2.0e-5,
+                rtol=2.0e-5,
+            )
+            torch.testing.assert_close(
+                actual_state,
+                expected_state,
+                atol=2.0e-5,
+                rtol=2.0e-5,
+            )
+
+    def test_reference_qk_normalization_is_zero_safe(self):
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(20260601)
+        query = torch.randn((4, 128), generator=generator) * 0.05
+        key = torch.randn((4, 128), generator=generator) * 0.05
+        query[0].zero_()
+        key[1].zero_()
+
+        query_norm, key_norm = self.validator.normalize_reference_qk(
+            torch,
+            query,
+            key,
+        )
+
+        self.assertTrue(torch.isfinite(query_norm).all())
+        self.assertTrue(torch.isfinite(key_norm).all())
+        torch.testing.assert_close(query_norm[0], torch.zeros_like(query_norm[0]))
+        torch.testing.assert_close(key_norm[1], torch.zeros_like(key_norm[1]))
+        torch.testing.assert_close(
+            torch.linalg.vector_norm(query_norm[2]),
+            torch.tensor(self.validator.P_MAX ** -0.5),
+            atol=1.0e-6,
+            rtol=1.0e-6,
+        )
+        torch.testing.assert_close(
+            torch.linalg.vector_norm(key_norm[2]),
+            torch.tensor(1.0),
+            atol=1.0e-6,
+            rtol=1.0e-6,
+        )
+
+    def test_multihead_launch_spec_rejects_head_group_size_above_lnc_when_spmd_disabled(self):
+        previous = os.environ.get("QWEN36_DELTANET_MULTIHEAD_SPMD")
+        os.environ["QWEN36_DELTANET_MULTIHEAD_SPMD"] = "0"
+        try:
+            with self.assertRaisesRegex(ValueError, "head-group-size exceeds --lnc"):
+                self.validator.multihead_launch_spec(num_heads=2, lnc=1)
+        finally:
+            if previous is None:
+                os.environ.pop("QWEN36_DELTANET_MULTIHEAD_SPMD", None)
+            else:
+                os.environ["QWEN36_DELTANET_MULTIHEAD_SPMD"] = previous
+
+    def test_blocked_triangular_solve_matches_torch_solve(self):
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(20260601)
+        strict_lower = torch.tril(
+            torch.randn((128, 128), generator=generator) * 0.01,
+            diagonal=-1,
+        )
+        lhs = torch.eye(128) + strict_lower
+        rhs = torch.randn((128, 128), generator=generator) * 0.05
+
+        expected = torch.linalg.solve_triangular(lhs, rhs, upper=False)
+        for block_size in (8, 16, 32):
+            actual = self.validator.blocked_lower_triangular_solve(
+                torch,
+                lhs,
+                rhs,
+                block_size,
+            )
+            torch.testing.assert_close(actual, expected, atol=2.0e-5, rtol=2.0e-5)
+
+    def test_block_prefix_triangular_solve_matches_torch_solve(self):
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(20260602)
+        strict_lower = torch.tril(
+            torch.randn((128, 128), generator=generator) * 0.05,
+            diagonal=-1,
+        )
+        lhs = torch.eye(128) + strict_lower
+        rhs = torch.randn((128, 128), generator=generator) * 0.05
+
+        expected = torch.linalg.solve_triangular(lhs, rhs, upper=False)
+        for block_size in (16, 32, 64):
+            actual = self.validator.block_prefix_lower_triangular_solve(
+                torch,
+                lhs,
+                rhs,
+                block_size,
+            )
+            torch.testing.assert_close(actual, expected, atol=2.0e-5, rtol=2.0e-5)
+
+    def test_hierarchical_kkt_triangular_solve_matches_torch_solve(self):
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(20260602)
+        strict_lower = torch.tril(
+            torch.randn((128, 128), generator=generator) * 0.01,
+            diagonal=-1,
+        )
+        lhs = torch.eye(128) + strict_lower
+        rhs = torch.randn((128, 128), generator=generator) * 0.05
+
+        expected = torch.linalg.solve_triangular(lhs, rhs, upper=False)
+        for leaf_size in (8, 16, 32):
+            actual = self.validator.hierarchical_kkt_lower_triangular_solve(
+                torch,
+                lhs,
+                rhs,
+                leaf_size,
+            )
+            torch.testing.assert_close(actual, expected, atol=2.0e-5, rtol=2.0e-5)
+
+    def test_two_step_doubling_solve_matches_realistic_chunks(self):
+        args = types.SimpleNamespace(
+            seed=20260601,
+            seq_len=512,
+            heads=4,
+            multihead=True,
+            value_scale=0.05,
+            state_scale=0.01,
+            gate_scale=1.0,
+        )
+
+        inputs = self.validator.make_inputs(torch, args)
+        lower = inputs["lower_mask"]
+        eye = inputs["identity"]
+
+        max_relative_norm = 0.0
+        max_absolute = 0.0
+        for head_idx in range(args.heads):
+            state = inputs["state_in"][head_idx].clone()
+            for start in range(0, args.seq_len, self.validator.P_MAX):
+                end = start + self.validator.P_MAX
+                _, key = self.validator.normalize_reference_qk(
+                    torch,
+                    inputs["query"][head_idx, start:end],
+                    inputs["key"][head_idx, start:end],
+                )
+                value = inputs["value"][head_idx, start:end]
+                g = inputs["g_raw"][head_idx, start:end]
+                beta = inputs["beta"][head_idx, start:end]
+
+                gc = torch.cumsum(g, dim=0)
+                k_beta = key * beta
+                v_beta = value * beta
+                decay = self.validator.stable_causal_decay(torch, gc, lower)
+                a_mat = -((k_beta @ key.T) * decay) * lower
+                lhs = eye - a_mat
+                rhs = v_beta - ((k_beta * torch.exp(gc)) @ state)
+
+                expected = torch.linalg.solve_triangular(lhs, rhs, upper=False)
+                actual = self.validator.scan_doubling_lower_triangular_solve(
+                    torch,
+                    lhs,
+                    rhs,
+                    steps=2,
+                )
+
+                diff = actual - expected
+                max_relative_norm = max(
+                    max_relative_norm,
+                    torch.linalg.vector_norm(diff).item()
+                    / torch.linalg.vector_norm(expected).item(),
+                )
+                max_absolute = max(max_absolute, diff.abs().max().item())
+
+                gl = gc[-1:]
+                key_decay = key * torch.exp(gl - gc)
+                state = (state * torch.exp(gl)) + (key_decay.T @ expected)
+
+        self.assertLess(max_relative_norm, 5.0e-6)
+        self.assertLess(max_absolute, 2.0e-6)
+
+    def test_blocked_reference_matches_current_reference(self):
+        args = types.SimpleNamespace(
+            seed=1234,
+            seq_len=256,
+            value_scale=0.05,
+            state_scale=0.01,
+            gate_scale=1.0,
+        )
+
+        inputs = self.validator.make_inputs(torch, args)
+        expected_output, expected_state = self.validator.reference_math(torch, inputs)
+        actual_output, actual_state = self.validator.blocked_reference_math(
+            torch,
+            inputs,
+            block_size=16,
+        )
+
+        torch.testing.assert_close(
+            actual_output,
+            expected_output,
+            atol=2.0e-5,
+            rtol=2.0e-5,
+        )
+        torch.testing.assert_close(
+            actual_state,
+            expected_state,
+            atol=2.0e-5,
+            rtol=2.0e-5,
+        )
+
+    def test_blocked_reference_matches_current_reference_multihead(self):
+        args = types.SimpleNamespace(
+            seed=1234,
+            seq_len=256,
+            heads=4,
+            multihead=True,
+            value_scale=0.05,
+            state_scale=0.01,
+            gate_scale=1.0,
+        )
+
+        inputs = self.validator.make_inputs(torch, args)
+        expected_output, expected_state = self.validator.reference_math(torch, inputs)
+        actual_output, actual_state = self.validator.blocked_reference_math(
+            torch,
+            inputs,
+            block_size=16,
+        )
+
+        torch.testing.assert_close(
+            actual_output,
+            expected_output,
+            atol=2.0e-5,
+            rtol=2.0e-5,
+        )
+        torch.testing.assert_close(
+            actual_state,
+            expected_state,
+            atol=2.0e-5,
+            rtol=2.0e-5,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
