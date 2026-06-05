@@ -132,11 +132,22 @@ Ported rebuild commits:
    - Log evidence: first chunk prepared and committed `commit_prefix_len=2048 commit_slot=0`; second chunk prepared by async execution with `attention_hit_len=2048`, `request_prefix_len=2500`, `prepared_shape=(1, 452)`, `computed=tensor([[2048]])`, `num_queries=tensor([[452]])`, `restore_mask=tensor([0])`, `commit_mask=tensor([0])`; then `modeling_qwen35.py:_prepare_hybrid_apc_pad_inputs` prepared the same row again inside `pad_inputs` and raised.
    - Root cause: `pad_inputs` prepares when both Hybrid APC masks are zero. That is correct for raw cold inputs, but wrong for an already-prepared same-request continuation whose masks are intentionally inert because active carry is authoritative.
    - Mitigation applied: async execution now sets `_qwen36_hybrid_apc_skip_pad_prepare_once` on the selected model wrapper whenever it has already prepared Hybrid APC inputs; `Qwen35ModelWrapper._prepare_hybrid_apc_pad_inputs` consumes that one-shot flag and returns the prepared args unchanged.
-   - Verification: local `PYTHONPATH=src python3 -m py_compile src/neuronx_distributed_inference/modules/async_execution.py contrib/models/Qwen3.6-27B/src/modeling_qwen35.py` passed; local `PYTHONPATH=src python3 -m unittest test.unit.modules.test_async_execution.TestCachedChunkedPrefillTkgRepair` passed. Runtime verification is pending source sync and vLLM restart.
+   - Verification: local `PYTHONPATH=src python3 -m py_compile src/neuronx_distributed_inference/modules/async_execution.py contrib/models/Qwen3.6-27B/src/modeling_qwen35.py` passed; local `PYTHONPATH=src python3 -m unittest test.unit.modules.test_async_execution.TestCachedChunkedPrefillTkgRepair` passed. Runtime verification after source sync passed exact prompt lengths `2500`, `4092`, `4096`, `8192`, and `16384` with coherent output and matching `usage.prompt_tokens`.
+
+13. The coherent CTE2048 standard-QKV anchor is too slow for the prefill-speed target.
+   - Runtime host: `ubuntu@16.26.184.190`
+   - Runtime log: `/home/ubuntu/validation_logs/fp8_256k_decode_nki/coherent_rebuild_stdqkv2_doubleprepfix_runtime_20260605T144922Z.log`
+   - Artifact: `/mnt/trainium_artifacts/qwen_artifacts/qwen36_32k_fp8_fp8all_lmheadfp8_gatesfp8_kvbf16_standard_qkv_segmented_cte512_gdnseg512_cte2048_pfx32k_slots64_20260605T132739Z_coherent_rebuild_stdqkv2_direct_scan0`
+   - Inputs/flags: standard QKV, CTE2048, segmented CTE512 prefix attention, GDN segment 512, KV BF16, recurrent checkpoint/cache BF16, Hybrid APC enabled.
+   - Coherence evidence: exact `8192` prompt returned coherent text with `usage.prompt_tokens=8192`; exact `16384` prompt with `max_tokens=1` returned a normal first token and `usage.prompt_tokens=16384`.
+   - Speed evidence: 16k `max_tokens=1` non-streaming wall time was `26.353s`, so conservative prompt throughput was `16384 / 26.353 = 621.7 prompt tok/s`.
+   - Root cause hypothesis: this anchor deliberately disabled QKV NKI because the stock QKV CTE kernel rejects Qwen's 5120 input width. Coherence is restored, but the speed path is still missing a Qwen-compatible QKV prefill kernel.
+   - Mitigation: keep this artifact as the coherent CTE2048 anchor; next speed work should port/adapt the working QKV tiled path for 5120-wide Qwen instead of reintroducing unrelated dense moat kernels.
+   - Verification: final serve-log scan after 2500/4092/4096/8192/16384 showed no `negative token_id`, `out-of-vocab token_id`, `fallback argmax`, `finite=0`, `nan=`, `NRT_RESOURCE`, `EngineDeadError`, `RuntimeError`, `ValueError`, `Traceback`, or `InternalServerError`; backend and proxy health were OK.
 
 ### Current next step
 
-Sync the cached-continuation and skip-double-prepare source repairs to `ubuntu@16.26.184.190`, restart the same artifact, and rerun exact boundary probes starting with `2500`, then `4092/4096`.
+Use the live standard-QKV CTE2048 artifact as the coherent anchor. The next speed slice should be a one-variable QKV prefill kernel fix for Qwen's 5120 hidden width; do not add packed qkvgate, output-proj NKI, quantized MLP NKI, or FP8 KV until QKV speed is isolated and the same coherence matrix stays green.
 
 Do not postprocess-only a BF16-traced artifact to FP32 recurrent banks. For this completed artifact, launch with BF16 recurrent banks:
 
