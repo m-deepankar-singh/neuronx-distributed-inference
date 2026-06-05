@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import json
+import re
 import subprocess
 from pathlib import Path
 
@@ -52,6 +54,40 @@ def _git_commit(repo: Path | None) -> str:
         ).strip()
     except (OSError, subprocess.CalledProcessError):
         return "unknown"
+
+
+def _automation_name(values: dict[str, str], override: str | None = None) -> str:
+    if override:
+        return override
+    base = values.get("BASE", "qwen36-compile")
+    speed_slice = values.get("SPEED_SLICE", "")
+    slug_source = speed_slice if speed_slice and speed_slice != "none" else base
+    slug = re.sub(r"[^a-zA-Z0-9]+", "-", slug_source).strip("-").lower()
+    if not slug:
+        slug = "qwen36-compile"
+    if not slug.startswith("qwen"):
+        slug = f"qwen-{slug}"
+    return f"monitor-{slug[:56]}-compile"
+
+
+def build_automation_payload(
+    values: dict[str, str],
+    *,
+    prompt: str,
+    name: str | None = None,
+    interval_minutes: int = 10,
+) -> dict[str, str]:
+    if interval_minutes <= 0:
+        raise ValueError("interval_minutes must be positive")
+    return {
+        "mode": "create",
+        "kind": "heartbeat",
+        "destination": "thread",
+        "name": _automation_name(values, name),
+        "rrule": f"FREQ=MINUTELY;INTERVAL={interval_minutes}",
+        "status": "ACTIVE",
+        "prompt": prompt,
+    }
 
 
 def render_prompt(
@@ -143,6 +179,22 @@ def main() -> int:
     parser.add_argument("--source-dir", default=None)
     parser.add_argument("--source-commit", default=None)
     parser.add_argument(
+        "--automation-json",
+        action="store_true",
+        help="Emit a codex_app.automation_update create payload instead of raw prompt text.",
+    )
+    parser.add_argument(
+        "--automation-name",
+        default=None,
+        help="Override the generated heartbeat automation name.",
+    )
+    parser.add_argument(
+        "--automation-interval-minutes",
+        type=int,
+        default=10,
+        help="Heartbeat interval for --automation-json payloads.",
+    )
+    parser.add_argument(
         "--launch-script",
         default="tmp_launch_qwen36_segcte2048.sh",
     )
@@ -158,17 +210,25 @@ def main() -> int:
     source_commit = args.source_commit or _git_commit(
         Path(source_dir) if source_dir != "unknown" else None
     )
-    print(
-        render_prompt(
-            values,
-            compile_host=args.compile_host,
-            runtime_host=args.runtime_host,
-            source_dir=source_dir,
-            source_commit=source_commit,
-            launch_script=args.launch_script,
-            boundary_lengths=args.boundary_lengths,
-        )
+    prompt = render_prompt(
+        values,
+        compile_host=args.compile_host,
+        runtime_host=args.runtime_host,
+        source_dir=source_dir,
+        source_commit=source_commit,
+        launch_script=args.launch_script,
+        boundary_lengths=args.boundary_lengths,
     )
+    if args.automation_json:
+        payload = build_automation_payload(
+            values,
+            prompt=prompt,
+            name=args.automation_name,
+            interval_minutes=args.automation_interval_minutes,
+        )
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        print(prompt)
     return 0
 
 

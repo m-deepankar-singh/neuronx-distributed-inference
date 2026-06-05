@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import sys
 from pathlib import Path
 
@@ -106,6 +107,36 @@ def test_render_prompt_rejects_missing_required_env_key():
         raise AssertionError("missing PIDFILE should fail")
 
 
+def test_build_automation_payload_uses_speed_slice_name_and_prompt():
+    values = {
+        "BASE": "qwen36_very_long_candidate_name_that_should_be_safely_shortened",
+        "SPEED_SLICE": "hostlogits_lmheadbf16",
+    }
+
+    payload = _SCRIPT.build_automation_payload(
+        values,
+        prompt="Monitor this compile",
+        interval_minutes=7,
+    )
+
+    assert payload["mode"] == "create"
+    assert payload["kind"] == "heartbeat"
+    assert payload["destination"] == "thread"
+    assert payload["status"] == "ACTIVE"
+    assert payload["rrule"] == "FREQ=MINUTELY;INTERVAL=7"
+    assert payload["name"] == "monitor-qwen-hostlogits-lmheadbf16-compile"
+    assert payload["prompt"] == "Monitor this compile"
+
+
+def test_build_automation_payload_rejects_non_positive_interval():
+    try:
+        _SCRIPT.build_automation_payload({}, prompt="x", interval_minutes=0)
+    except ValueError as exc:
+        assert "interval_minutes" in str(exc)
+    else:
+        raise AssertionError("non-positive interval should fail")
+
+
 def test_main_uses_env_log_argument_when_envlog_key_is_missing(
     tmp_path,
     capsys,
@@ -136,3 +167,42 @@ def test_main_uses_env_log_argument_when_envlog_key_is_missing(
 
     assert _SCRIPT.main() == 0
     assert f"Env log: {env_log}" in capsys.readouterr().out
+
+
+def test_main_can_emit_automation_json_payload(tmp_path, capsys, monkeypatch):
+    env_log = tmp_path / "compile_env.txt"
+    env_log.write_text(
+        "BASE=qwen36_hostlogits_test\n"
+        "ARTIFACT=/artifact\n"
+        "WORKDIR=/work\n"
+        "LOG=/compile.log\n"
+        "ENVLOG=/env.txt\n"
+        "PIDFILE=/compile.pid\n"
+        "SPEED_SLICE=hostlogits\n"
+    )
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "qwen36_compile_monitor_prompt.py",
+            "--env-log",
+            str(env_log),
+            "--source-dir",
+            "/repo",
+            "--source-commit",
+            "abc1234",
+            "--automation-json",
+            "--automation-name",
+            "monitor-explicit-name",
+            "--automation-interval-minutes",
+            "12",
+        ],
+    )
+
+    assert _SCRIPT.main() == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["name"] == "monitor-explicit-name"
+    assert payload["rrule"] == "FREQ=MINUTELY;INTERVAL=12"
+    assert payload["kind"] == "heartbeat"
+    assert "PID file: /compile.pid" in payload["prompt"]
