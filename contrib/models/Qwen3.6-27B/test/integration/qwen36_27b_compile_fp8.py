@@ -34,6 +34,16 @@ _FP8_ENV_DEFAULTS = {
 _WEIGHT_DTYPE_FP8_MLP_ONLY = "fp8_mlp_only"
 _WEIGHT_DTYPE_FP8_FULL = "fp8_full"
 _WEIGHT_DTYPE_BF16_CONTROL = "bf16_control"
+_FP8_EXCLUDE_GROUPS = {
+    "linear_attn",
+    "linear_attn_qkv",
+    "linear_attn_z",
+    "linear_attn_out_proj",
+    "mlp",
+    "self_attn",
+    "self_attn_qkv",
+    "self_attn_o_proj",
+}
 _DELTANET_CTE_BACKEND_ENV = {
     "USE_NKI_FUSED",
     "USE_NKI_CHUNKED",
@@ -446,6 +456,8 @@ def _full_fp8_modules_to_not_convert(
     num_layers: int,
     *,
     quantize_lm_head: bool,
+    quantize_linear_attn_gates: bool = False,
+    fp8_exclude_groups: set[str] | None = None,
 ) -> list[str]:
     """Exclude non-linear or sensitive modules from full FP8 conversion.
 
@@ -453,6 +465,7 @@ def _full_fp8_modules_to_not_convert(
     matmuls, keep lm_head in higher precision unless explicitly requested, and
     keep normalization/cache/state tensors unquantized.
     """
+    fp8_exclude_groups = fp8_exclude_groups or set()
     modules = [
         "embed_tokens",
         "model.embed_tokens",
@@ -462,6 +475,10 @@ def _full_fp8_modules_to_not_convert(
         "model.rotary_emb",
         "mrope_emb",
         "model.mrope_emb",
+        "hybrid_gdn_checkpoint_cache.recurrent_slots",
+        "hybrid_gdn_checkpoint_cache.conv_slots",
+        "model.hybrid_gdn_checkpoint_cache.recurrent_slots",
+        "model.hybrid_gdn_checkpoint_cache.conv_slots",
     ]
     if not quantize_lm_head:
         modules.extend(["lm_head", "model.lm_head"])
@@ -490,6 +507,38 @@ def _full_fp8_modules_to_not_convert(
                     f"{layer_prefix}.linear_attn.conv_state_buffer",
                 ]
             )
+            if not quantize_linear_attn_gates:
+                modules.extend(
+                    [
+                        f"{layer_prefix}.linear_attn.in_proj_a",
+                        f"{layer_prefix}.linear_attn.in_proj_b",
+                        f"{layer_prefix}.linear_attn.in_proj_ba",
+                    ]
+                )
+            if "linear_attn" in fp8_exclude_groups:
+                modules.append(f"{layer_prefix}.linear_attn")
+            else:
+                if "linear_attn_qkv" in fp8_exclude_groups:
+                    modules.append(f"{layer_prefix}.linear_attn.in_proj_qkv")
+                if "linear_attn_z" in fp8_exclude_groups:
+                    modules.append(f"{layer_prefix}.linear_attn.in_proj_z")
+                if "linear_attn_out_proj" in fp8_exclude_groups:
+                    modules.append(f"{layer_prefix}.linear_attn.out_proj")
+            if "mlp" in fp8_exclude_groups:
+                modules.append(f"{layer_prefix}.mlp")
+            if "self_attn" in fp8_exclude_groups:
+                modules.append(f"{layer_prefix}.self_attn")
+            else:
+                if "self_attn_qkv" in fp8_exclude_groups:
+                    modules.extend(
+                        [
+                            f"{layer_prefix}.self_attn.q_proj",
+                            f"{layer_prefix}.self_attn.k_proj",
+                            f"{layer_prefix}.self_attn.v_proj",
+                        ]
+                    )
+                if "self_attn_o_proj" in fp8_exclude_groups:
+                    modules.append(f"{layer_prefix}.self_attn.o_proj")
     return modules
 
 
@@ -540,7 +589,10 @@ def _is_full_fp8_weight(
     name: str,
     *,
     quantize_lm_head: bool,
+    quantize_linear_attn_gates: bool = False,
+    fp8_exclude_groups: set[str] | None = None,
 ) -> bool:
+    fp8_exclude_groups = fp8_exclude_groups or set()
     if not name.endswith(".weight"):
         return False
     parts = name.split(".")
@@ -551,6 +603,26 @@ def _is_full_fp8_weight(
 
     module_name = parts[-3]
     projection_name = parts[-2]
+    if module_name == "mlp" and "mlp" in fp8_exclude_groups:
+        return False
+    if module_name == "self_attn":
+        if "self_attn" in fp8_exclude_groups:
+            return False
+        if projection_name in {"q_proj", "k_proj", "v_proj"}:
+            return "self_attn_qkv" not in fp8_exclude_groups
+        if projection_name == "o_proj":
+            return "self_attn_o_proj" not in fp8_exclude_groups
+    if module_name == "linear_attn":
+        if "linear_attn" in fp8_exclude_groups:
+            return False
+        if projection_name in {"in_proj_a", "in_proj_b", "in_proj_ba"}:
+            return quantize_linear_attn_gates
+        if projection_name == "in_proj_qkv":
+            return "linear_attn_qkv" not in fp8_exclude_groups
+        if projection_name == "in_proj_z":
+            return "linear_attn_z" not in fp8_exclude_groups
+        if projection_name == "out_proj":
+            return "linear_attn_out_proj" not in fp8_exclude_groups
     supported_projection_names = {
         "mlp": {"gate_proj", "up_proj", "down_proj"},
         "self_attn": {"q_proj", "k_proj", "v_proj", "o_proj"},
@@ -583,6 +655,8 @@ def _save_manual_fp8_state_dict(
     weight_dtype: str,
     quantize_edge_mlp_layers: bool,
     quantize_lm_head: bool,
+    quantize_linear_attn_gates: bool = False,
+    fp8_exclude_groups: set[str] | None = None,
 ) -> None:
     """Create a sharded FP8 checkpoint directly from HF safetensors.
 
@@ -595,6 +669,7 @@ def _save_manual_fp8_state_dict(
         quantize_fp8_per_channel,
     )
 
+    fp8_exclude_groups = fp8_exclude_groups or set()
     num_layers = int(_load_text_config(model_path)["num_hidden_layers"])
     index_path = model_path / "model.safetensors.index.json"
     if index_path.exists():
@@ -627,6 +702,8 @@ def _save_manual_fp8_state_dict(
                 should_quantize = _is_full_fp8_weight(
                     name,
                     quantize_lm_head=quantize_lm_head,
+                    quantize_linear_attn_gates=quantize_linear_attn_gates,
+                    fp8_exclude_groups=fp8_exclude_groups,
                 )
             else:
                 raise ValueError(f"Unsupported FP8 weight dtype: {weight_dtype}")
@@ -678,10 +755,13 @@ def _build_config(args: argparse.Namespace):
     model_path = Path(args.model_path).expanduser().resolve()
     config_dict = _load_text_config(model_path)
     num_layers = int(config_dict["num_hidden_layers"])
+    fp8_exclude_groups = set(getattr(args, "fp8_exclude_groups", []) or [])
     if args.weight_dtype == _WEIGHT_DTYPE_FP8_FULL:
         modules_to_not_convert = _full_fp8_modules_to_not_convert(
             num_layers,
             quantize_lm_head=args.quantize_lm_head,
+            quantize_linear_attn_gates=args.fp8_quantize_linear_attn_gates,
+            fp8_exclude_groups=fp8_exclude_groups,
         )
     else:
         modules_to_not_convert = _mlp_only_modules_to_not_convert(num_layers)
@@ -793,6 +873,10 @@ def _build_config(args: argparse.Namespace):
         neuron_config_kwargs["vocab_parallel"] = True
         if args.output_logits_with_on_device_sampling:
             neuron_config_kwargs["output_logits"] = True
+    if args.disable_argmax_kernel:
+        neuron_config_kwargs["disable_argmax_kernel"] = True
+    if args.disable_context_encoding_argmax_kernel:
+        neuron_config_kwargs["disable_context_encoding_argmax_kernel"] = True
     if args.enable_prefix_caching or args.enable_hybrid_apc or args.enable_vllm_chunked_prefill:
         neuron_config_kwargs["is_block_kv_layout"] = True
         neuron_config_kwargs["pa_block_size"] = args.block_size
@@ -978,6 +1062,16 @@ def main() -> int:
             "host argmax."
         ),
     )
+    parser.add_argument(
+        "--disable-argmax-kernel",
+        action="store_true",
+        help="Disable the token-generation argmax NKI kernel in NeuronConfig.",
+    )
+    parser.add_argument(
+        "--disable-context-encoding-argmax-kernel",
+        action="store_true",
+        help="Disable the context-encoding argmax NKI kernel in NeuronConfig.",
+    )
     parser.add_argument("--kernel-q-tile-size", type=int, default=128)
     parser.add_argument("--kernel-kv-tile-size", type=int, default=1024)
     parser.add_argument(
@@ -1143,6 +1237,34 @@ def main() -> int:
             "matching common NVIDIA/vLLM FP8 policy."
         ),
     )
+    parser.add_argument(
+        "--fp8-quantize-linear-attn-gates",
+        action="store_true",
+        help=(
+            "Quantize DeltaNet gate projections in fp8_full mode. This is "
+            "opt-in because the coherent baseline keeps recurrent state in "
+            "higher precision while allowing the old-policy gate weight path "
+            "to be reproduced explicitly."
+        ),
+    )
+    parser.add_argument(
+        "--fp8-exclude-groups",
+        nargs="*",
+        choices=sorted(_FP8_EXCLUDE_GROUPS),
+        default=[],
+        help=(
+            "Optional fp8_full exclusion groups for one-variable FP8 policy "
+            "bisects."
+        ),
+    )
+    parser.add_argument(
+        "--postprocess-only",
+        action="store_true",
+        help=(
+            "Skip quantization/compile and only add reloadable checkpoint-bank "
+            "weights plus neuron_config JSON sanitization to an existing artifact."
+        ),
+    )
     parser.add_argument("--force-quantize", action="store_true")
     parser.add_argument("--quantize-only", action="store_true")
     parser.add_argument("--load-after-compile", action="store_true")
@@ -1154,6 +1276,12 @@ def main() -> int:
         parser.error("--quantized-checkpoints-path is required for FP8 weight modes")
     if args.quantize_lm_head and args.weight_dtype != _WEIGHT_DTYPE_FP8_FULL:
         parser.error("--quantize-lm-head is only valid with --weight-dtype fp8_full")
+    if args.fp8_quantize_linear_attn_gates and args.weight_dtype != _WEIGHT_DTYPE_FP8_FULL:
+        parser.error(
+            "--fp8-quantize-linear-attn-gates is only valid with --weight-dtype fp8_full"
+        )
+    if args.fp8_exclude_groups and args.weight_dtype != _WEIGHT_DTYPE_FP8_FULL:
+        parser.error("--fp8-exclude-groups is only valid with --weight-dtype fp8_full")
     if args.enable_split_qkv_tkg_nki_kernel and (
         args.enable_fused_qkv
         or args.enable_qkv_nki_kernels
@@ -1235,6 +1363,16 @@ def main() -> int:
     else:
         print("FP8_MODE disabled_bf16_control", flush=True)
     print("QUANTIZE_LM_HEAD", bool(args.quantize_lm_head), flush=True)
+    print(
+        "FP8_QUANTIZE_LINEAR_ATTN_GATES",
+        bool(args.fp8_quantize_linear_attn_gates),
+        flush=True,
+    )
+    print(
+        "FP8_EXCLUDE_GROUPS",
+        ",".join(sorted(set(args.fp8_exclude_groups))) or "none",
+        flush=True,
+    )
     print("MODEL_PATH", str(model_path), flush=True)
     print("COMPILED_PATH", str(compiled_path), flush=True)
     print("BASE_COMPILE_WORK_DIR", str(base_compile_work_dir), flush=True)
@@ -1294,6 +1432,14 @@ def main() -> int:
                 "enable_quantized_mlp_kernel": args.enable_quantized_mlp_kernel,
                 "enable_k_cache_transposed": args.enable_k_cache_transposed,
                 "enable_kv_cache_quant": args.enable_kv_cache_quant,
+                "disable_argmax_kernel": args.disable_argmax_kernel,
+                "disable_context_encoding_argmax_kernel": (
+                    args.disable_context_encoding_argmax_kernel
+                ),
+                "fp8_quantize_linear_attn_gates": (
+                    args.fp8_quantize_linear_attn_gates
+                ),
+                "fp8_exclude_groups": sorted(set(args.fp8_exclude_groups)),
                 "block_size": args.block_size,
                 "pa_min_blocks": _pa_min_blocks(args),
                 "pa_requested_blocks": _pa_requested_blocks(args),
@@ -1315,6 +1461,17 @@ def main() -> int:
         flush=True,
     )
 
+    if args.postprocess_only:
+        if not compiled_path.exists():
+            raise FileNotFoundError(
+                f"--postprocess-only requires existing artifact: {compiled_path}"
+            )
+        print("POSTPROCESS_ONLY_START", flush=True)
+        _ensure_hybrid_checkpoint_weights(compiled_path, inf_config)
+        _sanitize_reloadable_neuron_config(compiled_path)
+        print("COMPILE_DONE", flush=True)
+        return 0
+
     if args.weight_dtype == _WEIGHT_DTYPE_BF16_CONTROL:
         print("QUANTIZE_SKIP bf16_control", flush=True)
     elif args.force_quantize or not _quantized_checkpoint_ready(quantized_path):
@@ -1325,6 +1482,8 @@ def main() -> int:
             weight_dtype=args.weight_dtype,
             quantize_edge_mlp_layers=args.quantize_edge_mlp_layers,
             quantize_lm_head=args.quantize_lm_head,
+            quantize_linear_attn_gates=args.fp8_quantize_linear_attn_gates,
+            fp8_exclude_groups=set(args.fp8_exclude_groups),
         )
         print("QUANTIZE_DONE", flush=True)
     else:
