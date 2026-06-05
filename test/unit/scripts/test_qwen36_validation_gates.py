@@ -21,6 +21,10 @@ _BOUNDARY_APC = _load_script(
     "qwen36_openai_boundary_apc_probe",
     "validation_scripts/qwen36_openai_boundary_apc_probe.py",
 )
+_CHAT_BENCH = _load_script(
+    "qwen36_chat_completion_context_bench",
+    "validation_scripts/qwen36_chat_completion_context_bench.py",
+)
 
 
 def test_chat_apc_gate_fails_without_exact_repeats():
@@ -51,3 +55,27 @@ def test_boundary_metric_snapshot_is_optional(monkeypatch):
     monkeypatch.setattr(_BOUNDARY_APC.urllib.request, "urlopen", raise_url_error)
 
     assert _BOUNDARY_APC._metric_snapshot("http://127.0.0.1:8000", 0.1) == {}
+
+
+def test_chat_context_bench_detects_advertised_model(monkeypatch):
+    def fake_load_json(url, timeout):
+        assert url == "http://127.0.0.1:8001/v1/models"
+        assert timeout == 3.0
+        return 200, {"data": [{"id": "/served/qwen-artifact"}]}
+
+    monkeypatch.setattr(_CHAT_BENCH, "_load_json_from_url", fake_load_json)
+
+    assert (
+        _CHAT_BENCH._detect_model("http://127.0.0.1:8001", "fallback", 3.0)
+        == "/served/qwen-artifact"
+    )
+
+
+def test_chat_context_bench_detect_model_falls_back_on_empty_payload(monkeypatch):
+    monkeypatch.setattr(
+        _CHAT_BENCH,
+        "_load_json_from_url",
+        lambda *_args, **_kwargs: (200, {"data": []}),
+    )
+
+    assert _CHAT_BENCH._detect_model("http://127.0.0.1:8001", "fallback", 3.0) == "fallback"

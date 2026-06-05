@@ -280,7 +280,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-url", default="http://127.0.0.1:8001")
     parser.add_argument("--model", default="auto")
-    parser.add_argument("--chat-model", default="Qwen3.6-27B")
+    parser.add_argument("--chat-model", default="auto")
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--serve-log", action="append", default=[])

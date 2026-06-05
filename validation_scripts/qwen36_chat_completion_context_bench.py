@@ -25,6 +25,30 @@ def _parse_lengths(raw: str) -> list[int]:
     return lengths
 
 
+def _load_json_from_url(url: str, timeout: float) -> tuple[int, dict[str, Any]]:
+    request = urllib.request.Request(url, method="GET")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return response.status, json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        try:
+            payload = json.loads(exc.read().decode("utf-8"))
+        except Exception:
+            payload = {"error": {"message": str(exc)}}
+        return exc.code, payload
+
+
+def _detect_model(base_url: str, fallback: str, timeout: float) -> str:
+    status, payload = _load_json_from_url(base_url.rstrip("/") + "/v1/models", timeout)
+    if status < 400:
+        data = payload.get("data") if isinstance(payload, dict) else None
+        if isinstance(data, list) and data:
+            model_id = data[0].get("id")
+            if isinstance(model_id, str) and model_id:
+                return model_id
+    return fallback
+
+
 def _chat_token_count(tokenizer: Any, messages: list[dict[str, str]]) -> int:
     try:
         token_ids = tokenizer.apply_chat_template(
@@ -447,7 +471,13 @@ def main() -> int:
     from transformers import AutoTokenizer  # noqa: WPS433
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
-    endpoint = args.base_url.rstrip("/") + "/v1/chat/completions"
+    base_url = args.base_url.rstrip("/")
+    model = (
+        _detect_model(base_url, "Qwen3.6-27B", args.timeout)
+        if args.model == "auto"
+        else args.model
+    )
+    endpoint = base_url + "/v1/chat/completions"
     results = []
     for target_tokens in _parse_lengths(args.lengths):
         for repeat_idx in range(args.repeats):
@@ -478,7 +508,7 @@ def main() -> int:
                 group_results = [
                     _run_one(
                         url=endpoint,
-                        model=args.model,
+                        model=model,
                         messages=requests[0]["messages"],
                         max_tokens=args.max_tokens,
                         timeout=args.timeout,
@@ -493,7 +523,7 @@ def main() -> int:
                         executor.submit(
                             _run_one,
                             url=endpoint,
-                            model=args.model,
+                            model=model,
                             messages=request["messages"],
                             max_tokens=args.max_tokens,
                             timeout=args.timeout,
@@ -529,8 +559,8 @@ def main() -> int:
                 results.append(row)
 
     output = {
-        "base_url": args.base_url,
-        "model": args.model,
+        "base_url": base_url,
+        "model": model,
         "lengths": _parse_lengths(args.lengths),
         "turns": args.turns,
         "repeats": args.repeats,

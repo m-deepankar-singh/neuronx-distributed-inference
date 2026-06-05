@@ -19,7 +19,7 @@ def _args(**overrides):
     defaults = dict(
         base_url="http://127.0.0.1:8001",
         model="auto",
-        chat_model="Qwen3.6-27B",
+        chat_model="auto",
         model_path="/models/Qwen3.6-27B",
         output_dir="/tmp/qwen-runtime-validation",
         serve_log=["/logs/server.log"],
@@ -68,6 +68,8 @@ def test_build_steps_orders_coherence_log_scan_then_speed():
     assert steps[-1].phase == "speed"
     assert "qwen36_runtime_log_scan.py" in steps[-2].command[1]
     assert "qwen36_raw_completion_prefill_bench.py" in steps[-1].command[1]
+    chat_step = next(step for step in steps if step.name == "chat_multiturn")
+    assert chat_step.command[chat_step.command.index("--model") + 1] == "auto"
     assert "--lengths" in steps[-1].command
     assert "16384" in steps[-1].command
 
