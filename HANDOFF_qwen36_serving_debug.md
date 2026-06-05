@@ -657,3 +657,7 @@ bash tmp_compile_qwen32k_segcte2048_gdnseg512.sh
    - Ready requires `Finished Compilation for all HLOs`, `COMPILE_DONE`, no configured failure markers, `CHECKPOINT_BANK_WEIGHTS_ADDED` for tp0..tp3, and artifact files `model.pt` plus `neuron_config.json`.
    - The compile automation prompt generator now instructs future monitors to run `validation_scripts/qwen36_compile_status.py --env-log <env-log>` before rsync/runtime validation.
    - Verification passed locally: `python3 -m py_compile validation_scripts/qwen36_compile_status.py test/unit/scripts/test_qwen36_compile_status.py validation_scripts/qwen36_compile_monitor_prompt.py test/unit/scripts/test_qwen36_compile_monitor_prompt.py`; `python3 -m pytest test/unit/scripts/test_qwen36_compile_status.py test/unit/scripts/test_qwen36_compile_monitor_prompt.py`; `python3 validation_scripts/qwen36_compile_status.py --help`; and a synthetic env/log/artifact CLI smoke that returned `state=ready`.
+
+48. Removed stale `/tmp/tmp_bisect_probe3.py` automation dependency.
+   - The old ad hoc `/tmp/tmp_bisect_probe3.py` probe was previously missing on both runtime and compile hosts. The compile monitor prompt now explicitly points to the maintained `validation_scripts/qwen36_runtime_validation_matrix.py` driver instead of telling future monitors to use the missing tmp helper.
+   - The maintained matrix still covers the intended gates: exact boundaries, repeated 2500 prompt, unique 4k sweep, long raw prompts, chat multi-turn, runtime log scan, and raw cold-prefill speed after coherence.

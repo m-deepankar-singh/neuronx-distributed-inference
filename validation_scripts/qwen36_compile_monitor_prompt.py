@@ -123,7 +123,7 @@ If successful: verify artifact files and neuron_config, rsync EC2-to-EC2 from {c
 
 Preferred validation driver after launch: `validation_scripts/qwen36_runtime_validation_matrix.py --base-url http://127.0.0.1:<port> --model-path {model_path} --serve-log <serve.log> --output-dir <validation-output-dir>`. It runs the coherence/log-scan/speed gates in order and skips speed automatically if coherence or log scan fails.
 
-Coherence matrix: `/tmp/tmp_bisect_probe3.py`; exact boundary lengths {boundary_lengths}; unique 4k sweep around 4088..4104; repeated 2500 prompt; multi-turn probes at 160, 1225, and 2500; long probes at 8192 and 16384 where the artifact supports them. Runtime log scan must use `validation_scripts/qwen36_runtime_log_scan.py` and show zero matches for {scan}.
+Coherence matrix: use the maintained `validation_scripts/qwen36_runtime_validation_matrix.py` driver, not the old ad hoc `/tmp/tmp_bisect_probe3.py` helper that has been missing on runtime hosts. It must cover exact boundary lengths {boundary_lengths}, the unique 4k sweep around 4088..4104, repeated 2500 prompt, multi-turn probes at 160, 1225, and 2500, and long probes at 8192 and 16384 where the artifact supports them. Runtime log scan must use `validation_scripts/qwen36_runtime_log_scan.py` and show zero matches for {scan}.
 
 Speed validation only after coherence passes: run `validation_scripts/qwen36_raw_completion_prefill_bench.py --lengths 16384 --repeats 3 --max-tokens 1`; it requests `stream_options.include_usage=true` and computes tok/s from `usage.prompt_tokens / TTFT`. Report coherence verdict, log-scan result, cold-prefill tok/s, and all JSON/log paths.
 
