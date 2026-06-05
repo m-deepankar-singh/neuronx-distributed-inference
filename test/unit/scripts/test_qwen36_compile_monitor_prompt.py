@@ -144,6 +144,21 @@ def test_build_automation_payload_rejects_non_positive_interval():
         raise AssertionError("non-positive interval should fail")
 
 
+def test_automation_name_preserves_timestamp_when_base_is_long():
+    payload = _SCRIPT.build_automation_payload(
+        {
+            "BASE": "qwen36_" + ("verylongcomponent_" * 8),
+            "SPEED_SLICE": "none",
+            "TS": "20260606T010203Z_hostlogits",
+        },
+        prompt="Monitor this compile",
+    )
+
+    assert payload["name"].startswith("monitor-qwen36-")
+    assert payload["name"].endswith("20260606t010203z-hostlogits-compile")
+    assert len(payload["name"]) <= len("monitor-") + 56 + len("-compile")
+
+
 def test_main_uses_env_log_argument_when_envlog_key_is_missing(
     tmp_path,
     capsys,

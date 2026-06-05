@@ -134,8 +134,26 @@ def _default_next_ts(next_slice: str) -> str:
 
 
 def _automation_name(next_slice: str, ts: str) -> str:
-    slug = re.sub(r"[^a-zA-Z0-9]+", "-", f"{next_slice}-{ts}").strip("-").lower()
-    return f"monitor-qwen-{slug[:56]}-compile"
+    slug = _slug_with_suffix(f"qwen-{next_slice}", ts)
+    return f"monitor-{slug}-compile"
+
+
+def _slug(value: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9]+", "-", value).strip("-").lower()
+
+
+def _slug_with_suffix(head: str, suffix: str, max_len: int = 56) -> str:
+    head_slug = _slug(head)
+    suffix_slug = _slug(suffix)
+    if not suffix_slug:
+        return head_slug[:max_len]
+    if len(suffix_slug) >= max_len:
+        return suffix_slug[-max_len:]
+    available_head = max_len - len(suffix_slug) - 1
+    if available_head <= 0:
+        return suffix_slug[-max_len:]
+    joined = f"{head_slug[:available_head].strip('-')}-{suffix_slug}".strip("-")
+    return joined[:max_len]
 
 
 def next_preflight(

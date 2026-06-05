@@ -61,16 +61,31 @@ def _automation_name(values: dict[str, str], override: str | None = None) -> str
         return override
     base = values.get("BASE", "qwen36-compile")
     speed_slice = values.get("SPEED_SLICE", "")
-    slug_parts = [speed_slice if speed_slice and speed_slice != "none" else base]
-    if values.get("TS"):
-        slug_parts.append(values["TS"])
-    slug_source = "-".join(slug_parts)
-    slug = re.sub(r"[^a-zA-Z0-9]+", "-", slug_source).strip("-").lower()
+    slug_source = speed_slice if speed_slice and speed_slice != "none" else base
+    if not _slug(slug_source).startswith("qwen"):
+        slug_source = f"qwen-{slug_source}"
+    slug = _slug_with_suffix(slug_source, values.get("TS", ""))
     if not slug:
         slug = "qwen36-compile"
-    if not slug.startswith("qwen"):
-        slug = f"qwen-{slug}"
-    return f"monitor-{slug[:56]}-compile"
+    return f"monitor-{slug}-compile"
+
+
+def _slug(value: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9]+", "-", value).strip("-").lower()
+
+
+def _slug_with_suffix(head: str, suffix: str, max_len: int = 56) -> str:
+    head_slug = _slug(head)
+    suffix_slug = _slug(suffix)
+    if not suffix_slug:
+        return head_slug[:max_len]
+    if len(suffix_slug) >= max_len:
+        return suffix_slug[-max_len:]
+    available_head = max_len - len(suffix_slug) - 1
+    if available_head <= 0:
+        return suffix_slug[-max_len:]
+    joined = f"{head_slug[:available_head].strip('-')}-{suffix_slug}".strip("-")
+    return joined[:max_len]
 
 
 def build_automation_payload(

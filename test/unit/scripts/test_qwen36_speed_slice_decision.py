@@ -148,6 +148,17 @@ def test_slow_hostlogits_advances_to_lmhead_bf16_only():
     ]
 
 
+def test_decision_automation_name_preserves_long_timestamp_suffix():
+    name = _SCRIPT._automation_name(
+        "hostlogits_lmheadbf16",
+        "20260606T010203Z_hostlogits_lmheadbf16",
+    )
+
+    assert name.startswith("monitor-qwen-hostlogits-")
+    assert name.endswith("20260606t010203z-hostlogits-lmheadbf16-compile")
+    assert len(name) <= len("monitor-") + 56 + len("-compile")
+
+
 def test_slow_final_planned_slice_profiles_instead_of_branching():
     decision = _SCRIPT.decide(
         env_values={"SPEED_SLICE": "hostlogits_lmheadbf16"},
