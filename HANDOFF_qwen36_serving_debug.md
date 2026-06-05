@@ -403,18 +403,54 @@ Ported rebuild commits:
      - Local syntax: `python3 -m py_compile` passed for `config.py`, `gqa.py`, `attention_base.py`, and `qwen36_27b_compile_fp8.py`; `bash -n tmp_compile_qwen32k_segcte2048_gdnseg512.sh` passed.
      - Remote targeted tests under compile venv with `NEURON_PLATFORM_TARGET_OVERRIDE=trn2`: `python -m pytest test/unit/modules/attention/test_gqa.py -q` passed `14 passed`; focused attention-base tests including `test_prep_qkv_tensors_fuses_qk_norm_without_fusing_rope` and `test_prep_qkv_tensors_does_not_fuse_partial_rope_cache` passed `9 passed`.
 
+35. QKV CTE qk-norm-only compile completed and validated; coherent but still slow.
+   - Source branch/workdir: `/private/tmp/inferentia-gdn-prefill-speed-coherent`, branch `codex/qwen36-prefill-speed-coherent`.
+   - Local commits: `244f6d2 Add Qwen-safe QKV fused qk norm rope`, `3356b88 Add QKV CTE qk norm only fusion`.
+   - Compile host/source: `ubuntu@16.26.135.243`, `/home/ubuntu/inferentia-gdn-prefill-speed-coherent`, remote commit `8c308e4`.
+   - Compile PID/log/env:
+     - PID `95304`
+     - `/home/ubuntu/validation_logs/fp8_256k_decode_nki/qwen36_32k_fp8_fp8all_lmheadfp8_gatesfp8_kvbf16_qkvnki_qknorm_attention_cte512_gdnseg0_cte2048_pfx32k_slots64_20260605T195500Z_qknorm_direct_scan0_compile.log`
+     - `/home/ubuntu/validation_logs/fp8_256k_decode_nki/qwen36_32k_fp8_fp8all_lmheadfp8_gatesfp8_kvbf16_qkvnki_qknorm_attention_cte512_gdnseg0_cte2048_pfx32k_slots64_20260605T195500Z_qknorm_direct_scan0_env.txt`
+   - Artifact: `/mnt/trainium_artifacts/qwen_artifacts/qwen36_32k_fp8_fp8all_lmheadfp8_gatesfp8_kvbf16_qkvnki_qknorm_attention_cte512_gdnseg0_cte2048_pfx32k_slots64_20260605T195500Z_qknorm_direct_scan0`.
+   - Compile shape: `ENABLE_QKV_NKI_KERNELS=1`, `ENABLE_QKV_CTE_NKI_KERNEL_FUSE_QK_NORM=1`, `ENABLE_QKV_CTE_NKI_KERNEL_FUSE_ROPE=0`, `PREFIX_CTE_ATTENTION_BACKEND=attention_cte`, `QWEN36_DELTANET_FUSED_SEGMENT_TOKENS=0`, `QWEN36_DELTANET_MULTIHEAD_CTE=0`, `QWEN36_DELTANET_SOLVE_MODE=direct`, `QWEN36_DELTANET_SOLVE_SCAN_STEPS=0`, `GDN_RECURRENT_CACHE_DTYPE=bfloat16`, `GDN_CONV_CACHE_DTYPE=bfloat16`, `CTE_BUCKETS_RAW=2048`, `MAX_CONTEXT_LENGTH=32768`, `ENABLE_KV_CACHE_QUANT=0`, `QUANTIZE_LM_HEAD=1`, `FP8_QUANTIZE_LINEAR_ATTN_GATES=1`.
+   - Compile evidence: all 13 HLOs compiled, `INFO:Neuron:Finished Compilation for all HLOs in 418.9846622943878 seconds`, `CHECKPOINT_BANK_WEIGHTS_ADDED tp0..tp3 48 48 torch.bfloat16 torch.bfloat16`, and `COMPILE_DONE`.
+   - Config evidence: compile trace contained `"enable_qkv_cte_nki_kernel_fuse_qk_norm": true`, `"enable_qkv_cte_nki_kernel_fuse_rope": false`, and `"prefix_cte_attention_backend": "attention_cte"`. Env log confirmed `ENABLE_QKV_CTE_NKI_KERNEL_FUSE_QK_NORM=1`, `ENABLE_QKV_CTE_NKI_KERNEL_FUSE_ROPE=0`, `PREFIX_CTE_ATTENTION_BACKEND=attention_cte`, and `GDN_RECURRENT_CACHE_DTYPE=bfloat16`.
+   - Artifact verification: runtime artifact has `model.pt` `714M`, `neuron_config.json` `105K`, and four `weights/tp{0..3}_sharded_checkpoint.safetensors` shards of `7.8G` each.
+   - Transfer: first direct rsync failed with `ubuntu@16.26.184.190: Permission denied (publickey)` and `rsync error ... code 255`; direct SSH was fixed by authorizing compile-host public key `/home/ubuntu/.ssh/qwen_rsync_ed25519.pub` on the runtime host. A second rsync still failed because local SSH stripped the quoted `-e 'ssh -i ...'` identity string, causing rsync to use the default key and hit the same publickey error. A `bash -lc` test also failed with SSH usage text because the command string was split. Mitigation: copied `/tmp/qwen_rsync_qknorm_artifact.sh` to the compile host and ran it there; final EC2-to-EC2 rsync transferred `34,034,976,633` bytes in about `0:02:04`.
+   - Launch: first wrapper launch failed before vLLM because `/home/ubuntu/inferentia-gdn-prefill-speed-coherent/tmp_launch_qwen36_segcte2048.sh` was not executable: `Permission denied`. Mitigation: changed wrapper to invoke `bash tmp_launch_qwen36_segcte2048.sh`. Relaunch reached `HEALTH_OK attempt=47`.
+   - Launch flags: wrapper `/home/ubuntu/launch_qwen36_qknorm_32k_runtime.sh` used `MAX_MODEL_LEN=32768`, `SEQ_LEN=32768`, `CTE_BUCKETS=2048`, context pairs `2048:{256,512,1024,2048,4096,8192,16384,32768}`, token buckets `{512,16384,16640,32768}`, `GDN_RECURRENT_CACHE_DTYPE=bfloat16`, `GDN_CONV_CACHE_DTYPE=bfloat16`, `NUM_GPU_BLOCKS_OVERRIDE=128`, `PORT=8001`, `QWEN36_DELTANET_MULTIHEAD_CTE=0`, `QWEN36_DELTANET_FUSED_SEGMENT_TOKENS=0`, `QWEN36_DELTANET_SOLVE_MODE=direct`, `QWEN36_DELTANET_SOLVE_SCAN_STEPS=0`.
+   - Runtime config evidence: live log shows pre-compiled artifact loaded from the qknorm artifact path, hybrid KV-cache spec for `16/64` attention layers, KV quant off, QKV NKI enabled, BF16 recurrent/conv dtypes, and `prefix_cte_attention_backend="attention_cte"`.
+   - Validation setup errors:
+     - `/tmp/tmp_bisect_probe3.py` was missing on both runtime and compile hosts. Mitigation: used maintained validators from `validation_scripts/` and copied small helper scripts `/tmp/qwen36_scan_runtime_log.py` and `/tmp/qwen36_16k_cold_prefill_bench.py` to runtime.
+     - A remote structured JSON check failed because SSH stripped the `python3 -c` quoting, producing `bash: -c: line 1: syntax error near unexpected token '('`. Mitigation: verified flags from compile trace and env log instead.
+     - A multi-word `grep` log scan failed with `grep: token_id: No such file or directory`, `grep: argmax: No such file or directory`, and similar path errors because patterns were split by the remote shell. Mitigation: replaced it with exact-string Python log scanning.
+     - First multi-turn chat probe failed with HTTP `404` because the script defaulted to model id `Qwen3.6-27B`; server model id was `/home/ubuntu/models/Qwen3.6-27B`. Mitigation: reran with `--model /home/ubuntu/models/Qwen3.6-27B`.
+   - Coherence matrix:
+     - Primary raw exact boundaries `146,160,485,505,526,1225,2048,2049,2500,4092,4096`: pass; all HTTP 200, valid OpenAI bodies, matching `usage.prompt_tokens`, non-empty coherent text. JSONL: `/home/ubuntu/validation_logs/fp8_256k_decode_nki/qknorm_boundary_probe_20260605T2035Z.jsonl`.
+     - Repeated exact `2500`: pass 3/3; each row had `2048` prompt-token prefix hit and coherent text. JSONL: `/home/ubuntu/validation_logs/fp8_256k_decode_nki/qknorm_repeat2500_20260605T2037Z.jsonl`.
+     - Unique 4k sweep `4088..4104`: pass all 17 rows, including `4103`; no empty text or mojibake. JSONL: `/home/ubuntu/validation_logs/fp8_256k_decode_nki/qknorm_4k_sweep_20260605T2038Z.jsonl`.
+     - Long raw exact `8192` and `16384`: pass with coherent non-empty text and matching usage. JSONL: `/home/ubuntu/validation_logs/fp8_256k_decode_nki/qknorm_long_probe_20260605T2041Z.jsonl`.
+     - Multi-turn chat `160,1225,2500`: pass after rerun with correct model id; streamed usage present; outputs included `ack 8`, `.`, and `lambda`. JSON: `/home/ubuntu/validation_logs/fp8_256k_decode_nki/qknorm_chat_multiturn_20260605T2043Z.json`.
+   - Runtime log scans: exact-string scanner found zero matches for `negative token_id`, `out-of-vocab token_id`, `fallback argmax`, `finite=0`, `nan=`, `NaN`, `NRT_RESOURCE`, `Traceback`, `RuntimeError`, or `Internal Server Error` after coherence probes and again after the speed benchmark.
+   - 16k cold-prefill speed: usage-accounted streaming `/v1/completions`, exact `usage.prompt_tokens=16384`, `max_tokens=1`, unique cold prompts:
+     - run 0: TTFT `26.088903736999782s`, `628.006 tok/s`
+     - run 1: TTFT `26.08751873199799s`, `628.040 tok/s`
+     - run 2: TTFT `26.083300692997s`, `628.141 tok/s`
+     - mean `628.063 tok/s`
+     - JSON: `/home/ubuntu/validation_logs/fp8_256k_decode_nki/qknorm_16k_cold_prefill_20260605T2045Z.json`.
+   - Conclusion: qk-norm-only QKV CTE fusion is compile-safe and coherence-safe, but it does not improve cold prefill over the coherent attention-CTE anchor. It should not be pursued further as the primary speed lever.
+
 ### Current next step
 
-We now have four coherent CTE2048 artifacts in the same slow prefill class:
+We now have five coherent CTE2048 artifacts in the same slow prefill class:
 
 - Standard QKV + segmented attention + GDN seg512: coherent, about `622 tok/s`.
 - QKV NKI + segmented attention + GDN seg512: coherent, about `626-633 tok/s`.
 - QKV NKI + segmented attention + GDN seg0: coherent, about `638 tok/s`.
 - QKV NKI + attention_cte + GDN seg0: coherent, about `627 tok/s`.
+- QKV NKI + qk-norm-only QKV CTE fusion + attention_cte + GDN seg0: coherent, about `628 tok/s`.
 
-The next compile should be exactly one variable from the coherent attention-CTE anchor: enable `ENABLE_QKV_CTE_NKI_KERNEL_FUSE_QK_NORM=1` and keep `ENABLE_QKV_CTE_NKI_KERNEL_FUSE_ROPE=0`. Full-head fused RoPE is now proven incompatible with Qwen3.6 partial RoPE in the stock NKI QKV kernel. Do not combine this qk-norm-only slice with output-proj NKI, MLP NKI, packed qkvgate, multihead DeltaNet CTE, or FP8 KV.
-
-If qkvnki_qknorm is coherent, run the full coherence matrix and then 16k cold-prefill usage benchmark. If it is coherent but still slow, the next candidate speed slice is output projection NKI because it affects context and is more isolated than MLP/qkvgate.
+The next compile should not touch QKV/QK-norm/RoPE again. The remaining isolated speed slice to try is output projection NKI from the coherent attention-CTE/qknorm anchor, because it affects the cold context graph and is more isolated than MLP/qkvgate. Keep all coherence invariants unchanged: `attention_cte`, CTE2048, GDN seg0, BF16 recurrent/conv banks, KV BF16, multihead DeltaNet CTE off, FP8 KV off, packed qkvgate off, MLP NKI off.
 
 Older profiling/comparison follow-ups remain useful if the QK-norm/RoPE slice fails:
 
