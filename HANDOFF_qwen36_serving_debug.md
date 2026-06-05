@@ -440,6 +440,30 @@ Ported rebuild commits:
      - JSON: `/home/ubuntu/validation_logs/fp8_256k_decode_nki/qknorm_16k_cold_prefill_20260605T2045Z.json`.
    - Conclusion: qk-norm-only QKV CTE fusion is compile-safe and coherence-safe, but it does not improve cold prefill over the coherent attention-CTE anchor. It should not be pursued further as the primary speed lever.
 
+36. Output-projection NKI compile toggle was added, but the one-variable output-proj speed slice failed at HLO trace and must not be enabled for Qwen3.6 yet.
+   - Source branch/workdir: `/private/tmp/inferentia-gdn-prefill-speed-coherent`, branch `codex/qwen36-prefill-speed-coherent`.
+   - Local commit: `3465373 Add output projection NKI compile toggle`.
+   - Compile-driver change: `tmp_compile_qwen32k_segcte2048_gdnseg512.sh` now exposes `ENABLE_OUT_PROJ_NKI_KERNEL=0|1`, tags artifacts as `outprojstd` or `outprojnki`, writes the flag to the env log, and passes `--enable-out-proj-nki-kernel` only when explicitly enabled. Local `bash -n tmp_compile_qwen32k_segcte2048_gdnseg512.sh` passed.
+   - Compile host/source: `ubuntu@16.26.135.243`, `/home/ubuntu/inferentia-gdn-prefill-speed-coherent`, remote HEAD `8c308e4` plus synced compile-driver change from local commit `3465373`.
+   - Compile PID/log/env:
+     - PID `108387`
+     - `/home/ubuntu/validation_logs/fp8_256k_decode_nki/qwen36_32k_fp8_fp8all_lmheadfp8_gatesfp8_kvbf16_qkvnki_qknorm_outprojnki_attention_cte512_gdnseg0_cte2048_pfx32k_slots64_20260605T205300Z_outproj_direct_scan0_compile.log`
+     - `/home/ubuntu/validation_logs/fp8_256k_decode_nki/qwen36_32k_fp8_fp8all_lmheadfp8_gatesfp8_kvbf16_qkvnki_qknorm_outprojnki_attention_cte512_gdnseg0_cte2048_pfx32k_slots64_20260605T205300Z_outproj_direct_scan0_env.txt`
+   - Artifact target: `/mnt/trainium_artifacts/qwen_artifacts/qwen36_32k_fp8_fp8all_lmheadfp8_gatesfp8_kvbf16_qkvnki_qknorm_outprojnki_attention_cte512_gdnseg0_cte2048_pfx32k_slots64_20260605T205300Z_outproj_direct_scan0`.
+   - Compile shape: one-variable delta from the coherent qk-norm anchor: `ENABLE_OUT_PROJ_NKI_KERNEL=1`, with `ENABLE_QKV_NKI_KERNELS=1`, `ENABLE_QKV_CTE_NKI_KERNEL_FUSE_QK_NORM=1`, `ENABLE_QKV_CTE_NKI_KERNEL_FUSE_ROPE=0`, `PREFIX_CTE_ATTENTION_BACKEND=attention_cte`, `QWEN36_DELTANET_FUSED_SEGMENT_TOKENS=0`, `QWEN36_DELTANET_MULTIHEAD_CTE=0`, `QWEN36_DELTANET_SOLVE_MODE=direct`, `QWEN36_DELTANET_SOLVE_SCAN_STEPS=0`, `GDN_RECURRENT_CACHE_DTYPE=bfloat16`, `GDN_CONV_CACHE_DTYPE=bfloat16`, `CTE_BUCKETS_RAW=2048`, `MAX_CONTEXT_LENGTH=32768`, `ENABLE_KV_CACHE_QUANT=0`, `QUANTIZE_LM_HEAD=1`, and `FP8_QUANTIZE_LINEAR_ATTN_GATES=1`.
+   - Env evidence: compile trace and env log both show `enable_out_proj_nki_kernel=true`, `enable_qkv_cte_nki_kernel_fuse_qk_norm=true`, `enable_qkv_cte_nki_kernel_fuse_rope=false`, `prefix_cte_attention_backend="attention_cte"`, KV quant off, and BF16 recurrent/conv caches.
+   - Failure stage: first context HLO trace, before neuron-cc/NKI compilation, while tracing `context_encoding_model` for shape `[1,2048]`.
+   - Exact error: `RuntimeError: Shapes are not compatible for broadcasting: bf16[1,2048,5120] vs. bf16[1,2048,1536]. Expected dimension 2 of shape bf16[1,2048,5120] (5120) to match dimension 2 of shape bf16[1,2048,1536] (1536). Either that or that any of them is either 1 or unbounded. Try reshaping one of the tensors to match the other.`
+   - Root cause hypothesis, strongly supported by source inspection: the generic `GroupQueryAttention_O._kernel_o_proj()` path derives output width `H` from the transposed/partitioned `RowParallelLinear` weight and returns a TP-local attention width (`1536`, Qwen local heads * head dim) instead of the model hidden width (`5120`). The failure then surfaces in `modeling_qwen35.py` at the residual add in the standard attention path. This is a Qwen weight-layout/kernel-support gap, not an output coherence bug.
+   - Fix/mitigation applied: do not enable `ENABLE_OUT_PROJ_NKI_KERNEL` in the coherent-speed rebuild. Leave the flag available for a future Qwen-specific output-proj kernel/layout fix, but keep default `0` and exclude it from the current speed path.
+   - Errors encountered and mitigated:
+     - Compile-host disk was too low before launch: `/mnt/trainium_artifacts` showed only `18G` free (`/dev/root 484G 466G 18G 97%`). Mitigation, with explicit approval: deleted obsolete compile-host artifact/workdir copies (`head_norowscale`, old attention-CTE/qk-norm workdirs, standard-QKV coherent copy, and old 256k kkt_hier copy), freeing space to `159G` available.
+     - Remote `git pull --ff-only` failed with `There is no tracking information for the current branch`, exit `1`. Mitigation: tried explicit branch pull.
+     - Explicit remote pull failed with `fatal: couldn't find remote ref codex/qwen36-prefill-speed-coherent`, exit `1`, because the EC2 clone's `origin` points to `/home/ubuntu/inferentia-gdn-decode-step-baseline-20260605`, not the local pushed branch. Mitigation: synced the single committed compile-driver file to the compile host with `scp` and verified the remote diff.
+     - Local search command including nonexistent `scripts` failed with `rg: scripts: No such file or directory (os error 2)`, exit `2`. Root cause: no `scripts/` directory in this checkout. Mitigation: searched concrete existing paths.
+     - A remote grep evidence command using `|` inside the pattern was split by the shell/tooling, causing commands such as `COMPILE_DONE: command not found`, `Traceback: command not found`, and `grep: Compilation: No such file or directory`. A second grep with a multi-word pattern still treated `Compilation` as a file. Mitigation: used direct `tail`/source inspection for the exact error and avoid multi-word/piped grep patterns in remote one-liners.
+   - Verification result: compile process exited; `ps -p 108387` returned no running process, no `COMPILE_DONE`, no `model.pt`, and no `Finished Compilation for all HLOs`. Automation `monitor-qwen-outproj-compile` should be deleted after this failure is fully reported.
+
 ### Current next step
 
 We now have five coherent CTE2048 artifacts in the same slow prefill class:
@@ -450,13 +474,13 @@ We now have five coherent CTE2048 artifacts in the same slow prefill class:
 - QKV NKI + attention_cte + GDN seg0: coherent, about `627 tok/s`.
 - QKV NKI + qk-norm-only QKV CTE fusion + attention_cte + GDN seg0: coherent, about `628 tok/s`.
 
-The next compile should not touch QKV/QK-norm/RoPE again. The remaining isolated speed slice to try is output projection NKI from the coherent attention-CTE/qknorm anchor, because it affects the cold context graph and is more isolated than MLP/qkvgate. Keep all coherence invariants unchanged: `attention_cte`, CTE2048, GDN seg0, BF16 recurrent/conv banks, KV BF16, multihead DeltaNet CTE off, FP8 KV off, packed qkvgate off, MLP NKI off.
+The next compile should not touch QKV/QK-norm/RoPE/output-proj again. Output-proj NKI is now ruled out for Qwen3.6 until the generic kernel path is fixed for Qwen's RowParallel attention output layout.
 
-Older profiling/comparison follow-ups remain useful if the QK-norm/RoPE slice fails:
+The next useful step is profiling/diffing, not another blind speed kernel:
 
 1. Profile/direct-run the current attention-CTE context NEFF with `NEURON_RT_INSPECT`/`neuron-profile`, and compare top kernels with the prior slow segmented-CTE profile and the fast full-FP8/CTE2048 artifact profile if available.
 2. Diff the compile-time config and generated HLO/NEFF set between the old fast CTE2048 artifact and the coherent artifacts, focusing on context graph shape, number of 2048 calls per 16k request, modular flow flags, qkv kernel selection, attention implementation, and hidden fallback to standard/dense kernels.
-3. Only after profiling identifies the heavy kernel, add the next speed slice. Candidate slices should be one-variable and coherence-gated: TKG/context modular flow, Q/K norm+RoPE NKI, output projection NKI, or MLP CTE NKI. Do not enable packed qkvgate, quantized MLP NKI, multihead DeltaNet CTE, or FP8 KV by default.
+3. Only after profiling identifies the heavy kernel, add the next speed slice. Candidate slices should be one-variable and coherence-gated. Do not enable packed qkvgate, quantized MLP NKI, multihead DeltaNet CTE, FP8 KV, full-head fused RoPE, or output-proj NKI by default.
 
 For this completed attention-CTE artifact, launch with BF16 recurrent banks:
 
