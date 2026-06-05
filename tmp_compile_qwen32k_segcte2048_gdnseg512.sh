@@ -7,6 +7,7 @@ ART_ROOT=${ART_ROOT:-/mnt/trainium_artifacts/qwen_artifacts}
 LOGDIR=${LOGDIR:-/home/ubuntu/validation_logs/fp8_256k_decode_nki}
 TS=${TS:-$(date -u +%Y%m%dT%H%M%SZ)}
 COMPILE_DRY_RUN=${COMPILE_DRY_RUN:-0}
+SPEED_SLICE=${SPEED_SLICE:-}
 
 SEQ_LEN=${SEQ_LEN:-32768}
 MAX_CONTEXT_LENGTH=${MAX_CONTEXT_LENGTH:-${SEQ_LEN}}
@@ -142,6 +143,59 @@ elif [[ "${ENABLE_KV_CACHE_QUANT}" != "0" ]]; then
   exit 2
 fi
 
+check_slice_eq() {
+  local key="$1"
+  local actual="$2"
+  local expected="$3"
+  if [[ "${actual}" != "${expected}" ]]; then
+    echo "ERROR: SPEED_SLICE=${SPEED_SLICE} requires ${key}=${expected}, got ${actual}" >&2
+    exit 2
+  fi
+}
+
+validate_speed_slice() {
+  case "${SPEED_SLICE}" in
+    "")
+      return 0
+      ;;
+    sampletokonly)
+      check_slice_eq "DISABLE_ON_DEVICE_SAMPLING" "${DISABLE_ON_DEVICE_SAMPLING}" "0"
+      check_slice_eq "OUTPUT_LOGITS_WITH_ON_DEVICE_SAMPLING" "${OUTPUT_LOGITS_WITH_ON_DEVICE_SAMPLING}" "0"
+      check_slice_eq "QUANTIZE_LM_HEAD" "${QUANTIZE_LM_HEAD}" "1"
+      ;;
+    hostlogits)
+      check_slice_eq "DISABLE_ON_DEVICE_SAMPLING" "${DISABLE_ON_DEVICE_SAMPLING}" "1"
+      check_slice_eq "OUTPUT_LOGITS_WITH_ON_DEVICE_SAMPLING" "${OUTPUT_LOGITS_WITH_ON_DEVICE_SAMPLING}" "0"
+      check_slice_eq "QUANTIZE_LM_HEAD" "${QUANTIZE_LM_HEAD}" "1"
+      ;;
+    hostlogits_lmheadbf16)
+      check_slice_eq "DISABLE_ON_DEVICE_SAMPLING" "${DISABLE_ON_DEVICE_SAMPLING}" "1"
+      check_slice_eq "OUTPUT_LOGITS_WITH_ON_DEVICE_SAMPLING" "${OUTPUT_LOGITS_WITH_ON_DEVICE_SAMPLING}" "0"
+      check_slice_eq "QUANTIZE_LM_HEAD" "${QUANTIZE_LM_HEAD}" "0"
+      ;;
+    *)
+      echo "ERROR: unknown SPEED_SLICE=${SPEED_SLICE}; expected sampletokonly, hostlogits, hostlogits_lmheadbf16, or empty" >&2
+      exit 2
+      ;;
+  esac
+
+  check_slice_eq "ENABLE_QKV_NKI_KERNELS" "${ENABLE_QKV_NKI_KERNELS}" "1"
+  check_slice_eq "ENABLE_QKV_CTE_NKI_KERNEL_FUSE_QK_NORM" "${ENABLE_QKV_CTE_NKI_KERNEL_FUSE_QK_NORM}" "1"
+  check_slice_eq "ENABLE_QKV_CTE_NKI_KERNEL_FUSE_ROPE" "${ENABLE_QKV_CTE_NKI_KERNEL_FUSE_ROPE}" "0"
+  check_slice_eq "ENABLE_OUT_PROJ_NKI_KERNEL" "${ENABLE_OUT_PROJ_NKI_KERNEL}" "0"
+  check_slice_eq "ENABLE_KV_CACHE_QUANT" "${ENABLE_KV_CACHE_QUANT}" "0"
+  check_slice_eq "PREFIX_CTE_ATTENTION_BACKEND" "${PREFIX_CTE_ATTENTION_BACKEND}" "attention_cte"
+  check_slice_eq "QWEN36_DELTANET_FUSED_SEGMENT_TOKENS" "${QWEN36_DELTANET_FUSED_SEGMENT_TOKENS}" "0"
+  check_slice_eq "QWEN36_DELTANET_MULTIHEAD_CTE" "${QWEN36_DELTANET_MULTIHEAD_CTE}" "0"
+  check_slice_eq "QWEN36_DELTANET_SOLVE_MODE" "${QWEN36_DELTANET_SOLVE_MODE}" "direct"
+  check_slice_eq "QWEN36_DELTANET_SOLVE_SCAN_STEPS" "${QWEN36_DELTANET_SOLVE_SCAN_STEPS}" "0"
+  check_slice_eq "GDN_RECURRENT_CACHE_DTYPE" "${GDN_RECURRENT_CACHE_DTYPE}" "bfloat16"
+  check_slice_eq "GDN_CONV_CACHE_DTYPE" "${GDN_CONV_CACHE_DTYPE}" "bfloat16"
+  check_slice_eq "CTE_BUCKETS_RAW" "${CTE_BUCKETS_RAW}" "2048"
+}
+
+validate_speed_slice
+
 FORCE_QUANTIZE_FLAGS=()
 if [[ "${FORCE_QUANTIZE}" == "1" ]]; then
   FORCE_QUANTIZE_FLAGS=(--force-quantize)
@@ -261,6 +315,7 @@ printf "%s\n" \
   "DISABLE_CONTEXT_ENCODING_ARGMAX_KERNEL=1" \
   "OUTPUT_LOGITS_WITH_ON_DEVICE_SAMPLING=${OUTPUT_LOGITS_WITH_ON_DEVICE_SAMPLING}" \
   "COMPILE_DRY_RUN=${COMPILE_DRY_RUN}" \
+  "SPEED_SLICE=${SPEED_SLICE:-none}" \
   >"${ENVLOG}"
 
 if [[ "${COMPILE_DRY_RUN}" == "1" ]]; then

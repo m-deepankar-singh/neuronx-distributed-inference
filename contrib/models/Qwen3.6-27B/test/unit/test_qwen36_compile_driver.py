@@ -23,7 +23,24 @@ def _parse_key_values(text):
 
 
 class TestQwen36CompileDriver(unittest.TestCase):
-    def _run_dry_driver(self, **overrides):
+    def _speed_anchor_overrides(self):
+        return {
+            "ENABLE_QKV_NKI_KERNELS": "1",
+            "ENABLE_QKV_CTE_NKI_KERNEL_FUSE_QK_NORM": "1",
+            "ENABLE_QKV_CTE_NKI_KERNEL_FUSE_ROPE": "0",
+            "ENABLE_OUT_PROJ_NKI_KERNEL": "0",
+            "ENABLE_KV_CACHE_QUANT": "0",
+            "PREFIX_CTE_ATTENTION_BACKEND": "attention_cte",
+            "QWEN36_DELTANET_FUSED_SEGMENT_TOKENS": "0",
+            "QWEN36_DELTANET_MULTIHEAD_CTE": "0",
+            "QWEN36_DELTANET_SOLVE_MODE": "direct",
+            "QWEN36_DELTANET_SOLVE_SCAN_STEPS": "0",
+            "GDN_RECURRENT_CACHE_DTYPE": "bfloat16",
+            "GDN_CONV_CACHE_DTYPE": "bfloat16",
+            "CTE_BUCKETS_RAW": "2048",
+        }
+
+    def _run_dry_driver(self, check=True, **overrides):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             repo = root / "repo"
@@ -48,11 +65,13 @@ class TestQwen36CompileDriver(unittest.TestCase):
 
             completed = subprocess.run(
                 ["bash", str(_DRIVER)],
-                check=True,
+                check=check,
                 capture_output=True,
                 env=env,
                 text=True,
             )
+            if not check:
+                return completed
             stdout = _parse_key_values(completed.stdout)
             envlog = Path(stdout["ENVLOG"])
             return stdout, _parse_key_values(envlog.read_text()), Path(stdout["PIDFILE"])
@@ -83,6 +102,76 @@ class TestQwen36CompileDriver(unittest.TestCase):
         self.assertEqual(envlog["OUTPUT_LOGITS_WITH_ON_DEVICE_SAMPLING"], "0")
         self.assertEqual(envlog["ENVLOG"], stdout["ENVLOG"])
         self.assertFalse(pidfile.exists())
+
+    def test_speed_slice_hostlogits_keeps_lm_head_fp8_anchor(self):
+        stdout, envlog, pidfile = self._run_dry_driver(
+            **self._speed_anchor_overrides(),
+            SPEED_SLICE="hostlogits",
+            DISABLE_ON_DEVICE_SAMPLING=1,
+            OUTPUT_LOGITS_WITH_ON_DEVICE_SAMPLING=0,
+            QUANTIZE_LM_HEAD=1,
+        )
+
+        self.assertIn("hostlogits", stdout["BASE"])
+        self.assertIn("lmheadfp8", stdout["BASE"])
+        self.assertIn("attention_cte512", stdout["BASE"])
+        self.assertIn("gdnseg0", stdout["BASE"])
+        self.assertEqual(envlog["SPEED_SLICE"], "hostlogits")
+        self.assertEqual(envlog["SAMPLING"], "host_logits")
+        self.assertEqual(envlog["QUANTIZE_LM_HEAD"], "1")
+        self.assertEqual(envlog["ENABLE_OUT_PROJ_NKI_KERNEL"], "0")
+        self.assertEqual(envlog["PREFIX_CTE_ATTENTION_BACKEND"], "attention_cte")
+        self.assertFalse(pidfile.exists())
+
+    def test_speed_slice_hostlogits_rejects_confounded_lm_head_bf16(self):
+        completed = self._run_dry_driver(
+            False,
+            **self._speed_anchor_overrides(),
+            SPEED_SLICE="hostlogits",
+            DISABLE_ON_DEVICE_SAMPLING=1,
+            OUTPUT_LOGITS_WITH_ON_DEVICE_SAMPLING=0,
+            QUANTIZE_LM_HEAD=0,
+        )
+
+        self.assertEqual(completed.returncode, 2)
+        self.assertIn(
+            "SPEED_SLICE=hostlogits requires QUANTIZE_LM_HEAD=1",
+            completed.stderr,
+        )
+
+    def test_speed_slice_hostlogits_lmheadbf16_is_explicit_second_flip(self):
+        stdout, envlog, pidfile = self._run_dry_driver(
+            **self._speed_anchor_overrides(),
+            SPEED_SLICE="hostlogits_lmheadbf16",
+            DISABLE_ON_DEVICE_SAMPLING=1,
+            OUTPUT_LOGITS_WITH_ON_DEVICE_SAMPLING=0,
+            QUANTIZE_LM_HEAD=0,
+        )
+
+        self.assertIn("hostlogits", stdout["BASE"])
+        self.assertIn("lmheadbf16", stdout["BASE"])
+        self.assertEqual(envlog["SPEED_SLICE"], "hostlogits_lmheadbf16")
+        self.assertEqual(envlog["SAMPLING"], "host_logits")
+        self.assertEqual(envlog["QUANTIZE_LM_HEAD"], "0")
+        self.assertFalse(pidfile.exists())
+
+    def test_speed_slice_rejects_non_anchor_attention_backend(self):
+        overrides = self._speed_anchor_overrides()
+        overrides["PREFIX_CTE_ATTENTION_BACKEND"] = "segmented_cte"
+        completed = self._run_dry_driver(
+            False,
+            **overrides,
+            SPEED_SLICE="hostlogits",
+            DISABLE_ON_DEVICE_SAMPLING=1,
+            OUTPUT_LOGITS_WITH_ON_DEVICE_SAMPLING=0,
+            QUANTIZE_LM_HEAD=1,
+        )
+
+        self.assertEqual(completed.returncode, 2)
+        self.assertIn(
+            "SPEED_SLICE=hostlogits requires PREFIX_CTE_ATTENTION_BACKEND=attention_cte",
+            completed.stderr,
+        )
 
 
 if __name__ == "__main__":
