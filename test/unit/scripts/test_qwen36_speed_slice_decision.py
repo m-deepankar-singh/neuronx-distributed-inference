@@ -1,5 +1,7 @@
 import importlib.util
 import json
+import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -167,6 +169,59 @@ def test_decision_automation_name_preserves_long_timestamp_suffix():
     assert name.startswith("monitor-qwen-hostlogits-")
     assert name.endswith("20260606t010203z-hostlogits-lmheadbf16-compile")
     assert len(name) <= len("monitor-") + 56 + len("-compile")
+
+
+def test_next_preflight_dry_run_env_matches_compile_driver(tmp_path):
+    repo = tmp_path / "repo"
+    model = tmp_path / "model"
+    art_root = tmp_path / "artifacts"
+    logdir = tmp_path / "logs"
+    repo.mkdir()
+    model.mkdir()
+    decision = _SCRIPT.decide(
+        env_values={
+            "SPEED_SLICE": "sampletokonly",
+            "REPO": str(repo),
+            "MODEL": str(model),
+            "ART_ROOT": str(art_root),
+            "LOGDIR": str(logdir),
+        },
+        runtime_summary=_summary(coherence_ok=True),
+        speed_output=_speed(passed=False, mean=640.0),
+        speed_json_path=Path("/tmp/raw_speed.json"),
+        next_ts="20260606T010203Z_driver",
+    )
+    env = os.environ.copy()
+    env.update(decision["next_preflight"]["dry_run_env"])
+
+    completed = subprocess.run(
+        ["bash", str(_REPO_ROOT / decision["next_preflight"]["compile_driver"])],
+        check=True,
+        capture_output=True,
+        env=env,
+        text=True,
+    )
+    stdout = dict(
+        line.split("=", 1)
+        for line in completed.stdout.splitlines()
+        if "=" in line
+    )
+    envlog = dict(
+        line.split("=", 1)
+        for line in Path(stdout["ENVLOG"]).read_text().splitlines()
+        if "=" in line
+    )
+
+    assert stdout["TS"] == "20260606T010203Z_driver"
+    assert envlog["TS"] == "20260606T010203Z_driver"
+    assert envlog["SPEED_SLICE"] == "hostlogits"
+    assert envlog["SAMPLING"] == "host_logits"
+    assert envlog["PREFIX_CTE_ATTENTION_BACKEND"] == "attention_cte"
+    assert envlog["QWEN36_DELTANET_FUSED_SEGMENT_TOKENS"] == "0"
+    assert envlog["ENABLE_KV_CACHE_QUANT"] == "0"
+    assert "hostlogits" in stdout["BASE"]
+    assert "attention_cte512" in stdout["BASE"]
+    assert "gdnseg0" in stdout["BASE"]
 
 
 def test_slow_final_planned_slice_profiles_instead_of_branching():
