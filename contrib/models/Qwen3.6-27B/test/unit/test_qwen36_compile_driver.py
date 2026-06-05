@@ -88,6 +88,8 @@ class TestQwen36CompileDriver(unittest.TestCase):
         self.assertEqual(envlog["OUTPUT_LOGITS_WITH_ON_DEVICE_SAMPLING"], "0")
         self.assertEqual(envlog["COMPILE_DRY_RUN"], "1")
         self.assertEqual(envlog["ENVLOG"], stdout["ENVLOG"])
+        self.assertEqual(envlog["TS"], "unittest")
+        self.assertEqual(stdout["TS"], "unittest")
         self.assertFalse(pidfile.exists())
 
     def test_host_logits_mode_is_tagged_without_on_device_label(self):

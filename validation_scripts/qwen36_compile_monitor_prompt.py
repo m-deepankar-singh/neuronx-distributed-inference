@@ -114,6 +114,7 @@ def render_prompt(
         "MEMORY_FLAGS",
         "SEQ_LEN",
         "MAX_CONTEXT_LENGTH",
+        "TS",
         "CTE_BUCKETS",
         "PREFIX_BUCKETS",
         "TOKEN_GENERATION_BUCKETS",

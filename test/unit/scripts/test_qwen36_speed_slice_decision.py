@@ -93,6 +93,7 @@ def test_slow_sample_token_slice_advances_to_hostlogits():
         runtime_summary=_summary(coherence_ok=True),
         speed_output=_speed(passed=False, mean=640.0),
         speed_json_path=Path("/tmp/raw_speed.json"),
+        next_ts="20260606T010203Z_hostlogits",
     )
 
     assert decision["decision"] == "launch_next_speed_slice"
@@ -105,7 +106,11 @@ def test_slow_sample_token_slice_advances_to_hostlogits():
         "create_heartbeat_automation_from_template",
         "run_launch_command_after_automation_exists",
     ]
+    assert preflight["ts"] == "20260606T010203Z_hostlogits"
     dry_run = preflight["dry_run_command"]
+    launch = preflight["launch_command_after_automation"]
+    assert "TS=20260606T010203Z_hostlogits" in dry_run
+    assert "TS=20260606T010203Z_hostlogits" in launch
     assert "COMPILE_DRY_RUN=1" in dry_run
     assert "SPEED_SLICE=hostlogits" in dry_run
     assert "PREFIX_CTE_ATTENTION_BACKEND=attention_cte" in dry_run
@@ -119,7 +124,7 @@ def test_slow_sample_token_slice_advances_to_hostlogits():
     assert "monitor-qwen-hostlogits-compile" in preflight[
         "automation_payload_command_template"
     ]
-    assert "COMPILE_DRY_RUN=0" in preflight["launch_command_after_automation"]
+    assert "COMPILE_DRY_RUN=0" in launch
 
 
 def test_slow_hostlogits_advances_to_lmhead_bf16_only():
@@ -128,6 +133,7 @@ def test_slow_hostlogits_advances_to_lmhead_bf16_only():
         runtime_summary=_summary(coherence_ok=True),
         speed_output=_speed(passed=False, mean=900.0),
         speed_json_path=Path("/tmp/raw_speed.json"),
+        next_ts="20260606T010203Z_lmhead",
     )
 
     assert decision["decision"] == "launch_next_speed_slice"
@@ -136,6 +142,9 @@ def test_slow_hostlogits_advances_to_lmhead_bf16_only():
     assert "QUANTIZE_LM_HEAD=0" in decision["next_preflight"]["dry_run_command"]
     assert "DISABLE_ON_DEVICE_SAMPLING=1" in decision["next_preflight"][
         "dry_run_command"
+    ]
+    assert "TS=20260606T010203Z_lmhead" in decision["next_preflight"][
+        "launch_command_after_automation"
     ]
 
 
@@ -168,6 +177,8 @@ def test_main_finds_speed_path_from_runtime_summary(tmp_path, monkeypatch, capsy
             str(env_log),
             "--runtime-summary",
             str(summary_path),
+            "--next-ts",
+            "20260606T010203Z_cli",
         ],
     )
 
@@ -175,4 +186,5 @@ def test_main_finds_speed_path_from_runtime_summary(tmp_path, monkeypatch, capsy
     payload = json.loads(capsys.readouterr().out)
     assert payload["decision"] == "launch_next_speed_slice"
     assert payload["next_speed_slice"] == "hostlogits"
+    assert payload["next_preflight"]["ts"] == "20260606T010203Z_cli"
     assert "COMPILE_DRY_RUN=1" in payload["next_preflight"]["dry_run_command"]

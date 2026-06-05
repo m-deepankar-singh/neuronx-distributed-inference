@@ -277,6 +277,7 @@ printf "%s\n" \
   "NEURON_PLATFORM_TARGET_OVERRIDE=${NEURON_PLATFORM_TARGET_OVERRIDE}" \
   "NEURON_CC_FLAGS=${NEURON_CC_FLAGS}" \
   "NKI_LIBRARY_SRC=${NKI_LIBRARY_SRC}" \
+  "TS=${TS}" \
   "USE_NKI_DECODE=${USE_NKI_DECODE}" \
   "QWEN36_DELTANET_CTE_IMPL=${QWEN36_DELTANET_CTE_IMPL}" \
   "QWEN36_DELTANET_MULTIHEAD_CTE=${QWEN36_DELTANET_MULTIHEAD_CTE}" \
@@ -326,6 +327,7 @@ if [[ "${COMPILE_DRY_RUN}" == "1" ]]; then
   echo "LOG=${LOG}"
   echo "ENVLOG=${ENVLOG}"
   echo "PIDFILE=${PID}"
+  echo "TS=${TS}"
   echo "COMPILE_DRY_RUN=1"
   exit 0
 elif [[ "${COMPILE_DRY_RUN}" != "0" ]]; then
@@ -405,4 +407,5 @@ echo "QUANTIZED_CHECKPOINTS=${QUANT}"
 echo "LOG=${LOG}"
 echo "ENVLOG=${ENVLOG}"
 echo "PIDFILE=${PID}"
+echo "TS=${TS}"
 echo "PID=$(cat "${PID}")"

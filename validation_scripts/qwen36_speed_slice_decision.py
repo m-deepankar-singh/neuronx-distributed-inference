@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import shlex
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -126,10 +127,22 @@ def _quote_env_command(env: dict[str, str], command: list[str]) -> str:
     return " ".join(parts)
 
 
-def next_preflight(env_values: dict[str, str], next_slice: str) -> dict[str, Any]:
+def _default_next_ts(next_slice: str) -> str:
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return f"{stamp}_{next_slice}"
+
+
+def next_preflight(
+    env_values: dict[str, str],
+    next_slice: str,
+    *,
+    next_ts: str | None = None,
+) -> dict[str, Any]:
     env: dict[str, str] = {
         key: env_values[key] for key in _INHERIT_ENV_KEYS if key in env_values
     }
+    ts = next_ts or _default_next_ts(next_slice)
+    env["TS"] = ts
     env.update(_ANCHOR_FLAGS)
     env.update(_SLICE_FLAGS[next_slice])
     env["COMPILE_DRY_RUN"] = "1"
@@ -146,6 +159,7 @@ def next_preflight(env_values: dict[str, str], next_slice: str) -> dict[str, Any
     )
     automation_name = f"monitor-qwen-{next_slice.replace('_', '-')}-compile"
     return {
+        "ts": ts,
         "dry_run_command": dry_run_command,
         "automation_payload_command_template": (
             "python3 validation_scripts/qwen36_compile_monitor_prompt.py "
@@ -167,6 +181,7 @@ def decide(
     runtime_summary: dict[str, Any],
     speed_output: dict[str, Any] | None,
     speed_json_path: Path | None,
+    next_ts: str | None = None,
 ) -> dict[str, Any]:
     current_slice = _normal_slice(env_values)
     coherence_ok = bool(runtime_summary.get("coherence_and_log_scan_passed"))
@@ -255,7 +270,11 @@ def decide(
             "decision": "launch_next_speed_slice",
             "next_speed_slice": next_slice,
             "next_required_flags": _required_flags(next_slice),
-            "next_preflight": next_preflight(env_values, next_slice),
+            "next_preflight": next_preflight(
+                env_values,
+                next_slice,
+                next_ts=next_ts,
+            ),
             "reason": "coherent_but_prefill_speed_below_target",
         }
     )
@@ -272,6 +291,11 @@ def main() -> int:
         default=None,
         help="Override raw_prefill_speed.json path; defaults to runtime summary output.",
     )
+    parser.add_argument(
+        "--next-ts",
+        default=None,
+        help="Timestamp/suffix to reuse for generated next-slice dry-run and launch commands.",
+    )
     parser.add_argument("--output-json", type=Path, default=None)
     args = parser.parse_args()
 
@@ -286,6 +310,7 @@ def main() -> int:
         runtime_summary=runtime_summary,
         speed_output=speed_output,
         speed_json_path=speed_path,
+        next_ts=args.next_ts,
     )
     encoded = json.dumps(decision, indent=2, sort_keys=True) + "\n"
     if args.output_json is not None:

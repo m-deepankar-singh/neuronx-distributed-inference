@@ -40,6 +40,7 @@ def test_render_prompt_contains_compile_validation_and_runtime_gates():
         "KERNELS": "decode_deltanet,qkvnki_qknorm,outprojstd,segmented_attention_cte",
         "SEQ_LEN": "32768",
         "MAX_CONTEXT_LENGTH": "32768",
+        "TS": "20260606T010203Z_hostlogits",
         "CTE_BUCKETS": "2048",
         "GDN_RECURRENT_CACHE_DTYPE": "bfloat16",
         "GDN_CONV_CACHE_DTYPE": "bfloat16",
@@ -64,6 +65,7 @@ def test_render_prompt_contains_compile_validation_and_runtime_gates():
     assert "PID file: /logs/compile.pid" in prompt
     assert "- SAMPLING=host_logits" in prompt
     assert "- SPEED_SLICE=hostlogits" in prompt
+    assert "- TS=20260606T010203Z_hostlogits" in prompt
     assert "- DISABLE_ON_DEVICE_SAMPLING=1" in prompt
     assert "`Finished Compilation for all HLOs`" in prompt
     assert "`CHECKPOINT_BANK_WEIGHTS_ADDED` for tp0..tp3" in prompt
