@@ -318,7 +318,7 @@ Ported rebuild commits:
    - Mitigation: proceeded with manual monitoring using deterministic PID/log/artifact paths, and noted that no stale automation exists for this compile.
    - Remaining risk: if this thread is not actively monitored, no heartbeat will wake it automatically. Manual monitor command is listed below.
 
-31. Attention-CTE one-variable compile is in flight to test the remaining cold-prefill speed suspect.
+31. Attention-CTE one-variable compile completed and validated; it is coherent but not faster.
    - Compile host: `ubuntu@16.26.135.243`
    - Source: `/home/ubuntu/inferentia-gdn-prefill-speed-coherent`
    - PID: `81458`
@@ -329,64 +329,44 @@ Ported rebuild commits:
    - Workdir: `/mnt/trainium_artifacts/qwen_artifacts/_nxd_work_32k_fp8_fp8all_lmheadfp8_gatesfp8_kvbf16_qkvnki_tiled_attention_cte512_gdnseg0_cte2048_20260605T180405Z_attncte_direct_scan0`
    - Command shape: `TS=20260605T180405Z_attncte`, `ENABLE_QKV_NKI_KERNELS=1`, `CTE_BUCKETS_RAW=2048`, `PREFIX_CTE_ATTENTION_BACKEND=attention_cte`, `PREFIX_CTE_ATTENTION_SEGMENT_SIZE=512`, `QWEN36_DELTANET_FUSED_SEGMENT_TOKENS=0`, `QWEN36_DELTANET_MULTIHEAD_CTE=0`, `ENABLE_KV_CACHE_QUANT=0`, `QUANTIZE_LM_HEAD=1`, `FP8_QUANTIZE_LINEAR_ATTN_GATES=1`, `QWEN36_DELTANET_SOLVE_MODE=direct`, `QWEN36_DELTANET_SOLVE_SCAN_STEPS=0`, `GDN_RECURRENT_CACHE_DTYPE=bfloat16`, `GDN_CONV_CACHE_DTYPE=bfloat16`, `bash tmp_compile_qwen32k_segcte2048_gdnseg512.sh`.
    - Env verification: env log contains `PREFIX_CTE_ATTENTION_BACKEND=attention_cte`, `QWEN36_DELTANET_FUSED_SEGMENT_TOKENS=0`, `ENABLE_QKV_NKI_KERNELS=1`, `ENABLE_KV_CACHE_QUANT=0`, and BF16 GDN dtypes. `CONTEXT_TRACE_SHAPE` also records `"prefix_cte_attention_backend": "attention_cte"`.
-   - Initial status: PID alive; context HLO generation started; no immediate traceback, NCC error, or disk error.
+   - Compile result: `Finished Compilation for all HLOs in 418.6668481826782 seconds`, `CHECKPOINT_BANK_WEIGHTS_ADDED` for `tp0..tp3` with `48 48 torch.bfloat16 torch.bfloat16`, and `COMPILE_DONE`.
+   - Artifact files verified on compile and runtime hosts: `model.pt` `748425994` bytes, `neuron_config.json` `106546` bytes, and `weights/tp0..tp3_sharded_checkpoint.safetensors` `8321591748` bytes each.
+   - Runtime host: `ubuntu@16.26.184.190`
+   - Runtime artifact: `/mnt/trainium_artifacts/qwen_artifacts/qwen36_32k_fp8_fp8all_lmheadfp8_gatesfp8_kvbf16_qkvnki_tiled_attention_cte512_gdnseg0_cte2048_pfx32k_slots64_20260605T180405Z_attncte_direct_scan0`
+   - Runtime log: `/home/ubuntu/validation_logs/fp8_256k_decode_nki/qkvnki_tiled_attention_cte_direct_scan0_runtime_20260605T183200Z.log`
+   - Launch command shape: `MAX_MODEL_LEN=32768`, `SEQ_LEN=32768`, `CTE_BUCKETS=2048`, context pairs `2048:{256,512,1024,2048,4096,8192,16384,32768}`, token buckets `{512,16384,16640,32768}`, `GDN_RECURRENT_CACHE_DTYPE=bfloat16`, `GDN_CONV_CACHE_DTYPE=bfloat16`, `QWEN36_DELTANET_FUSED_SEGMENT_TOKENS=0`, `QWEN36_DELTANET_MULTIHEAD_CTE=0`, `QWEN36_DELTANET_SOLVE_MODE=direct`, `QWEN36_DELTANET_SOLVE_SCAN_STEPS=0`, `PREFIX_CTE_ATTENTION_BACKEND=attention_cte`, port `8001`.
+   - Health: server reached `/health` on attempt 6 with serve PID `33585` and EngineCore PID `33737`.
+   - Config evidence: runtime command line contains `prefix_cte_attention_backend="attention_cte"`, `qkv_nki_kernel_enabled=true`, `kv_cache_quant=false`, `context_encoding_buckets=[2048]`, bucket pairs through `32768`, BF16 recurrent/conv GDN cache dtypes, and `use_hybrid_apc_manager=true`.
+   - Primary raw exact boundary probe: lengths `146,160,485,505,526,1225,2048,2049,2500,4092,4096` all returned HTTP 200, valid OpenAI bodies, matching `usage.prompt_tokens`, and coherent non-empty text. JSONL: `/home/ubuntu/validation_logs/fp8_256k_decode_nki/attncte_boundary_probe_20260605T183800Z.jsonl`.
+   - Unique 4k sweep: lengths `4088..4104` all passed, including `4103`, with valid coherent text. JSONL: `/home/ubuntu/validation_logs/fp8_256k_decode_nki/attncte_4k_sweep_20260605T184000Z.jsonl`.
+   - Repeated 2500 probe: 3/3 passed; repeats 1 and 2 showed `2048` token prefix-cache hits and coherent text. JSONL: `/home/ubuntu/validation_logs/fp8_256k_decode_nki/attncte_repeat2500_20260605T184300Z.jsonl`.
+   - Multi-turn chat probe: target prompt sizes `160,1225,2500` passed with streamed content (`ack 4` / `lambda`) and usage-derived completion tokens. JSON: `/home/ubuntu/validation_logs/fp8_256k_decode_nki/attncte_chat_multiturn_20260605T184500Z.json`.
+   - Long raw probe: lengths `8192` and `16384` passed with coherent text. JSONL: `/home/ubuntu/validation_logs/fp8_256k_decode_nki/attncte_long_probe_20260605T184700Z.jsonl`.
+   - Final serve-log scan after validation: no `negative token_id`, `out-of-vocab token_id`, `fallback argmax`, `finite=0`, `nan=`, `NaN`, `NRT_RESOURCE`, engine death, traceback, internal server error, or dtype mismatch markers.
+   - 16k usage-accounted streaming cold-prefill benchmark (`max_tokens=1`, `stream_options.include_usage=true`): run 0 `16373 / 26.123764895997738 = 626.747 tok/s`; run 1 `16373 / 26.10490949099767 = 627.200 tok/s`; run 2 `16373 / 26.1018272729998 = 627.274 tok/s`; mean `627.074 tok/s`. JSON: `/home/ubuntu/validation_logs/fp8_256k_decode_nki/attncte_16k_cold_prefill_20260605T184900Z.json`.
+   - Errors encountered and mitigated:
+     - Local monitor poll wrapped approved `ssh` behind local `sleep` and failed with `ssh: connect to host 16.26.135.243 port 22: Operation not permitted`, exit `255`. Root cause: sandbox/prefix issue in local command shape, not compile-host failure. Mitigation: reran as direct `ssh` and remote-side `sleep`.
+     - Safetensor dtype check under system `python3` failed with `ModuleNotFoundError: No module named 'safetensors'`, exit `1`. Root cause: system Python missing the package. Mitigation: reran with `/home/ubuntu/venvs/neuron_230_segmented_cte/bin/python`; dtype check passed.
+     - The launch command's SSH wrapper stayed attached after `nohup`; runtime process was healthy with PPID 1 and log/PID files were present. Root cause hypothesis: remote shell/job-control attachment, not model failure. Mitigation: verified process list/log/health separately.
+     - The 16k benchmark exec wrapper did not return even though no benchmark process remained and the JSON result file was complete. Root cause hypothesis: stale local SSH exec session. Mitigation: parsed completed JSON output directly.
+   - Conclusion: switching from `segmented_cte` to `attention_cte` does not recover cold-prefill speed. This artifact is coherent, but its 16k cold prefill is the same slow class as the coherent `segmented_cte` artifacts (`~627 tok/s` vs `~638 tok/s`). The speed bottleneck is not `QWEN36_DELTANET_FUSED_SEGMENT_TOKENS=512` and not the `segmented_cte` prefix-attention backend by itself.
 
 ### Current next step
 
-Monitor the one-variable no-GDN-segmentation compile:
+We now have three coherent CTE2048 artifacts in the same slow prefill class:
 
-```bash
-ssh ubuntu@16.26.135.243 \
-  'pidfile=/home/ubuntu/validation_logs/fp8_256k_decode_nki/qwen36_32k_fp8_fp8all_lmheadfp8_gatesfp8_kvbf16_qkvnki_tiled_segmented_cte512_gdnseg0_cte2048_pfx32k_slots64_20260605T171105Z_nogdnseg_direct_scan0_compile.pid; \
-   log=/home/ubuntu/validation_logs/fp8_256k_decode_nki/qwen36_32k_fp8_fp8all_lmheadfp8_gatesfp8_kvbf16_qkvnki_tiled_segmented_cte512_gdnseg0_cte2048_pfx32k_slots64_20260605T171105Z_nogdnseg_direct_scan0_compile.log; \
-   pid=$(cat "$pidfile" 2>/dev/null || true); \
-   ps -p "$pid" -o pid,etime,stat,cmd || true; \
-   grep -nE "Finished generating HLO|Finished Compilation|CHECKPOINT_BANK_WEIGHTS_ADDED|COMPILE_DONE|Traceback|RuntimeError|Exception|NCC_|No space left|Killed" "$log" | tail -120'
-```
+- Standard QKV + segmented attention + GDN seg512: coherent, about `622 tok/s`.
+- QKV NKI + segmented attention + GDN seg512: coherent, about `626-633 tok/s`.
+- QKV NKI + segmented attention + GDN seg0: coherent, about `638 tok/s`.
+- QKV NKI + attention_cte + GDN seg0: coherent, about `627 tok/s`.
 
-Artifact under compile:
+The next step should not be another compile that only toggles GDN segmentation or prefix attention. Those variables are now cleared for the 3k gap. The next useful action is to profile or inspect the compiled context graph composition against the old fast/incoherent artifact and the earlier full-FP8 working branches:
 
-```bash
-/mnt/trainium_artifacts/qwen_artifacts/qwen36_32k_fp8_fp8all_lmheadfp8_gatesfp8_kvbf16_qkvnki_tiled_segmented_cte512_gdnseg0_cte2048_pfx32k_slots64_20260605T171105Z_nogdnseg_direct_scan0
-```
+1. Profile/direct-run the current attention-CTE context NEFF with `NEURON_RT_INSPECT`/`neuron-profile`, and compare top kernels with the prior slow segmented-CTE profile and the fast full-FP8/CTE2048 artifact profile if available.
+2. Diff the compile-time config and generated HLO/NEFF set between the old fast CTE2048 artifact and the coherent artifacts, focusing on context graph shape, number of 2048 calls per 16k request, modular flow flags, qkv kernel selection, attention implementation, and hidden fallback to standard/dense kernels.
+3. Only after profiling identifies the heavy kernel, add the next speed slice. Candidate slices should be one-variable and coherence-gated: TKG/context modular flow, Q/K norm+RoPE NKI, output projection NKI, or MLP CTE NKI. Do not enable packed qkvgate, quantized MLP NKI, multihead DeltaNet CTE, or FP8 KV by default.
 
-Compile command shape:
-
-```bash
-TS=20260605T171105Z_nogdnseg \
-ENABLE_QKV_NKI_KERNELS=1 \
-CTE_BUCKETS_RAW=2048 \
-PREFIX_CTE_ATTENTION_BACKEND=segmented_cte \
-PREFIX_CTE_ATTENTION_SEGMENT_SIZE=512 \
-QWEN36_DELTANET_FUSED_SEGMENT_TOKENS=0 \
-QWEN36_DELTANET_MULTIHEAD_CTE=0 \
-ENABLE_KV_CACHE_QUANT=0 \
-QUANTIZE_LM_HEAD=1 \
-FP8_QUANTIZE_LINEAR_ATTN_GATES=1 \
-QWEN36_DELTANET_SOLVE_MODE=direct \
-QWEN36_DELTANET_SOLVE_SCAN_STEPS=0 \
-GDN_RECURRENT_CACHE_DTYPE=bfloat16 \
-GDN_CONV_CACHE_DTYPE=bfloat16 \
-bash tmp_compile_qwen32k_segcte2048_gdnseg512.sh
-```
-
-Result from the no-GDN-seg experiment: coherent, but still only about `638 tok/s` at exact 16k cold prefill. Do not repeat this compile as a speed fix.
-
-The next isolated speed experiment should move off `segmented_cte` for cold prefill and compile the same coherent policy with `PREFIX_CTE_ATTENTION_BACKEND=attention_cte`, keeping all else fixed (`QKV NKI`, `CTE2048`, `KV BF16`, `GDN segment tokens 0`, `direct scan0`, `multihead DeltaNet CTE off`). Reason: raw `pfx0` context is slow even without prefix reads and remains slow when GDN segmentation is disabled, so the remaining compile-baked suspect in the cold context graph is segmented CTE attention/model integration overhead.
-
-Manual monitor command for the current attention-CTE compile:
-
-```bash
-ssh ubuntu@16.26.135.243 \
-  'pidfile=/home/ubuntu/validation_logs/fp8_256k_decode_nki/qwen36_32k_fp8_fp8all_lmheadfp8_gatesfp8_kvbf16_qkvnki_tiled_attention_cte512_gdnseg0_cte2048_pfx32k_slots64_20260605T180405Z_attncte_direct_scan0_compile.pid; \
-   log=/home/ubuntu/validation_logs/fp8_256k_decode_nki/qwen36_32k_fp8_fp8all_lmheadfp8_gatesfp8_kvbf16_qkvnki_tiled_attention_cte512_gdnseg0_cte2048_pfx32k_slots64_20260605T180405Z_attncte_direct_scan0_compile.log; \
-   pid=$(cat "$pidfile" 2>/dev/null || true); \
-   ps -p "$pid" -o pid,etime,stat,cmd || true; \
-   grep -nE "Finished generating HLO|Compilation Successfully Completed|Finished Compilation|CHECKPOINT_BANK_WEIGHTS_ADDED|COMPILE_DONE|Traceback|RuntimeError|Exception|NCC_|No space left|Killed" "$log" | tail -160; \
-   df -h /mnt/trainium_artifacts | tail -1'
-```
-
-Do not postprocess-only a BF16-traced artifact to FP32 recurrent banks. For this completed artifact, launch with BF16 recurrent banks:
+For this completed attention-CTE artifact, launch with BF16 recurrent banks:
 
 ```bash
 GDN_RECURRENT_CACHE_DTYPE=bfloat16 \
