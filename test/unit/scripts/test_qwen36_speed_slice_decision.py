@@ -85,7 +85,11 @@ def test_speed_pass_keeps_candidate():
 
 def test_slow_sample_token_slice_advances_to_hostlogits():
     decision = _SCRIPT.decide(
-        env_values={"SPEED_SLICE": "sampletokonly"},
+        env_values={
+            "SPEED_SLICE": "sampletokonly",
+            "REPO": "/home/ubuntu/repo",
+            "MODEL": "/home/ubuntu/model",
+        },
         runtime_summary=_summary(coherence_ok=True),
         speed_output=_speed(passed=False, mean=640.0),
         speed_json_path=Path("/tmp/raw_speed.json"),
@@ -95,6 +99,27 @@ def test_slow_sample_token_slice_advances_to_hostlogits():
     assert decision["next_speed_slice"] == "hostlogits"
     assert decision["next_required_flags"]["DISABLE_ON_DEVICE_SAMPLING"] == "1"
     assert decision["next_required_flags"]["QUANTIZE_LM_HEAD"] == "1"
+    preflight = decision["next_preflight"]
+    assert preflight["run_order"] == [
+        "run_dry_run_command",
+        "create_heartbeat_automation_from_template",
+        "run_launch_command_after_automation_exists",
+    ]
+    dry_run = preflight["dry_run_command"]
+    assert "COMPILE_DRY_RUN=1" in dry_run
+    assert "SPEED_SLICE=hostlogits" in dry_run
+    assert "PREFIX_CTE_ATTENTION_BACKEND=attention_cte" in dry_run
+    assert "QWEN36_DELTANET_FUSED_SEGMENT_TOKENS=0" in dry_run
+    assert "ENABLE_KV_CACHE_QUANT=0" in dry_run
+    assert "ENABLE_QKV_CTE_NKI_KERNEL_FUSE_ROPE=0" in dry_run
+    assert "REPO=/home/ubuntu/repo" in dry_run
+    assert "MODEL=/home/ubuntu/model" in dry_run
+    assert "tmp_compile_qwen32k_segcte2048_gdnseg512.sh" in dry_run
+    assert "<ENVLOG_FROM_DRY_RUN>" in preflight["automation_payload_command_template"]
+    assert "monitor-qwen-hostlogits-compile" in preflight[
+        "automation_payload_command_template"
+    ]
+    assert "COMPILE_DRY_RUN=0" in preflight["launch_command_after_automation"]
 
 
 def test_slow_hostlogits_advances_to_lmhead_bf16_only():
@@ -108,6 +133,10 @@ def test_slow_hostlogits_advances_to_lmhead_bf16_only():
     assert decision["decision"] == "launch_next_speed_slice"
     assert decision["next_speed_slice"] == "hostlogits_lmheadbf16"
     assert decision["next_required_flags"]["QUANTIZE_LM_HEAD"] == "0"
+    assert "QUANTIZE_LM_HEAD=0" in decision["next_preflight"]["dry_run_command"]
+    assert "DISABLE_ON_DEVICE_SAMPLING=1" in decision["next_preflight"][
+        "dry_run_command"
+    ]
 
 
 def test_slow_final_planned_slice_profiles_instead_of_branching():
@@ -146,3 +175,4 @@ def test_main_finds_speed_path_from_runtime_summary(tmp_path, monkeypatch, capsy
     payload = json.loads(capsys.readouterr().out)
     assert payload["decision"] == "launch_next_speed_slice"
     assert payload["next_speed_slice"] == "hostlogits"
+    assert "COMPILE_DRY_RUN=1" in payload["next_preflight"]["dry_run_command"]

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shlex
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +34,36 @@ _SLICE_FLAGS = {
         "QUANTIZE_LM_HEAD": "0",
     },
 }
+
+_ANCHOR_FLAGS = {
+    "ENABLE_QKV_NKI_KERNELS": "1",
+    "ENABLE_QKV_CTE_NKI_KERNEL_FUSE_QK_NORM": "1",
+    "ENABLE_QKV_CTE_NKI_KERNEL_FUSE_ROPE": "0",
+    "ENABLE_OUT_PROJ_NKI_KERNEL": "0",
+    "ENABLE_KV_CACHE_QUANT": "0",
+    "PREFIX_CTE_ATTENTION_BACKEND": "attention_cte",
+    "QWEN36_DELTANET_FUSED_SEGMENT_TOKENS": "0",
+    "QWEN36_DELTANET_MULTIHEAD_CTE": "0",
+    "QWEN36_DELTANET_SOLVE_MODE": "direct",
+    "QWEN36_DELTANET_SOLVE_SCAN_STEPS": "0",
+    "GDN_RECURRENT_CACHE_DTYPE": "bfloat16",
+    "GDN_CONV_CACHE_DTYPE": "bfloat16",
+    "CTE_BUCKETS_RAW": "2048",
+    "SEQ_LEN": "32768",
+    "MAX_CONTEXT_LENGTH": "32768",
+    "FP8_QUANTIZE_LINEAR_ATTN_GATES": "1",
+}
+
+_INHERIT_ENV_KEYS = [
+    "REPO",
+    "MODEL",
+    "ART_ROOT",
+    "LOGDIR",
+    "NKI_LIBRARY_SRC",
+    "NEURON_PLATFORM_TARGET_OVERRIDE",
+    "NEURON_CC_FLAGS",
+    "MAX_GDN_CHECKPOINT_SLOTS",
+]
 
 
 def parse_env_log(path: Path) -> dict[str, str]:
@@ -89,6 +120,47 @@ def _required_flags(next_slice: str | None) -> dict[str, str]:
     return dict(_SLICE_FLAGS.get(next_slice, {}))
 
 
+def _quote_env_command(env: dict[str, str], command: list[str]) -> str:
+    parts = [f"{key}={shlex.quote(value)}" for key, value in env.items()]
+    parts.extend(shlex.quote(item) for item in command)
+    return " ".join(parts)
+
+
+def next_preflight(env_values: dict[str, str], next_slice: str) -> dict[str, Any]:
+    env: dict[str, str] = {
+        key: env_values[key] for key in _INHERIT_ENV_KEYS if key in env_values
+    }
+    env.update(_ANCHOR_FLAGS)
+    env.update(_SLICE_FLAGS[next_slice])
+    env["COMPILE_DRY_RUN"] = "1"
+    env.setdefault("MAX_GDN_CHECKPOINT_SLOTS", "64")
+    dry_run_command = _quote_env_command(
+        env,
+        ["bash", "tmp_compile_qwen32k_segcte2048_gdnseg512.sh"],
+    )
+    launch_env = dict(env)
+    launch_env["COMPILE_DRY_RUN"] = "0"
+    launch_command = _quote_env_command(
+        launch_env,
+        ["bash", "tmp_compile_qwen32k_segcte2048_gdnseg512.sh"],
+    )
+    automation_name = f"monitor-qwen-{next_slice.replace('_', '-')}-compile"
+    return {
+        "dry_run_command": dry_run_command,
+        "automation_payload_command_template": (
+            "python3 validation_scripts/qwen36_compile_monitor_prompt.py "
+            "--env-log <ENVLOG_FROM_DRY_RUN> "
+            f"--automation-json --automation-name {shlex.quote(automation_name)}"
+        ),
+        "launch_command_after_automation": launch_command,
+        "run_order": [
+            "run_dry_run_command",
+            "create_heartbeat_automation_from_template",
+            "run_launch_command_after_automation_exists",
+        ],
+    }
+
+
 def decide(
     *,
     env_values: dict[str, str],
@@ -119,6 +191,7 @@ def decide(
         "decision": None,
         "next_speed_slice": None,
         "next_required_flags": {},
+        "next_preflight": None,
         "reason": None,
     }
 
@@ -182,6 +255,7 @@ def decide(
             "decision": "launch_next_speed_slice",
             "next_speed_slice": next_slice,
             "next_required_flags": _required_flags(next_slice),
+            "next_preflight": next_preflight(env_values, next_slice),
             "reason": "coherent_but_prefill_speed_below_target",
         }
     )
