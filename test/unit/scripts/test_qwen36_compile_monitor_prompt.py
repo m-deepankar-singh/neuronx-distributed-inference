@@ -66,6 +66,7 @@ def test_render_prompt_contains_compile_validation_and_runtime_gates():
     assert "`CHECKPOINT_BANK_WEIGHTS_ADDED` for tp0..tp3" in prompt
     assert "`COMPILE_DONE`" in prompt
     assert "qwen36_compile_status.py" in prompt
+    assert "return a quiet/DONT_NOTIFY heartbeat status" in prompt
     assert "rsync EC2-to-EC2" in prompt
     assert "qwen36_runtime_validation_matrix.py" in prompt
     assert "not the old ad hoc `/tmp/tmp_bisect_probe3.py`" in prompt

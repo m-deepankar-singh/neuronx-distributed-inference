@@ -119,6 +119,8 @@ Expected compile shape:
 
 Success requires: compile process exited cleanly, `Finished Compilation for all HLOs`, no exception, `CHECKPOINT_BANK_WEIGHTS_ADDED` for tp0..tp3 with dtypes matching the env log, `COMPILE_DONE`, `{artifact}/model.pt`, and `{artifact}/neuron_config.json`. Use `validation_scripts/qwen36_compile_status.py --env-log {envlog}` for the structured readiness verdict before rsync.
 
+If the compile is still running and the status helper or log scan shows no new failure signal, return a quiet/DONT_NOTIFY heartbeat status instead of starting a manual monitoring loop. Notify only for terminal compile failure, completed compile readiness, runtime validation failure, or coherent speed results.
+
 If successful: verify artifact files and neuron_config, rsync EC2-to-EC2 from {compile_host} to {runtime_host}, launch on {runtime_host} with `{launch_script}` using the artifact and dtype settings from the env log, wait for `/health`, then run the coherence matrix before any speed claim.
 
 Preferred validation driver after launch: `validation_scripts/qwen36_runtime_validation_matrix.py --base-url http://127.0.0.1:<port> --model-path {model_path} --serve-log <serve.log> --output-dir <validation-output-dir>`. It runs the coherence/log-scan/speed gates in order and skips speed automatically if coherence or log scan fails.
