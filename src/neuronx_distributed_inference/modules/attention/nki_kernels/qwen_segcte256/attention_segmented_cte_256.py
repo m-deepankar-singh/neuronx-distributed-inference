@@ -1222,16 +1222,16 @@ def attention_segmented_cte(
         prior_tokens=640:  prior_last_segment_tokens=128, iterations=2 (prior_seg_size=512)
         prior_tokens=1024: prior_last_segment_tokens=512, iterations=2 (prior_seg_size=512)
     """
-    if kvp_offset != None:
-        raise ValueError(
-            "qwen_segcte256 KVP mode is not production validated; use the "
-            "non-KVP segmented CTE path"
-        )
-    if k_pre_transposed:
-        raise ValueError(
-            "qwen_segcte256 supports only k_pre_transposed=False; "
-            "the transposed-K path has not been production validated"
-        )
+    kernel_assert(
+        kvp_offset == None,
+        "qwen_segcte256 KVP mode is not production validated; use the "
+        "non-KVP segmented CTE path",
+    )
+    kernel_assert(
+        not k_pre_transposed,
+        "qwen_segcte256 supports only k_pre_transposed=False; "
+        "the transposed-K path has not been production validated",
+    )
 
     # Extract dimensions
     if tp_q:

@@ -795,22 +795,6 @@ class NeuronGatedDeltaNet(nn.Module):
             g = F.pad(g, (0, pad_size))
         total_seq_len = S + pad_size
 
-        BH = B * H
-        # Flatten to (BH, S, dim) for per-(b,h) kernel calls
-        query_flat = query.reshape(BH, total_seq_len, k_dim).contiguous()
-        key_flat = key.reshape(BH, total_seq_len, k_dim).contiguous()
-        value_flat = value.reshape(BH, total_seq_len, v_dim).contiguous()
-
-        # g and beta: (BH, S) -> (BH, S, 1) for the kernel's (S, 1) input layout
-        g_flat = g.reshape(BH, total_seq_len).unsqueeze(-1).contiguous()
-        beta_flat = beta.reshape(BH, total_seq_len).unsqueeze(-1).contiguous()
-        if initial_state is None:
-            initial_state_flat = torch.zeros(
-                BH, k_dim, v_dim, dtype=torch.float32, device=query.device
-            )
-        else:
-            initial_state_flat = initial_state.reshape(BH, k_dim, v_dim).float().contiguous()
-
         # Create constant mask tensors (shared across all B*H calls)
         device = query.device
         lower_mask = torch.tensor(
@@ -823,31 +807,102 @@ class NeuronGatedDeltaNet(nn.Module):
             _make_lower_mask_diag(), dtype=torch.float32, device=device
         )
 
-        all_outputs = []
-        all_states = []
-        for bh in range(BH):
-            out_bh, state_bh = _deltanet_fused_kernel(
-                query_flat[bh],  # (S, 128)
-                key_flat[bh],  # (S, 128)
-                value_flat[bh],  # (S, 128)
-                g_flat[bh],  # (S, 1) — RAW g, not cumsum
-                beta_flat[bh],  # (S, 1) — sigmoid(b)
-                initial_state_flat[bh],  # (128, 128) recurrent checkpoint
-                lower_mask,  # (128, 128)
-                identity_mat,  # (128, 128)
-                lower_mask_diag,  # (128, 128)
+        def _run_fused_segment(
+            query_segment,
+            key_segment,
+            value_segment,
+            g_segment,
+            beta_segment,
+            segment_initial_state,
+        ):
+            segment_len = int(query_segment.shape[2])
+            bh_count = B * H
+            query_flat = query_segment.reshape(
+                bh_count,
+                segment_len,
+                k_dim,
+            ).contiguous()
+            key_flat = key_segment.reshape(bh_count, segment_len, k_dim).contiguous()
+            value_flat = value_segment.reshape(
+                bh_count,
+                segment_len,
+                v_dim,
+            ).contiguous()
+            g_flat = g_segment.reshape(bh_count, segment_len).unsqueeze(-1).contiguous()
+            beta_flat = (
+                beta_segment.reshape(bh_count, segment_len).unsqueeze(-1).contiguous()
             )
-            all_outputs.append(out_bh)
-            all_states.append(state_bh)
+            if segment_initial_state is None:
+                initial_state_flat = torch.zeros(
+                    bh_count, k_dim, v_dim, dtype=torch.float32, device=query.device
+                )
+            else:
+                initial_state_flat = (
+                    segment_initial_state.reshape(bh_count, k_dim, v_dim)
+                    .float()
+                    .contiguous()
+                )
 
-        output = torch.stack(all_outputs, dim=0)
-        output = output.reshape(B, H, total_seq_len, v_dim)
+            segment_outputs = []
+            segment_states = []
+            for bh in range(bh_count):
+                out_bh, state_bh = _deltanet_fused_kernel(
+                    query_flat[bh],  # (segment_len, 128)
+                    key_flat[bh],  # (segment_len, 128)
+                    value_flat[bh],  # (segment_len, 128)
+                    g_flat[bh],  # (segment_len, 1) — RAW g, not cumsum
+                    beta_flat[bh],  # (segment_len, 1) — sigmoid(b)
+                    initial_state_flat[bh],  # (128, 128) recurrent checkpoint
+                    lower_mask,  # (128, 128)
+                    identity_mat,  # (128, 128)
+                    lower_mask_diag,  # (128, 128)
+                )
+                segment_outputs.append(out_bh)
+                segment_states.append(state_bh)
+
+            segment_output = torch.stack(segment_outputs, dim=0)
+            segment_output = segment_output.reshape(B, H, segment_len, v_dim)
+            segment_state = torch.stack(segment_states, dim=0)
+            segment_state = segment_state.reshape(B, H, k_dim, v_dim)
+            return segment_output, segment_state
+
+        segment_tokens = int(
+            os.environ.get("QWEN36_DELTANET_FUSED_SEGMENT_TOKENS", "0") or "0"
+        )
+        if segment_tokens > 0 and total_seq_len > segment_tokens:
+            if segment_tokens < chunk_size or segment_tokens % chunk_size != 0:
+                raise ValueError(
+                    "QWEN36_DELTANET_FUSED_SEGMENT_TOKENS must be a positive "
+                    "multiple of the fused DeltaNet chunk size; "
+                    f"got segment_tokens={segment_tokens}, chunk_size={chunk_size}"
+                )
+            segment_outputs = []
+            segment_state = initial_state
+            for start in range(0, total_seq_len, segment_tokens):
+                end = min(start + segment_tokens, total_seq_len)
+                segment_output, segment_state = _run_fused_segment(
+                    query[:, :, start:end, :],
+                    key[:, :, start:end, :],
+                    value[:, :, start:end, :],
+                    g[:, :, start:end],
+                    beta[:, :, start:end],
+                    segment_state,
+                )
+                segment_outputs.append(segment_output)
+            output = torch.cat(segment_outputs, dim=2)[:, :, :S]
+            return output, segment_state if output_final_state else None
+
+        output, last_recurrent_state = _run_fused_segment(
+            query,
+            key,
+            value,
+            g,
+            beta,
+            initial_state,
+        )
         output = output[:, :, :S]
 
-        if output_final_state:
-            final_state = torch.stack(all_states, dim=0)
-            last_recurrent_state = final_state.reshape(B, H, k_dim, v_dim)
-        else:
+        if not output_final_state:
             last_recurrent_state = None
 
         return output, last_recurrent_state
