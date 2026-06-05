@@ -2293,6 +2293,11 @@ def execute_model_prefix_caching(
                     "_hybrid_apc_pending_input_dict",
                     input_dict,
                 )
+                setattr(
+                    model_to_execute,
+                    "_qwen36_hybrid_apc_skip_pad_prepare_once",
+                    True,
+                )
         else:
             input_dict = _with_hybrid_apc_owner_metadata(
                 input_dict,

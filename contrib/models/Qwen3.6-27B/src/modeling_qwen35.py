@@ -5534,6 +5534,9 @@ class Qwen35ModelWrapper(ModelWrapper):
         return extended_inputs
 
     def _prepare_hybrid_apc_pad_inputs(self, args):
+        if getattr(self, "_qwen36_hybrid_apc_skip_pad_prepare_once", False):
+            self._qwen36_hybrid_apc_skip_pad_prepare_once = False
+            return args
         if (
             self.tag != CONTEXT_ENCODING_MODEL_TAG
             or len(args) < 29
