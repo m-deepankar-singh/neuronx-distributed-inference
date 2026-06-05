@@ -20,7 +20,7 @@ from neuronx_distributed_inference.modules.attention.utils import transpose_para
 import nki
 from nkilib.core.output_projection.output_projection_cte import output_projection_cte
 from nkilib.core.qkv.qkv import qkv
-from nkilib.core.utils.common_types import NormType, QKVOutputLayout, QuantizationType
+from nkilib.core.utils.common_types import NormType, QKNormConfig, QKVOutputLayout, QuantizationType
 
 logger = logging.getLogger("Neuron")
 # To satisfy test_gqa
@@ -588,8 +588,19 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
                     self.hidden_size, self.num_key_value_heads * self.head_dim, bias=self.bias
                 )
 
-    def forward(self, hidden_states: torch.Tensor, rmsnorm=None, adapter_ids=None, residual=None,
-                cos_cache=None, sin_cache=None):
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        rmsnorm=None,
+        adapter_ids=None,
+        residual=None,
+        cos_cache=None,
+        sin_cache=None,
+        q_layernorm=None,
+        k_layernorm=None,
+        qk_norm_pre_rope_enabled: bool = False,
+        qk_norm_eps: Optional[float] = None,
+    ):
         if self.sequence_parallel_enabled and self.tensor_model_parallel_group is not None:
             hidden_states = gather_from_sequence_parallel_region(
                 hidden_states,
@@ -600,7 +611,17 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
 
         if self.qkv_kernel_enabled or self.qkv_nki_kernel_enabled:
             assert self.fused_qkv, "QKV kernel only supported when fused_qkv is TRUE"
-            return self._kernel_qkv_forward(hidden_states, rmsnorm, residual, cos_cache, sin_cache)
+            return self._kernel_qkv_forward(
+                hidden_states,
+                rmsnorm,
+                residual,
+                cos_cache,
+                sin_cache,
+                q_layernorm=q_layernorm,
+                k_layernorm=k_layernorm,
+                qk_norm_pre_rope_enabled=qk_norm_pre_rope_enabled,
+                qk_norm_eps=qk_norm_eps,
+            )
         else:
             Q, K, V = self._native_qkv_forward(hidden_states, adapter_ids)
         return Q, K, V, residual
@@ -706,7 +727,39 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
 
         return QuantizationType.ROW, qkv_scale.data, None
 
-    def _kernel_qkv_forward(self, hidden_states, rmsnorm, residual, cos_cache, sin_cache):
+    @staticmethod
+    def _qk_rmsnorm_gamma(layernorm, name: str):
+        if layernorm is None:
+            return None
+        if isinstance(layernorm, nn.LayerNorm):
+            raise RuntimeError(
+                f"QKV CTE fused RoPE can only fuse RMSNorm-style pre-RoPE QK norm; "
+                f"{name} is torch.nn.LayerNorm."
+            )
+        gamma = getattr(layernorm, "weight", None)
+        if gamma is None:
+            raise RuntimeError(
+                f"QKV CTE fused RoPE requested pre-RoPE QK norm, but {name} has no weight"
+            )
+        beta = getattr(layernorm, "bias", None)
+        if beta is not None:
+            raise RuntimeError(
+                f"QKV CTE fused RoPE requested RMSNorm-style QK norm, but {name} has bias"
+            )
+        return gamma.data.unsqueeze(0)
+
+    def _kernel_qkv_forward(
+        self,
+        hidden_states,
+        rmsnorm,
+        residual,
+        cos_cache,
+        sin_cache,
+        q_layernorm=None,
+        k_layernorm=None,
+        qk_norm_pre_rope_enabled: bool = False,
+        qk_norm_eps: Optional[float] = None,
+    ):
         # get shape
         bs, seqlen, hidden_dim = hidden_states.shape
         fused_qkv_size = self._validate_qkv_kernel_layout(hidden_dim)
@@ -726,6 +779,22 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
                 qkv_norm_type = NormType.RMS_NORM_SKIP_GAMMA
 
         fuse_rope = cos_cache is not None and sin_cache is not None
+        pre_rope_qk_norm_config = None
+        pre_rope_q_gamma = None
+        pre_rope_k_gamma = None
+        if fuse_rope and qk_norm_pre_rope_enabled:
+            if q_layernorm is None or k_layernorm is None:
+                raise RuntimeError(
+                    "QKV CTE fused RoPE requested pre-RoPE QK norm but q/k layernorms "
+                    "were not provided"
+                )
+            pre_rope_q_gamma = self._qk_rmsnorm_gamma(q_layernorm, "q_layernorm")
+            pre_rope_k_gamma = self._qk_rmsnorm_gamma(k_layernorm, "k_layernorm")
+            pre_rope_qk_norm_config = QKNormConfig(
+                q_norm=NormType.RMS_NORM,
+                k_norm=NormType.RMS_NORM,
+                eps=qk_norm_eps if qk_norm_eps is not None else self.rms_norm_eps,
+            )
 
         fused_residual_add = False
         mlp_prev = None
@@ -761,6 +830,9 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
             d_head=self.head_dim,
             num_q_heads=self.num_attention_heads // self.tp_degree,
             num_kv_heads=self.num_key_value_heads // self.tp_degree,
+            qk_norm_pre_rope=pre_rope_qk_norm_config,
+            qk_norm_pre_rope_q_gamma=pre_rope_q_gamma,
+            qk_norm_pre_rope_k_gamma=pre_rope_k_gamma,
         )
         if fused_residual_add:
             residual = hidden_states

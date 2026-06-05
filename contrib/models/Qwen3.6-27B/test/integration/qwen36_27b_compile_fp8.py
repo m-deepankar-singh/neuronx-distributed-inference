@@ -852,6 +852,8 @@ def _build_config(args: argparse.Namespace):
     ):
         neuron_config_kwargs["qkv_kernel_enabled"] = True
         neuron_config_kwargs["qkv_nki_kernel_enabled"] = True
+    if args.enable_qkv_cte_nki_kernel_fuse_rope:
+        neuron_config_kwargs["qkv_cte_nki_kernel_fuse_rope"] = True
     if args.enable_split_qkv_tkg_nki_kernel:
         neuron_config_kwargs["qkv_tkg_nki_kernel_enabled"] = True
     if args.enable_attn_block_tkg_nki_kernel:
@@ -1126,6 +1128,15 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--enable-qkv-cte-nki-kernel-fuse-rope",
+        action="store_true",
+        help=(
+            "Fuse context-encoding RoPE into the stock QKV NKI kernel. For "
+            "Qwen pre-RoPE Q/K RMSNorm, the model wrapper passes Q/K norm "
+            "weights into the kernel so the math stays pre-RoPE."
+        ),
+    )
+    parser.add_argument(
         "--enable-split-qkv-tkg-nki-kernel",
         action="store_true",
         help=(
@@ -1327,6 +1338,10 @@ def main() -> int:
             "--enable-fused-qkv, --enable-qkv-nki-kernels, "
             "or --enable-attn-block-tkg-nki-kernel"
         )
+    if args.enable_qkv_cte_nki_kernel_fuse_rope and not args.enable_qkv_nki_kernels:
+        parser.error(
+            "--enable-qkv-cte-nki-kernel-fuse-rope requires --enable-qkv-nki-kernels"
+        )
     if (
         args.context_encoding_bucket_pairs is not None
         and not (args.enable_prefix_caching or args.enable_hybrid_apc)
@@ -1450,6 +1465,9 @@ def main() -> int:
                 "enable_deltanet_decode_nki": args.enable_deltanet_decode_nki,
                 "enable_fused_qkv": args.enable_fused_qkv,
                 "enable_qkv_nki_kernels": args.enable_qkv_nki_kernels,
+                "enable_qkv_cte_nki_kernel_fuse_rope": (
+                    args.enable_qkv_cte_nki_kernel_fuse_rope
+                ),
                 "enable_split_qkv_tkg_nki_kernel": (
                     args.enable_split_qkv_tkg_nki_kernel
                 ),

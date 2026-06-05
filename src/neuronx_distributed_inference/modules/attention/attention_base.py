@@ -534,11 +534,36 @@ class NeuronAttentionBase(nn.Module):
            also return residual for MLP """
         is_qkv_cte_fuse_rope_nki_kernel_enabled = self.neuron_config.is_prefill_stage and self.qkv_cte_nki_kernel_fuse_rope
         assert not (is_qkv_cte_fuse_rope_nki_kernel_enabled and self.use_qk_norm and self.qk_norm_placement == QKNormPlacement.PRE_ROPE), "qkv cte nki kernel fuse rope is not compatible with pre rope qk norm"
+        has_pre_rope_qk_layernorm = (
+            self.q_layernorm is not None
+            and self.k_layernorm is not None
+            and self.qk_norm_placement == QKNormPlacement.PRE_ROPE
+        )
+        qk_norm_in_qkv_kernel = (
+            is_qkv_cte_fuse_rope_nki_kernel_enabled and has_pre_rope_qk_layernorm
+        )
+        if qk_norm_in_qkv_kernel and (
+            isinstance(self.q_layernorm, nn.LayerNorm)
+            or isinstance(self.k_layernorm, nn.LayerNorm)
+        ):
+            raise RuntimeError(
+                "qkv_cte_nki_kernel_fuse_rope with pre-RoPE QK norm requires "
+                "RMSNorm-style q_layernorm/k_layernorm modules"
+            )
         if is_qkv_cte_fuse_rope_nki_kernel_enabled:
             if cos_cache is None or sin_cache is None:
                 cos_cache, sin_cache = self.rotary_emb(hidden_states, position_ids)
             Q, K, V, residual = self.get_qkv_proj()(
-                hidden_states=hidden_states, rmsnorm=rmsnorm, adapter_ids=adapter_ids, residual=residual, cos_cache=cos_cache, sin_cache=sin_cache,
+                hidden_states=hidden_states,
+                rmsnorm=rmsnorm,
+                adapter_ids=adapter_ids,
+                residual=residual,
+                cos_cache=cos_cache,
+                sin_cache=sin_cache,
+                q_layernorm=self.q_layernorm if qk_norm_in_qkv_kernel else None,
+                k_layernorm=self.k_layernorm if qk_norm_in_qkv_kernel else None,
+                qk_norm_pre_rope_enabled=qk_norm_in_qkv_kernel,
+                qk_norm_eps=self.rms_norm_eps,
             )
         else:
             Q, K, V, residual = self.get_qkv_proj()(
@@ -554,11 +579,13 @@ class NeuronAttentionBase(nn.Module):
         bsz, q_len, _ = hidden_states.size()
         if self.qkv_proj_sp_enabled:
             q_len *= self.tensor_model_parallel_group.size()
+        q_layernorm = None if qk_norm_in_qkv_kernel else self.q_layernorm
+        k_layernorm = None if qk_norm_in_qkv_kernel else self.k_layernorm
         Q = move_heads_front(
-            Q, bsz, q_len, self.num_heads, self.head_dim, layernorm=self.q_layernorm, post_transpose_layernorm=self.post_transpose_layernorm
+            Q, bsz, q_len, self.num_heads, self.head_dim, layernorm=q_layernorm, post_transpose_layernorm=self.post_transpose_layernorm
         )
         K = move_heads_front(
-            K, bsz, q_len, self.num_key_value_heads, self.head_dim, layernorm=self.k_layernorm, post_transpose_layernorm=self.post_transpose_layernorm
+            K, bsz, q_len, self.num_key_value_heads, self.head_dim, layernorm=k_layernorm, post_transpose_layernorm=self.post_transpose_layernorm
         )
         V = move_heads_front(V, bsz, q_len, self.num_key_value_heads, self.head_dim, layernorm=None)
 

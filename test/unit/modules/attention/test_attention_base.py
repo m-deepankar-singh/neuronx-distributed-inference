@@ -11,6 +11,7 @@ from neuronx_distributed_inference.modules.attention.attention_base import (
     FlashAttentionStrategy,
     GroupQueryAttention_QKV,
     NeuronAttentionBase,
+    QKNormPlacement,
 )
 from neuronx_distributed_inference.utils.testing import build_function
 
@@ -587,6 +588,75 @@ def test_prep_qkv_tensors_qkv_cte_fuse_rope_nki_kernel(
         assert "sin_cache" not in qkv_proj_kwargs or qkv_proj_kwargs["sin_cache"] is None
         # apply_rotary_pos_emb should be called to apply rope separately
         mock_apply_rotary_pos_emb.assert_called_once()
+
+
+@patch("neuronx_distributed_inference.modules.attention.attention_base.apply_rotary_pos_emb")
+def test_prep_qkv_tensors_fused_rope_passes_qwen_pre_rope_qk_norm(
+    mock_apply_rotary_pos_emb, attn_module
+):
+    batch_size = 1
+    seq_len = 8
+    attn_module.qkv_cte_nki_kernel_fuse_rope = True
+    attn_module.neuron_config.is_prefill_stage = True
+    attn_module.qk_norm_placement = QKNormPlacement.PRE_ROPE
+
+    q_norm = MockTorchModule()
+    k_norm = MockTorchModule()
+    q_norm.weight = torch.nn.Parameter(torch.rand(attn_module.head_dim), requires_grad=False)
+    k_norm.weight = torch.nn.Parameter(torch.rand(attn_module.head_dim), requires_grad=False)
+    q_norm.side_effect = AssertionError("q_layernorm should be fused in qkv kernel")
+    k_norm.side_effect = AssertionError("k_layernorm should be fused in qkv kernel")
+    attn_module.q_layernorm = q_norm
+    attn_module.k_layernorm = k_norm
+
+    q = torch.rand((batch_size, seq_len, attn_module.num_heads * attn_module.head_dim))
+    k = torch.rand((batch_size, seq_len, attn_module.num_key_value_heads * attn_module.head_dim))
+    v = torch.rand((batch_size, seq_len, attn_module.num_key_value_heads * attn_module.head_dim))
+    attn_module.qkv_proj = MockTorchModule(return_value=(q, k, v, None))
+
+    cos_cache = torch.rand((batch_size, seq_len, attn_module.head_dim))
+    sin_cache = torch.rand((batch_size, seq_len, attn_module.head_dim))
+    attn_module.rotary_emb = MagicMock(return_value=(cos_cache, sin_cache))
+
+    position_ids = torch.ones((batch_size, seq_len))
+    hidden_states = torch.rand((batch_size, seq_len, attn_module.hidden_size))
+    actual_q, actual_k, actual_v, actual_cos_cache, actual_sin_cache, _ = (
+        attn_module.prep_qkv_tensors(
+            position_ids=position_ids,
+            hidden_states=hidden_states,
+            past_key_value=None,
+        )
+    )
+
+    expected_q = (
+        q.view(batch_size, seq_len, attn_module.num_heads, attn_module.head_dim)
+        .transpose(1, 2)
+        .contiguous()
+    )
+    expected_k = (
+        k.view(batch_size, seq_len, attn_module.num_key_value_heads, attn_module.head_dim)
+        .transpose(1, 2)
+        .contiguous()
+    )
+    expected_v = (
+        v.view(batch_size, seq_len, attn_module.num_key_value_heads, attn_module.head_dim)
+        .transpose(1, 2)
+        .contiguous()
+    )
+    torch.testing.assert_close(actual_q, expected_q)
+    torch.testing.assert_close(actual_k, expected_k)
+    torch.testing.assert_close(actual_v, expected_v)
+    torch.testing.assert_close(actual_cos_cache, cos_cache)
+    torch.testing.assert_close(actual_sin_cache, sin_cache)
+
+    qkv_proj_kwargs = attn_module.qkv_proj.call_args.kwargs
+    assert qkv_proj_kwargs["q_layernorm"] is q_norm
+    assert qkv_proj_kwargs["k_layernorm"] is k_norm
+    assert qkv_proj_kwargs["qk_norm_pre_rope_enabled"] is True
+    assert qkv_proj_kwargs["qk_norm_eps"] == attn_module.rms_norm_eps
+    q_norm.assert_not_called()
+    k_norm.assert_not_called()
+    mock_apply_rotary_pos_emb.assert_not_called()
 
 
 def _check_qkv_proj_call(attn_module, hidden_states, is_context_parallel = False, is_cte = True):

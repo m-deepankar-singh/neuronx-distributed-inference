@@ -11,14 +11,12 @@ def _bind_qkv_kernel_helpers(qkv_proj):
         "_expected_local_fused_qkv_size",
         "_validate_qkv_kernel_layout",
         "_qkv_kernel_quantization_args",
+        "_qk_rmsnorm_gamma",
     ):
-        setattr(
-            qkv_proj,
-            method_name,
-            getattr(gqa.GroupQueryAttention_QKV, method_name).__get__(
-                qkv_proj, gqa.GroupQueryAttention_QKV
-            ),
-        )
+        method = getattr(gqa.GroupQueryAttention_QKV, method_name)
+        if method_name != "_qk_rmsnorm_gamma":
+            method = method.__get__(qkv_proj, gqa.GroupQueryAttention_QKV)
+        setattr(qkv_proj, method_name, method)
 
 
 @pytest.mark.parametrize(
@@ -120,6 +118,93 @@ def test_kernel_qkv_forward_rope_fusion(mock_qkv_kernel, batch_size, seq_len, fu
     assert K.shape == (batch_size, seq_len, num_key_value_heads * head_dim // tp_degree)
     assert V.shape == (batch_size, seq_len, num_key_value_heads * head_dim // tp_degree)
     assert residual is None
+
+
+@patch('neuronx_distributed_inference.modules.attention.gqa.qkv_kernel')
+def test_kernel_qkv_forward_passes_pre_rope_qk_rmsnorm(mock_qkv_kernel):
+    batch_size = 1
+    seq_len = 8
+    hidden_size = 16
+    head_dim = 4
+    num_attention_heads = 8
+    num_key_value_heads = 2
+    tp_degree = 2
+    fused_qkv_size = (num_attention_heads + 2 * num_key_value_heads) * head_dim // tp_degree
+
+    hidden_states = torch.rand((batch_size, seq_len, hidden_size))
+    cos_cache = torch.rand((batch_size, seq_len, head_dim))
+    sin_cache = torch.rand((batch_size, seq_len, head_dim))
+    QKV = torch.rand((batch_size, seq_len, fused_qkv_size))
+    mock_kernel_call = MagicMock(return_value=QKV)
+    mock_qkv_kernel.__getitem__ = MagicMock(return_value=mock_kernel_call)
+
+    qkv_proj = Mock(spec=gqa.GroupQueryAttention_QKV)
+    qkv_proj.num_attention_heads = num_attention_heads
+    qkv_proj.num_key_value_heads = num_key_value_heads
+    qkv_proj.tp_degree = tp_degree
+    qkv_proj.head_dim = head_dim
+    qkv_proj.fused_rmsnorm = False
+    qkv_proj.fused_rmsnorm_skip_gamma = False
+    qkv_proj.logical_nc_config = 1
+    qkv_proj.bias = False
+    qkv_proj.qkv_kernel_nbsd_layout = False
+    qkv_proj.rms_norm_eps = 1e-6
+    _bind_qkv_kernel_helpers(qkv_proj)
+
+    qkv_proj.Wqkv = Mock()
+    qkv_proj.Wqkv.weight = Mock()
+    qkv_proj.Wqkv.weight.shape = (hidden_size, fused_qkv_size)
+    qkv_proj.Wqkv.weight.dtype = torch.float32
+    qkv_proj.Wqkv.bias = None
+
+    q_norm = torch.nn.Module()
+    k_norm = torch.nn.Module()
+    q_norm.weight = torch.nn.Parameter(torch.rand(head_dim), requires_grad=False)
+    k_norm.weight = torch.nn.Parameter(torch.rand(head_dim), requires_grad=False)
+
+    qkv_proj._split_fused_qkv = Mock(
+        return_value=(
+            torch.rand((batch_size, seq_len, num_attention_heads * head_dim // tp_degree)),
+            torch.rand((batch_size, seq_len, num_key_value_heads * head_dim // tp_degree)),
+            torch.rand((batch_size, seq_len, num_key_value_heads * head_dim // tp_degree)),
+        )
+    )
+
+    gqa.GroupQueryAttention_QKV._kernel_qkv_forward(
+        qkv_proj,
+        hidden_states,
+        None,
+        None,
+        cos_cache,
+        sin_cache,
+        q_layernorm=q_norm,
+        k_layernorm=k_norm,
+        qk_norm_pre_rope_enabled=True,
+        qk_norm_eps=1e-5,
+    )
+
+    kernel_kwargs = mock_kernel_call.call_args.kwargs
+    qk_norm_cfg = kernel_kwargs["qk_norm_pre_rope"]
+    assert isinstance(qk_norm_cfg, gqa.QKNormConfig)
+    assert qk_norm_cfg.q_norm == gqa.NormType.RMS_NORM
+    assert qk_norm_cfg.k_norm == gqa.NormType.RMS_NORM
+    assert qk_norm_cfg.eps == 1e-5
+    torch.testing.assert_close(
+        kernel_kwargs["qk_norm_pre_rope_q_gamma"], q_norm.weight.data.unsqueeze(0)
+    )
+    torch.testing.assert_close(
+        kernel_kwargs["qk_norm_pre_rope_k_gamma"], k_norm.weight.data.unsqueeze(0)
+    )
+
+
+def test_kernel_qkv_forward_rejects_layernorm_for_pre_rope_qk_norm():
+    qkv_proj = Mock(spec=gqa.GroupQueryAttention_QKV)
+    qkv_proj.rms_norm_eps = 1e-6
+
+    with pytest.raises(RuntimeError, match="RMSNorm-style"):
+        gqa.GroupQueryAttention_QKV._qk_rmsnorm_gamma(
+            torch.nn.LayerNorm(4), "q_layernorm"
+        )
 
 
 def test_fused_qkv_nki_installs_quantized_layout_hook(monkeypatch):
