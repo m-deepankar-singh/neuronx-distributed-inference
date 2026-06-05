@@ -61,7 +61,10 @@ def _automation_name(values: dict[str, str], override: str | None = None) -> str
         return override
     base = values.get("BASE", "qwen36-compile")
     speed_slice = values.get("SPEED_SLICE", "")
-    slug_source = speed_slice if speed_slice and speed_slice != "none" else base
+    slug_parts = [speed_slice if speed_slice and speed_slice != "none" else base]
+    if values.get("TS"):
+        slug_parts.append(values["TS"])
+    slug_source = "-".join(slug_parts)
     slug = re.sub(r"[^a-zA-Z0-9]+", "-", slug_source).strip("-").lower()
     if not slug:
         slug = "qwen36-compile"

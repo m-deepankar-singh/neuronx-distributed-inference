@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shlex
 from datetime import datetime, timezone
 from pathlib import Path
@@ -132,6 +133,11 @@ def _default_next_ts(next_slice: str) -> str:
     return f"{stamp}_{next_slice}"
 
 
+def _automation_name(next_slice: str, ts: str) -> str:
+    slug = re.sub(r"[^a-zA-Z0-9]+", "-", f"{next_slice}-{ts}").strip("-").lower()
+    return f"monitor-qwen-{slug[:56]}-compile"
+
+
 def next_preflight(
     env_values: dict[str, str],
     next_slice: str,
@@ -157,7 +163,7 @@ def next_preflight(
         launch_env,
         ["bash", "tmp_compile_qwen32k_segcte2048_gdnseg512.sh"],
     )
-    automation_name = f"monitor-qwen-{next_slice.replace('_', '-')}-compile"
+    automation_name = _automation_name(next_slice, ts)
     return {
         "ts": ts,
         "dry_run_command": dry_run_command,

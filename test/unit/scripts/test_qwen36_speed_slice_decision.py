@@ -121,7 +121,7 @@ def test_slow_sample_token_slice_advances_to_hostlogits():
     assert "MODEL=/home/ubuntu/model" in dry_run
     assert "tmp_compile_qwen32k_segcte2048_gdnseg512.sh" in dry_run
     assert "<ENVLOG_FROM_DRY_RUN>" in preflight["automation_payload_command_template"]
-    assert "monitor-qwen-hostlogits-compile" in preflight[
+    assert "monitor-qwen-hostlogits-20260606t010203z-hostlogits-compile" in preflight[
         "automation_payload_command_template"
     ]
     assert "COMPILE_DRY_RUN=0" in launch

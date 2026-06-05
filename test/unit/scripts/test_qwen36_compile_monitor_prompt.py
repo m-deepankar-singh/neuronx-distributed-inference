@@ -115,6 +115,7 @@ def test_build_automation_payload_uses_speed_slice_name_and_prompt():
     values = {
         "BASE": "qwen36_very_long_candidate_name_that_should_be_safely_shortened",
         "SPEED_SLICE": "hostlogits_lmheadbf16",
+        "TS": "20260606T010203Z_lmhead",
     }
 
     payload = _SCRIPT.build_automation_payload(
@@ -128,7 +129,9 @@ def test_build_automation_payload_uses_speed_slice_name_and_prompt():
     assert payload["destination"] == "thread"
     assert payload["status"] == "ACTIVE"
     assert payload["rrule"] == "FREQ=MINUTELY;INTERVAL=7"
-    assert payload["name"] == "monitor-qwen-hostlogits-lmheadbf16-compile"
+    assert payload["name"] == (
+        "monitor-qwen-hostlogits-lmheadbf16-20260606t010203z-lmhead-compile"
+    )
     assert payload["prompt"] == "Monitor this compile"
 
 
