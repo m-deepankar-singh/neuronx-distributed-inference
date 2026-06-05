@@ -571,3 +571,36 @@ bash tmp_compile_qwen32k_segcte2048_gdnseg512.sh
    - Early evidence before stopping manual polling: env log shows `SAMPLING=on_device_greedy_sampletokonly` and `OUTPUT_LOGITS_WITH_ON_DEVICE_SAMPLING=0`; process command has no `--output-logits-with-on-device-sampling`; compile trace shows `disable_context_encoding_argmax_kernel=true`, `enable_qkv_cte_nki_kernel_fuse_qk_norm=true`, `enable_out_proj_nki_kernel=false`, and `enable_kv_cache_quant=false`.
    - HLO evidence: HLO generation completed in `302.8270480632782 seconds`, with each context HLO around `30-32s`. This is effectively identical to the coherent qk-norm anchor's HLO generation time (`300.4844801425934s`), so dropping returned debug logits does not recover the old short HLO generation path. The compile is still worth validating for runtime TTFT, but the current best hypothesis shifts toward the old `hostlogits`/`lmheadbf16` graph shape or another old compile-policy difference.
    - User instruction after launch: do not manually monitor continuously; rely on automation unless asked for a check or a heartbeat reports a meaningful result.
+
+39. Next compile decision tree after the sample-token-only automation verdict.
+   - Do not launch another compile until `monitor-qwen-sampletokonly-compile` reports a final compile/runtime verdict.
+   - If sample-token-only is incoherent, revert to the coherent qk-norm anchor and do not pursue sampling-output changes further.
+   - If sample-token-only is coherent but still slow, the next one-variable compile should flip only sampling mode to host-side logits:
+
+```bash
+TS=<timestamp>_hostlogits \
+DISABLE_ON_DEVICE_SAMPLING=1 \
+OUTPUT_LOGITS_WITH_ON_DEVICE_SAMPLING=0 \
+ENABLE_QKV_NKI_KERNELS=1 \
+ENABLE_QKV_CTE_NKI_KERNEL_FUSE_QK_NORM=1 \
+ENABLE_QKV_CTE_NKI_KERNEL_FUSE_ROPE=0 \
+ENABLE_OUT_PROJ_NKI_KERNEL=0 \
+PREFIX_CTE_ATTENTION_BACKEND=attention_cte \
+QWEN36_DELTANET_FUSED_SEGMENT_TOKENS=0 \
+QWEN36_DELTANET_MULTIHEAD_CTE=0 \
+QWEN36_DELTANET_SOLVE_MODE=direct \
+QWEN36_DELTANET_SOLVE_SCAN_STEPS=0 \
+GDN_RECURRENT_CACHE_DTYPE=bfloat16 \
+GDN_CONV_CACHE_DTYPE=bfloat16 \
+CTE_BUCKETS_RAW=2048 \
+SEQ_LEN=32768 \
+MAX_CONTEXT_LENGTH=32768 \
+ENABLE_KV_CACHE_QUANT=0 \
+QUANTIZE_LM_HEAD=1 \
+FP8_QUANTIZE_LINEAR_ATTN_GATES=1 \
+bash tmp_compile_qwen32k_segcte2048_gdnseg512.sh
+```
+
+   - Rationale: this isolates hostlogits from lm_head dtype. The old fast family used `hostlogits` and `lmheadbf16`, but changing both at once would confound the result.
+   - If hostlogits-only is coherent but still slow, the next one-variable compile should keep hostlogits and flip only `QUANTIZE_LM_HEAD=0` to reproduce the old `lmheadbf16` policy.
+   - Before either compile, create a new automation with exact PID/log/env/artifact paths. Do not reuse `monitor-qwen-sampletokonly-compile`.
