@@ -3914,3 +3914,107 @@ Local test limitation:
 * Mitigation:
   those NxD-runtime-dependent tests need the Neuron/NxD environment on the EC2
   host. They were not used as local commit gates.
+
+## 2026-06-05 Decode-Step Baseline Reproduction Anchor
+
+Current live baseline for the next multi-head branch comparison:
+
+* Runtime host: `ubuntu@16.26.184.190`.
+* Backend: `http://127.0.0.1:8001`.
+* Proxy: `http://127.0.0.1:8000`.
+* Backend log:
+  `/home/ubuntu/validation_logs/fp8_256k_decode_nki/head_norowscale_baseline_backend_20260605T1228Z.log`.
+* Proxy log:
+  `/home/ubuntu/validation_logs/fp8_256k_decode_nki/head_norowscale_baseline_proxy_nothink_20260605T1239Z.log`.
+* Artifact:
+  `/mnt/trainium_artifacts/qwen_artifacts/qwen36_27b_256k_fp8_full_lmheadfp8_kvfp8_hybrid_apc_nki_decode_splitqkv_gdnrecbfloat16_sampletokens_b256_cte256_512_pfx16k_slots64_async_20260605T113222Z_head_norowscale`.
+
+Compile host/source:
+
+* Host: `ubuntu@16.26.135.243`.
+* Source: `/home/ubuntu/inferentia-gdn-decode-step-baseline-20260605`.
+* Base commit: `834543e`.
+* Local source delta:
+  split-QKV TKG row scales defaulted off via
+  `QWEN36_SPLIT_QKV_TKG_ROW_SCALES=0`, restoring the May 28 kernel contract
+  with `QuantizationType.NONE` and `qkv_w_scales=None`.
+
+Compile command:
+
+```bash
+TS=$(date -u +%Y%m%dT%H%M%SZ)_head_norowscale \
+LOGDIR=/home/ubuntu/validation_logs/fp8_256k_decode_nki \
+LOAD_AFTER_COMPILE=0 \
+QWEN36_SPLIT_QKV_TKG_ROW_SCALES=0 \
+bash tmp_compile_qwen256k_fp8_full_decode_splitqkv_sampletokens.sh
+```
+
+Compile result:
+
+* `Finished Compilation for all HLOs`.
+* `CHECKPOINT_BANK_WEIGHTS_ADDED` for tp0..tp3.
+* Checkpoint banks: `48 48 torch.bfloat16` per TP shard.
+* `COMPILE_DONE`.
+
+Backend launch flags:
+
+```bash
+--model-path /home/ubuntu/models/Qwen3.6-27B
+--compiled-artifacts /mnt/trainium_artifacts/qwen_artifacts/qwen36_27b_256k_fp8_full_lmheadfp8_kvfp8_hybrid_apc_nki_decode_splitqkv_gdnrecbfloat16_sampletokens_b256_cte256_512_pfx16k_slots64_async_20260605T113222Z_head_norowscale
+--max-model-len 262144
+--seq-len 262144
+--cte-buckets "256 512"
+--context-encoding-bucket-pairs "256:256 512:256 256:512 512:512 256:1024 512:1024 256:2048 512:2048 256:4096 512:4096 256:8192 512:8192 512:16384"
+--token-generation-buckets "512 768 1024 1280 2048 2304 4096 4352 8192 8448 16384 16640 24576 24832 32768 33024 65536 65792 131072 131328 262144"
+--tensor-parallel-size 4
+--logical-nc-config 2
+--max-num-seqs 1
+--ctx-batch-size 1
+--async-mode
+--enable-prefix-caching
+--enable-hybrid-apc
+--enable-vllm-chunked-prefill
+--block-size 256
+--gdn-checkpoint-interval 256
+--max-gdn-checkpoint-slots 64
+--gdn-recurrent-cache-dtype bfloat16
+--gdn-conv-cache-dtype bfloat16
+--hybrid-cache-mode all
+--hybrid-apc-require-vllm-metadata
+--hybrid-apc-enable-backed-prefix-reads
+--num-gpu-blocks-override 1024
+--host 127.0.0.1
+--port 8001
+```
+
+Proxy launch:
+
+```bash
+python3 contrib/models/Qwen3.6-27B/vllm/qwen36_chat_proxy.py \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --backend-url http://127.0.0.1:8001
+```
+
+Validation result:
+
+* Runtime health passed for backend and proxy.
+* Cold chat HTTP 200 at 146, 160, 485, 505, 526, 1225, 2048, 2049, and
+  2500 tokens.
+* No serve-log evidence of `negative token_id`, `out-of-vocab token_id`,
+  `fallback argmax`, logits NaN, `NRT_EXEC`, or `NRT_RESOURCE`.
+* Natural-language smoke is coherent and matches the old May 28 "usable
+  artifact" class.
+* Strict semantic quality is not clean: exact marker-copy and structured recall
+  fail. Treat this as a runtime-stable slow-prefix baseline, not final output
+  coherence.
+
+Speed baseline:
+
+* 512 target: 511 prompt tokens, TTFT 0.9689s, effective prompt tok/s 527.2.
+* 16k target: 16373 prompt tokens, TTFT 46.4619s, effective prompt tok/s
+  352.4.
+
+Dedicated detailed note:
+
+`profile_artifacts/qwen36_head_norowscale_baseline_20260605/README.md`.
