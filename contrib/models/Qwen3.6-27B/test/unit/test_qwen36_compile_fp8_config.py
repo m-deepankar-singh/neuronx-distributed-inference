@@ -102,10 +102,15 @@ def _args(**overrides):
         deltanet_cte_backend="env",
         disable_on_device_sampling=True,
         output_logits_with_on_device_sampling=False,
+        disable_argmax_kernel=False,
+        disable_context_encoding_argmax_kernel=False,
+        fp8_quantize_linear_attn_gates=False,
         kernel_q_tile_size=128,
         kernel_kv_tile_size=1024,
         enable_fused_qkv=False,
         enable_qkv_nki_kernels=False,
+        enable_qkv_cte_nki_kernel_fuse_rope=False,
+        enable_qkv_cte_nki_kernel_fuse_qk_norm=False,
         enable_split_qkv_tkg_nki_kernel=False,
         enable_attn_block_tkg_nki_kernel=False,
         enable_attn_block_tkg_cascaded_attention=False,
@@ -805,7 +810,7 @@ class TestQwen36CompileFp8Config(unittest.TestCase):
             self.assertIn("existing.weight", keys)
             self.assertIn("hybrid_gdn_checkpoint_cache.recurrent_slots.1", keys)
             self.assertIn("hybrid_gdn_checkpoint_cache.conv_slots.1", keys)
-            self.assertEqual(recurrent.dtype, _COMPILE.torch.bfloat16)
+            self.assertEqual(recurrent.dtype, _COMPILE.torch.float32)
             self.assertEqual(tuple(recurrent.shape), (64, 12, 128, 128))
             self.assertEqual(conv.dtype, _COMPILE.torch.bfloat16)
             self.assertEqual(tuple(conv.shape), (64, 2560, 3))

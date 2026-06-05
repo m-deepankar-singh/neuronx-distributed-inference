@@ -301,6 +301,20 @@ class TestQwen36ModelAliases(unittest.TestCase):
         self.assertEqual(aliases[state], 4)
         self.assertEqual(aliases[checkpoint], 5)
 
+    def test_on_device_tokens_only_aliases_after_single_trace_output(self):
+        instance, (kv0, kv1, state, checkpoint) = _make_instance(
+            self.qwen_module,
+            output_logits=False,
+            on_device_sampling_config=object(),
+        )
+
+        _module, aliases = instance.get(bucket_rank=0)
+
+        self.assertEqual(aliases[kv0], 1)
+        self.assertEqual(aliases[kv1], 2)
+        self.assertEqual(aliases[state], 3)
+        self.assertEqual(aliases[checkpoint], 4)
+
     def test_gathered_logits_mask_only_actual_vocab_padding(self):
         lm_head = SimpleNamespace(pad_size=248320, gather_output=True)
         config = SimpleNamespace(vocab_size=248320)
