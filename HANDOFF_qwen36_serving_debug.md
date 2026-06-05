@@ -299,6 +299,38 @@ Ported rebuild commits:
    - 16k usage-accounted streaming cold-prefill benchmark (`/v1/completions`, exact 16384 token-id prompt, `max_tokens=1`, `stream_options.include_usage=true`): run 0 `25.6959s TTFT`, `637.6 tok/s`; run 1 `25.6728s TTFT`, `638.2 tok/s`; run 2 `25.6755s TTFT`, `638.1 tok/s`.
    - Conclusion: disabling GDN internal segmentation did not recover prefill speed. It preserves coherence but is effectively the same speed class as the prior coherent QKV-NKI segmented-CTE artifact. The bottleneck is not the `QWEN36_DELTANET_FUSED_SEGMENT_TOKENS=512` loop.
 
+29. Compile-host cleanup was required before the next compile.
+   - Compile host: `ubuntu@16.26.135.243`
+   - Initial disk state before cleanup: `/dev/root 484G`, `397G used`, `87G avail` after cleanup; before cleanup the same filesystem had only about `16G` free, too little for another full artifact and checkpoint-bank insertion.
+   - Cleanup command context: delete compile-host-only copies that were already transferred/validated or superseded:
+     - `/mnt/trainium_artifacts/qwen_artifacts/qwen36_32k_fp8_fp8all_lmheadfp8_gatesfp8_kvbf16_qkvnki_tiled_segmented_cte512_gdnseg0_cte2048_pfx32k_slots64_20260605T171105Z_nogdnseg_direct_scan0`
+     - `/mnt/trainium_artifacts/qwen_artifacts/qwen36_32k_fp8_fp8all_lmheadfp8_gatesfp8_kvbf16_qkvnki_tiled_segmented_cte512_gdnseg512_cte2048_pfx32k_slots64_20260605T152927Z_direct_scan0`
+     - `/mnt/trainium_artifacts/qwen_artifacts/_nxd_work_32k_fp8_fp8all_lmheadfp8_gatesfp8_kvbf16_qkvnki_tiled_segmented_cte512_gdnseg0_cte2048_20260605T171105Z_nogdnseg_direct_scan0`
+     - `/mnt/trainium_artifacts/qwen_artifacts/_nxd_work_32k_fp8_fp8all_lmheadfp8_gatesfp8_kvbf16_qkvnki_tiled_segmented_cte512_gdnseg512_cte2048_20260605T152927Z_direct_scan0`
+   - Root cause/hypothesis: compile artifacts are about 32-37G each; keeping multiple validated attempts on the compile host leaves too little room for the next compile. Runtime host still has the validated no-GDN artifact live; the compile-host copy was not needed for serving.
+   - Mitigation result: disk free increased to `87G`, enough for the next one-variable compile.
+
+30. Automation setup for the next compile failed at the Codex app tool layer.
+   - Tool calls attempted: `codex_app.automation_update` with `mode=create` and `mode=suggested_create`, `kind=heartbeat`, 10-minute RRULE, and both full and minimal monitor prompts.
+   - Error text returned by tool: `automation_update received invalid arguments.`
+   - Context: this was before launching the attention-CTE compile, because compiles should have monitors/automations.
+   - Root cause hypothesis: the app automation tool rejected heartbeat create payloads in this resumed-goal context; minimal and explicit-thread variants both failed, so the issue was not prompt length alone.
+   - Mitigation: proceeded with manual monitoring using deterministic PID/log/artifact paths, and noted that no stale automation exists for this compile.
+   - Remaining risk: if this thread is not actively monitored, no heartbeat will wake it automatically. Manual monitor command is listed below.
+
+31. Attention-CTE one-variable compile is in flight to test the remaining cold-prefill speed suspect.
+   - Compile host: `ubuntu@16.26.135.243`
+   - Source: `/home/ubuntu/inferentia-gdn-prefill-speed-coherent`
+   - PID: `81458`
+   - PID file: `/home/ubuntu/validation_logs/fp8_256k_decode_nki/qwen36_32k_fp8_fp8all_lmheadfp8_gatesfp8_kvbf16_qkvnki_tiled_attention_cte512_gdnseg0_cte2048_pfx32k_slots64_20260605T180405Z_attncte_direct_scan0_compile.pid`
+   - Compile log: `/home/ubuntu/validation_logs/fp8_256k_decode_nki/qwen36_32k_fp8_fp8all_lmheadfp8_gatesfp8_kvbf16_qkvnki_tiled_attention_cte512_gdnseg0_cte2048_pfx32k_slots64_20260605T180405Z_attncte_direct_scan0_compile.log`
+   - Env log: `/home/ubuntu/validation_logs/fp8_256k_decode_nki/qwen36_32k_fp8_fp8all_lmheadfp8_gatesfp8_kvbf16_qkvnki_tiled_attention_cte512_gdnseg0_cte2048_pfx32k_slots64_20260605T180405Z_attncte_direct_scan0_env.txt`
+   - Artifact: `/mnt/trainium_artifacts/qwen_artifacts/qwen36_32k_fp8_fp8all_lmheadfp8_gatesfp8_kvbf16_qkvnki_tiled_attention_cte512_gdnseg0_cte2048_pfx32k_slots64_20260605T180405Z_attncte_direct_scan0`
+   - Workdir: `/mnt/trainium_artifacts/qwen_artifacts/_nxd_work_32k_fp8_fp8all_lmheadfp8_gatesfp8_kvbf16_qkvnki_tiled_attention_cte512_gdnseg0_cte2048_20260605T180405Z_attncte_direct_scan0`
+   - Command shape: `TS=20260605T180405Z_attncte`, `ENABLE_QKV_NKI_KERNELS=1`, `CTE_BUCKETS_RAW=2048`, `PREFIX_CTE_ATTENTION_BACKEND=attention_cte`, `PREFIX_CTE_ATTENTION_SEGMENT_SIZE=512`, `QWEN36_DELTANET_FUSED_SEGMENT_TOKENS=0`, `QWEN36_DELTANET_MULTIHEAD_CTE=0`, `ENABLE_KV_CACHE_QUANT=0`, `QUANTIZE_LM_HEAD=1`, `FP8_QUANTIZE_LINEAR_ATTN_GATES=1`, `QWEN36_DELTANET_SOLVE_MODE=direct`, `QWEN36_DELTANET_SOLVE_SCAN_STEPS=0`, `GDN_RECURRENT_CACHE_DTYPE=bfloat16`, `GDN_CONV_CACHE_DTYPE=bfloat16`, `bash tmp_compile_qwen32k_segcte2048_gdnseg512.sh`.
+   - Env verification: env log contains `PREFIX_CTE_ATTENTION_BACKEND=attention_cte`, `QWEN36_DELTANET_FUSED_SEGMENT_TOKENS=0`, `ENABLE_QKV_NKI_KERNELS=1`, `ENABLE_KV_CACHE_QUANT=0`, and BF16 GDN dtypes. `CONTEXT_TRACE_SHAPE` also records `"prefix_cte_attention_backend": "attention_cte"`.
+   - Initial status: PID alive; context HLO generation started; no immediate traceback, NCC error, or disk error.
+
 ### Current next step
 
 Monitor the one-variable no-GDN-segmentation compile:
@@ -341,6 +373,18 @@ bash tmp_compile_qwen32k_segcte2048_gdnseg512.sh
 Result from the no-GDN-seg experiment: coherent, but still only about `638 tok/s` at exact 16k cold prefill. Do not repeat this compile as a speed fix.
 
 The next isolated speed experiment should move off `segmented_cte` for cold prefill and compile the same coherent policy with `PREFIX_CTE_ATTENTION_BACKEND=attention_cte`, keeping all else fixed (`QKV NKI`, `CTE2048`, `KV BF16`, `GDN segment tokens 0`, `direct scan0`, `multihead DeltaNet CTE off`). Reason: raw `pfx0` context is slow even without prefix reads and remains slow when GDN segmentation is disabled, so the remaining compile-baked suspect in the cold context graph is segmented CTE attention/model integration overhead.
+
+Manual monitor command for the current attention-CTE compile:
+
+```bash
+ssh ubuntu@16.26.135.243 \
+  'pidfile=/home/ubuntu/validation_logs/fp8_256k_decode_nki/qwen36_32k_fp8_fp8all_lmheadfp8_gatesfp8_kvbf16_qkvnki_tiled_attention_cte512_gdnseg0_cte2048_pfx32k_slots64_20260605T180405Z_attncte_direct_scan0_compile.pid; \
+   log=/home/ubuntu/validation_logs/fp8_256k_decode_nki/qwen36_32k_fp8_fp8all_lmheadfp8_gatesfp8_kvbf16_qkvnki_tiled_attention_cte512_gdnseg0_cte2048_pfx32k_slots64_20260605T180405Z_attncte_direct_scan0_compile.log; \
+   pid=$(cat "$pidfile" 2>/dev/null || true); \
+   ps -p "$pid" -o pid,etime,stat,cmd || true; \
+   grep -nE "Finished generating HLO|Compilation Successfully Completed|Finished Compilation|CHECKPOINT_BANK_WEIGHTS_ADDED|COMPILE_DONE|Traceback|RuntimeError|Exception|NCC_|No space left|Killed" "$log" | tail -160; \
+   df -h /mnt/trainium_artifacts | tail -1'
+```
 
 Do not postprocess-only a BF16-traced artifact to FP32 recurrent banks. For this completed artifact, launch with BF16 recurrent banks:
 
