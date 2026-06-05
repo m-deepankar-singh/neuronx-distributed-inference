@@ -42,6 +42,8 @@ def test_check_status_ready_when_all_compile_markers_and_files_exist(tmp_path):
         artifact=_artifact(tmp_path),
         pid_file=None,
         required_ranks=["tp0", "tp1", "tp2", "tp3"],
+        expected_recurrent_dtype="bf16",
+        expected_conv_dtype="torch.bfloat16",
     )
 
     assert result["ready"]
@@ -51,6 +53,8 @@ def test_check_status_ready_when_all_compile_markers_and_files_exist(tmp_path):
     assert result["checkpoint_banks"]["tp0"]["recurrent_count"] == 48
     assert result["missing_checkpoint_ranks"] == []
     assert result["missing_artifact_files"] == []
+    assert result["checkpoint_dtype_mismatches"] == []
+    assert result["expected_checkpoint_dtypes"]["recurrent_dtype"] == "bfloat16"
 
 
 def test_check_status_reports_missing_checkpoint_rank(tmp_path):
@@ -85,6 +89,39 @@ def test_check_status_reports_failure_marker(tmp_path):
     assert result["failure_lines"][0]["marker"] == "Traceback"
 
 
+def test_check_status_reports_checkpoint_dtype_mismatch(tmp_path):
+    log = tmp_path / "compile.log"
+    log.write_text(_success_log())
+
+    result = _SCRIPT.check_status(
+        log=log,
+        artifact=_artifact(tmp_path),
+        pid_file=None,
+        required_ranks=["tp0", "tp1"],
+        expected_recurrent_dtype="float32",
+        expected_conv_dtype="bfloat16",
+    )
+
+    assert not result["ready"]
+    assert result["state"] == "incomplete"
+    assert result["checkpoint_dtype_mismatches"] == [
+        {
+            "rank": "tp0",
+            "field": "recurrent_dtype",
+            "expected": "float32",
+            "actual": "bfloat16",
+            "raw_actual": "torch.bfloat16",
+        },
+        {
+            "rank": "tp1",
+            "field": "recurrent_dtype",
+            "expected": "float32",
+            "actual": "bfloat16",
+            "raw_actual": "torch.bfloat16",
+        },
+    ]
+
+
 def test_check_status_running_when_pid_is_live_and_not_ready(tmp_path):
     log = tmp_path / "compile.log"
     log.write_text("still compiling\n")
@@ -116,7 +153,13 @@ def test_cli_reads_paths_from_env_log(tmp_path):
     log = tmp_path / "compile.log"
     log.write_text(_success_log())
     env = tmp_path / "compile_env.txt"
-    env.write_text(f"LOG={log}\nARTIFACT={artifact}\nPIDFILE={tmp_path / 'compile.pid'}\n")
+    env.write_text(
+        f"LOG={log}\n"
+        f"ARTIFACT={artifact}\n"
+        f"PIDFILE={tmp_path / 'compile.pid'}\n"
+        "GDN_RECURRENT_CACHE_DTYPE=bfloat16\n"
+        "GDN_CONV_CACHE_DTYPE=bfloat16\n"
+    )
 
     completed = subprocess.run(
         [
@@ -134,3 +177,38 @@ def test_cli_reads_paths_from_env_log(tmp_path):
     assert payload["ready"]
     assert payload["log"] == str(log)
     assert payload["artifact"] == str(artifact)
+    assert payload["expected_checkpoint_dtypes"] == {
+        "conv_dtype": "bfloat16",
+        "recurrent_dtype": "bfloat16",
+    }
+
+
+def test_cli_fails_when_env_log_expected_dtype_disagrees(tmp_path):
+    artifact = _artifact(tmp_path)
+    log = tmp_path / "compile.log"
+    log.write_text(_success_log())
+    env = tmp_path / "compile_env.txt"
+    env.write_text(
+        f"LOG={log}\n"
+        f"ARTIFACT={artifact}\n"
+        f"PIDFILE={tmp_path / 'compile.pid'}\n"
+        "GDN_RECURRENT_CACHE_DTYPE=float32\n"
+        "GDN_CONV_CACHE_DTYPE=bfloat16\n"
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(_SCRIPT_PATH),
+            "--env-log",
+            str(env),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 1
+    payload = json.loads(completed.stdout)
+    assert not payload["ready"]
+    assert payload["checkpoint_dtype_mismatches"][0]["expected"] == "float32"

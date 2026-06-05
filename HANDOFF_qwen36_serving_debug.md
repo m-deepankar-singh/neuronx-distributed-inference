@@ -654,9 +654,11 @@ bash tmp_compile_qwen32k_segcte2048_gdnseg512.sh
 
 47. Compile readiness status checker.
    - Added `validation_scripts/qwen36_compile_status.py`, which reads `LOG`, `ARTIFACT`, and `PIDFILE` from a compile env log and emits a structured JSON verdict: `ready`, `running`, `failed`, or `incomplete`.
-   - Ready requires `Finished Compilation for all HLOs`, `COMPILE_DONE`, no configured failure markers, `CHECKPOINT_BANK_WEIGHTS_ADDED` for tp0..tp3, and artifact files `model.pt` plus `neuron_config.json`.
+   - Ready requires `Finished Compilation for all HLOs`, `COMPILE_DONE`, no configured failure markers, `CHECKPOINT_BANK_WEIGHTS_ADDED` for tp0..tp3, checkpoint-bank dtypes matching `GDN_RECURRENT_CACHE_DTYPE` and `GDN_CONV_CACHE_DTYPE` from the env log, and artifact files `model.pt` plus `neuron_config.json`.
    - The compile automation prompt generator now instructs future monitors to run `validation_scripts/qwen36_compile_status.py --env-log <env-log>` before rsync/runtime validation.
    - Verification passed locally: `python3 -m py_compile validation_scripts/qwen36_compile_status.py test/unit/scripts/test_qwen36_compile_status.py validation_scripts/qwen36_compile_monitor_prompt.py test/unit/scripts/test_qwen36_compile_monitor_prompt.py`; `python3 -m pytest test/unit/scripts/test_qwen36_compile_status.py test/unit/scripts/test_qwen36_compile_monitor_prompt.py`; `python3 validation_scripts/qwen36_compile_status.py --help`; and a synthetic env/log/artifact CLI smoke that returned `state=ready`.
+   - Follow-up: dtype validation was added because prior artifacts could compile with checkpoint-bank dtype mismatches that only surfaced at launch. `validation_scripts/qwen36_compile_status.py` now normalizes `torch.bfloat16`/`bfloat16` and `torch.float32`/`float32`, and reports `checkpoint_dtype_mismatches` as readiness failures.
+   - Verification for dtype mismatch: a synthetic env log requesting `GDN_RECURRENT_CACHE_DTYPE=float32` against a BF16 checkpoint-bank compile log returned `ready=false`, `state=incomplete`, and recurrent `checkpoint_dtype_mismatches` for `tp0..tp3`.
 
 48. Removed stale `/tmp/tmp_bisect_probe3.py` automation dependency.
    - The old ad hoc `/tmp/tmp_bisect_probe3.py` probe was previously missing on both runtime and compile hosts. The compile monitor prompt now explicitly points to the maintained `validation_scripts/qwen36_runtime_validation_matrix.py` driver instead of telling future monitors to use the missing tmp helper.
