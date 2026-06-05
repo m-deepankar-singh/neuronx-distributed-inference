@@ -6,6 +6,7 @@ MODEL=${MODEL:-/home/ubuntu/models/Qwen3.6-27B}
 ART_ROOT=${ART_ROOT:-/mnt/trainium_artifacts/qwen_artifacts}
 LOGDIR=${LOGDIR:-/home/ubuntu/validation_logs/fp8_256k_decode_nki}
 TS=${TS:-$(date -u +%Y%m%dT%H%M%SZ)}
+COMPILE_DRY_RUN=${COMPILE_DRY_RUN:-0}
 
 SEQ_LEN=${SEQ_LEN:-32768}
 MAX_CONTEXT_LENGTH=${MAX_CONTEXT_LENGTH:-${SEQ_LEN}}
@@ -110,15 +111,18 @@ elif [[ "${FP8_QUANTIZE_LINEAR_ATTN_GATES}" != "0" ]]; then
 fi
 
 SAMPLING_TAG="sampletoklogits"
+SAMPLING_MODE="on_device_greedy_sampletoklogits"
 SAMPLING_FLAGS=()
 if [[ "${DISABLE_ON_DEVICE_SAMPLING}" == "1" ]]; then
   SAMPLING_TAG="hostlogits"
+  SAMPLING_MODE="host_logits"
   SAMPLING_FLAGS=(--disable-on-device-sampling)
 elif [[ "${DISABLE_ON_DEVICE_SAMPLING}" == "0" ]]; then
   if [[ "${OUTPUT_LOGITS_WITH_ON_DEVICE_SAMPLING}" == "1" ]]; then
     SAMPLING_FLAGS=(--output-logits-with-on-device-sampling)
   elif [[ "${OUTPUT_LOGITS_WITH_ON_DEVICE_SAMPLING}" == "0" ]]; then
     SAMPLING_TAG="sampletokonly"
+    SAMPLING_MODE="on_device_greedy_sampletokonly"
   else
     echo "ERROR: OUTPUT_LOGITS_WITH_ON_DEVICE_SAMPLING must be 0 or 1, got ${OUTPUT_LOGITS_WITH_ON_DEVICE_SAMPLING}" >&2
     exit 2
@@ -238,7 +242,7 @@ printf "%s\n" \
   "PREFIX_CTE_ATTENTION_BACKEND=${PREFIX_CTE_ATTENTION_BACKEND}" \
   "PREFIX_CTE_ATTENTION_SEGMENT_SIZE=${PREFIX_CTE_ATTENTION_SEGMENT_SIZE}" \
   "KERNELS=decode_deltanet,${QKV_KERNEL_TAG},${OUT_PROJ_KERNEL_TAG},segmented_attention_cte" \
-  "SAMPLING=on_device_greedy_${SAMPLING_TAG}" \
+  "SAMPLING=${SAMPLING_MODE}" \
   "MEMORY_FLAGS=${LM_HEAD_MEMORY_TAG},kv_cache_${KV_CACHE_TAG},no_tkg_checkpoint_commit,gdn_recurrent_${GDN_RECURRENT_CACHE_DTYPE},gdn_conv_${GDN_CONV_CACHE_DTYPE}" \
   "GDN_RECURRENT_CACHE_DTYPE=${GDN_RECURRENT_CACHE_DTYPE}" \
   "GDN_CONV_CACHE_DTYPE=${GDN_CONV_CACHE_DTYPE}" \
@@ -255,7 +259,23 @@ printf "%s\n" \
   "DISABLE_ON_DEVICE_SAMPLING=${DISABLE_ON_DEVICE_SAMPLING}" \
   "DISABLE_CONTEXT_ENCODING_ARGMAX_KERNEL=1" \
   "OUTPUT_LOGITS_WITH_ON_DEVICE_SAMPLING=${OUTPUT_LOGITS_WITH_ON_DEVICE_SAMPLING}" \
+  "COMPILE_DRY_RUN=${COMPILE_DRY_RUN}" \
   >"${ENVLOG}"
+
+if [[ "${COMPILE_DRY_RUN}" == "1" ]]; then
+  echo "BASE=${BASE}"
+  echo "ARTIFACT=${ART}"
+  echo "WORKDIR=${WORK}"
+  echo "QUANTIZED_CHECKPOINTS=${QUANT}"
+  echo "LOG=${LOG}"
+  echo "ENVLOG=${ENVLOG}"
+  echo "PIDFILE=${PID}"
+  echo "COMPILE_DRY_RUN=1"
+  exit 0
+elif [[ "${COMPILE_DRY_RUN}" != "0" ]]; then
+  echo "ERROR: COMPILE_DRY_RUN must be 0 or 1, got ${COMPILE_DRY_RUN}" >&2
+  exit 2
+fi
 
 (
   set -euo pipefail
