@@ -174,9 +174,131 @@ Ported rebuild commits:
    - Mitigation applied locally: replace the top-level LoRA helper import with a lazy `_is_lora_module()` wrapper and update QKV/O-proj call sites.
    - Verification: remote compile-host `PYTHONPATH=src /home/ubuntu/venvs/neuron_230_segmented_cte/bin/python -m py_compile src/neuronx_distributed_inference/modules/attention/gqa.py test/unit/modules/attention/test_gqa.py` passed with the corrected PATH/target override; remote `pytest -q test/unit/modules/attention/test_gqa.py` passed 11 tests with 11 warnings.
 
+17. QKV NKI compile monitoring command had a local quoting error; the compile itself was unaffected.
+   - Command: SSH monitor for `/home/ubuntu/validation_logs/fp8_256k_decode_nki/qwen36_32k_fp8_fp8all_lmheadfp8_gatesfp8_kvbf16_qkvnki_tiled_segmented_cte512_gdnseg512_cte2048_pfx32k_slots64_20260605T152927Z_direct_scan0_compile.log`.
+   - Error: `bash: -c: line 1: unexpected EOF while looking for matching "\""`.
+   - Context: compile host `ubuntu@16.26.135.243`, source `/home/ubuntu/inferentia-gdn-prefill-speed-coherent` at commit `f2c46e6`, PID `65418`, artifact `/mnt/trainium_artifacts/qwen_artifacts/qwen36_32k_fp8_fp8all_lmheadfp8_gatesfp8_kvbf16_qkvnki_tiled_segmented_cte512_gdnseg512_cte2048_pfx32k_slots64_20260605T152927Z_direct_scan0`.
+   - Root cause: the monitor command mixed single quotes and a mismatched double quote around the remote `tail -80 "$log"` expression.
+   - Mitigation: reran the monitor command with balanced quoting.
+   - Verification: corrected monitor showed the compile still running, all HLOs completed successfully, no `QKV NKI expects`, `row-scale layout`, `NCC_INKI016`, traceback, or runtime exception in the log, and checkpoint-bank sharding had started.
+
+18. First EC2-to-EC2 rsync of the completed QKV NKI artifact failed because compile host could not authenticate to runtime host.
+   - Command: from local SSH into `ubuntu@16.26.135.243`, run `rsync -aH --partial --info=progress2 -e "ssh -o StrictHostKeyChecking=no" /mnt/trainium_artifacts/qwen_artifacts/qwen36_32k_fp8_fp8all_lmheadfp8_gatesfp8_kvbf16_qkvnki_tiled_segmented_cte512_gdnseg512_cte2048_pfx32k_slots64_20260605T152927Z_direct_scan0/ ubuntu@16.26.184.190:/mnt/trainium_artifacts/qwen_artifacts/qwen36_32k_fp8_fp8all_lmheadfp8_gatesfp8_kvbf16_qkvnki_tiled_segmented_cte512_gdnseg512_cte2048_pfx32k_slots64_20260605T152927Z_direct_scan0/`.
+   - Error: `ubuntu@16.26.184.190: Permission denied (publickey).` followed by `rsync: connection unexpectedly closed (0 bytes received so far) [sender]` and `rsync error: unexplained error (code 255)`.
+   - Context: compile host `ubuntu@16.26.135.243`; runtime host `ubuntu@16.26.184.190`; artifact completed with log `COMPILE_DONE`, all four checkpoint-bank insertions, `model.pt`, `neuron_config.json`, and nested `weights/tp{0..3}_sharded_checkpoint.safetensors`.
+   - Root cause: the local workstation can SSH to both hosts, but the compile host did not yet have an SSH key authorized on the runtime host, so true EC2-to-EC2 rsync could not authenticate.
+   - Mitigation: create or reuse a dedicated compile-host rsync key and append only its public key to runtime `~/.ssh/authorized_keys`; then rerun rsync from compile host to runtime host.
+   - Verification: dedicated key `qwen-rsync-20260605` was authorized on `ubuntu@16.26.184.190`; retry transferred `39,067,142,602` bytes in about `0:02:45`; runtime artifact verified with `model.pt`, `neuron_config.json`, and four nested `weights/tp{0..3}_sharded_checkpoint.safetensors` files of `9,529,553,860` bytes each.
+
+19. Runtime launch of the QKV NKI artifact failed before health because postprocess wrote FP32 checkpoint banks into a BF16-traced model.
+   - Command: `MAX_MODEL_LEN=32768 SEQ_LEN=32768 CTE_BUCKETS=2048 CONTEXT_ENCODING_BUCKET_PAIRS="2048:256 2048:512 2048:1024 2048:2048 2048:4096 2048:8192 2048:16384 2048:32768" TOKEN_GENERATION_BUCKETS="512 16384 16640 32768" GDN_RECURRENT_CACHE_DTYPE=float32 GDN_CONV_CACHE_DTYPE=bfloat16 PORT=8001 bash tmp_launch_qwen36_segcte2048.sh /mnt/trainium_artifacts/qwen_artifacts/qwen36_32k_fp8_fp8all_lmheadfp8_gatesfp8_kvbf16_qkvnki_tiled_segmented_cte512_gdnseg512_cte2048_pfx32k_slots64_20260605T152927Z_direct_scan0 /home/ubuntu/validation_logs/fp8_256k_decode_nki/qkvnki_tiled_direct_scan0_runtime_20260605T160443Z.log`.
+   - Error: `SERVER_EXITED_BEFORE_HEALTH`; root TorchScript error from `SPMDBucketModelScript.initialize`: `Incorrect data type for checkpoint key hybrid_gdn_checkpoint_cache.recurrent_slots.0: received float, expected c10::BFloat16` repeated for recurrent slots `0..47`; API server ended with `RuntimeError: Engine core initialization failed. See root cause above.`
+   - Context: runtime host `ubuntu@16.26.184.190`, source commit `f2c46e6`, artifact compiled on `ubuntu@16.26.135.243`; compile log had `CHECKPOINT_BANK_WEIGHTS_ADDED tp0..tp3 48 48 torch.float32 torch.bfloat16` and `COMPILE_DONE`.
+   - Root cause hypothesis: the compile/postprocess path honored the checkpoint-bank insertion dtype (`torch.float32`) but the traced model graph/state schema still expects recurrent checkpoint slots as `bfloat16`. This is the same class of mismatch previously warned about: do not postprocess-only a BF16-traced artifact to FP32 recurrent banks.
+   - Mitigation: inspect artifact safetensors/model schema; if the trace truly expects BF16, convert recurrent checkpoint banks to BF16 and launch with `GDN_RECURRENT_CACHE_DTYPE=bfloat16` for this validation. Separately fix the compile path if the intended target is a truly FP32-traced recurrent cache.
+   - Verification: created `/mnt/trainium_artifacts/qwen_artifacts/qwen36_32k_fp8_fp8all_lmheadfp8_gatesfp8_kvbf16_qkvnki_tiled_segmented_cte512_gdnseg512_cte2048_pfx32k_slots64_20260605T152927Z_direct_scan0_recbf16fix`; converted 48 recurrent checkpoint tensors per TP shard to `torch.bfloat16`; confirmed recurrent and conv checkpoint slots are both `torch.bfloat16`; relaunch with `GDN_RECURRENT_CACHE_DTYPE=bfloat16 GDN_CONV_CACHE_DTYPE=bfloat16` reached `HEALTH_OK attempt=61`.
+
+20. QKV NKI BF16-corrected artifact had one empty raw completion in the unique 4k sweep.
+   - Runtime host/log: `ubuntu@16.26.184.190`, `/home/ubuntu/validation_logs/fp8_256k_decode_nki/qkvnki_tiled_direct_scan0_recbf16_runtime_20260605T161129Z.log`.
+   - Artifact: `/mnt/trainium_artifacts/qwen_artifacts/qwen36_32k_fp8_fp8all_lmheadfp8_gatesfp8_kvbf16_qkvnki_tiled_segmented_cte512_gdnseg512_cte2048_pfx32k_slots64_20260605T152927Z_direct_scan0_recbf16fix`.
+   - Probe command context: self-contained OpenAI `/v1/completions` and `/v1/chat/completions` probes on `127.0.0.1:8001`, tokenizer-verified exact prompt lengths, `temperature=0`, no `logprobs`.
+   - Failure: unique raw completion at exact prompt length `4103` returned HTTP 200 with `usage_prompt=4103`, `usage_completion=1`, no text, and the probe marked `bad=["empty"]`.
+   - Neighboring evidence: primary boundaries `146,160,485,505,526,1225,2048,2049,2500,4092,4096` all passed; repeated exact `2500` passed 3/3; unique raw sweep `4088..4102` and `4104` passed; chat multi-turn `160,1225,2500` passed.
+   - Root cause hypothesis: this may be a legitimate EOS/local prompt artifact rather than cache corruption because adjacent lengths and multi-turn probes are coherent, but it must be rerun with fresh markers and serve-log inspection before calling the artifact coherent.
+   - Mitigation: rerun targeted exact `4103` variants with fresh markers and scan the serve log for invalid token fallback, NaN logits, or EOS-only sampling.
+   - Verification: five fresh exact-`4103` variants all returned non-empty coherent text with `usage_prompt=4103`, `usage_completion=24`, and no badness markers; final serve-log scans showed no `negative token_id`, `out-of-vocab token_id`, `fallback argmax`, `finite=0`, `nan=`, `NRT_RESOURCE`, engine crash, traceback, runtime error, or internal server error.
+
+21. QKV NKI CTE2048 artifact is coherent but does not recover the cold-prefill speed target.
+   - Runtime host/log: `ubuntu@16.26.184.190`, `/home/ubuntu/validation_logs/fp8_256k_decode_nki/qkvnki_tiled_direct_scan0_recbf16_runtime_20260605T161129Z.log`.
+   - Artifact under test: `/mnt/trainium_artifacts/qwen_artifacts/qwen36_32k_fp8_fp8all_lmheadfp8_gatesfp8_kvbf16_qkvnki_tiled_segmented_cte512_gdnseg512_cte2048_pfx32k_slots64_20260605T152927Z_direct_scan0_recbf16fix`.
+   - Launch flags: `MAX_MODEL_LEN=32768`, `SEQ_LEN=32768`, `CTE_BUCKETS=2048`, context pairs `2048:{256,512,1024,2048,4096,8192,16384,32768}`, token buckets `{512,16384,16640,32768}`, `GDN_RECURRENT_CACHE_DTYPE=bfloat16`, `GDN_CONV_CACHE_DTYPE=bfloat16`, `PORT=8001`, Hybrid APC enabled, segmented CTE prefix attention, GDN segment 512.
+   - Runtime config evidence: live server command includes `fused_qkv=true`, `qkv_kernel_enabled=true`, `qkv_nki_kernel_enabled=true`, `kv_cache_quant=false`, `prefix_cte_attention_backend="segmented_cte"`, `prefix_cte_attention_segment_size=512`, `max_prompt_length=32768`.
+   - Coherence matrix:
+     - Raw exact boundaries `146,160,485,505,526,1225,2048,2049,2500,4092,4096`: pass with matching `usage.prompt_tokens`.
+     - Repeated exact `2500`: pass 3/3.
+     - Unique sweep `4088..4104`: pass except one non-reproducing empty at `4103`; five fresh exact-`4103` variants passed.
+     - Chat multi-turn exact prompt tokens `160,1225,2500`: pass.
+   - 16k cold-prefill benchmark: streaming `/v1/completions`, `max_tokens=1`, `stream_options.include_usage=true`, exact `usage.prompt_tokens=16384`; runs were `26.1831s` / `625.7 tok/s`, `25.8873s` / `632.9 tok/s`, and `25.8859s` / `632.9 tok/s`.
+   - Interpretation: the QKV NKI layout/scale fix is compile-safe and coherence-safe, and the runtime says the QKV NKI path is enabled, but it is not the missing prefill-speed lever in this segmented CTE2048 configuration. The next speed work should profile before adding another kernel; likely bottlenecks are segmented CTE attention/GDN segmentation scheduling or remaining dense projections, not QKV layout.
+   - Verification: server remains healthy on `127.0.0.1:8001`; final serve-log scan is clean.
+
+22. Full-runtime 16k Neuron profiling run was not usable for TTFT, but it exposed async timeouts and confirmed that naive whole-server profiling is too disruptive.
+   - Runtime host: `ubuntu@16.26.184.190`
+   - Script: `/home/ubuntu/inferentia-gdn-prefill-speed-coherent/tmp_profile_qwen36_qkvnki_16k_prefill.sh`
+   - Profile root: `/home/ubuntu/validation_logs/fp8_256k_decode_nki/qkvnki_prefill_profile_20260605T163533Z`
+   - Artifact under test: `/mnt/trainium_artifacts/qwen_artifacts/qwen36_32k_fp8_fp8all_lmheadfp8_gatesfp8_kvbf16_qkvnki_tiled_segmented_cte512_gdnseg512_cte2048_pfx32k_slots64_20260605T152927Z_direct_scan0_recbf16fix`
+   - Launch context: server was relaunched with `NEURON_RT_INSPECT_ENABLE=1`, `NEURON_RT_INSPECT_DEVICE_PROFILE=1`, and `NEURON_RT_INSPECT_OUTPUT_DIR` pointing at the profile root, then a single exact 16k `max_tokens=1` completion request was sent.
+   - Error/evidence: `prefill_request.json` recorded `actual_prompt_tokens=16384`, `chunks=1`, `http=200`, `total_seconds=603.2149450778961`, `ttft_seconds=null`, `usage=null`, and `text=""`. The profiled server log emitted repeated Neuron runtime warnings: `Timeout polling for async exec completion on nc ... (waited 2 minutes)` and later 4 minutes.
+   - Root cause hypothesis: enabling runtime device-profile collection on the full vLLM server makes the multi-NEFF async execution path stall enough that the request result cannot be used as a prefill benchmark. The useful profile data must be captured from specific context NEFFs, not by timing a live full-server request under profiling.
+   - Mitigation applied: stopped the profiled server path, manually relaunched the normal non-profiled server on port `8001`, and kept the generated inspect directory only for NEFF identification.
+   - Verification: the normal server was relaunched and reached `HEALTH_OK`; only a `layout_opt` NTFF was complete enough to summarize from the full-server run, with `total_time=0.048718152211`, `hardware_flops=1750128852992`, and `transpose_flops=1385322430464`, which is not the context bottleneck.
+
+23. Profiling stop command returned exit 255 because the remote kill pattern likely matched the SSH command shell.
+   - Command context: local SSH into `ubuntu@16.26.184.190` to stop the profiled vLLM server and any matching `tmp_profile_qwen36_qkvnki_16k_prefill` process after the 603s stalled request.
+   - Error: SSH returned exit code `255` during the remote stop sequence.
+   - Root cause hypothesis: the remote `pkill -9 -f "[t]mp_profile_qwen36_qkvnki_16k_prefill"` pattern still matched or disrupted the remote command/session being executed under SSH, closing the connection before a clean status could be returned.
+   - Mitigation applied: followed with explicit process checks and a normal launcher restart instead of relying on that stop command result.
+   - Verification: runtime host process state was checked afterward and the non-profiled server was relaunched to `HEALTH_OK`.
+
+24. Direct context-NEFF profiler initially failed on the NEFF checksum lookup.
+   - Runtime host: `ubuntu@16.26.184.190`
+   - Script: `/home/ubuntu/inferentia-gdn-prefill-speed-coherent/tmp_profile_qwen36_context_neffs_from_inspect.sh`
+   - Command context: map compile-workdir context NEFFs to runtime inspect NEFFs by SHA and run `neuron-explorer capture/view` for selected context graphs.
+   - Error: `xargs: sha256sum: terminated by signal 13`, and the script exited with code `125` under `pipefail`.
+   - Root cause: `find_neff_by_sha` used a `find | xargs sha256sum | awk` pipeline; when `awk` stopped after the first match, upstream `sha256sum` received SIGPIPE, which became fatal under `pipefail`.
+   - Mitigation applied: rewrote the lookup to loop over `find` results and compute `sha256sum` one file at a time, returning immediately on a matching digest without a SIGPIPE-prone pipeline.
+   - Verification: rerunning the script progressed past NEFF mapping and captured the first direct context profile.
+
+25. Direct profiling shows the cold context graph is already the 16k speed bottleneck before prefix reads.
+   - Runtime profile root: `/home/ubuntu/validation_logs/fp8_256k_decode_nki/qkvnki_prefill_profile_20260605T163533Z/direct_context_captures_20260605T165525Z`
+   - Compile workdir: `/mnt/trainium_artifacts/qwen_artifacts/_nxd_work_32k_fp8_fp8all_lmheadfp8_gatesfp8_kvbf16_qkvnki_tiled_segmented_cte512_gdnseg512_cte2048_20260605T152927Z_direct_scan0`
+   - NEFF profiled: `context_encoding_model/_tp0_bk0/graph.neff` mapped by SHA to runtime inspect NEFF `neff_642651114238503_vnc_0.neff`; this is the `context_bk0_pfx0` graph.
+   - Metrics from `neuron-explorer view --output-format summary-json`: `total_time=3.132167956813`, `total_exec_time=3.13216400481`, `total_active_time=1.258159555751`, `tensor_engine_active_time=0.565739726504`, `tensor_engine_active_time_percent=0.1806224105171051`, `vector_engine_active_time=0.492130449926`, `vector_engine_active_time_percent=0.15712134748570308`, `dma_active_time=0.406673390022`, `dma_active_time_percent=0.1298376701470992`, `hbm_read_bytes=31017606071`, `hbm_write_bytes=11101448403`, `spill_reload_bytes=116516096`, `hardware_flops=19279660899840`, `transpose_flops=339695382912`, `mfu_estimated_percent=0.06277731969607976`, `mm_arithmetic_intensity=449.67689216811834`, `peak_flops_bandwidth_ratio=109.83687150837989`.
+   - Interpretation: one cold 2048-token context graph takes about `3.13s` on device; a 16k cold prompt uses eight such chunks, so `8 * 3.13s = 25.1s`, matching the measured 16k wall time of about 25.9-26.2s. The bottleneck is therefore inside the compiled context graph, not OpenAI/vLLM Python scheduling or prefix-cache bookkeeping.
+   - Root cause hypothesis: because `pfx0` is already slow, segmented prefix attention is not the first-order cold-prefill bottleneck. The leading remaining one-variable suspect is GDN internal segmentation (`QWEN36_DELTANET_FUSED_SEGMENT_TOKENS=512`) or the base GDN solve path inside the context graph.
+   - Mitigation in flight: launched a one-variable no-GDN-segmentation compile with `QWEN36_DELTANET_FUSED_SEGMENT_TOKENS=0`, keeping QKV NKI, CTE2048, segmented CTE512 prefix attention, KV BF16, lm_head FP8, gates FP8, direct solve scan0, and multihead DeltaNet CTE off.
+   - Verification pending: compare the new no-GDN-seg artifact against the same coherence matrix and a 16k usage-accounted cold-prefill benchmark. If coherent and faster, the speed loss is from the GDN segmentation loop; if coherent and still slow, profile the no-GDN context NEFF and compare per-engine metrics against this profile.
+
 ### Current next step
 
-Use the live standard-QKV CTE2048 artifact as the coherent anchor. The next speed slice is the one-variable QKV NKI FP8 layout/scale fix; do not add packed qkvgate, output-proj NKI, quantized MLP NKI, or FP8 KV until QKV speed is isolated and the same coherence matrix stays green.
+Monitor the one-variable no-GDN-segmentation compile:
+
+```bash
+ssh ubuntu@16.26.135.243 \
+  'pidfile=/home/ubuntu/validation_logs/fp8_256k_decode_nki/qwen36_32k_fp8_fp8all_lmheadfp8_gatesfp8_kvbf16_qkvnki_tiled_segmented_cte512_gdnseg0_cte2048_pfx32k_slots64_20260605T171105Z_nogdnseg_direct_scan0_compile.pid; \
+   log=/home/ubuntu/validation_logs/fp8_256k_decode_nki/qwen36_32k_fp8_fp8all_lmheadfp8_gatesfp8_kvbf16_qkvnki_tiled_segmented_cte512_gdnseg0_cte2048_pfx32k_slots64_20260605T171105Z_nogdnseg_direct_scan0_compile.log; \
+   pid=$(cat "$pidfile" 2>/dev/null || true); \
+   ps -p "$pid" -o pid,etime,stat,cmd || true; \
+   grep -nE "Finished generating HLO|Finished Compilation|CHECKPOINT_BANK_WEIGHTS_ADDED|COMPILE_DONE|Traceback|RuntimeError|Exception|NCC_|No space left|Killed" "$log" | tail -120'
+```
+
+Artifact under compile:
+
+```bash
+/mnt/trainium_artifacts/qwen_artifacts/qwen36_32k_fp8_fp8all_lmheadfp8_gatesfp8_kvbf16_qkvnki_tiled_segmented_cte512_gdnseg0_cte2048_pfx32k_slots64_20260605T171105Z_nogdnseg_direct_scan0
+```
+
+Compile command shape:
+
+```bash
+TS=20260605T171105Z_nogdnseg \
+ENABLE_QKV_NKI_KERNELS=1 \
+CTE_BUCKETS_RAW=2048 \
+PREFIX_CTE_ATTENTION_BACKEND=segmented_cte \
+PREFIX_CTE_ATTENTION_SEGMENT_SIZE=512 \
+QWEN36_DELTANET_FUSED_SEGMENT_TOKENS=0 \
+QWEN36_DELTANET_MULTIHEAD_CTE=0 \
+ENABLE_KV_CACHE_QUANT=0 \
+QUANTIZE_LM_HEAD=1 \
+FP8_QUANTIZE_LINEAR_ATTN_GATES=1 \
+QWEN36_DELTANET_SOLVE_MODE=direct \
+QWEN36_DELTANET_SOLVE_SCAN_STEPS=0 \
+GDN_RECURRENT_CACHE_DTYPE=bfloat16 \
+GDN_CONV_CACHE_DTYPE=bfloat16 \
+bash tmp_compile_qwen32k_segcte2048_gdnseg512.sh
+```
+
+If the no-GDN-seg artifact compiles, rsync it EC2-to-EC2 to `ubuntu@16.26.184.190`, launch with BF16 recurrent/conv dtypes, and run the full coherence matrix before speed testing.
 
 Do not postprocess-only a BF16-traced artifact to FP32 recurrent banks. For this completed artifact, launch with BF16 recurrent banks:
 
