@@ -1000,6 +1000,139 @@ def _with_zero_hybrid_apc_slots(input_dict: Dict[str, Any]) -> Dict[str, Any]:
     return output
 
 
+def _cached_suffix_tokens_from_metadata(
+    input_dict: Dict[str, Any],
+    *,
+    batch_size: int,
+) -> torch.Tensor | None:
+    input_ids = input_dict.get("input_ids")
+    if (
+        not isinstance(input_ids, torch.Tensor)
+        or input_ids.ndim < 2
+        or input_ids.shape[0] != 1
+        or input_ids.shape[1] != 0
+        or batch_size != 1
+    ):
+        return None
+
+    records = _hybrid_apc_request_records(input_dict, batch_size=batch_size)
+    full_input_ids = _first_present(
+        input_dict.get("hybrid_full_input_ids"),
+        input_dict.get("full_input_ids"),
+        _hybrid_apc_record_values(records, "full_input_ids"),
+    )
+    if full_input_ids is None:
+        return None
+    if not isinstance(full_input_ids, torch.Tensor):
+        full_input_ids = torch.tensor(
+            [list(full_input_ids)],
+            dtype=input_ids.dtype,
+            device=input_ids.device,
+        )
+    if (
+        full_input_ids.ndim < 2
+        or full_input_ids.shape[0] != 1
+        or full_input_ids.shape[1] == 0
+    ):
+        return None
+
+    computed_len = _first_present(
+        input_dict.get("vllm_attention_hit_len"),
+        input_dict.get("hybrid_attention_hit_len"),
+        input_dict.get("attention_hit_len"),
+        input_dict.get("computed_context_lens"),
+        _hybrid_apc_record_values(records, "vllm_attention_hit_len"),
+    )
+    computed_len = _single_batch_value(computed_len)
+    if computed_len is None:
+        return None
+    computed_len = max(0, _to_python_int(computed_len))
+
+    active_suffix_len = _first_present(
+        input_dict.get("hybrid_active_suffix_len"),
+        input_dict.get("active_suffix_len"),
+        _hybrid_apc_record_values(records, "active_suffix_len"),
+    )
+    active_suffix_len = _single_batch_value(active_suffix_len)
+    if active_suffix_len is not None:
+        suffix_len = max(0, _to_python_int(active_suffix_len))
+    else:
+        request_prefix_len = _first_present(
+            input_dict.get("request_prefix_len"),
+            input_dict.get("hybrid_request_prefix_len"),
+            _hybrid_apc_record_values(records, "request_prefix_len"),
+        )
+        request_prefix_len = _single_batch_value(request_prefix_len)
+        if request_prefix_len is None:
+            return None
+        suffix_len = max(0, _to_python_int(request_prefix_len) - computed_len)
+    if suffix_len <= 0:
+        return None
+
+    suffix_end = min(int(full_input_ids.shape[1]), computed_len + suffix_len)
+    suffix = full_input_ids[:, computed_len:suffix_end]
+    if suffix.shape[1] != suffix_len:
+        return None
+    return suffix.to(dtype=input_ids.dtype, device=input_ids.device)
+
+
+def _repair_cached_chunked_prefill_tkg_inputs(
+    input_dict: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Rebuild vLLM cached chunk-continuation token ids before TKG execution."""
+
+    batch_size = _batch_size_from_input_dict(input_dict)
+    suffix = _cached_suffix_tokens_from_metadata(input_dict, batch_size=batch_size)
+    if suffix is None:
+        return input_dict
+
+    output = dict(input_dict)
+    output["input_ids"] = suffix
+
+    query_len = int(suffix.shape[1])
+    device = suffix.device
+    output["num_queries"] = torch.full(
+        (batch_size, 1),
+        query_len,
+        dtype=torch.int32,
+        device=device,
+    )
+
+    computed = _batch_int_list(output, "computed_context_lens", batch_size=batch_size)
+    if computed is not None:
+        output["full_context_lens"] = torch.tensor(
+            [
+                [max(0, int(computed[row_idx]) + query_len)]
+                for row_idx in range(batch_size)
+            ],
+            dtype=torch.int32,
+            device=device,
+        )
+
+    position_ids = output.get("position_ids")
+    if not isinstance(position_ids, torch.Tensor) or position_ids.numel() == 0:
+        start = int(computed[0]) if computed else 0
+        output["position_ids"] = torch.arange(
+            start,
+            start + query_len,
+            dtype=torch.int32,
+            device=device,
+        ).reshape(batch_size, query_len)
+    elif position_ids.ndim >= 2 and position_ids.shape[1] != query_len:
+        output["position_ids"] = position_ids[:, :query_len]
+
+    if os.environ.get("QWEN36_HYBRID_APC_DEBUG") == "1":
+        print(
+            "[hybrid_apc_debug] repair-cached-tkg "
+            f"input_shape={tuple(input_dict['input_ids'].shape)} "
+            f"repaired_shape={tuple(suffix.shape)} "
+            f"computed={output.get('computed_context_lens')} "
+            f"num_queries={output.get('num_queries')}",
+            flush=True,
+        )
+    return output
+
+
 _UNBACKED_SUFFIX_ONLY_HYBRID_APC_ERROR = (
     "suffix-only hybrid APC received an attention prefix hit "
     "without scheduler-authorized GDN checkpoint metadata"
@@ -2161,6 +2294,11 @@ def execute_model_prefix_caching(
                     input_dict,
                 )
         else:
+            input_dict = _with_hybrid_apc_owner_metadata(
+                input_dict,
+                hybrid_apc_owner,
+            )
+            input_dict = _repair_cached_chunked_prefill_tkg_inputs(input_dict)
             input_dict = _with_disabled_hybrid_apc_controls(input_dict)
         if "num_queries" not in input_dict:
             full_context_lens = input_dict["full_context_lens"]

@@ -101,7 +101,31 @@ Ported rebuild commits:
    - Mitigation: for this artifact, restore recurrent checkpoint banks to BF16 and launch with `--gdn-recurrent-cache-dtype bfloat16`. A true FP32 recurrent checkpoint-bank artifact requires a source fix before compile so the traced checkpoint-bank parameters are FP32.
    - Verification: pending BF16 restore and runtime launch.
 
+10. First inline runtime probe used the wrong Python environment on the runtime host.
+   - Runtime host: `ubuntu@16.26.184.190`
+   - Command: `python3 - <<'PY' ... from transformers import AutoTokenizer ...`
+   - Error: `ModuleNotFoundError: No module named 'transformers'`
+   - Context: probing the live `coherent_rebuild_stdqkv2_direct_scan0` artifact through `http://127.0.0.1:8000/v1/chat/completions`.
+   - Root cause: system Python on the runtime host is not the Neuron/vLLM environment.
+   - Mitigation: use `/opt/aws_neuronx_venv_pytorch_inference_vllm_0_16/bin/python` for tokenizer-backed probes.
+   - Verification: exact-token probes then ran successfully.
+
+11. CTE2048 artifact is coherent through 2048 tokens but crashes on the first cached continuation at 2049.
+   - Runtime host: `ubuntu@16.26.184.190`
+   - Runtime log: `/home/ubuntu/validation_logs/fp8_256k_decode_nki/coherent_rebuild_stdqkv2_bf16rec_runtime_20260605T142519Z.log`
+   - Artifact: `/mnt/trainium_artifacts/qwen_artifacts/qwen36_32k_fp8_fp8all_lmheadfp8_gatesfp8_kvbf16_standard_qkv_segmented_cte512_gdnseg512_cte2048_pfx32k_slots64_20260605T132739Z_coherent_rebuild_stdqkv2_direct_scan0`
+   - Inputs/flags: standard QKV, CTE2048, segmented CTE512 prefix attention, GDN segment 512, KV BF16, recurrent checkpoint/cache BF16, Hybrid APC enabled, chunked prefill enabled.
+   - Passing probes: exact prompt lengths `146`, `160`, `485`, `505`, `526`, `1225`, and `2048` all returned coherent text with matching `usage.prompt_tokens`.
+   - Failing probe: exact prompt length `2049`; subsequent `2500`, `4092`, and `4096` requests failed because the engine was already dead.
+   - Exact runtime error: `RuntimeError: shape '[1, 1]' is invalid for input of size 0` at `src/neuronx_distributed_inference/models/model_wrapper.py:1874`, called from `_process_async_inputs`.
+   - Log evidence immediately before crash: `tag=token_generation_model index=0 name=input_ids shape=(1, 0)`, `position_ids shape=(1, 1) min=2048`, `slot_mapping shape=(1, 1) min=8448`, `computed_context_lens min=2048`, and `num_queries min=0`. The dumped scheduler output showed `scheduled_cached_reqs`, `num_computed_tokens=[2048]`, `num_scheduled_tokens=1`, `request_prefix_len=2049`, `active_suffix_len=1`, and `full_input_ids` present in Hybrid APC metadata.
+   - Root cause hypothesis: vLLM V1 cached/chunked-prefill continuation schedules one active suffix token after the 2048-token CTE chunk, but the Neuron token-generation input path does not merge the request metadata for non-context executions. The model wrapper receives an impossible tuple: empty `input_ids` but non-empty active `position_ids` and `slot_mapping`.
+   - Mitigation applied: add `_repair_cached_chunked_prefill_tkg_inputs` in `async_execution.py`; for non-context execution, attach Hybrid APC owner metadata, reconstruct the active suffix from `full_input_ids[computed_context_lens:computed_context_lens + active_suffix_len]`, set `num_queries` to the suffix length, and then build inert Hybrid APC args.
+   - Verification: local `PYTHONPATH=src python3 -m py_compile src/neuronx_distributed_inference/modules/async_execution.py test/unit/modules/test_async_execution.py` passed; local `PYTHONPATH=src python3 -m unittest test.unit.modules.test_async_execution.TestCachedChunkedPrefillTkgRepair` passed. Runtime verification is pending source sync and vLLM restart.
+
 ### Current next step
+
+Sync the cached-continuation source repair to `ubuntu@16.26.184.190`, restart the same artifact, and rerun the exact boundary probes starting with `2049`.
 
 Do not postprocess-only a BF16-traced artifact to FP32 recurrent banks. For this completed artifact, launch with BF16 recurrent banks:
 

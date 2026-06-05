@@ -13,6 +13,7 @@ from neuronx_distributed_inference.modules.async_execution import (
     _combine_vectorized_hybrid_apc_inputs,
     _is_chunked_prefill_execution,
     _is_context_encoding_execution,
+    _repair_cached_chunked_prefill_tkg_inputs,
     cancel_hybrid_apc_request,
     execute_model_prefix_caching,
     finish_hybrid_apc_request,
@@ -42,6 +43,52 @@ class TestAsyncRequestIdsSignature(unittest.TestCase):
         )
 
         self.assertEqual(_async_request_ids_signature(model), (1, 0))
+
+
+class TestCachedChunkedPrefillTkgRepair(unittest.TestCase):
+    def test_rebuilds_empty_cached_suffix_from_full_prompt_metadata(self):
+        input_dict = {
+            "input_ids": torch.empty((1, 0), dtype=torch.int32),
+            "position_ids": torch.tensor([[2048]], dtype=torch.int32),
+            "computed_context_lens": torch.tensor([[2048]], dtype=torch.int32),
+            "num_queries": torch.tensor([[0]], dtype=torch.int32),
+            "hybrid_request_records": (
+                {
+                    "request_id": "req-a",
+                    "full_input_ids": tuple(range(2049)),
+                    "vllm_attention_hit_len": 2048,
+                    "request_prefix_len": 2049,
+                    "active_suffix_len": 1,
+                },
+            ),
+        }
+
+        repaired = _repair_cached_chunked_prefill_tkg_inputs(input_dict)
+
+        self.assertTrue(
+            torch.equal(
+                repaired["input_ids"],
+                torch.tensor([[2048]], dtype=torch.int32),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                repaired["num_queries"],
+                torch.tensor([[1]], dtype=torch.int32),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                repaired["full_context_lens"],
+                torch.tensor([[2049]], dtype=torch.int32),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                repaired["position_ids"],
+                torch.tensor([[2048]], dtype=torch.int32),
+            )
+        )
 
 
 class TestAsyncTensorWrapper(unittest.TestCase):
