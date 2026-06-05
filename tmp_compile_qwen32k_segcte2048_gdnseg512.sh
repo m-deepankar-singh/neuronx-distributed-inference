@@ -216,6 +216,7 @@ printf "%s\n" \
   "WORKDIR=${WORK}" \
   "QUANTIZED_CHECKPOINTS=${QUANT}" \
   "LOG=${LOG}" \
+  "ENVLOG=${ENVLOG}" \
   "PIDFILE=${PID}" \
   "REPO=${REPO}" \
   "MODEL=${MODEL}" \
