@@ -17,6 +17,8 @@ import struct
 import sys
 from typing import Any, Hashable, NamedTuple
 
+import torch
+
 
 logger = logging.getLogger(__name__)
 _SCHEDULER_MODULE = "vllm.v1.core.sched.scheduler"
@@ -79,6 +81,8 @@ _HYBRID_APC_RUNTIME_CONFIG_KEYS = (
     "hybrid_apc_enable_backed_prefix_reads",
     "hybrid_apc_max_backed_prefix_read_len",
     "hybrid_apc_allow_mixed_prefill_decode",
+    "hybrid_apc_prefill_chunk_tokens",
+    "qwen_prefill_group_size",
 )
 _HYBRID_APC_BRIDGE_CONFIG_ATTRS = {
     "hybrid_apc_allow_local_hash_fallback": "allow_local_hash_fallback",
@@ -1583,12 +1587,206 @@ def _prefill_completion_has_incomplete_row(prefill_completion_state: Any) -> boo
     return bool(values) and not all(values)
 
 
+def _runner_vocab_size(runner: Any) -> int | None:
+    owners = [
+        runner,
+        getattr(runner, "model", None),
+        getattr(getattr(runner, "model", None), "model", None),
+        getattr(getattr(getattr(runner, "model", None), "model", None), "config", None),
+        getattr(runner, "model_config", None),
+    ]
+    for owner in owners:
+        vocab_size = getattr(owner, "vocab_size", None)
+        if vocab_size is not None:
+            try:
+                return int(vocab_size)
+            except (TypeError, ValueError):
+                return None
+        config = getattr(owner, "config", None)
+        vocab_size = getattr(config, "vocab_size", None)
+        if vocab_size is not None:
+            try:
+                return int(vocab_size)
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def _format_token_id(value: int) -> str:
+    if value < 0:
+        return str(value)
+    return f"{value} (0x{value & 0xFFFFFFFF:08x})"
+
+
+def _prefill_state_for_output_rows(
+    values: list[bool],
+    output_rows: int,
+) -> list[bool]:
+    if output_rows <= 0:
+        return []
+    if output_rows == len(values):
+        return values
+    completed_count = sum(1 for value in values if value)
+    if completed_count > 0 and output_rows == completed_count:
+        return [True] * output_rows
+    return values[:output_rows]
+
+
+def _validate_completed_prefill_sampled_tokens(
+    sampled_token_ids: Any,
+    prefill_completion_state: Any,
+    *,
+    vocab_size: int | None,
+    stage: str,
+) -> None:
+    values = _prefill_completion_state_values(prefill_completion_state)
+    if not values or sampled_token_ids is None or not hasattr(sampled_token_ids, "shape"):
+        return
+    if not hasattr(sampled_token_ids, "dtype"):
+        return
+    if sampled_token_ids.dtype not in (torch.int32, torch.int64):
+        raise ValueError(
+            "Qwen3.6 sampled token ids must be int32 or int64 before vLLM "
+            f"publishes completed prefill rows; stage={stage}; "
+            f"dtype={sampled_token_ids.dtype}"
+        )
+    shape = getattr(sampled_token_ids, "shape", ())
+    if not shape:
+        return
+    row_values = _prefill_state_for_output_rows(values, int(shape[0]))
+    row_count = min(len(row_values), int(shape[0]))
+    for row_idx, is_done in enumerate(row_values[:row_count]):
+        if not is_done:
+            continue
+        row = sampled_token_ids[row_idx].reshape(-1)
+        if row.numel() == 0:
+            continue
+        invalid_id, reason = _sampled_token_invalid_id_and_reason(
+            row,
+            vocab_size=vocab_size,
+        )
+        if invalid_id is None:
+            continue
+        raise ValueError(
+            "Qwen3.6 sampled token id contract violated before vLLM output "
+            f"update: {reason}; stage={stage}; row={row_idx}; "
+            f"token_id={_format_token_id(invalid_id)}; "
+            f"prefill_completion_state={values}; "
+            f"sampled_shape={tuple(sampled_token_ids.shape)}"
+        )
+
+
+def _sampled_token_invalid_id_and_reason(
+    row: Any,
+    *,
+    vocab_size: int | None,
+) -> tuple[int | None, str | None]:
+    if row is None or not hasattr(row, "numel") or row.numel() == 0:
+        return None, None
+    min_id = int(row.min().item())
+    max_id = int(row.max().item())
+    if min_id < 0:
+        return min_id, "negative"
+    if vocab_size is not None and max_id >= vocab_size:
+        return max_id, f"out-of-vocab for vocab_size={vocab_size}"
+    return None, None
+
+
+def _logits_argmax_token_ids_for_sample_shape(
+    logits_source: Any,
+    sampled_token_ids: Any,
+    *,
+    vocab_size: int | None = None,
+) -> Any:
+    logits_tensor = _first_tensor_like(logits_source)
+    if logits_tensor is None or not hasattr(logits_tensor, "dim"):
+        return None
+    if not torch.is_floating_point(logits_tensor):
+        return None
+    if logits_tensor.dim() >= 3:
+        logits_for_argmax = logits_tensor[:, -1, :]
+    elif logits_tensor.dim() == 2:
+        logits_for_argmax = logits_tensor
+    elif logits_tensor.dim() == 1:
+        logits_for_argmax = logits_tensor.reshape(1, -1)
+    else:
+        return None
+    if vocab_size is not None and int(logits_for_argmax.shape[-1]) < int(vocab_size):
+        return None
+
+    argmax = logits_for_argmax.detach().float().argmax(dim=-1)
+    target_shape = tuple(getattr(sampled_token_ids, "shape", ()))
+    if len(target_shape) <= 1:
+        shaped = argmax.reshape(-1)
+    else:
+        shaped = argmax.reshape(-1, *([1] * (len(target_shape) - 1)))
+    return shaped.to(
+        device=sampled_token_ids.device,
+        dtype=sampled_token_ids.dtype,
+    )
+
+
+def _summarize_logits_for_fallback(logits_source: Any) -> str:
+    logits_tensor = _first_tensor_like(logits_source)
+    if logits_tensor is None or not hasattr(logits_tensor, "dim"):
+        return "logits=unavailable"
+    if not torch.is_floating_point(logits_tensor):
+        return (
+            f"logits_shape={tuple(getattr(logits_tensor, 'shape', ())) } "
+            f"logits_dtype={getattr(logits_tensor, 'dtype', None)} non_float"
+        )
+    try:
+        logits_float = logits_tensor.detach().float()
+        flat = logits_float.reshape(-1)
+        finite_mask = torch.isfinite(flat)
+        finite_count = int(finite_mask.sum().item())
+        nan_count = int(torch.isnan(flat).sum().item())
+        posinf_count = int(
+            torch.logical_and(torch.isinf(flat), flat > 0).sum().item()
+        )
+        neginf_count = int(
+            torch.logical_and(torch.isinf(flat), flat < 0).sum().item()
+        )
+        finite_min = finite_max = None
+        if finite_count:
+            finite_values = flat[finite_mask]
+            finite_min = float(finite_values.min().item())
+            finite_max = float(finite_values.max().item())
+        logits_for_argmax = (
+            logits_float[:, -1, :] if logits_float.dim() >= 3 else logits_float
+        )
+        argmax = logits_for_argmax.argmax(dim=-1).detach().cpu().reshape(-1)
+        argmax_values = (
+            logits_for_argmax.gather(
+                dim=-1,
+                index=logits_for_argmax.argmax(dim=-1, keepdim=True),
+            )
+            .detach()
+            .cpu()
+            .reshape(-1)
+        )
+        return (
+            f"logits_shape={tuple(logits_tensor.shape)} logits_dtype={logits_tensor.dtype} "
+            f"finite={finite_count}/{int(flat.numel())} nan={nan_count} "
+            f"posinf={posinf_count} neginf={neginf_count} "
+            f"finite_min={finite_min} finite_max={finite_max} "
+            f"argmax={argmax[:4].tolist()} "
+            f"argmax_values={[float(item) for item in argmax_values[:4].tolist()]}"
+        )
+    except Exception as exc:  # pragma: no cover - diagnostic only
+        return f"logits_summary_error={type(exc).__name__}: {exc}"
+
+
 def _mask_incomplete_prefill_sampled_tokens(
     sampler_output: Any,
     prefill_completion_state: Any,
+    *,
+    vocab_size: int | None = None,
+    stage: str = "sample",
+    logits_source: Any = None,
 ) -> Any:
     values = _prefill_completion_state_values(prefill_completion_state)
-    if not values or all(values):
+    if not values:
         if _env_flag("QWEN36_HYBRID_APC_DEBUG"):
             print(
                 "[hybrid_apc_debug] sample-mask skip "
@@ -1620,14 +1818,106 @@ def _mask_incomplete_prefill_sampled_tokens(
     if row_count <= 0:
         return sampler_output
 
-    masked_token_ids = sampled_token_ids.clone()
-    for row_idx, is_done in enumerate(values[:row_count]):
+    row_values = _prefill_state_for_output_rows(values, int(shape[0]))
+    row_count = min(len(row_values), int(shape[0]))
+    fallback_token_ids = None
+    masked_token_ids = None
+    repaired_completed_rows: list[dict[str, Any]] = []
+    for row_idx, is_done in enumerate(row_values[:row_count]):
         if not is_done:
+            if masked_token_ids is None:
+                masked_token_ids = sampled_token_ids.clone()
             masked_token_ids[row_idx] = -1
+            continue
+
+        row = sampled_token_ids[row_idx].reshape(-1)
+        invalid_id, reason = _sampled_token_invalid_id_and_reason(
+            row,
+            vocab_size=vocab_size,
+        )
+        if invalid_id is None:
+            continue
+
+        if fallback_token_ids is None:
+            fallback_token_ids = _logits_argmax_token_ids_for_sample_shape(
+                logits_source,
+                sampled_token_ids,
+                vocab_size=vocab_size,
+            )
+        if (
+            fallback_token_ids is None
+            or not hasattr(fallback_token_ids, "shape")
+            or int(fallback_token_ids.shape[0]) <= row_idx
+        ):
+            raise ValueError(
+                "Qwen3.6 completed prefill sampled token is invalid and logits "
+                "are unavailable for host fallback. Compile the artifact with "
+                "--output-logits-with-on-device-sampling from a build that "
+                "gathers vocab-parallel output logits, or use "
+                "--disable-on-device-sampling for host sampling. "
+                f"{reason}; stage={stage}; row={row_idx}; "
+                f"token_id={_format_token_id(invalid_id)}; "
+                f"prefill_completion_state={values}; "
+                f"effective_output_state={row_values}; "
+                f"sampled_shape={tuple(sampled_token_ids.shape)}"
+            )
+
+        if masked_token_ids is None:
+            masked_token_ids = sampled_token_ids.clone()
+        masked_token_ids[row_idx] = fallback_token_ids[row_idx]
+        repaired_completed_rows.append(
+            {
+                "row": row_idx,
+                "reason": reason,
+                "token_id": invalid_id,
+                "fallback": int(fallback_token_ids[row_idx].reshape(-1)[0].item()),
+                "logits_summary": _summarize_logits_for_fallback(logits_source),
+            }
+        )
+
+    if masked_token_ids is None:
+        _validate_completed_prefill_sampled_tokens(
+            sampled_token_ids,
+            values,
+            vocab_size=vocab_size,
+            stage=stage,
+        )
+        if _env_flag("QWEN36_HYBRID_APC_DEBUG"):
+            print(
+                "[hybrid_apc_debug] sample-mask skip "
+                f"prefill_completion_state={values}",
+                flush=True,
+            )
+        return sampler_output
+
+    _validate_completed_prefill_sampled_tokens(
+        masked_token_ids,
+        values,
+        vocab_size=vocab_size,
+        stage=stage,
+    )
     try:
         sampler_output.sampled_token_ids = masked_token_ids
     except Exception:
         return sampler_output
+    for row in repaired_completed_rows:
+        logger.warning(
+            "Replacing invalid completed-prefill sampled token with logits "
+            "argmax before vLLM output update: stage=%s row=%s %s "
+            "token_id=%s fallback_token_id=%s prefill_completion_state=%s",
+            stage,
+            row["row"],
+            row["reason"],
+            _format_token_id(int(row["token_id"])),
+            row["fallback"],
+            values,
+        )
+        logger.warning(
+            "Qwen3.6 fallback logits summary: stage=%s row=%s %s",
+            stage,
+            row["row"],
+            row["logits_summary"],
+        )
     if _env_flag("QWEN36_HYBRID_APC_DEBUG"):
         try:
             before = sampled_token_ids.detach().cpu().reshape(-1).tolist()
@@ -1711,6 +2001,16 @@ def _split_sample_logits_output(value: Any) -> tuple[Any, Any, str]:
     return value, None, type(value).__name__
 
 
+def _json_float_value(value: float) -> float | str:
+    if value != value:
+        return "nan"
+    if value == float("inf"):
+        return "inf"
+    if value == float("-inf"):
+        return "-inf"
+    return float(value)
+
+
 def _log_sample_logits_comparison(
     hidden_states: Any,
     model_input: Any,
@@ -1734,13 +2034,51 @@ def _log_sample_logits_comparison(
             "sampler_output_type": type(sampler_output).__name__,
         }
         if token_tensor is not None and logits_tensor is not None:
+            row["sampled_dtype"] = str(token_tensor.dtype)
+            row["logits_dtype"] = str(logits_tensor.dtype)
             logits_tensor = logits_tensor.detach().float()
+            flat_logits = logits_tensor.reshape(-1)
+            finite_mask = torch.isfinite(flat_logits)
+            finite_count = int(finite_mask.sum().item())
+            row.update(
+                {
+                    "logits_numel": int(flat_logits.numel()),
+                    "logits_finite": finite_count,
+                    "logits_nan": int(torch.isnan(flat_logits).sum().item()),
+                    "logits_posinf": int(
+                        torch.logical_and(torch.isinf(flat_logits), flat_logits > 0)
+                        .sum()
+                        .item()
+                    ),
+                    "logits_neginf": int(
+                        torch.logical_and(torch.isinf(flat_logits), flat_logits < 0)
+                        .sum()
+                        .item()
+                    ),
+                }
+            )
+            if finite_count:
+                finite_flat = flat_logits[finite_mask]
+                row["logits_finite_min"] = float(finite_flat.min().item())
+                row["logits_finite_max"] = float(finite_flat.max().item())
+            else:
+                row["logits_finite_min"] = None
+                row["logits_finite_max"] = None
             logits_for_argmax = (
                 logits_tensor[:, -1, :]
                 if logits_tensor.dim() >= 3
                 else logits_tensor
             )
             argmax_tokens = logits_for_argmax.argmax(dim=-1).detach().cpu().reshape(-1)
+            argmax_values = (
+                logits_for_argmax.gather(
+                    dim=-1,
+                    index=logits_for_argmax.argmax(dim=-1, keepdim=True),
+                )
+                .detach()
+                .cpu()
+                .reshape(-1)
+            )
             sampled_tokens = token_tensor.detach().cpu().reshape(-1)
             count = min(int(argmax_tokens.numel()), int(sampled_tokens.numel()))
             row.update(
@@ -1750,6 +2088,10 @@ def _log_sample_logits_comparison(
                     ],
                     "logits_argmax_tokens": [
                         int(item) for item in argmax_tokens[: min(count, 8)].tolist()
+                    ],
+                    "logits_argmax_values": [
+                        _json_float_value(float(item))
+                        for item in argmax_values[: min(count, 8)].tolist()
                     ],
                     "num_compared": count,
                     "num_matches": int(
@@ -1968,7 +2310,7 @@ def patch_neuron_model_runner_class(runner_cls: type) -> bool:
                 clone = getattr(hidden_states, "clone", None)
                 if clone is not None:
                     hidden_states = clone()
-            hidden_states_for_sampling, _, _ = _split_sample_logits_output(
+            hidden_states_for_sampling, logits_for_fallback, _ = _split_sample_logits_output(
                 hidden_states
             )
             token_tensor_for_sampling = _first_tensor_like(hidden_states_for_sampling)
@@ -1991,6 +2333,9 @@ def patch_neuron_model_runner_class(runner_cls: type) -> bool:
             sampler_output = _mask_incomplete_prefill_sampled_tokens(
                 sampler_output,
                 prefill_state,
+                vocab_size=_runner_vocab_size(self),
+                stage="sample_on_device",
+                logits_source=logits_for_fallback,
             )
             _log_sample_logits_comparison(hidden_states, model_input, sampler_output)
             return sampler_output
@@ -2087,6 +2432,8 @@ def patch_neuron_model_runner_class(runner_cls: type) -> bool:
                 sampler_outputs = _mask_incomplete_prefill_sampled_tokens(
                     sampler_outputs,
                     prefill_state,
+                    vocab_size=_runner_vocab_size(self),
+                    stage="generate_model_runner_output",
                 )
             return original_generate_output(self, sampler_outputs, *args, **kwargs)
 

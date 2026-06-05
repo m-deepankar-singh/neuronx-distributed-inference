@@ -61,6 +61,7 @@ from neuronx_distributed.parallel_layers.layers import (
     ParallelEmbedding,
     RowParallelLinear,
 )
+from neuronx_distributed.parallel_layers.mappings import _gather_along_dim
 from neuronx_distributed.utils import cpu_mode
 
 try:
@@ -1941,7 +1942,13 @@ class NeuronQwen35Attention(NeuronAttentionBase):
         # variant for this split projection until that kernel store is fixed.
         kernel = _qkv_tkg_nki_kernel[1]
         scale = getattr(projection, "scale", None)
-        if scale is not None:
+        use_row_scales = os.getenv("QWEN36_SPLIT_QKV_TKG_ROW_SCALES", "0").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        if scale is not None and use_row_scales:
             scale_tensor = scale.data if hasattr(scale, "data") else scale
             qkv_w_scales = self._prepare_qkv_tkg_scale(
                 scale_tensor,
@@ -4322,6 +4329,20 @@ def _debug_logits_stage(stage: str, tensor) -> None:
         )
 
 
+def _qwen36_output_logits_for_return(logits, lm_head, neuron_config):
+    if not (
+        getattr(neuron_config, "output_logits", False)
+        and getattr(neuron_config, "on_device_sampling_config", None) is not None
+        and not getattr(lm_head, "gather_output", True)
+    ):
+        return logits
+    return _gather_along_dim(
+        logits,
+        partition_dim=2,
+        process_group=getattr(lm_head, "tensor_parallel_group", None),
+    )
+
+
 class NeuronQwen35Model(NeuronBaseModel):
     def setup_attr_for_model(self, config: Qwen35InferenceConfig):
         self.on_device_sampling = (
@@ -4890,7 +4911,13 @@ class NeuronQwen35Model(NeuronBaseModel):
         _debug_logits_stage("before_return_logits", logits)
         outputs = [res]
         if self.neuron_config.output_logits and self.on_device_sampling:
-            outputs += [logits]
+            outputs += [
+                _qwen36_output_logits_for_return(
+                    logits,
+                    self.lm_head,
+                    self.neuron_config,
+                )
+            ]
         outputs += updated_kv_cache
 
         # Append DeltaNet state tensors (for input_output_aliases)
