@@ -259,6 +259,46 @@ Ported rebuild commits:
    - Mitigation in flight: launched a one-variable no-GDN-segmentation compile with `QWEN36_DELTANET_FUSED_SEGMENT_TOKENS=0`, keeping QKV NKI, CTE2048, segmented CTE512 prefix attention, KV BF16, lm_head FP8, gates FP8, direct solve scan0, and multihead DeltaNet CTE off.
    - Verification pending: compare the new no-GDN-seg artifact against the same coherence matrix and a 16k usage-accounted cold-prefill benchmark. If coherent and faster, the speed loss is from the GDN segmentation loop; if coherent and still slow, profile the no-GDN context NEFF and compare per-engine metrics against this profile.
 
+26. The no-GDN-segmentation CTE2048 compile completed cleanly with BF16 checkpoint banks.
+   - Compile host: `ubuntu@16.26.135.243`
+   - Source: `/home/ubuntu/inferentia-gdn-prefill-speed-coherent`
+   - Command shape: `ENABLE_QKV_NKI_KERNELS=1`, `CTE_BUCKETS_RAW=2048`, `PREFIX_CTE_ATTENTION_BACKEND=segmented_cte`, `PREFIX_CTE_ATTENTION_SEGMENT_SIZE=512`, `QWEN36_DELTANET_FUSED_SEGMENT_TOKENS=0`, `QWEN36_DELTANET_MULTIHEAD_CTE=0`, `ENABLE_KV_CACHE_QUANT=0`, `QUANTIZE_LM_HEAD=1`, `FP8_QUANTIZE_LINEAR_ATTN_GATES=1`, `QWEN36_DELTANET_SOLVE_MODE=direct`, `QWEN36_DELTANET_SOLVE_SCAN_STEPS=0`, `GDN_RECURRENT_CACHE_DTYPE=bfloat16`, `GDN_CONV_CACHE_DTYPE=bfloat16`.
+   - PID/log: PID `73303`, `/home/ubuntu/validation_logs/fp8_256k_decode_nki/qwen36_32k_fp8_fp8all_lmheadfp8_gatesfp8_kvbf16_qkvnki_tiled_segmented_cte512_gdnseg0_cte2048_pfx32k_slots64_20260605T171105Z_nogdnseg_direct_scan0_compile.log`.
+   - Env log: `/home/ubuntu/validation_logs/fp8_256k_decode_nki/qwen36_32k_fp8_fp8all_lmheadfp8_gatesfp8_kvbf16_qkvnki_tiled_segmented_cte512_gdnseg0_cte2048_pfx32k_slots64_20260605T171105Z_nogdnseg_direct_scan0_env.txt`; confirmed `QWEN36_DELTANET_FUSED_SEGMENT_TOKENS=0`.
+   - Artifact: `/mnt/trainium_artifacts/qwen_artifacts/qwen36_32k_fp8_fp8all_lmheadfp8_gatesfp8_kvbf16_qkvnki_tiled_segmented_cte512_gdnseg0_cte2048_pfx32k_slots64_20260605T171105Z_nogdnseg_direct_scan0`.
+   - Compile evidence: HLO generation completed, priority HLO compiled, all HLOs completed with `INFO:Neuron:Finished Compilation for all HLOs in 418.1721477508545 seconds`, sharding completed, then `COMPILE_DONE`.
+   - Checkpoint-bank evidence: log lines `CHECKPOINT_BANK_WEIGHTS_ADDED tp{0..3}_sharded_checkpoint.safetensors 48 48 torch.bfloat16 torch.bfloat16`.
+   - Artifact verification: `model.pt` size `707806474`, `neuron_config.json` size `106546`, and four safetensor shards of `8321591748` bytes each. Runtime and compile-host safetensor checks both found 48 recurrent and 48 conv checkpoint-bank tensors per TP shard, all `torch.bfloat16`.
+   - Resource note: compile host disk dropped to about `9.2G` free during checkpoint-bank insertion and ended around `16G` free. If another compile is needed on this host, clean old artifacts first instead of relying on this margin.
+   - Transfer: EC2-to-EC2 rsync from compile host to runtime host `ubuntu@16.26.184.190` with `~/.ssh/qwen_rsync_ed25519`; transferred `33,994,280,012` bytes in about `0:02:08`.
+
+27. Runtime validation had two missing-file/path errors before the maintained probes were run.
+   - Runtime host: `ubuntu@16.26.184.190`
+   - Error 1 command: `/home/ubuntu/venvs/neuron_230_segmented_cte/bin/python` used for artifact dtype verification.
+   - Error 1 text: `bash: line 1: /home/ubuntu/venvs/neuron_230_segmented_cte/bin/python: No such file or directory`
+   - Root cause 1: runtime host uses `/opt/aws_neuronx_venv_pytorch_inference_vllm_0_16`, not the compile-host helper venv.
+   - Mitigation 1: reran safetensor dtype verification with `/opt/aws_neuronx_venv_pytorch_inference_vllm_0_16/bin/python`; verification passed.
+   - Error 2 command: `python /tmp/tmp_bisect_probe3.py`
+   - Error 2 text: `bash: line 1: python: command not found`
+   - Error 3 command: `python3 /tmp/tmp_bisect_probe3.py`
+   - Error 3 text: `python3: can't open file '/tmp/tmp_bisect_probe3.py': [Errno 2] No such file or directory`
+   - Root cause 2/3: this runtime instance does not have the old ad hoc `/tmp/tmp_bisect_probe3.py`, and `python` is not on PATH.
+   - Mitigation 2/3: used maintained repo validators instead: `validation_scripts/qwen36_openai_boundary_apc_probe.py` for exact token-id raw completions and `validation_scripts/qwen36_chat_completion_context_bench.py` for multi-turn chat streaming usage.
+
+28. The no-GDN-segmentation artifact is coherent but still slow at 16k cold prefill.
+   - Runtime host/log: `ubuntu@16.26.184.190`, `/home/ubuntu/validation_logs/fp8_256k_decode_nki/qkvnki_tiled_direct_scan0_nogdnseg_runtime_20260605T174340Z.log`.
+   - Launch command shape: `MAX_MODEL_LEN=32768`, `SEQ_LEN=32768`, `CTE_BUCKETS=2048`, context pairs `2048:{256,512,1024,2048,4096,8192,16384,32768}`, token buckets `{512,16384,16640,32768}`, `GDN_RECURRENT_CACHE_DTYPE=bfloat16`, `GDN_CONV_CACHE_DTYPE=bfloat16`, `QWEN36_DELTANET_FUSED_SEGMENT_TOKENS=0`, `QWEN36_DELTANET_MULTIHEAD_CTE=0`, `QWEN36_DELTANET_SOLVE_MODE=direct`, `QWEN36_DELTANET_SOLVE_SCAN_STEPS=0`, port `8001`.
+   - Live server config evidence: command line contains `fused_qkv=true`, `qkv_kernel_enabled=true`, `qkv_nki_kernel_enabled=true`, `kv_cache_quant=false`, `prefix_cte_attention_backend="segmented_cte"`, `prefix_cte_attention_segment_size=512`, `max_prompt_length=32768`, and BF16 recurrent/conv GDN cache dtypes.
+   - Health: launch reached `HEALTH_OK attempt=35`; final health check remained `HEALTH_OK` with server PID `31549`.
+   - Primary raw exact boundary probe: lengths `146,160,485,505,526,1225,2048,2049,2500,4092,4096` all returned HTTP 200, valid OpenAI bodies, matching `usage.prompt_tokens`, and non-empty coherent text. JSONL: `/home/ubuntu/validation_logs/fp8_256k_decode_nki/nogdnseg_boundary_probe_20260605T174559Z.jsonl`.
+   - Unique 4k sweep: lengths `4088..4104` all passed, including `4103`, with non-empty coherent text and matching `usage.prompt_tokens`. JSONL: `/home/ubuntu/validation_logs/fp8_256k_decode_nki/nogdnseg_4k_sweep_20260605T174706Z.jsonl`.
+   - Repeated 2500 probe: 3/3 passed; repeats 1 and 2 showed `2048` token prefix-cache hits and coherent text. JSONL: `/home/ubuntu/validation_logs/fp8_256k_decode_nki/nogdnseg_repeat2500_20260605T174935Z.jsonl`.
+   - Multi-turn chat probe: target prompt sizes `160,1225,2500` passed with non-empty streamed content (`ack 4` or `lambda`) and usage-derived completion tokens. JSON: `/home/ubuntu/validation_logs/fp8_256k_decode_nki/nogdnseg_chat_multiturn_20260605T175024Z.json`.
+   - Long raw probe: lengths `8192` and `16384` passed with coherent non-empty text; 16k case had `usage.prompt_tokens=16384`. JSONL: `/home/ubuntu/validation_logs/fp8_256k_decode_nki/nogdnseg_long_probe_20260605T175110Z.jsonl`.
+   - Final serve-log scan after validation: no `negative token_id`, `out-of-vocab token_id`, `fallback argmax`, `finite=0`, `nan=`, `NaN`, `NRT_RESOURCE`, engine death, traceback, internal server error, or dtype mismatch markers.
+   - 16k usage-accounted streaming cold-prefill benchmark (`/v1/completions`, exact 16384 token-id prompt, `max_tokens=1`, `stream_options.include_usage=true`): run 0 `25.6959s TTFT`, `637.6 tok/s`; run 1 `25.6728s TTFT`, `638.2 tok/s`; run 2 `25.6755s TTFT`, `638.1 tok/s`.
+   - Conclusion: disabling GDN internal segmentation did not recover prefill speed. It preserves coherence but is effectively the same speed class as the prior coherent QKV-NKI segmented-CTE artifact. The bottleneck is not the `QWEN36_DELTANET_FUSED_SEGMENT_TOKENS=512` loop.
+
 ### Current next step
 
 Monitor the one-variable no-GDN-segmentation compile:
@@ -298,7 +338,9 @@ GDN_CONV_CACHE_DTYPE=bfloat16 \
 bash tmp_compile_qwen32k_segcte2048_gdnseg512.sh
 ```
 
-If the no-GDN-seg artifact compiles, rsync it EC2-to-EC2 to `ubuntu@16.26.184.190`, launch with BF16 recurrent/conv dtypes, and run the full coherence matrix before speed testing.
+Result from the no-GDN-seg experiment: coherent, but still only about `638 tok/s` at exact 16k cold prefill. Do not repeat this compile as a speed fix.
+
+The next isolated speed experiment should move off `segmented_cte` for cold prefill and compile the same coherent policy with `PREFIX_CTE_ATTENTION_BACKEND=attention_cte`, keeping all else fixed (`QKV NKI`, `CTE2048`, `KV BF16`, `GDN segment tokens 0`, `direct scan0`, `multihead DeltaNet CTE off`). Reason: raw `pfx0` context is slow even without prefix reads and remains slow when GDN segmentation is disabled, so the remaining compile-baked suspect in the cold context graph is segmented CTE attention/model integration overhead.
 
 Do not postprocess-only a BF16-traced artifact to FP32 recurrent banks. For this completed artifact, launch with BF16 recurrent banks:
 
