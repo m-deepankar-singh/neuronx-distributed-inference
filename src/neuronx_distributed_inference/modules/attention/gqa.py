@@ -1,6 +1,6 @@
 import enum
 import logging
-from typing import Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 from neuronx_distributed.parallel_layers import parallel_state
@@ -17,16 +17,113 @@ from torch.distributed import ProcessGroup
 from torch.nn import functional as F
 
 from neuronx_distributed_inference.modules.attention.utils import transpose_parallel_linear_layer
-from neuronx_distributed_inference.modules.lora_serving.lora_module import is_lora_module
-
 import nki
 from nkilib.core.output_projection.output_projection_cte import output_projection_cte
 from nkilib.core.qkv.qkv import qkv
-from nkilib.core.utils.common_types import NormType, QKVOutputLayout
+from nkilib.core.utils.common_types import NormType, QKVOutputLayout, QuantizationType
 
 logger = logging.getLogger("Neuron")
 # To satisfy test_gqa
 qkv_kernel = nki.jit(qkv)
+
+_QKV_NKI_SCALE_PMAX = 128
+_qkv_nki_weight_cache: Dict[str, torch.Tensor] = {}
+_qkv_nki_scale_cache: Dict[str, torch.Tensor] = {}
+
+
+def _is_float8_tensor(tensor: torch.Tensor) -> bool:
+    fp8_dtypes = tuple(
+        dtype
+        for dtype in (
+            getattr(torch, "float8_e4m3fn", None),
+            getattr(torch, "float8_e5m2", None),
+        )
+        if dtype is not None
+    )
+    return tensor.dtype in fp8_dtypes
+
+
+def _transpose_tensor_preserve_fp8(tensor: torch.Tensor) -> torch.Tensor:
+    if _is_float8_tensor(tensor):
+        return tensor.view(torch.int8).t().contiguous().view(tensor.dtype)
+    return tensor.t().contiguous()
+
+
+def _get_qkv_nki_weight_from_state_dict(prefix: str, state_dict: Dict[str, Any]) -> torch.Tensor:
+    if prefix in _qkv_nki_weight_cache:
+        return _qkv_nki_weight_cache[prefix]
+
+    key = prefix + "weight"
+    if key not in state_dict:
+        raise RuntimeError(f"Cannot find {key} in the state_dict")
+
+    transposed_weight = _transpose_tensor_preserve_fp8(state_dict[key])
+    _qkv_nki_weight_cache[prefix] = transposed_weight
+    return transposed_weight
+
+
+def _get_qkv_nki_scale_from_state_dict(prefix: str, state_dict: Dict[str, Any]) -> torch.Tensor:
+    if prefix in _qkv_nki_scale_cache:
+        return _qkv_nki_scale_cache[prefix]
+
+    scale_key = prefix + "scale"
+    legacy_scale_key = prefix + "weight_scale"
+    if scale_key in state_dict:
+        scale = state_dict[scale_key]
+    elif legacy_scale_key in state_dict:
+        scale = state_dict[legacy_scale_key]
+    else:
+        raise RuntimeError(f"Cannot find {scale_key} or {legacy_scale_key} in the state_dict")
+
+    if len(scale.shape) != 2:
+        raise RuntimeError(f"QKV NKI scale must be 2D, got shape {scale.shape} for {prefix}")
+
+    if scale.shape[1] == 1:
+        scale = scale.t()
+    elif scale.shape[0] not in (1, _QKV_NKI_SCALE_PMAX):
+        raise RuntimeError(
+            f"QKV NKI scale must be [I, 1], [1, I], or [{_QKV_NKI_SCALE_PMAX}, I], "
+            f"got shape {scale.shape} for {prefix}"
+        )
+
+    if scale.shape[0] == 1:
+        scale = torch.broadcast_to(scale, (_QKV_NKI_SCALE_PMAX, scale.shape[1]))
+    scale = scale.contiguous()
+    _qkv_nki_scale_cache[prefix] = scale
+    return scale
+
+
+def _preprocess_quantized_qkv_nki_weight(layer):
+    orig_weight_attrs = vars(layer.weight)
+    layer.weight = torch.nn.Parameter(layer.weight.clone().T, requires_grad=False)
+    layer.weight.__dict__.update(orig_weight_attrs)
+    setattr(layer.weight, "partition_dim", 1 - getattr(layer.weight, "partition_dim", 0))
+    setattr(layer.weight, "get_tensor_from_state_dict", _get_qkv_nki_weight_from_state_dict)
+
+
+def _preprocess_quantized_qkv_nki_scale(layer):
+    if not hasattr(layer, "scale") or layer.scale is None:
+        return
+
+    orig_scale_attrs = vars(layer.scale)
+    scale = layer.scale.clone().T
+    scale = torch.broadcast_to(scale, (_QKV_NKI_SCALE_PMAX, scale.shape[1]))
+    layer.scale = torch.nn.Parameter(scale, requires_grad=False)
+    layer.scale.__dict__.update(orig_scale_attrs)
+    setattr(layer.scale, "partition_dim", 1 - getattr(layer.scale, "partition_dim", 0))
+    setattr(layer.scale, "get_tensor_from_state_dict", _get_qkv_nki_scale_from_state_dict)
+
+
+def preprocess_quantized_qkv_nki_layer(layer):
+    """Keep quantized fused-QKV parameters in the layout required by the NKI QKV kernel."""
+    _preprocess_quantized_qkv_nki_weight(layer)
+    _preprocess_quantized_qkv_nki_scale(layer)
+
+
+def _is_lora_module(module) -> bool:
+    from neuronx_distributed_inference.modules.lora_serving.lora_module import is_lora_module
+
+    return is_lora_module(module)
 
 
 class GQA(enum.Enum):
@@ -422,6 +519,14 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
                     # we need to transpose the weights on the CPU side to avoid
                     # needing to transpose on the device when using QKV kernel
                     self.Wqkv.weight = transpose_parallel_linear_layer(self.Wqkv.weight)
+                    # Quantization replaces the parallel-linear module after
+                    # init. Preserve the QKV-kernel [H, I] weight layout and
+                    # row-scale [128, I] layout on the replacement module too.
+                    setattr(
+                        self.Wqkv,
+                        "post_create_quantized_module_hook",
+                        preprocess_quantized_qkv_nki_layer,
+                    )
 
                 # Set heads info as weight parameter attributes to be used in weights sharding
                 setattr(self.Wqkv.weight, "fused_qkv", True)
@@ -505,24 +610,24 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
             logger.debug("QKV: native compiler")
             QKV = (
                 self.Wqkv(hidden_states)
-                if not is_lora_module(self.Wqkv)
+                if not _is_lora_module(self.Wqkv)
                 else self.Wqkv(hidden_states, adapter_ids)
             )
             return self._split_fused_qkv(QKV)
         else:
             Q = (
                 self.q_proj(hidden_states)
-                if not is_lora_module(self.q_proj)
+                if not _is_lora_module(self.q_proj)
                 else self.q_proj(hidden_states, adapter_ids)
             )
             K = (
                 self.k_proj(hidden_states)
-                if not is_lora_module(self.k_proj)
+                if not _is_lora_module(self.k_proj)
                 else self.k_proj(hidden_states, adapter_ids)
             )
             V = (
                 self.v_proj(hidden_states)
-                if not is_lora_module(self.v_proj)
+                if not _is_lora_module(self.v_proj)
                 else self.v_proj(hidden_states, adapter_ids)
             )
             if self.clip_qkv is not None:
@@ -563,10 +668,51 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
         logger.debug(f"V shape after tensor_split: {V.shape}")
         return Q, K, V
 
+    def _expected_local_fused_qkv_size(self) -> int:
+        return (
+            (self.num_attention_heads + 2 * self.num_key_value_heads)
+            * self.head_dim
+            // self.tp_degree
+        )
+
+    def _validate_qkv_kernel_layout(self, hidden_dim: int) -> int:
+        fused_qkv_size = self._expected_local_fused_qkv_size()
+        expected_shape = (hidden_dim, fused_qkv_size)
+        actual_shape = tuple(self.Wqkv.weight.shape)
+        if actual_shape != expected_shape:
+            raise RuntimeError(
+                "QKV NKI expects Wqkv.weight in transposed [hidden, fused_qkv_per_tp_rank] "
+                f"layout {expected_shape}, got {actual_shape}. If this is an FP8/quantized "
+                "compile, the quantized module must preserve the QKV-kernel post-create hook."
+            )
+        return fused_qkv_size
+
+    def _qkv_kernel_quantization_args(self, fused_qkv_size: int):
+        if not isinstance(self.Wqkv, BaseQuantizeParallelLinear):
+            return QuantizationType.NONE, None, None
+
+        qkv_scale = getattr(self.Wqkv, "scale", None)
+        if qkv_scale is None:
+            raise RuntimeError("Quantized QKV NKI requires Wqkv.scale for FP8 row dequantization")
+
+        scale_shape = tuple(qkv_scale.shape)
+        valid_scale_shapes = ((1, fused_qkv_size), (_QKV_NKI_SCALE_PMAX, fused_qkv_size))
+        if scale_shape not in valid_scale_shapes:
+            raise RuntimeError(
+                "Quantized QKV NKI expects Wqkv.scale in row-scale layout "
+                f"[1, I] or [{_QKV_NKI_SCALE_PMAX}, I] with I={fused_qkv_size}, "
+                f"got {scale_shape}. The quantized QKV post-create hook likely did not run."
+            )
+
+        return QuantizationType.ROW, qkv_scale.data, None
+
     def _kernel_qkv_forward(self, hidden_states, rmsnorm, residual, cos_cache, sin_cache):
         # get shape
         bs, seqlen, hidden_dim = hidden_states.shape
-        _, fused_qkv_size = self.Wqkv.weight.shape
+        fused_qkv_size = self._validate_qkv_kernel_layout(hidden_dim)
+        qkv_quantization_type, qkv_w_scale, qkv_in_scale = self._qkv_kernel_quantization_args(
+            fused_qkv_size
+        )
 
         qkv_output_layout = QKVOutputLayout.BSD
         if self.qkv_kernel_nbsd_layout:
@@ -600,6 +746,9 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
             fused_qkv_weights=self.Wqkv.weight.data,
             output_layout=qkv_output_layout,
             bias=self.Wqkv.bias.data.unsqueeze(0) if self.bias else None,
+            quantization_type=qkv_quantization_type,
+            qkv_w_scale=qkv_w_scale,
+            qkv_in_scale=qkv_in_scale,
             fused_residual_add=fused_residual_add,
             mlp_prev=mlp_prev,
             attention_prev=attention_prev,
@@ -1070,7 +1219,7 @@ class GroupQueryAttention_O(BaseGroupQueryAttention):
 
         return (
             self.o_proj(attention_output)
-            if not is_lora_module(self.o_proj)
+            if not _is_lora_module(self.o_proj)
             else self.o_proj(attention_output, adapter_ids)
         )
 

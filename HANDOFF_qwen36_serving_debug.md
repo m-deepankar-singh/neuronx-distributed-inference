@@ -68,9 +68,10 @@ Ported rebuild commits:
    - Failing path: `src/neuronx_distributed_inference/modules/attention/gqa.py:_kernel_qkv_forward` calling `/home/ubuntu/nki-library-2.30/src/nkilib_src/nkilib/core/qkv/qkv_cte.py`
    - Error: `[NCC_INKI016] Kernel validation exception: [QKV CTE Kernel] weights.shape[1] must be <= 4096, but got 5120.`
    - Inputs/flags: `ENABLE_QKV_NKI_KERNELS=1`, `CTE_BUCKETS_RAW=2048`, `PREFIX_CTE_ATTENTION_BACKEND=segmented_cte`, `PREFIX_CTE_ATTENTION_SEGMENT_SIZE=512`, `QWEN36_DELTANET_FUSED_SEGMENT_TOKENS=512`, `QWEN36_DELTANET_MULTIHEAD_CTE=0`, `ENABLE_KV_CACHE_QUANT=0`, `QUANTIZE_LM_HEAD=1`, `FP8_QUANTIZE_LINEAR_ATTN_GATES=1`.
-   - Root cause hypothesis: the stock NKI Library QKV CTE kernel cannot handle Qwen3.6's 5120-wide input projection in this baseline stack. This is a compile-time kernel capability limit, not a model coherence result.
-   - Mitigation: do not use stock `--enable-qkv-nki-kernels` for the first coherent-speed anchor. Relaunch the same CTE2048 segmented-attention/GDN candidate with `ENABLE_QKV_NKI_KERNELS=0`, then revisit QKV speed as a separate kernel-port task.
-   - Verification: pending fallback compile.
+   - Refined root cause after NKI docs/source inspection: this was not a hidden-width limit. AWS/NKI QKV documents `fused_qkv_weights` as `[H, I]` and QKV CTE validates `I <= 4096`; Qwen3.6 TP=4 has `H=5120` and local `I=(24/4 + 2*(4/4))*256 = 2048`. The observed `weights.shape[1]=5120` means the FP8 fused-QKV parameter reached the kernel as `[I, H]`, so quantization had dropped the transposed `[H, I]` loader/layout contract.
+   - Secondary root cause: the wrapper did not pass `QuantizationType.ROW` or `qkv_w_scale` for FP8 per-channel QKV weights, even though the NKI QKV API supports row-scale dequantization.
+   - Mitigation: do not use stock `--enable-qkv-nki-kernels` for the first coherent-speed anchor. After the coherent standard-QKV anchor is green, fix QKV NKI as one isolated source slice by preserving the transposed layout through quantized module creation and passing row scales to the kernel.
+   - Verification: standard-QKV fallback compile/runtime became the coherent anchor; QKV NKI source fix pending compile validation.
 
 7. Standard-QKV fallback compile exposed a remaining Python `raise` inside the segmented CTE NKI kernel.
    - Artifact base: `qwen36_32k_fp8_fp8all_lmheadfp8_gatesfp8_kvbf16_standard_qkv_segmented_cte512_gdnseg512_cte2048_pfx32k_slots64_20260605T132507Z_coherent_rebuild_stdqkv_direct_scan0`
@@ -141,13 +142,41 @@ Ported rebuild commits:
    - Inputs/flags: standard QKV, CTE2048, segmented CTE512 prefix attention, GDN segment 512, KV BF16, recurrent checkpoint/cache BF16, Hybrid APC enabled.
    - Coherence evidence: exact `8192` prompt returned coherent text with `usage.prompt_tokens=8192`; exact `16384` prompt with `max_tokens=1` returned a normal first token and `usage.prompt_tokens=16384`.
    - Speed evidence: 16k `max_tokens=1` non-streaming wall time was `26.353s`, so conservative prompt throughput was `16384 / 26.353 = 621.7 prompt tok/s`.
-   - Root cause hypothesis: this anchor deliberately disabled QKV NKI because the stock QKV CTE kernel rejects Qwen's 5120 input width. Coherence is restored, but the speed path is still missing a Qwen-compatible QKV prefill kernel.
+   - Root cause hypothesis, refined: this anchor deliberately disabled QKV NKI because the FP8 fused-QKV path lost its `[H, I]` parameter layout and row-scale contract after quantization. Coherence is restored, but the speed path is still missing a validated QKV NKI rebuild.
    - Mitigation: keep this artifact as the coherent CTE2048 anchor; next speed work should port/adapt the working QKV tiled path for 5120-wide Qwen instead of reintroducing unrelated dense moat kernels.
    - Verification: final serve-log scan after 2500/4092/4096/8192/16384 showed no `negative token_id`, `out-of-vocab token_id`, `fallback argmax`, `finite=0`, `nan=`, `NRT_RESOURCE`, `EngineDeadError`, `RuntimeError`, `ValueError`, `Traceback`, or `InternalServerError`; backend and proxy health were OK.
 
+14. QKV NKI FP8 source audit found a missing quantized layout/scale contract.
+   - Local source paths: `src/neuronx_distributed_inference/modules/attention/gqa.py`, `src/neuronx_distributed_inference/modules/attention/utils.py`.
+   - Remote docs/source evidence: AWS QKV API documents `fused_qkv_weights` as `[H, I]`; compile-host NKI Library 2.30 `qkv_cte_utils.py` validates `_H == H` and `I <= 4096`; `qkv_cte.py` supports `QuantizationType.ROW` with `qkv_w_scale` shape `[1, I]` or `[128, I]`.
+   - Inputs/flags that expose it: `ENABLE_QKV_NKI_KERNELS=1`, `weight_dtype=fp8_full`, `QUANTIZE_LM_HEAD=1`, `FP8_QUANTIZE_LINEAR_ATTN_GATES=1`, Qwen3.6 TP=4.
+   - Root cause: `GroupQueryAttention_QKV.__init__` transposed non-quantized `Wqkv.weight`, but did not install a `post_create_quantized_module_hook`, so FP8 quantization replaced the module with default `[I, H]` weight and `[I, 1]` scale metadata. `_kernel_qkv_forward` then derived `fused_qkv_size` from `Wqkv.weight.shape[1]`, mistaking hidden size `5120` for output width, and passed no row scale.
+   - Mitigation applied locally: added `preprocess_quantized_qkv_nki_layer`, FP8-preserving transposed state-dict loaders, a `[128, I]` QKV row-scale loader, explicit QKV layout/scale guards, and `QuantizationType.ROW` / `qkv_w_scale` kernel arguments for quantized QKV.
+   - Verification: local `py_compile` passed; remote compile-host `test/unit/modules/attention/test_gqa.py` passed 11 tests under the Neuron venv with `PATH=/opt/aws_neuronx_venv_pytorch_inference_vllm_0_16/bin:$PATH NEURON_PLATFORM_TARGET_OVERRIDE=trn2 NEURON_CC_FLAGS="--target trn2"`.
+
+15. Local QKV unit-test run used a Python environment without Neuron/NxD.
+   - Command: `PYTHONPATH=src python3 -m pytest -q test/unit/modules/attention/test_gqa.py`
+   - Error: `ModuleNotFoundError: No module named 'neuronx_distributed'`
+   - Context: local macOS/workspace Python after QKV NKI source edits.
+   - Root cause: local Python lacks the Neuron/NxD package needed to import `neuronx_distributed_inference.modules.attention.gqa`.
+   - Mitigation: use local `py_compile` for syntax and run the real unit test on `ubuntu@16.26.135.243` with `/home/ubuntu/venvs/neuron_230_segmented_cte/bin/python`.
+   - Verification: local `PYTHONPATH=src python3 -m py_compile src/neuronx_distributed_inference/modules/attention/gqa.py test/unit/modules/attention/test_gqa.py` passed.
+
+16. Remote QKV unit-test import exposed environment and circular-import issues before assertions ran.
+   - Command 1: `PYTHONPATH=src /home/ubuntu/venvs/neuron_230_segmented_cte/bin/python -m pytest -q test/unit/modules/attention/test_gqa.py`
+   - Error 1: `FileNotFoundError: [Errno 2] No such file or directory: 'libneuronpjrt-path'`
+   - Root cause 1: `/opt/aws_neuronx_venv_pytorch_inference_vllm_0_16/bin` was not on `PATH`.
+   - Command 2: same command with that venv bin on `PATH`.
+   - Error 2: `RuntimeError: Unsupported Platform - r7i.24xlarge`; compile host is CPU-only and needs an explicit target override.
+   - Mitigation 2: rerun with `NEURON_PLATFORM_TARGET_OVERRIDE=trn2 NEURON_CC_FLAGS="--target trn2"`.
+   - Error 3 after the target override: `ImportError: cannot import name 'replicate_kv' from partially initialized module 'neuronx_distributed_inference.modules.attention.gqa'`; import path was `gqa.py -> lora_serving.__init__ -> lora_checkpoint.py -> gqa.replicate_kv`.
+   - Root cause 3: `gqa.py` imported `is_lora_module` at module import time, which executes the LoRA package initializer before `replicate_kv` is defined.
+   - Mitigation applied locally: replace the top-level LoRA helper import with a lazy `_is_lora_module()` wrapper and update QKV/O-proj call sites.
+   - Verification: remote compile-host `PYTHONPATH=src /home/ubuntu/venvs/neuron_230_segmented_cte/bin/python -m py_compile src/neuronx_distributed_inference/modules/attention/gqa.py test/unit/modules/attention/test_gqa.py` passed with the corrected PATH/target override; remote `pytest -q test/unit/modules/attention/test_gqa.py` passed 11 tests with 11 warnings.
+
 ### Current next step
 
-Use the live standard-QKV CTE2048 artifact as the coherent anchor. The next speed slice should be a one-variable QKV prefill kernel fix for Qwen's 5120 hidden width; do not add packed qkvgate, output-proj NKI, quantized MLP NKI, or FP8 KV until QKV speed is isolated and the same coherence matrix stays green.
+Use the live standard-QKV CTE2048 artifact as the coherent anchor. The next speed slice is the one-variable QKV NKI FP8 layout/scale fix; do not add packed qkvgate, output-proj NKI, quantized MLP NKI, or FP8 KV until QKV speed is isolated and the same coherence matrix stays green.
 
 Do not postprocess-only a BF16-traced artifact to FP32 recurrent banks. For this completed artifact, launch with BF16 recurrent banks:
 
