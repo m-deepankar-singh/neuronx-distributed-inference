@@ -99,6 +99,7 @@ def render_prompt(
         "FP8_QUANTIZE_LINEAR_ATTN_GATES",
         "DISABLE_ON_DEVICE_SAMPLING",
         "OUTPUT_LOGITS_WITH_ON_DEVICE_SAMPLING",
+        "SPEED_SLICE",
     ]
     flag_lines = "\n".join(
         f"- {key}={values[key]}" for key in flags if key in values

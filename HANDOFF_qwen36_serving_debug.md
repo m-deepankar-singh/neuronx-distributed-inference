@@ -682,9 +682,9 @@ bash tmp_compile_qwen32k_segcte2048_gdnseg512.sh
 
 52. Validation-tool manifest for remote/source drift.
    - Added `validation_scripts/qwen36_validation_tool_manifest.py` to build/verify SHA256 manifests for the maintained Qwen validation/profiling scripts. This addresses the current EC2 workflow where the compile-host clone often receives source changes via manual `scp` instead of a reliable git remote branch.
-   - Default manifest coverage includes compile readiness, monitor prompt generation, runtime coherence matrix, log scan, raw prefill speed gate, boundary/chat probes, direct context-NEFF profiling, profile summary comparison, and the manifest tool itself. `--include-tests` adds the matching unit tests.
+   - Default manifest coverage includes the compile driver, compile readiness, monitor prompt generation, runtime coherence matrix, log scan, raw prefill speed gate, boundary/chat probes, direct context-NEFF profiling, profile summary comparison, and the manifest tool itself. `--include-tests` adds the matching unit tests, including the compile-driver dry-run guard tests.
    - Intended workflow before remote validation: build a local manifest, sync/copy the listed files if needed, then run `python3 validation_scripts/qwen36_validation_tool_manifest.py --repo <remote-source> --manifest <manifest.json> --mode verify` on the host that will run validators. `--mode file-list` emits the repo-relative files for a copy command.
-   - Verification passed locally: manifest build for 10 files, self-verify with `mismatch_count=0`, file-list output, and `python3 -m pytest test/unit/scripts` (`56 passed`).
+   - Verification passed locally: manifest build for 11 files, self-verify with `mismatch_count=0`, file-list output, and `python3 -m pytest test/unit/scripts` (`57 passed`).
 
 53. Compile-driver speed-slice guard for the next sampling/lm_head experiments.
    - `tmp_compile_qwen32k_segcte2048_gdnseg512.sh` now accepts optional `SPEED_SLICE=sampletokonly|hostlogits|hostlogits_lmheadbf16`. When set, it fails before compile if the env drifts from the coherent qk-norm attention-CTE anchor: QKV NKI + QK norm on, fused RoPE off, output-proj NKI off, KV quant off, attention_cte, GDN segmentation off, multihead CTE off, direct scan0 solve, BF16 GDN caches, and CTE2048.

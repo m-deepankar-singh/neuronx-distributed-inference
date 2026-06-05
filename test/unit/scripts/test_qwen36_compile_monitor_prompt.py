@@ -44,6 +44,7 @@ def test_render_prompt_contains_compile_validation_and_runtime_gates():
         "GDN_CONV_CACHE_DTYPE": "bfloat16",
         "DISABLE_ON_DEVICE_SAMPLING": "1",
         "OUTPUT_LOGITS_WITH_ON_DEVICE_SAMPLING": "0",
+        "SPEED_SLICE": "hostlogits",
     }
 
     prompt = _SCRIPT.render_prompt(
@@ -61,6 +62,7 @@ def test_render_prompt_contains_compile_validation_and_runtime_gates():
     assert "abc1234" in prompt
     assert "PID file: /logs/compile.pid" in prompt
     assert "- SAMPLING=host_logits" in prompt
+    assert "- SPEED_SLICE=hostlogits" in prompt
     assert "- DISABLE_ON_DEVICE_SAMPLING=1" in prompt
     assert "`Finished Compilation for all HLOs`" in prompt
     assert "`CHECKPOINT_BANK_WEIGHTS_ADDED` for tp0..tp3" in prompt

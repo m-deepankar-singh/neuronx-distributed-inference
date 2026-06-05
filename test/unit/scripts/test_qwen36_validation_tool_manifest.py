@@ -15,6 +15,15 @@ sys.modules[_SPEC.name] = _SCRIPT
 _SPEC.loader.exec_module(_SCRIPT)
 
 
+def test_default_manifest_covers_compile_driver_and_validation_tools():
+    assert "tmp_compile_qwen32k_segcte2048_gdnseg512.sh" in _SCRIPT.DEFAULT_FILES
+    assert "validation_scripts/qwen36_runtime_validation_matrix.py" in _SCRIPT.DEFAULT_FILES
+    assert (
+        "contrib/models/Qwen3.6-27B/test/unit/test_qwen36_compile_driver.py"
+        in _SCRIPT.DEFAULT_TEST_FILES
+    )
+
+
 def test_build_manifest_records_hashes_and_missing_files(tmp_path):
     existing = tmp_path / "validation_scripts" / "tool.py"
     existing.parent.mkdir(parents=True)
