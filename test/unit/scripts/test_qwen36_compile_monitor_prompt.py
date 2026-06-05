@@ -79,6 +79,8 @@ def test_render_prompt_contains_compile_validation_and_runtime_gates():
     assert "`fallback argmax`" in prompt
     assert "usage.prompt_tokens / TTFT" in prompt
     assert "--min-prefill-tok-s 3000" in prompt
+    assert "qwen36_speed_slice_decision.py" in prompt
+    assert "do not launch that compile directly from this monitor" in prompt
     assert "Do not launch a duplicate compile" in prompt
 
 
