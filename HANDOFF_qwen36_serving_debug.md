@@ -546,3 +546,28 @@ QUANTIZE_LM_HEAD=1 \
 FP8_QUANTIZE_LINEAR_ATTN_GATES=1 \
 bash tmp_compile_qwen32k_segcte2048_gdnseg512.sh
 ```
+
+38. Sample-token-only compile slice is in flight under automation; no manual polling needed unless the user asks.
+   - Source branch/workdir: `/private/tmp/inferentia-gdn-prefill-speed-coherent`, branch `codex/qwen36-prefill-speed-coherent`.
+   - Commit: `0901798 Add Qwen tokens-only sampling compile option`.
+   - What changed: `tmp_compile_qwen32k_segcte2048_gdnseg512.sh` now supports `OUTPUT_LOGITS_WITH_ON_DEVICE_SAMPLING=0|1` and tags artifacts as `sampletokonly` or `sampletoklogits`; aliases are covered for tokens-only on-device sampling; stale compile-config test defaults were updated for the current QKV CTE fusion flags, argmax flags, FP8 gate flag, and FP32 recurrent checkpoint-bank policy.
+   - Local checks: `bash -n tmp_compile_qwen32k_segcte2048_gdnseg512.sh` passed; Python syntax checks for the updated unit tests passed.
+   - Remote checks on compile host `ubuntu@16.26.135.243`:
+     - Correct shell check passed: `bash -n tmp_compile_qwen32k_segcte2048_gdnseg512.sh`.
+     - Focused alias tests passed: `3 passed in 1.11s`.
+     - Full updated two-file unit suite passed: `75 passed, 3 subtests passed in 1.35s`.
+   - Errors encountered and mitigated:
+     - Incorrect command: `PYTHONPATH=src /home/ubuntu/venvs/neuron_230_segmented_cte/bin/python -m py_compile tmp_compile_qwen32k_segcte2048_gdnseg512.sh ...`.
+       Error: `SyntaxError: invalid decimal literal` at the Bash parameter expansion in `MODEL=${MODEL:-/home/ubuntu/models/Qwen3.6-27B}`. Root cause: tried to run Python compilation on a shell script. Mitigation: reran with `bash -n`; shell syntax passed.
+     - Broad compile-config pytest initially failed with stale fixture/defaults, first at `AttributeError: 'Namespace' object has no attribute 'enable_qkv_cte_nki_kernel_fuse_rope'`, then `disable_argmax_kernel`, then `fp8_quantize_linear_attn_gates`; the checkpoint-bank test also expected `torch.bfloat16` recurrent slots while current policy writes recurrent `torch.float32` and conv `torch.bfloat16`. Mitigation: updated the unit fixture defaults and expected recurrent dtype; reran remote suite successfully.
+   - Active compile automation: `monitor-qwen-sampletokonly-compile`, every 10 minutes.
+   - Compile host/source: `ubuntu@16.26.135.243`, `/home/ubuntu/inferentia-gdn-prefill-speed-coherent`, local commit `0901798` synced.
+   - Compile PID/log/env:
+     - PID `123175`
+     - `/home/ubuntu/validation_logs/fp8_256k_decode_nki/qwen36_32k_fp8_fp8all_lmheadfp8_gatesfp8_kvbf16_qkvnki_qknorm_outprojstd_sampletokonly_attention_cte512_gdnseg0_cte2048_pfx32k_slots64_20260605T221059Z_sampletokonly_direct_scan0_compile.log`
+     - `/home/ubuntu/validation_logs/fp8_256k_decode_nki/qwen36_32k_fp8_fp8all_lmheadfp8_gatesfp8_kvbf16_qkvnki_qknorm_outprojstd_sampletokonly_attention_cte512_gdnseg0_cte2048_pfx32k_slots64_20260605T221059Z_sampletokonly_direct_scan0_env.txt`
+   - Artifact target: `/mnt/trainium_artifacts/qwen_artifacts/qwen36_32k_fp8_fp8all_lmheadfp8_gatesfp8_kvbf16_qkvnki_qknorm_outprojstd_sampletokonly_attention_cte512_gdnseg0_cte2048_pfx32k_slots64_20260605T221059Z_sampletokonly_direct_scan0`.
+   - Compile shape: one-variable delta from coherent qk-norm anchor: `OUTPUT_LOGITS_WITH_ON_DEVICE_SAMPLING=0`, `ENABLE_QKV_NKI_KERNELS=1`, `ENABLE_QKV_CTE_NKI_KERNEL_FUSE_QK_NORM=1`, `ENABLE_QKV_CTE_NKI_KERNEL_FUSE_ROPE=0`, `ENABLE_OUT_PROJ_NKI_KERNEL=0`, `PREFIX_CTE_ATTENTION_BACKEND=attention_cte`, `QWEN36_DELTANET_FUSED_SEGMENT_TOKENS=0`, `QWEN36_DELTANET_MULTIHEAD_CTE=0`, `QWEN36_DELTANET_SOLVE_MODE=direct`, `QWEN36_DELTANET_SOLVE_SCAN_STEPS=0`, `GDN_RECURRENT_CACHE_DTYPE=bfloat16`, `GDN_CONV_CACHE_DTYPE=bfloat16`, `CTE_BUCKETS_RAW=2048`, `MAX_CONTEXT_LENGTH=32768`, `ENABLE_KV_CACHE_QUANT=0`, `QUANTIZE_LM_HEAD=1`, and `FP8_QUANTIZE_LINEAR_ATTN_GATES=1`.
+   - Early evidence before stopping manual polling: env log shows `SAMPLING=on_device_greedy_sampletokonly` and `OUTPUT_LOGITS_WITH_ON_DEVICE_SAMPLING=0`; process command has no `--output-logits-with-on-device-sampling`; compile trace shows `disable_context_encoding_argmax_kernel=true`, `enable_qkv_cte_nki_kernel_fuse_qk_norm=true`, `enable_out_proj_nki_kernel=false`, and `enable_kv_cache_quant=false`.
+   - HLO evidence: HLO generation completed in `302.8270480632782 seconds`, with each context HLO around `30-32s`. This is effectively identical to the coherent qk-norm anchor's HLO generation time (`300.4844801425934s`), so dropping returned debug logits does not recover the old short HLO generation path. The compile is still worth validating for runtime TTFT, but the current best hypothesis shifts toward the old `hostlogits`/`lmheadbf16` graph shape or another old compile-policy difference.
+   - User instruction after launch: do not manually monitor continuously; rely on automation unless asked for a check or a heartbeat reports a meaningful result.
