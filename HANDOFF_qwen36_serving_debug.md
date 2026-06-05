@@ -90,21 +90,24 @@ Ported rebuild commits:
    - Inputs/flags: `--gdn-recurrent-cache-dtype float32`, `--gdn-conv-cache-dtype bfloat16`, `ENABLE_QKV_NKI_KERNELS=0`, `CTE_BUCKETS_RAW=2048`, `PREFIX_CTE_ATTENTION_BACKEND=segmented_cte`.
    - Root cause: `_ensure_hybrid_checkpoint_weights` used `NeuronConfig.torch_dtype` for both recurrent and conv checkpoint-bank tensors and skipped existing checkpoint-bank keys, so postprocess-only could not correct an already-added BF16 recurrent bank.
    - Mitigation: make `_ensure_hybrid_checkpoint_weights` derive recurrent and conv dtypes from `gdn_recurrent_cache_dtype` / `gdn_conv_cache_dtype`, and rewrite existing checkpoint-bank tensors when their dtype does not match.
-   - Verification: pending postprocess-only repair of the completed artifact.
+   - Verification: postprocess-only repair changed recurrent banks to `torch.float32`, but runtime load then failed because the compiled graph expected BF16 checkpoint-bank tensors.
+
+9. Postprocess-only FP32 recurrent-bank repair made the completed artifact unloadable.
+   - Runtime host: `ubuntu@16.26.184.190`
+   - Runtime log: `/home/ubuntu/validation_logs/fp8_256k_decode_nki/coherent_rebuild_stdqkv2_runtime_20260605T141619Z.log`
+   - Artifact: `/mnt/trainium_artifacts/qwen_artifacts/qwen36_32k_fp8_fp8all_lmheadfp8_gatesfp8_kvbf16_standard_qkv_segmented_cte512_gdnseg512_cte2048_pfx32k_slots64_20260605T132739Z_coherent_rebuild_stdqkv2_direct_scan0`
+   - Error: `Incorrect data type for checkpoint key hybrid_gdn_checkpoint_cache.recurrent_slots.0: received float, expected c10::BFloat16`
+   - Root cause: the compiled `model.pt` was traced with BF16 checkpoint-bank parameter dtype. Rewriting safetensors to FP32 after compile cannot change the traced model's expected parameter dtype.
+   - Mitigation: for this artifact, restore recurrent checkpoint banks to BF16 and launch with `--gdn-recurrent-cache-dtype bfloat16`. A true FP32 recurrent checkpoint-bank artifact requires a source fix before compile so the traced checkpoint-bank parameters are FP32.
+   - Verification: pending BF16 restore and runtime launch.
 
 ### Current next step
 
-Repair the completed standard-QKV artifact before runtime validation:
+Do not postprocess-only a BF16-traced artifact to FP32 recurrent banks. For this completed artifact, launch with BF16 recurrent banks:
 
 ```bash
-python contrib/models/Qwen3.6-27B/test/integration/qwen36_27b_compile_fp8.py \
-  --postprocess-only \
-  --compiled-path /mnt/trainium_artifacts/qwen_artifacts/qwen36_32k_fp8_fp8all_lmheadfp8_gatesfp8_kvbf16_standard_qkv_segmented_cte512_gdnseg512_cte2048_pfx32k_slots64_20260605T132739Z_coherent_rebuild_stdqkv2_direct_scan0 \
-  --quantized-checkpoints-path /mnt/trainium_artifacts/qwen_artifacts/_quantized/qwen36_27b_fp8_full_fp8all_lmheadfp8_gatesfp8 \
-  --weight-dtype fp8_full \
-  --gdn-recurrent-cache-dtype float32 \
-  --gdn-conv-cache-dtype bfloat16 \
-  ...
+GDN_RECURRENT_CACHE_DTYPE=bfloat16 \
+bash tmp_launch_qwen36_segcte2048.sh ...
 ```
 
 Compile the same coherent-speed anchor with standard QKV after the segmented CTE `kernel_assert` fix:

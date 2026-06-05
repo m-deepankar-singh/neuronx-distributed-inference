@@ -13,6 +13,8 @@ CTE_BUCKETS="${CTE_BUCKETS:-2048}"
 CONTEXT_ENCODING_BUCKET_PAIRS="${CONTEXT_ENCODING_BUCKET_PAIRS:-2048:0 2048:256 2048:512 2048:1024 2048:2048 2048:4096 2048:8192 2048:16384 2048:32768 2048:65536 2048:131072 2048:262144}"
 TOKEN_GENERATION_BUCKETS="${TOKEN_GENERATION_BUCKETS:-512 16384 16640 32768 65536 131072 262144}"
 MAX_GDN_CHECKPOINT_SLOTS="${MAX_GDN_CHECKPOINT_SLOTS:-64}"
+GDN_RECURRENT_CACHE_DTYPE="${GDN_RECURRENT_CACHE_DTYPE:-float32}"
+GDN_CONV_CACHE_DTYPE="${GDN_CONV_CACHE_DTYPE:-bfloat16}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-}"
 NUM_GPU_BLOCKS_OVERRIDE="${NUM_GPU_BLOCKS_OVERRIDE:-}"
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-}"
@@ -89,8 +91,8 @@ nohup env \
     "${NUM_GPU_BLOCKS_ARGS[@]}" \
     --gdn-checkpoint-interval 256 \
     --max-gdn-checkpoint-slots "${MAX_GDN_CHECKPOINT_SLOTS}" \
-    --gdn-recurrent-cache-dtype float32 \
-    --gdn-conv-cache-dtype bfloat16 \
+    --gdn-recurrent-cache-dtype "${GDN_RECURRENT_CACHE_DTYPE}" \
+    --gdn-conv-cache-dtype "${GDN_CONV_CACHE_DTYPE}" \
     --hybrid-cache-mode all \
     --hybrid-apc-require-vllm-metadata \
     --hybrid-apc-enable-backed-prefix-reads \
