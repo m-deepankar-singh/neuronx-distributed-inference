@@ -194,6 +194,39 @@ def _pa_num_blocks(args: argparse.Namespace) -> int:
     )
 
 
+def _normalize_cache_dtype(value: str | None, *, default: str = "float32") -> str:
+    if value is None:
+        value = default
+    normalized = str(value).lower()
+    aliases = {
+        "fp32": "float32",
+        "float32": "float32",
+        "torch.float32": "float32",
+        "bf16": "bfloat16",
+        "bfloat16": "bfloat16",
+        "torch.bfloat16": "bfloat16",
+    }
+    if normalized not in aliases:
+        raise ValueError(
+            "GDN recurrent cache dtype must be float32 or bfloat16, "
+            f"got {value}"
+        )
+    return aliases[normalized]
+
+
+def _recurrent_cache_dtype(args: argparse.Namespace) -> str:
+    dtype = _normalize_cache_dtype(
+        args.hybrid_gdn_recurrent_cache_dtype or args.gdn_recurrent_cache_dtype,
+        default="float32",
+    )
+    if args.enable_hybrid_apc and args.hybrid_cache_mode == "all" and dtype != "float32":
+        raise ValueError(
+            "Hybrid APC all-mode requires float32 recurrent GDN checkpoint "
+            "cache state; use --gdn-recurrent-cache-dtype float32"
+        )
+    return dtype
+
+
 def _override_config(args: argparse.Namespace) -> dict:
     _validate_hybrid_apc_args(args)
     cte_buckets = _cte_buckets(args)
@@ -204,9 +237,7 @@ def _override_config(args: argparse.Namespace) -> dict:
     )
     token_generation_buckets = _token_generation_buckets(args)
     token_generation_batches = _token_generation_batches(args)
-    recurrent_cache_dtype = (
-        args.hybrid_gdn_recurrent_cache_dtype or args.gdn_recurrent_cache_dtype
-    )
+    recurrent_cache_dtype = _recurrent_cache_dtype(args)
     conv_cache_dtype = args.hybrid_gdn_conv_cache_dtype or args.gdn_conv_cache_dtype
     neuron_config = {
         "tp_degree": args.tensor_parallel_size,
@@ -499,9 +530,7 @@ def main() -> int:
         "enable_chunked_prefill": args.enable_vllm_chunked_prefill,
         "additional_config": additional_config,
     }
-    recurrent_cache_dtype = (
-        args.hybrid_gdn_recurrent_cache_dtype or args.gdn_recurrent_cache_dtype
-    )
+    recurrent_cache_dtype = _recurrent_cache_dtype(args)
     if args.enable_prefix_caching or args.enable_hybrid_apc:
         llm_kwargs["mamba_cache_mode"] = args.mamba_cache_mode or "all"
         llm_kwargs["mamba_ssm_cache_dtype"] = (

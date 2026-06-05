@@ -635,20 +635,20 @@ def _allocate_attention_buffers(
     bufs.exp_sb = _repeat_ref(exp_sb_row, atp.num_grps)
 
     bufs.mm1_psum = []
-    mm1_psum_row = []
-    for large_tile_idx in range(atp.num_large_tiles_per_section):
-        tile_row = []
-        for k_tile_idx in range(4):
-            tile_row.append(
-                nl.ndarray(
-                    (mm1_p, mm1_n),
-                    dtype=ac.mm_out_dtype,
-                    buffer=nl.psum,
-                    address=(0, (k_tile_idx % 4) * PSUM_BANK_SIZE),
-                )
-            )
-        mm1_psum_row.append(tile_row)
     for grp_idx in range(atp.num_grps):
+        mm1_psum_row = []
+        for large_tile_idx in range(atp.num_large_tiles_per_section):
+            tile_row = []
+            for k_tile_idx in range(4):
+                tile_row.append(
+                    nl.ndarray(
+                        (mm1_p, mm1_n),
+                        dtype=ac.mm_out_dtype,
+                        buffer=nl.psum,
+                        address=(0, (k_tile_idx % 4) * PSUM_BANK_SIZE),
+                    )
+                )
+            mm1_psum_row.append(tile_row)
         bufs.mm1_psum.append(mm1_psum_row)
 
     if not atp.dynamic_sel_mask:
@@ -695,17 +695,17 @@ def _allocate_attention_buffers(
     bufs.exp_tp_sb = _repeat_ref(exp_tp_row, atp.num_grps)
 
     bufs.mm2_psum = []
-    mm2_psum_row = []
-    for large_tile_idx in range(atp.num_large_tiles_per_section):
-        mm2_psum_row.append(
-            nl.ndarray(
-                (mm2_p, mm2_n),
-                dtype=ac.mm_out_dtype,
-                buffer=nl.psum,
-                address=(0, ((4 + (large_tile_idx % 4)) * PSUM_BANK_SIZE)),
-            )
-        )
     for grp_idx in range(atp.num_grps):
+        mm2_psum_row = []
+        for large_tile_idx in range(atp.num_large_tiles_per_section):
+            mm2_psum_row.append(
+                nl.ndarray(
+                    (mm2_p, mm2_n),
+                    dtype=ac.mm_out_dtype,
+                    buffer=nl.psum,
+                    address=(0, ((4 + (large_tile_idx % 4)) * PSUM_BANK_SIZE)),
+                )
+            )
         bufs.mm2_psum.append(mm2_psum_row)
 
 

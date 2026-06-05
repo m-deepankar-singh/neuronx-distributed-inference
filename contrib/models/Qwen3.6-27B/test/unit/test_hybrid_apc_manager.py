@@ -1018,6 +1018,115 @@ class TestHybridAPCSchedulerBridge(unittest.TestCase):
         self.assertEqual(prepared.plan.checkpoint_key, key_b)
         self.assertEqual(prepared.input_dict["hybrid_restore_slot_ids"].item(), 1)
 
+    def test_same_request_suffix_uses_active_gdn_carry(self):
+        store = _store()
+        bridge = HybridAPCSchedulerBridge(
+            store=store,
+            slot_allocator=HybridAPCSlotAllocator(num_slots=4),
+            cache_salt="tenant-a",
+            model_revision="rev-a",
+        )
+        first = bridge.prepare_request(
+            request_id="req-live",
+            input_dict={
+                "input_ids": torch.arange(128, dtype=torch.int32).unsqueeze(0)
+            },
+            attention_hit_len=0,
+            cumulative_hashes_by_prefix_len={128: "h128"},
+        )
+        bridge.commit_prefill(first)
+        bridge.finish_request("req-live")
+        _SCHEDULER_PATCH.authorize_hybrid_apc_prefix_read(
+            first.commit_key,
+            request_id="req-live",
+        )
+
+        same_request = bridge.prepare_suffix_only_request(
+            request_id="req-live",
+            input_dict={
+                "input_ids": torch.arange(128, 192, dtype=torch.int32).unsqueeze(0)
+            },
+            attention_hit_len=128,
+            request_prefix_len=192,
+        )
+
+        self.assertIsNotNone(same_request)
+        self.assertEqual(same_request.input_dict["computed_context_lens"].item(), 128)
+        self.assertEqual(
+            same_request.input_dict["hybrid_restore_prefix_lens"].item(),
+            128,
+        )
+        self.assertEqual(same_request.input_dict["hybrid_restore_mask"].item(), 0)
+        self.assertEqual(same_request.input_dict["hybrid_restore_slot_ids"].item(), 0)
+
+        _SCHEDULER_PATCH.authorize_hybrid_apc_prefix_read(
+            first.commit_key,
+            request_id="req-other",
+        )
+        other_request = bridge.prepare_suffix_only_request(
+            request_id="req-other",
+            input_dict={
+                "input_ids": torch.arange(128, 192, dtype=torch.int32).unsqueeze(0)
+            },
+            attention_hit_len=128,
+            request_prefix_len=192,
+        )
+
+        self.assertIsNotNone(other_request)
+        self.assertEqual(other_request.input_dict["hybrid_restore_mask"].item(), 1)
+
+    def test_same_request_full_prompt_slice_uses_active_gdn_carry(self):
+        store = _store()
+        bridge = HybridAPCSchedulerBridge(
+            store=store,
+            slot_allocator=HybridAPCSlotAllocator(num_slots=4),
+            cache_salt="tenant-a",
+            model_revision="rev-a",
+        )
+        first = bridge.prepare_request(
+            request_id="req-live-full",
+            input_dict={
+                "input_ids": torch.arange(128, dtype=torch.int32).unsqueeze(0)
+            },
+            attention_hit_len=0,
+            cumulative_hashes_by_prefix_len={128: "h128"},
+        )
+        bridge.commit_prefill(first)
+        bridge.finish_request("req-live-full")
+
+        same_request = bridge.prepare_request(
+            request_id="req-live-full",
+            input_dict={
+                "input_ids": torch.arange(192, dtype=torch.int32).unsqueeze(0)
+            },
+            attention_hit_len=128,
+            request_prefix_len=192,
+            cumulative_hashes_by_prefix_len={128: "h128", 192: "h192"},
+        )
+
+        self.assertEqual(
+            same_request.input_dict["input_ids"].shape,
+            torch.Size([1, 64]),
+        )
+        self.assertEqual(same_request.input_dict["computed_context_lens"].item(), 128)
+        self.assertEqual(
+            same_request.input_dict["hybrid_restore_prefix_lens"].item(),
+            128,
+        )
+        self.assertEqual(same_request.input_dict["hybrid_restore_mask"].item(), 0)
+
+        other_request = bridge.prepare_request(
+            request_id="req-other-full",
+            input_dict={
+                "input_ids": torch.arange(192, dtype=torch.int32).unsqueeze(0)
+            },
+            attention_hit_len=128,
+            request_prefix_len=192,
+            cumulative_hashes_by_prefix_len={128: "h128", 192: "h192"},
+        )
+
+        self.assertEqual(other_request.input_dict["hybrid_restore_mask"].item(), 1)
+
     def test_bridge_suffix_only_restore_uses_checkpoint_attention_block_refs(self):
         store = _store()
         key, _checkpoint = _insert(

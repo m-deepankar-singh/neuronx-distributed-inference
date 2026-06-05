@@ -13,6 +13,8 @@ from neuronx_distributed_inference.modules.async_execution import (
     _combine_vectorized_hybrid_apc_inputs,
     _is_chunked_prefill_execution,
     _is_context_encoding_execution,
+    _with_hybrid_apc_candidate_owner_metadata,
+    _with_hybrid_apc_owner_metadata,
     cancel_hybrid_apc_request,
     execute_model_prefix_caching,
     finish_hybrid_apc_request,
@@ -569,6 +571,70 @@ class TestHybridAPCAsyncBridge(unittest.TestCase):
         self.assertEqual(bridge.prepare_kwargs["request_id"], "req-wrapper-direct")
         self.assertIn("_hybrid_apc_prepared", input_dict)
 
+    def test_prefix_caching_execution_finds_context_wrapper_bridge(self):
+        bridge = _FakeHybridBridge()
+        context_owner = SimpleNamespace(
+            config=SimpleNamespace(use_hybrid_apc_manager=True),
+            hybrid_apc_bridge=bridge,
+        )
+        base = SimpleNamespace(
+            config=SimpleNamespace(use_hybrid_apc_manager=True),
+            neuron_config=SimpleNamespace(
+                enable_fused_speculation=False,
+                enable_eagle_speculation=False,
+            ),
+            context_encoding_model=context_owner,
+        )
+        model = _FakePrefixModel()
+        input_dict = _prefix_input_dict()
+        input_dict.update(
+            {
+                "request_id": "req-context-owner",
+                "vllm_attention_hit_len": torch.tensor([2], dtype=torch.int32),
+            }
+        )
+
+        execute_model_prefix_caching(base, model, input_dict)
+
+        self.assertEqual(bridge.prepare_kwargs["request_id"], "req-context-owner")
+        self.assertIn("_hybrid_apc_prepared", input_dict)
+
+    def test_prefix_caching_execution_reuses_last_bridge_for_continuation(self):
+        bridge = _FakeHybridBridge()
+        base = SimpleNamespace(
+            config=SimpleNamespace(use_hybrid_apc_manager=True),
+            neuron_config=SimpleNamespace(
+                enable_fused_speculation=False,
+                enable_eagle_speculation=False,
+            ),
+            hybrid_apc_bridge=bridge,
+        )
+        model = _FakePrefixModel()
+        first_input = _prefix_input_dict()
+        first_input.update(
+            {
+                "request_id": "req-first",
+                "vllm_attention_hit_len": torch.tensor([2], dtype=torch.int32),
+            }
+        )
+
+        execute_model_prefix_caching(base, model, first_input)
+        finish_hybrid_apc_request(first_input)
+        base.hybrid_apc_bridge = None
+
+        second_input = _prefix_input_dict()
+        second_input.update(
+            {
+                "request_id": "req-second",
+                "vllm_attention_hit_len": torch.tensor([2], dtype=torch.int32),
+            }
+        )
+
+        execute_model_prefix_caching(base, model, second_input)
+
+        self.assertEqual(bridge.prepare_kwargs["request_id"], "req-second")
+        self.assertIn("_hybrid_apc_prepared", second_input)
+
     def test_prefix_caching_execution_uses_wrapper_scheduler_records(self):
         base = SimpleNamespace(
             config=SimpleNamespace(use_hybrid_apc_manager=True),
@@ -737,6 +803,141 @@ class TestHybridAPCAsyncBridge(unittest.TestCase):
             )
         )
 
+    def test_single_token_cached_prefill_continuation_uses_context_execution(self):
+        base = SimpleNamespace(
+            neuron_config=SimpleNamespace(
+                enable_fused_speculation=False,
+                enable_eagle_speculation=False,
+            ),
+            _is_prefill=lambda position_ids: not bool(position_ids.min().item()),
+        )
+        input_dict = _prefix_input_dict()
+        input_dict.update(
+            {
+                "input_ids": torch.empty((1, 0), dtype=torch.int32),
+                "position_ids": torch.empty((1, 0), dtype=torch.int32),
+                "hybrid_prefill_completion_state": torch.tensor([0], dtype=torch.int32),
+                "vllm_attention_hit_len": torch.tensor([2048], dtype=torch.int32),
+                "request_prefix_len": 2049,
+                "active_suffix_len": 1,
+            }
+        )
+
+        self.assertTrue(
+            _is_chunked_prefill_execution(
+                base,
+                input_dict,
+                is_fused_speculation=False,
+            )
+        )
+
+    def test_owner_metadata_single_token_continuation_uses_context_execution(self):
+        base = SimpleNamespace(
+            neuron_config=SimpleNamespace(
+                enable_fused_speculation=False,
+                enable_eagle_speculation=False,
+            ),
+            _qwen36_vllm_request_ids=("req-2049",),
+            _qwen36_vllm_prefill_completion_state=torch.tensor(
+                [0],
+                dtype=torch.int32,
+            ),
+            _qwen36_vllm_hybrid_apc_metadata_by_request_id={
+                "req-2049": {
+                    "vllm_attention_hit_len": 2048,
+                    "request_prefix_len": 2049,
+                    "active_suffix_len": 1,
+                    "full_input_ids": tuple(range(2049)),
+                },
+            },
+        )
+        input_dict = _prefix_input_dict()
+        input_dict.update(
+            {
+                "input_ids": torch.empty((1, 0), dtype=torch.int32),
+                "position_ids": torch.empty((1, 0), dtype=torch.int32),
+            }
+        )
+
+        enriched = _with_hybrid_apc_owner_metadata(input_dict, base)
+
+        self.assertIn("hybrid_request_records", enriched)
+        self.assertTrue(
+            _is_chunked_prefill_execution(
+                base,
+                enriched,
+                is_fused_speculation=False,
+            )
+        )
+
+    def test_candidate_owner_metadata_uses_wrapper_records_for_prefill_probe(self):
+        base = SimpleNamespace()
+        wrapper = SimpleNamespace(
+            _qwen36_vllm_request_ids=("req-wrapper-2049",),
+            _qwen36_vllm_prefill_completion_state=torch.tensor(
+                [0],
+                dtype=torch.int32,
+            ),
+            _qwen36_vllm_hybrid_apc_metadata_by_request_id={
+                "req-wrapper-2049": {
+                    "vllm_attention_hit_len": 2048,
+                    "request_prefix_len": 2049,
+                    "active_suffix_len": 1,
+                },
+            },
+        )
+        input_dict = _prefix_input_dict()
+        input_dict.update(
+            {
+                "input_ids": torch.empty((1, 0), dtype=torch.int32),
+                "position_ids": torch.empty((1, 0), dtype=torch.int32),
+            }
+        )
+
+        enriched = _with_hybrid_apc_candidate_owner_metadata(input_dict, base, wrapper)
+
+        self.assertIn("hybrid_request_records", enriched)
+        self.assertTrue(
+            _is_chunked_prefill_execution(
+                SimpleNamespace(
+                    neuron_config=SimpleNamespace(
+                        enable_fused_speculation=False,
+                        enable_eagle_speculation=False,
+                    )
+                ),
+                enriched,
+                is_fused_speculation=False,
+            )
+        )
+
+    def test_completed_single_token_decode_stays_generation_execution(self):
+        base = SimpleNamespace(
+            neuron_config=SimpleNamespace(
+                enable_fused_speculation=False,
+                enable_eagle_speculation=False,
+            ),
+            _is_prefill=lambda position_ids: not bool(position_ids.min().item()),
+        )
+        input_dict = _prefix_input_dict()
+        input_dict.update(
+            {
+                "input_ids": torch.tensor([[13]], dtype=torch.int32),
+                "position_ids": torch.tensor([[2048]], dtype=torch.int32),
+                "hybrid_prefill_completion_state": torch.tensor([1], dtype=torch.int32),
+                "vllm_attention_hit_len": torch.tensor([2048], dtype=torch.int32),
+                "request_prefix_len": 2048,
+                "active_suffix_len": 1,
+            }
+        )
+
+        self.assertFalse(
+            _is_chunked_prefill_execution(
+                base,
+                input_dict,
+                is_fused_speculation=False,
+            )
+        )
+
     def test_commit_debug_switch_cancels_instead_of_committing_metadata(self):
         base = SimpleNamespace(
             config=SimpleNamespace(use_hybrid_apc_manager=True),
@@ -848,6 +1049,39 @@ class TestHybridAPCAsyncBridge(unittest.TestCase):
             )
         )
 
+    def test_prepare_debug_switch_zeroes_only_restore_mask(self):
+        bridge = _FakeHybridBridge()
+        base = SimpleNamespace(
+            config=SimpleNamespace(use_hybrid_apc_manager=True),
+            hybrid_apc_bridge=bridge,
+        )
+        input_dict = _prefix_input_dict()
+        input_dict.update(
+            {
+                "request_id": "req-zero-restore-only",
+                "vllm_attention_hit_len": torch.tensor([2], dtype=torch.int32),
+            }
+        )
+
+        with patch.dict(
+            "os.environ",
+            {"QWEN36_ZERO_HYBRID_GDN_RESTORE_MASK": "1"},
+        ):
+            prepared = prepare_hybrid_apc_request_for_execution(base, input_dict)
+
+        self.assertTrue(
+            torch.equal(
+                prepared["hybrid_restore_mask"],
+                torch.tensor([0], dtype=torch.int32),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                prepared["hybrid_commit_mask"],
+                torch.tensor([1], dtype=torch.int32),
+            )
+        )
+
     def test_prefix_caching_execution_cancels_hybrid_apc_on_model_failure(self):
         base = SimpleNamespace(
             config=SimpleNamespace(use_hybrid_apc_manager=True),
@@ -950,6 +1184,62 @@ class TestHybridAPCAsyncBridge(unittest.TestCase):
             torch.equal(
                 model.calls[0][0],
                 torch.tensor([[12, 13]], dtype=torch.int32),
+            )
+        )
+
+    def test_single_token_same_request_suffix_prepares_hybrid_apc(self):
+        bridge = _FakeHybridBridge()
+        base = SimpleNamespace(
+            config=SimpleNamespace(use_hybrid_apc_manager=True),
+            neuron_config=SimpleNamespace(
+                enable_fused_speculation=False,
+                enable_eagle_speculation=False,
+            ),
+            hybrid_apc_bridge=bridge,
+        )
+        input_dict = _prefix_input_dict()
+        input_dict.update(
+            {
+                "input_ids": torch.tensor([[99]], dtype=torch.int32),
+                "attention_mask": torch.ones((1, 1), dtype=torch.int32),
+                "position_ids": torch.tensor([[2048]], dtype=torch.int32),
+                "slot_mapping": torch.tensor([[2304]], dtype=torch.int32),
+                "block_table": torch.arange(10, dtype=torch.int32).reshape(1, 10),
+                "computed_context_lens": torch.tensor([[2048]], dtype=torch.int32),
+                "full_context_lens": torch.tensor([[2049]], dtype=torch.int32),
+                "request_id": "req-2049",
+                "hybrid_cached_request_ids": ("req-2049",),
+                "hybrid_prefill_completion_state": torch.tensor([0], dtype=torch.int32),
+                "vllm_attention_hit_len": torch.tensor([2048], dtype=torch.int32),
+                "request_prefix_len": 2049,
+                "active_suffix_len": 1,
+            }
+        )
+
+        prepared = prepare_hybrid_apc_request_for_execution(base, input_dict)
+
+        self.assertEqual(bridge.suffix_prepare_calls[0]["request_id"], "req-2049")
+        self.assertEqual(bridge.suffix_prepare_calls[0]["attention_hit_len"], 2048)
+        self.assertEqual(bridge.suffix_prepare_calls[0]["request_prefix_len"], 2049)
+        self.assertTrue(
+            torch.equal(prepared["input_ids"], torch.tensor([[99]], dtype=torch.int32))
+        )
+        self.assertTrue(
+            torch.equal(
+                prepared["computed_context_lens"],
+                torch.tensor([[2048]], dtype=torch.int32),
+            )
+        )
+        self.assertTrue(
+            torch.equal(prepared["num_queries"], torch.tensor([[1]], dtype=torch.int32))
+        )
+        self.assertTrue(
+            torch.equal(prepared["hybrid_restore_mask"], torch.tensor([0], dtype=torch.int32))
+        )
+        self.assertTrue(
+            torch.equal(
+                prepared["hybrid_restore_prefix_lens"],
+                torch.tensor([2048], dtype=torch.int32),
             )
         )
 
@@ -1753,6 +2043,18 @@ class TestHybridAPCAsyncBridge(unittest.TestCase):
             torch.equal(
                 prepared["num_queries"],
                 torch.tensor([[2]], dtype=torch.int32),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                prepared["hybrid_restore_mask"],
+                torch.tensor([0], dtype=torch.int32),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                prepared["hybrid_restore_prefix_lens"],
+                torch.tensor([2], dtype=torch.int32),
             )
         )
 

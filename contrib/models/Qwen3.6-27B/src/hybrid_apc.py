@@ -308,6 +308,7 @@ def apply_hybrid_apc_prefill_plan(
     plan: HybridAPCHitPlan,
     commit_slot: int | None = None,
     request_prefix_len: int | None = None,
+    gdn_active_carry: bool = False,
     block_size: int | None = None,
 ) -> dict[str, torch.Tensor]:
     """Materialize model inputs for a scheduler-selected hybrid APC hit plan.
@@ -518,17 +519,18 @@ def apply_hybrid_apc_prefill_plan(
 
     disable_restore = _env_flag("QWEN36_DISABLE_HYBRID_GDN_RESTORE")
     disable_commit = _env_flag("QWEN36_DISABLE_HYBRID_GDN_COMMIT")
-    restore_enabled = plan.checkpoint_slot is not None and not disable_restore
+    restore_available = plan.checkpoint_slot is not None and not disable_restore
+    restore_enabled = restore_available and not gdn_active_carry
     commit_enabled = commit_slot is not None and not disable_commit
     output["computed_context_lens"] = _batch_i32_col(restore_len)
     output["full_context_lens"] = _batch_i32_col(prompt_len)
     output["num_queries"] = _batch_i32_col(suffix_len)
     output["hybrid_restore_slot_ids"] = _batch_i32(
-        0 if not restore_enabled else int(plan.checkpoint_slot)
+        0 if not restore_available else int(plan.checkpoint_slot)
     )
     output["hybrid_restore_mask"] = _batch_i32(1 if restore_enabled else 0)
     output["hybrid_restore_prefix_lens"] = _batch_i32(
-        restore_len if restore_enabled else 0
+        restore_len if restore_available else 0
     )
     output["hybrid_commit_slot_ids"] = _batch_i32(
         0 if not commit_enabled else commit_slot
@@ -540,7 +542,8 @@ def apply_hybrid_apc_prefill_plan(
             "[hybrid_apc_debug] apply "
             f"prompt_len={prompt_len} restore_len={restore_len} "
             f"suffix_len={suffix_len} restore_slot={plan.checkpoint_slot} "
-            f"commit_slot={commit_slot} input_shape={tuple(input_ids.shape)} "
+            f"commit_slot={commit_slot} gdn_active_carry={gdn_active_carry} "
+            f"input_shape={tuple(input_ids.shape)} "
             f"output_shape={tuple(output['input_ids'].shape)}",
             flush=True,
         )
@@ -555,6 +558,7 @@ def apply_hybrid_apc_suffix_prefill_plan(
     request_prefix_len: int,
     commit_slot: int | None = None,
     attention_block_refs: Iterable[int] | None = None,
+    gdn_active_carry: bool = False,
 ) -> dict[str, torch.Tensor]:
     """Materialize Hybrid APC controls when vLLM already sliced to suffix.
 
@@ -671,7 +675,7 @@ def apply_hybrid_apc_suffix_prefill_plan(
     output["full_context_lens"] = _batch_i32_col(prompt_len)
     output["num_queries"] = _batch_i32_col(suffix_len)
     output["hybrid_restore_slot_ids"] = _batch_i32(int(plan.checkpoint_slot))
-    output["hybrid_restore_mask"] = _batch_i32(1)
+    output["hybrid_restore_mask"] = _batch_i32(0 if gdn_active_carry else 1)
     output["hybrid_restore_prefix_lens"] = _batch_i32(restore_len)
     output["hybrid_commit_slot_ids"] = _batch_i32(0 if commit_slot is None else commit_slot)
     output["hybrid_commit_mask"] = _batch_i32(1 if commit_slot is not None else 0)
@@ -682,6 +686,7 @@ def apply_hybrid_apc_suffix_prefill_plan(
             f"prompt_len={prompt_len} restore_len={restore_len} "
             f"suffix_len={suffix_len} restore_slot={plan.checkpoint_slot} "
             f"commit_slot={commit_slot} "
+            f"gdn_active_carry={gdn_active_carry} "
             f"attention_block_refs={refs} "
             f"input_shape={tuple(input_ids.shape)}",
             flush=True,
@@ -794,6 +799,7 @@ class HybridAPCSchedulerBridge:
         self.allow_local_hash_fallback = bool(allow_local_hash_fallback)
         self.require_attention_block_refs = bool(require_attention_block_refs)
         self.reject_unbacked_attention_hits = bool(reject_unbacked_attention_hits)
+        self._same_request_committed_keys: dict[Hashable, set[HybridPrefixKey]] = {}
         self.store.set_checkpoint_slot_releaser(
             self.slot_allocator.release_committed
         )
@@ -938,12 +944,32 @@ class HybridAPCSchedulerBridge:
             if self.store.lookup(commit_key) is None:
                 commit_slot = self._reserve_commit_slot()
 
+        same_request_keys = self._same_request_committed_keys.get(request_id, set())
+        existing_record = self.store._requests.get(request_id)
+        if existing_record is not None:
+            same_request_keys = same_request_keys | set(existing_record.committed_keys)
+        gdn_active_carry = (
+            plan.checkpoint_key is not None
+            and plan.checkpoint_key in same_request_keys
+        )
+        if (
+            os.environ.get("QWEN36_HYBRID_APC_DEBUG") == "1"
+            and gdn_active_carry
+        ):
+            print(
+                "[hybrid_apc_debug] prefill-active-carry "
+                f"request_id={request_id!r} prefix_len={plan.restore_checkpoint_prefix_len} "
+                f"slot={plan.checkpoint_slot}",
+                flush=True,
+            )
+
         model_inputs = apply_hybrid_apc_prefill_plan(
             input_dict,
             plan=plan,
             commit_slot=commit_slot,
             request_prefix_len=prompt_len,
             block_size=self.store.block_size,
+            gdn_active_carry=gdn_active_carry,
         )
         record = self.store.on_request_restore(
             request_id=request_id,
@@ -1133,12 +1159,29 @@ class HybridAPCSchedulerBridge:
             if self.store.lookup(commit_key) is None:
                 commit_slot = self._reserve_commit_slot()
 
+        same_request_keys = self._same_request_committed_keys.get(request_id, set())
+        existing_record = self.store._requests.get(request_id)
+        if existing_record is not None:
+            same_request_keys = same_request_keys | set(existing_record.committed_keys)
+        gdn_active_carry = checkpoint.key in same_request_keys
+        if (
+            os.environ.get("QWEN36_HYBRID_APC_DEBUG") == "1"
+            and gdn_active_carry
+        ):
+            print(
+                "[hybrid_apc_debug] suffix-active-carry "
+                f"request_id={request_id!r} prefix_len={checkpoint.prefix_len} "
+                f"slot={checkpoint.gdn_checkpoint_slot}",
+                flush=True,
+            )
+
         model_inputs = apply_hybrid_apc_suffix_prefill_plan(
             input_dict,
             plan=plan,
             request_prefix_len=request_prefix_len,
             commit_slot=commit_slot,
             attention_block_refs=checkpoint.attention_block_refs,
+            gdn_active_carry=gdn_active_carry,
         )
         record = self.store.on_request_restore(
             request_id=request_id,
@@ -1189,6 +1232,12 @@ class HybridAPCSchedulerBridge:
             request_id=prepared.request_id,
             checkpoint_key=prepared.commit_key,
         )
+        self._same_request_committed_keys.setdefault(
+            prepared.request_id,
+            set(),
+        ).add(prepared.commit_key)
+        if len(self._same_request_committed_keys) > 4096:
+            self._same_request_committed_keys.clear()
         if prepared.commit_slot in record.reserved_slots:
             record.reserved_slots.remove(prepared.commit_slot)
         return checkpoint

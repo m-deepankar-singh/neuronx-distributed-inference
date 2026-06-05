@@ -125,6 +125,10 @@ def _fake_modules():
             _make_lower_mask_diag=lambda *args, **kwargs: None,
             _make_identity=lambda *args, **kwargs: None,
         ),
+        "src.nki_kernels.nki_deltanet_fused_legacy": _module(
+            "src.nki_kernels.nki_deltanet_fused_legacy",
+            deltanet_fused_chunked_fwd=lambda *args, **kwargs: None,
+        ),
         "src.hybrid_apc": _module(
             "src.hybrid_apc",
             HybridAPCMetadataStore=object,
@@ -500,6 +504,61 @@ class TestQwen36ModelAliases(unittest.TestCase):
 
         torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-5)
 
+    def test_expanded_prefix_attention_matches_reference(self):
+        torch.manual_seed(789)
+        batch_size = 1
+        q_heads = 8
+        kv_heads = 2
+        q_len = 6
+        cache_len = 11
+        head_dim = 8
+        Q = torch.randn(batch_size, q_heads, q_len, head_dim)
+        K_cache = torch.randn(batch_size, kv_heads, cache_len, head_dim)
+        V_cache = torch.randn(batch_size, kv_heads, cache_len, head_dim)
+        query_positions = torch.arange(cache_len - q_len, cache_len).view(1, q_len)
+        cache_positions = torch.arange(cache_len).view(1, 1, 1, cache_len)
+        key_valid_mask = torch.ones(batch_size, 1, 1, cache_len, dtype=torch.bool)
+        key_valid_mask[:, :, :, -1] = False
+
+        actual = self.qwen_module._qwen35_expanded_prefix_attention(
+            Q,
+            K_cache,
+            V_cache,
+            query_positions,
+            cache_positions,
+            key_valid_mask,
+        )
+        expected = _expanded_prefix_attention_reference(
+            Q,
+            K_cache,
+            V_cache,
+            query_positions,
+            cache_positions,
+            key_valid_mask,
+        )
+
+        torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-5)
+
+    def test_prefix_attention_impl_env_selects_legacy_expanded(self):
+        with patch.dict(
+            os.environ,
+            {"QWEN36_PREFIX_ATTENTION_IMPL": "legacy_expanded"},
+            clear=True,
+        ):
+            self.assertEqual(
+                self.qwen_module._qwen36_prefix_attention_impl(),
+                "expanded",
+            )
+
+    def test_prefix_attention_impl_rejects_unknown_value(self):
+        with patch.dict(
+            os.environ,
+            {"QWEN36_PREFIX_ATTENTION_IMPL": "bogus"},
+            clear=True,
+        ):
+            with self.assertRaisesRegex(ValueError, "QWEN36_PREFIX_ATTENTION_IMPL"):
+                self.qwen_module._qwen36_prefix_attention_impl()
+
     def test_grouped_prefix_attention_rejects_invalid_gqa_shape(self):
         Q = torch.zeros(1, 5, 2, 4)
         K_cache = torch.zeros(1, 2, 3, 4)
@@ -543,6 +602,64 @@ class TestQwen36ModelAliases(unittest.TestCase):
         self.assertEqual(aliases[kv1], 3)
         self.assertEqual(aliases[state], 4)
         self.assertEqual(aliases[checkpoint], 5)
+
+    def test_hybrid_checkpoint_aliases_skip_tkg_without_commit(self):
+        instance, (kv0, kv1, state, checkpoint) = _make_instance(
+            self.qwen_module,
+            output_logits=True,
+            on_device_sampling_config=object(),
+        )
+        instance.module.config.use_hybrid_apc_manager = True
+        instance.module.config.hybrid_apc_commit_during_token_generation = False
+        instance.module.n_active_tokens = 1
+
+        _module, aliases = instance.get(bucket_rank=0)
+
+        self.assertEqual(aliases[kv0], 2)
+        self.assertEqual(aliases[kv1], 3)
+        self.assertEqual(aliases[state], 4)
+        self.assertNotIn(checkpoint, aliases)
+
+    def test_hybrid_checkpoint_aliases_include_tkg_with_commit(self):
+        instance, (kv0, kv1, state, checkpoint) = _make_instance(
+            self.qwen_module,
+            output_logits=True,
+            on_device_sampling_config=object(),
+        )
+        instance.module.config.use_hybrid_apc_manager = True
+        instance.module.config.hybrid_apc_commit_during_token_generation = True
+        instance.module.n_active_tokens = 1
+
+        _module, aliases = instance.get(bucket_rank=0)
+
+        self.assertEqual(aliases[kv0], 2)
+        self.assertEqual(aliases[kv1], 3)
+        self.assertEqual(aliases[state], 4)
+        self.assertEqual(aliases[checkpoint], 5)
+
+    def test_alias_output_count_guard_rejects_shifted_deltanet_states(self):
+        module = SimpleNamespace(
+            kv_mgr=SimpleNamespace(past_key_values=[object(), object()]),
+            config=SimpleNamespace(
+                use_hybrid_cache_manager=False,
+                use_hybrid_apc_manager=True,
+                hybrid_apc_commit_during_token_generation=False,
+            ),
+            _deltanet_state_params=[object()],
+            _deltanet_updated_states=[torch.zeros(1), torch.zeros(1)],
+            _hybrid_gdn_checkpoint_params=[],
+            _hybrid_gdn_checkpoint_updated_states=[],
+        )
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "_deltanet_updated_states has 2 tensors but _deltanet_state_params has 1",
+        ):
+            self.qwen_module._qwen36_validate_alias_output_counts(
+                module,
+                updated_kv_cache=[torch.zeros(1), torch.zeros(1)],
+                is_for_context_encoding=True,
+            )
 
     def test_gathered_logits_mask_only_actual_vocab_padding(self):
         lm_head = SimpleNamespace(pad_size=248320, gather_output=True)
@@ -713,6 +830,49 @@ class TestQwen36ModelAliases(unittest.TestCase):
         self.assertTrue(torch.equal(recurrent_out[1:], old_recurrent[1:]))
         self.assertTrue(torch.equal(conv_out[1:], old_conv[1:]))
 
+    def test_hybrid_checkpoint_bank_reasserts_configured_dtype_after_global_cast(self):
+        config = SimpleNamespace(
+            layer_types=["linear_attention"],
+            max_gdn_checkpoint_slots=3,
+            linear_num_value_heads=1,
+            linear_num_key_heads=1,
+            linear_key_head_dim=2,
+            linear_value_head_dim=2,
+            linear_conv_kernel_dim=3,
+            hybrid_recurrent_cache_dtype="float32",
+            hybrid_conv_cache_dtype="bfloat16",
+            neuron_config=SimpleNamespace(tp_degree=1),
+        )
+        cache = self.qwen_module.HybridGDNCheckpointCache(config).to(torch.bfloat16)
+        linear_attn = SimpleNamespace(
+            recurrent_state_buffer=nn.Parameter(
+                torch.zeros((1, 1, 2, 2), dtype=torch.bfloat16),
+                requires_grad=False,
+            ),
+            conv_state_buffer=nn.Parameter(
+                torch.zeros((1, 6, 2), dtype=torch.float32),
+                requires_grad=False,
+            ),
+        )
+        module = SimpleNamespace(
+            config=config,
+            layers=[SimpleNamespace(linear_attn=linear_attn)],
+            hybrid_gdn_checkpoint_cache=cache,
+        )
+
+        self.assertEqual(linear_attn.recurrent_state_buffer.dtype, torch.bfloat16)
+        self.assertEqual(linear_attn.conv_state_buffer.dtype, torch.float32)
+        self.assertEqual(cache.recurrent_slots[0].dtype, torch.bfloat16)
+
+        self.qwen_module._reassert_hybrid_gdn_checkpoint_param_dtypes(module)
+
+        self.assertEqual(linear_attn.recurrent_state_buffer.dtype, torch.float32)
+        self.assertEqual(linear_attn.conv_state_buffer.dtype, torch.bfloat16)
+        self.assertEqual(cache.recurrent_slots[0].dtype, torch.float32)
+        self.assertEqual(cache.conv_slots[0].dtype, torch.bfloat16)
+        self.assertEqual(cache.recurrent_dtype, torch.float32)
+        self.assertEqual(cache.conv_dtype, torch.bfloat16)
+
     def test_hybrid_checkpoint_restore_clamps_slots_and_ignores_inactive_rows(self):
         config = SimpleNamespace(
             layer_types=["linear_attention"],
@@ -768,6 +928,43 @@ class TestQwen36ModelAliases(unittest.TestCase):
         self.assertTrue(torch.equal(conv_out[0], cache.conv_slots[0][2]))
         self.assertTrue(torch.equal(recurrent_out[1], recurrent_state_buffer[0]))
         self.assertTrue(torch.equal(conv_out[1], conv_state_buffer[0]))
+
+    def test_hybrid_checkpoint_restore_zeroes_inactive_rows_for_context_prefill(self):
+        config = SimpleNamespace(
+            layer_types=["linear_attention"],
+            max_gdn_checkpoint_slots=2,
+            linear_num_value_heads=1,
+            linear_num_key_heads=1,
+            linear_key_head_dim=2,
+            linear_value_head_dim=2,
+            linear_conv_kernel_dim=3,
+            hybrid_recurrent_cache_dtype="float32",
+            hybrid_conv_cache_dtype="bfloat16",
+            neuron_config=SimpleNamespace(tp_degree=1),
+        )
+        cache = self.qwen_module.HybridGDNCheckpointCache(config)
+        recurrent_state_buffer = torch.full((1, 1, 2, 2), 101.0)
+        conv_state_buffer = torch.full((1, 6, 2), 11.0, dtype=torch.bfloat16)
+        layers = [
+            SimpleNamespace(
+                linear_attn=SimpleNamespace(
+                    recurrent_state_buffer=recurrent_state_buffer,
+                    conv_state_buffer=conv_state_buffer,
+                )
+            )
+        ]
+
+        restored = cache.restore_to_active_rows(
+            layers=layers,
+            seq_ids=torch.tensor([0], dtype=torch.int32),
+            checkpoint_slot_ids=torch.tensor([0], dtype=torch.int32),
+            restore_mask=torch.tensor([0], dtype=torch.int32),
+            zero_inactive=True,
+        )
+        recurrent_out, conv_out = restored[0]
+
+        self.assertTrue(torch.equal(recurrent_out, torch.zeros_like(recurrent_out)))
+        self.assertTrue(torch.equal(conv_out, torch.zeros_like(conv_out)))
 
     def test_legacy_tkg_args_are_env_gated(self):
         with patch.dict(os.environ, {}, clear=True):
@@ -941,6 +1138,22 @@ class TestQwen36ModelAliases(unittest.TestCase):
             )
         )
 
+    def test_hybrid_apc_controls_materialized_for_zeroed_restore_mask(self):
+        self.assertTrue(
+            self.qwen_module._qwen36_hybrid_apc_controls_materialized(
+                torch.tensor([0], dtype=torch.int32),
+                torch.tensor([2048], dtype=torch.int32),
+                torch.tensor([0], dtype=torch.int32),
+            )
+        )
+        self.assertFalse(
+            self.qwen_module._qwen36_hybrid_apc_controls_materialized(
+                torch.tensor([0], dtype=torch.int32),
+                torch.tensor([0], dtype=torch.int32),
+                torch.tensor([0], dtype=torch.int32),
+            )
+        )
+
     def test_hybrid_apc_pad_prepare_preserves_full_prefix_tail_contract(self):
         wrapper = _make_wrapper(
             self.qwen_module,
@@ -1008,6 +1221,48 @@ class TestQwen36ModelAliases(unittest.TestCase):
         self.assertEqual(int(padded[24].item()), 3)
         self.assertEqual(int(padded[27].item()), 7)
         self.assertEqual(int(padded[28].item()), 1)
+
+    def test_hybrid_apc_pad_prepare_skips_materialized_restore_prefix(self):
+        wrapper = _make_wrapper(
+            self.qwen_module,
+            tag=self.qwen_module.CONTEXT_ENCODING_MODEL_TAG,
+        )
+        wrapper.neuron_config = SimpleNamespace(
+            enable_fused_speculation=False,
+            enable_eagle_speculation=False,
+        )
+        wrapper.is_prefix_caching = True
+
+        empty = torch.empty(0)
+        base_args = list(wrapper._base_inputs[0])
+        materialized_tail = [
+            empty,
+            empty,
+            empty,
+            empty,
+            empty,
+            empty,
+            torch.empty(0, dtype=torch.int32),
+            torch.empty(0, dtype=torch.bfloat16),
+            torch.empty(0, dtype=torch.int32),
+            torch.tensor([5], dtype=torch.int32),
+            torch.tensor([0], dtype=torch.int32),
+            torch.tensor([2048], dtype=torch.int32),
+            torch.tensor([0], dtype=torch.int32),
+            torch.tensor([0], dtype=torch.int32),
+        ]
+
+        with patch.object(
+            self.qwen_module,
+            "prepare_hybrid_apc_request_for_execution",
+            side_effect=AssertionError("materialized controls must not re-prepare"),
+        ):
+            padded = wrapper.pad_inputs(*(base_args + materialized_tail))
+
+        self.assertEqual(len(padded), 29)
+        self.assertEqual(int(padded[24].item()), 5)
+        self.assertEqual(int(padded[25].item()), 0)
+        self.assertEqual(int(padded[26].item()), 2048)
 
     def test_restored_suffix_deltanet_mask_uses_token_padding(self):
         input_ids = torch.tensor([[11, 12, 0, 0]], dtype=torch.int64)
@@ -1256,6 +1511,207 @@ class TestQwen36ModelAliases(unittest.TestCase):
             )
         )
 
+    def _make_tiny_deltanet_for_carry_test(self, recurrent_dtype=torch.float32):
+        layer = self.qwen_module.NeuronGatedDeltaNet.__new__(
+            self.qwen_module.NeuronGatedDeltaNet
+        )
+        nn.Module.__init__(layer)
+
+        hidden_size = 4
+        key_dim = 2
+        value_dim = 2
+        conv_kernel_size = 3
+        conv_dim = key_dim * 2 + value_dim
+
+        layer.hidden_size = hidden_size
+        layer.tp_degree = 1
+        layer.global_num_v_heads = 1
+        layer.global_num_k_heads = 1
+        layer.head_k_dim = key_dim
+        layer.head_v_dim = value_dim
+        layer.num_v_heads = 1
+        layer.num_k_heads = 1
+        layer.global_key_dim = key_dim
+        layer.global_value_dim = value_dim
+        layer.key_dim = key_dim
+        layer.value_dim = value_dim
+        layer.conv_kernel_size = conv_kernel_size
+        layer.conv_dim = conv_dim
+        layer.layer_idx = 0
+        layer.use_hybrid_cache_manager = False
+        layer.use_hybrid_apc_manager = True
+        layer.use_qwen_hybrid_chunked_prefill = True
+        layer.use_qwen_hybrid_chunked_prefill_nki = False
+        layer.use_qwen_deltanet_decode_nki = False
+        layer.use_cold_zero_conv_fast_path = False
+        layer.head_dim = key_dim
+        layer.kv_heads_per_rank = 1
+
+        layer.conv1d_weight = nn.Linear(conv_kernel_size, conv_dim, bias=False)
+        layer.in_proj_qkv = nn.Linear(hidden_size, conv_dim, bias=False)
+        layer.in_proj_z = nn.Linear(hidden_size, value_dim, bias=False)
+        layer.in_proj_b = nn.Linear(hidden_size, 1, bias=False)
+        layer.in_proj_a = nn.Linear(hidden_size, 1, bias=False)
+        layer.dt_bias_weight = nn.Linear(1, 1, bias=False)
+        layer.A_log_weight = nn.Linear(1, 1, bias=False)
+        layer.norm = nn.Identity()
+        layer.out_proj = nn.Linear(value_dim, hidden_size, bias=False)
+        layer.recurrent_state_buffer = nn.Parameter(
+            torch.zeros((1, 1, key_dim, value_dim), dtype=recurrent_dtype),
+            requires_grad=False,
+        )
+        layer.conv_state_buffer = nn.Parameter(
+            torch.zeros((1, conv_dim, conv_kernel_size - 1), dtype=torch.bfloat16),
+            requires_grad=False,
+        )
+
+        with torch.no_grad():
+            for module in (
+                layer.conv1d_weight,
+                layer.in_proj_qkv,
+                layer.in_proj_z,
+                layer.in_proj_b,
+                layer.in_proj_a,
+                layer.out_proj,
+            ):
+                module.weight.uniform_(-0.04, 0.04)
+            layer.dt_bias_weight.weight.fill_(-1.0)
+            layer.A_log_weight.weight.fill_(-2.0)
+
+        return layer
+
+    def _assert_hybrid_gdn_checkpoint_carry_matches_full_prefill_on_cpu(
+        self, seq_len
+    ):
+        torch.manual_seed(36 + seq_len)
+        chunk = 512
+        full_chunks = seq_len // chunk
+        suffix = seq_len - full_chunks * chunk
+        self.assertGreater(full_chunks, 0)
+        self.assertGreater(suffix, 0)
+        hidden = torch.randn((1, seq_len, 4), dtype=torch.float32) * 0.05
+
+        for recurrent_dtype in (torch.float32, torch.bfloat16):
+            layer = self._make_tiny_deltanet_for_carry_test(recurrent_dtype)
+            cache_config = SimpleNamespace(
+                layer_types=["linear_attention"],
+                max_gdn_checkpoint_slots=3,
+                linear_num_value_heads=1,
+                linear_num_key_heads=1,
+                linear_key_head_dim=2,
+                linear_value_head_dim=2,
+                linear_conv_kernel_dim=3,
+                hybrid_recurrent_cache_dtype=(
+                    "bfloat16" if recurrent_dtype is torch.bfloat16 else "float32"
+                ),
+                hybrid_conv_cache_dtype="bfloat16",
+                neuron_config=SimpleNamespace(tp_degree=1),
+            )
+            cache = self.qwen_module.HybridGDNCheckpointCache(cache_config)
+            layers = [SimpleNamespace(linear_attn=layer)]
+            seq_ids = torch.tensor([0], dtype=torch.int32)
+
+            def run_cte(tokens, start_pos, past):
+                positions = torch.arange(
+                    start_pos,
+                    start_pos + tokens.shape[1],
+                    dtype=torch.int64,
+                ).unsqueeze(0)
+                mask = torch.ones((1, tokens.shape[1], 1), dtype=torch.float32)
+                with patch.dict(
+                    os.environ,
+                    {"USE_PYTORCH_CHUNK": "1", "USE_NKI_FUSED": "0"},
+                    clear=False,
+                ):
+                    output, _kv, recurrent, conv = layer(
+                        tokens,
+                        position_ids=positions,
+                        past_key_value=past,
+                        seq_ids=seq_ids,
+                        is_for_context_encoding=True,
+                        deltanet_padding_mask=mask,
+                    )
+                return output, recurrent, conv
+
+            def commit(slot, recurrent, conv):
+                recurrent_out, conv_out = cache.commit_from_active_rows(
+                    layer_state_pairs=[(0, recurrent, conv)],
+                    seq_ids=seq_ids,
+                    checkpoint_slot_ids=torch.tensor([slot], dtype=torch.int32),
+                    commit_mask=torch.tensor([1], dtype=torch.int32),
+                )
+                with torch.no_grad():
+                    cache.recurrent_slots[0].copy_(recurrent_out)
+                    cache.conv_slots[0].copy_(conv_out)
+
+            def restore(slot):
+                return cache.restore_to_active_rows(
+                    layers=layers,
+                    seq_ids=seq_ids,
+                    checkpoint_slot_ids=torch.tensor([slot], dtype=torch.int32),
+                    restore_mask=torch.tensor([1], dtype=torch.int32),
+                )[0]
+
+            zero_past = (
+                torch.zeros_like(layer.recurrent_state_buffer),
+                torch.zeros_like(layer.conv_state_buffer),
+            )
+            full_output, full_recurrent, full_conv = run_cte(hidden, 0, zero_past)
+
+            split_outputs = []
+            past = zero_past
+            for chunk_idx in range(full_chunks):
+                start = chunk_idx * chunk
+                output, recurrent, conv = run_cte(
+                    hidden[:, start : start + chunk], start, past
+                )
+                split_outputs.append(output)
+                commit(chunk_idx, recurrent, conv)
+                past = restore(chunk_idx)
+
+            padded_tail = torch.zeros((1, chunk, 4), dtype=hidden.dtype)
+            tail_start = full_chunks * chunk
+            padded_tail[:, :suffix] = hidden[:, tail_start:]
+            positions = torch.cat(
+                [
+                    torch.arange(tail_start, seq_len, dtype=torch.int64),
+                    torch.ones((chunk - suffix,), dtype=torch.int64),
+                ]
+            ).unsqueeze(0)
+            tail_mask = torch.zeros((1, chunk, 1), dtype=torch.float32)
+            tail_mask[:, :suffix] = 1
+            with patch.dict(
+                os.environ,
+                {"USE_PYTORCH_CHUNK": "1", "USE_NKI_FUSED": "0"},
+                clear=False,
+            ):
+                out2, _kv, rec2, conv2 = layer(
+                    padded_tail,
+                    position_ids=positions,
+                    past_key_value=past,
+                    seq_ids=seq_ids,
+                    is_for_context_encoding=True,
+                    deltanet_padding_mask=tail_mask,
+                )
+
+            split_outputs.append(out2[:, :suffix])
+            split_output = torch.cat(split_outputs, dim=1)
+            max_diff = (split_output - full_output).abs().max().item()
+            rec_diff = (rec2.float() - full_recurrent.float()).abs().max().item()
+            conv_diff = (conv2.float() - full_conv.float()).abs().max().item()
+
+            tolerance = 1e-5 if recurrent_dtype is torch.float32 else 2e-3
+            msg = (seq_len, recurrent_dtype)
+            self.assertLessEqual(max_diff, tolerance, msg)
+            self.assertLessEqual(rec_diff, tolerance, msg)
+            self.assertLessEqual(conv_diff, tolerance, msg)
+
+    def test_hybrid_gdn_checkpoint_carry_matches_full_prefill_on_cpu(self):
+        self._assert_hybrid_gdn_checkpoint_carry_matches_full_prefill_on_cpu(1225)
+
+    def test_hybrid_gdn_checkpoint_carry_matches_full_prefill_on_cpu_at_cliff(self):
+        self._assert_hybrid_gdn_checkpoint_carry_matches_full_prefill_on_cpu(526)
+
     def test_dummy_cte_rows_zero_restore_controls(self):
         restore_slots, restore_mask, restore_prefix = (
             self.qwen_module._qwen36_pad_hybrid_restore_controls_for_dummy_cte_rows(
@@ -1352,6 +1808,29 @@ class TestQwen36ModelAliases(unittest.TestCase):
         self.assertEqual(request_dict["request_prefix_len"], (256, 272))
         self.assertEqual(request_dict["vllm_attention_hit_len"], (0, 256))
         self.assertEqual(request_dict["active_suffix_len"], (256, 16))
+
+    def test_request_scoped_vllm_metadata_tensorizes_full_input_ids(self):
+        request_dict = {
+            "input_ids": torch.empty((1, 0), dtype=torch.int32),
+        }
+
+        self.qwen_module._qwen36_add_vllm_hybrid_apc_metadata(
+            request_dict,
+            request_ids=("req-2049",),
+            metadata_by_request_id={
+                "req-2049": {
+                    "request_prefix_len": 2049,
+                    "full_input_ids": tuple(range(2049)),
+                    "vllm_attention_hit_len": 2048,
+                    "active_suffix_len": 1,
+                },
+            },
+        )
+
+        self.assertIsInstance(request_dict["full_input_ids"], torch.Tensor)
+        self.assertEqual(request_dict["full_input_ids"].dtype, torch.int32)
+        self.assertEqual(tuple(request_dict["full_input_ids"].shape), (1, 2049))
+        self.assertEqual(int(request_dict["full_input_ids"][0, -1].item()), 2048)
 
     def test_vllm_metadata_request_ids_prefer_scheduler_new_request_ids(self):
         selected = self.qwen_module._qwen36_select_vllm_hybrid_apc_request_ids(

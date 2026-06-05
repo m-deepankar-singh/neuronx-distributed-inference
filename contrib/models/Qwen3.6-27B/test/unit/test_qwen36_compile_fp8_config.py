@@ -146,6 +146,8 @@ def _args(**overrides):
         hybrid_apc_commit_during_token_generation=False,
         quantize_edge_mlp_layers=False,
         quantize_lm_head=False,
+        fp8_quantize_linear_attn_gates=False,
+        fp8_exclude_groups=[],
     )
     defaults.update(overrides)
     return argparse.Namespace(**defaults)
@@ -190,6 +192,30 @@ class TestQwen36CompileFp8Config(unittest.TestCase):
         self.assertIsNone(config.neuron_config.on_device_sampling_config)
         self.assertEqual(config.neuron_config.pa_num_blocks, 8)
         self.assertTrue(config.neuron_config.quantized)
+
+    def test_full_fp8_keeps_hybrid_checkpoint_bank_out_of_conversion(self):
+        with patch.object(
+            _COMPILE,
+            "_load_text_config",
+            return_value={"num_hidden_layers": 2},
+        ), patch.dict(
+            sys.modules,
+            {
+                "neuronx_distributed_inference.models.config": _fake_config_module(),
+                "src.modeling_qwen35": _fake_qwen_module(),
+            },
+        ):
+            config, modules = _COMPILE._build_config(
+                _args(weight_dtype="fp8_full", quantize_lm_head=True),
+            )
+
+        self.assertEqual(config.config_dict["gdn_recurrent_cache_dtype"], "float32")
+        self.assertIn("hybrid_gdn_checkpoint_cache.recurrent_slots", modules)
+        self.assertIn("hybrid_gdn_checkpoint_cache.conv_slots", modules)
+        self.assertIn(
+            "hybrid_gdn_checkpoint_cache.recurrent_slots",
+            config.neuron_config.modules_to_not_convert,
+        )
 
     def test_compile_can_trace_batched_token_generation(self):
         with patch.object(
@@ -690,6 +716,9 @@ class TestQwen36CompileFp8Config(unittest.TestCase):
         self.assertIn("layers.0.linear_attn.conv1d_weight", modules)
         self.assertIn("layers.0.linear_attn.A_log_weight", modules)
         self.assertIn("layers.0.linear_attn.dt_bias_weight", modules)
+        self.assertIn("layers.0.linear_attn.in_proj_a", modules)
+        self.assertIn("layers.0.linear_attn.in_proj_b", modules)
+        self.assertIn("layers.0.linear_attn.in_proj_ba", modules)
         self.assertIn("lm_head", modules)
 
     def test_fp8_full_can_quantize_lm_head_when_requested(self):
@@ -714,6 +743,124 @@ class TestQwen36CompileFp8Config(unittest.TestCase):
 
         self.assertNotIn("lm_head", modules)
         self.assertNotIn("model.lm_head", modules)
+
+    def test_fp8_full_keeps_linear_attention_gate_projections_bf16(self):
+        self.assertFalse(
+            _COMPILE._is_full_fp8_weight(
+                "layers.0.linear_attn.in_proj_a.weight",
+                quantize_lm_head=True,
+            ),
+        )
+        self.assertFalse(
+            _COMPILE._is_full_fp8_weight(
+                "layers.0.linear_attn.in_proj_b.weight",
+                quantize_lm_head=True,
+            ),
+        )
+        self.assertFalse(
+            _COMPILE._is_full_fp8_weight(
+                "layers.0.linear_attn.in_proj_ba.weight",
+                quantize_lm_head=True,
+            ),
+        )
+        self.assertTrue(
+            _COMPILE._is_full_fp8_weight(
+                "layers.0.linear_attn.in_proj_qkv.weight",
+                quantize_lm_head=True,
+            ),
+        )
+
+    def test_fp8_full_can_use_legacy_fp8_linear_attention_gate_policy(self):
+        self.assertTrue(
+            _COMPILE._is_full_fp8_weight(
+                "layers.0.linear_attn.in_proj_a.weight",
+                quantize_lm_head=True,
+                quantize_linear_attn_gates=True,
+            ),
+        )
+        self.assertTrue(
+            _COMPILE._is_full_fp8_weight(
+                "layers.0.linear_attn.in_proj_b.weight",
+                quantize_lm_head=True,
+                quantize_linear_attn_gates=True,
+            ),
+        )
+        self.assertFalse(
+            _COMPILE._is_full_fp8_weight(
+                "layers.0.linear_attn.in_proj_ba.weight",
+                quantize_lm_head=True,
+                quantize_linear_attn_gates=True,
+            ),
+        )
+
+    def test_legacy_fp8_linear_attention_gate_policy_matches_old_config(self):
+        with patch.object(
+            _COMPILE,
+            "_load_text_config",
+            return_value={"num_hidden_layers": 2},
+        ), patch.dict(
+            sys.modules,
+            {
+                "neuronx_distributed_inference.models.config": _fake_config_module(),
+                "src.modeling_qwen35": _fake_qwen_module(),
+            },
+        ):
+            _config, modules = _COMPILE._build_config(
+                _args(
+                    weight_dtype="fp8_full",
+                    quantize_lm_head=True,
+                    fp8_quantize_linear_attn_gates=True,
+                ),
+            )
+
+        self.assertNotIn("layers.0.linear_attn.in_proj_a", modules)
+        self.assertNotIn("layers.0.linear_attn.in_proj_b", modules)
+        self.assertNotIn("layers.0.linear_attn.in_proj_ba", modules)
+
+    def test_fp8_full_can_exclude_remaining_linear_attention_matmuls(self):
+        for weight_name in (
+            "layers.0.linear_attn.in_proj_qkv.weight",
+            "layers.0.linear_attn.in_proj_z.weight",
+            "layers.0.linear_attn.out_proj.weight",
+        ):
+            self.assertFalse(
+                _COMPILE._is_full_fp8_weight(
+                    weight_name,
+                    quantize_lm_head=False,
+                    fp8_exclude_groups={"linear_attn"},
+                ),
+            )
+        self.assertTrue(
+            _COMPILE._is_full_fp8_weight(
+                "layers.0.mlp.up_proj.weight",
+                quantize_lm_head=False,
+                fp8_exclude_groups={"linear_attn"},
+            ),
+        )
+
+    def test_fp8_full_exclude_groups_are_reflected_in_config(self):
+        with patch.object(
+            _COMPILE,
+            "_load_text_config",
+            return_value={"num_hidden_layers": 2},
+        ), patch.dict(
+            sys.modules,
+            {
+                "neuronx_distributed_inference.models.config": _fake_config_module(),
+                "src.modeling_qwen35": _fake_qwen_module(),
+            },
+        ):
+            config, modules = _COMPILE._build_config(
+                _args(
+                    weight_dtype="fp8_full",
+                    fp8_exclude_groups=["linear_attn", "mlp"],
+                ),
+            )
+
+        self.assertIn("layers.0.linear_attn", modules)
+        self.assertIn("layers.0.mlp", modules)
+        self.assertIn("model.layers.1.linear_attn", modules)
+        self.assertIn("layers.0.linear_attn", config.neuron_config.modules_to_not_convert)
 
     def test_user_wlo_skip_patterns_are_appended_and_deduplicated(self):
         with patch.object(
@@ -1130,6 +1277,8 @@ class TestQwen36CompileFp8Config(unittest.TestCase):
                 linear_value_head_dim=128,
                 linear_conv_kernel_dim=4,
                 max_gdn_checkpoint_slots=64,
+                hybrid_recurrent_cache_dtype="float32",
+                hybrid_conv_cache_dtype="bfloat16",
                 neuron_config=types.SimpleNamespace(
                     tp_degree=4,
                     torch_dtype=_COMPILE.torch.bfloat16,
@@ -1148,7 +1297,7 @@ class TestQwen36CompileFp8Config(unittest.TestCase):
             self.assertIn("existing.weight", keys)
             self.assertIn("hybrid_gdn_checkpoint_cache.recurrent_slots.1", keys)
             self.assertIn("hybrid_gdn_checkpoint_cache.conv_slots.1", keys)
-            self.assertEqual(recurrent.dtype, _COMPILE.torch.bfloat16)
+            self.assertEqual(recurrent.dtype, _COMPILE.torch.float32)
             self.assertEqual(tuple(recurrent.shape), (64, 12, 128, 128))
             self.assertEqual(conv.dtype, _COMPILE.torch.bfloat16)
             self.assertEqual(tuple(conv.shape), (64, 2560, 3))

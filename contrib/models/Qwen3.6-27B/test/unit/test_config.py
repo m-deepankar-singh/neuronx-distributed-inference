@@ -218,6 +218,14 @@ class TestDeltaNetConfig(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "hybrid_recurrent_cache_dtype"):
             _make_config(hybrid_recurrent_cache_dtype="fp8")
 
+    def test_hybrid_apc_requires_float32_recurrent_checkpoint_cache(self):
+        with self.assertRaisesRegex(ValueError, "requires float32 recurrent GDN"):
+            _make_config(
+                use_hybrid_apc_manager=True,
+                gdn_checkpoint_interval=128,
+                hybrid_recurrent_cache_dtype="bf16",
+            )
+
     def test_hybrid_apc_rejects_non_all_mode(self):
         with self.assertRaisesRegex(ValueError, "hybrid_cache_mode='all'"):
             _make_config(use_hybrid_apc_manager=True, hybrid_cache_mode="align")

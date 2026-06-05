@@ -385,6 +385,77 @@ class TestFusedDeltaNetDecayMath(unittest.TestCase):
         self.assertLess(max_relative_norm, 5.0e-6)
         self.assertLess(max_absolute, 2.0e-6)
 
+    def test_two_step_doubling_solve_truncates_weak_decay_chunks(self):
+        args = types.SimpleNamespace(
+            seed=1241,
+            seq_len=512,
+            heads=4,
+            multihead=True,
+            value_scale=0.05,
+            state_scale=0.01,
+            gate_scale=0.01,
+        )
+
+        inputs = self.validator.make_inputs(torch, args)
+        lower = inputs["lower_mask"]
+        eye = inputs["identity"]
+        head_idx = 3
+        state = inputs["state_in"][head_idx].clone()
+        rel_scan2 = None
+        rel_scan7 = None
+
+        for start in range(0, args.seq_len, self.validator.P_MAX):
+            end = start + self.validator.P_MAX
+            _, key = self.validator.normalize_reference_qk(
+                torch,
+                inputs["query"][head_idx, start:end],
+                inputs["key"][head_idx, start:end],
+            )
+            value = inputs["value"][head_idx, start:end]
+            g = inputs["g_raw"][head_idx, start:end]
+            beta = inputs["beta"][head_idx, start:end]
+
+            gc = torch.cumsum(g, dim=0)
+            k_beta = key * beta
+            v_beta = value * beta
+            decay = self.validator.stable_causal_decay(torch, gc, lower)
+            a_mat = -((k_beta @ key.T) * decay) * lower
+            lhs = eye - a_mat
+            rhs = v_beta - ((k_beta * torch.exp(gc)) @ state)
+
+            expected = torch.linalg.solve_triangular(lhs, rhs, upper=False)
+            if start == 256:
+                scan2 = self.validator.scan_doubling_lower_triangular_solve(
+                    torch,
+                    lhs,
+                    rhs,
+                    steps=2,
+                )
+                scan7 = self.validator.scan_doubling_lower_triangular_solve(
+                    torch,
+                    lhs,
+                    rhs,
+                    steps=7,
+                )
+                rel_scan2 = (
+                    torch.linalg.vector_norm(scan2 - expected)
+                    / torch.linalg.vector_norm(expected)
+                ).item()
+                rel_scan7 = (
+                    torch.linalg.vector_norm(scan7 - expected)
+                    / torch.linalg.vector_norm(expected)
+                ).item()
+                break
+
+            gl = gc[-1:]
+            key_decay = key * torch.exp(gl - gc)
+            state = (state * torch.exp(gl)) + (key_decay.T @ expected)
+
+        self.assertIsNotNone(rel_scan2)
+        self.assertIsNotNone(rel_scan7)
+        self.assertGreater(rel_scan2, 5.0e-3)
+        self.assertLess(rel_scan7, 5.0e-6)
+
     def test_blocked_reference_matches_current_reference(self):
         args = types.SimpleNamespace(
             seed=1234,

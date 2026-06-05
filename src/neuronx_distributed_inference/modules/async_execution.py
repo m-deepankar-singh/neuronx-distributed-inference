@@ -216,6 +216,23 @@ def _with_hybrid_apc_owner_metadata(
     return output
 
 
+def _with_hybrid_apc_candidate_owner_metadata(
+    input_dict: Dict[str, Any],
+    *owners: Any,
+) -> Dict[str, Any]:
+    output = input_dict
+    seen: set[int] = set()
+    for owner in owners:
+        if owner is None:
+            continue
+        owner_id = id(owner)
+        if owner_id in seen:
+            continue
+        seen.add(owner_id)
+        output = _with_hybrid_apc_owner_metadata(output, owner)
+    return output
+
+
 def _batch_size_from_input_dict(input_dict: Dict[str, Any]) -> int:
     batch_size = 1
     for key in (
@@ -1043,7 +1060,7 @@ def _is_same_request_chunked_prefill_continuation(
     suffix_len: int,
     active_suffix_len: int | None,
 ) -> bool:
-    if suffix_len <= 1 or hit_len <= 0:
+    if suffix_len <= 0 or hit_len <= 0:
         return False
     active_len = _active_chunk_suffix_len(
         suffix_len=suffix_len,
@@ -1088,6 +1105,23 @@ def _with_inert_hybrid_apc_chunk_continuation(
     )
     output["num_queries"] = torch.tensor([[max(0, int(suffix_len))]], **kwargs)
     return _with_zero_hybrid_apc_slots(output)
+
+
+def _with_same_request_gdn_active_carry(
+    input_dict: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Keep attention prefix reads but carry same-request GDN state directly."""
+
+    output = dict(input_dict)
+    _zero_mask_if_present(output, "hybrid_restore_mask")
+    return output
+
+
+def _replace_prepared_input_dict(prepared, input_dict: Dict[str, Any]):
+    if hasattr(prepared, "_replace"):
+        return prepared._replace(input_dict=input_dict)
+    prepared.input_dict = input_dict
+    return prepared
 
 
 def _is_completed_cached_decode_row(
@@ -1303,6 +1337,10 @@ def _hybrid_gdn_restore_disabled() -> bool:
     )
 
 
+def _hybrid_gdn_restore_mask_zeroed() -> bool:
+    return _env_flag("QWEN36_ZERO_HYBRID_GDN_RESTORE_MASK")
+
+
 def _hybrid_gdn_commit_disabled() -> bool:
     return _env_flag("QWEN36_DISABLE_HYBRID_GDN_COMMIT") or _env_flag(
         "QWEN36_DISABLE_HYBRID_GDN_RESTORE_COMMIT"
@@ -1316,7 +1354,7 @@ def _zero_mask_if_present(input_dict: Dict[str, Any], key: str):
 
 
 def _apply_hybrid_gdn_debug_switches(input_dict: Dict[str, Any]) -> Dict[str, Any]:
-    if _hybrid_gdn_restore_disabled():
+    if _hybrid_gdn_restore_disabled() or _hybrid_gdn_restore_mask_zeroed():
         _zero_mask_if_present(input_dict, "hybrid_restore_mask")
     if _hybrid_gdn_commit_disabled():
         _zero_mask_if_present(input_dict, "hybrid_commit_mask")
@@ -1330,6 +1368,7 @@ def _get_hybrid_apc_bridge(
     bridge = _first_present(
         input_dict.get("hybrid_apc_bridge"),
         getattr(neuron_base_instance, "hybrid_apc_bridge", None),
+        getattr(neuron_base_instance, "_hybrid_apc_last_bridge", None),
     )
     if bridge is None:
         ensure_bridge = getattr(
@@ -1340,6 +1379,35 @@ def _get_hybrid_apc_bridge(
         if ensure_bridge is not None:
             bridge = ensure_bridge()
     return bridge
+
+
+def _select_hybrid_apc_owner(
+    neuron_base_instance: "NeuronBaseForCausalLM",
+    model_to_execute: "ModelWrapper",
+    input_dict: Dict[str, Any],
+):
+    candidates = (
+        neuron_base_instance,
+        model_to_execute,
+        getattr(neuron_base_instance, "context_encoding_model", None),
+        getattr(neuron_base_instance, "token_generation_model", None),
+    )
+    fallback = neuron_base_instance
+    seen: set[int] = set()
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        candidate_id = id(candidate)
+        if candidate_id in seen:
+            continue
+        seen.add(candidate_id)
+        if fallback is neuron_base_instance and _is_hybrid_apc_enabled(candidate):
+            fallback = candidate
+        if not _is_hybrid_apc_enabled(candidate):
+            continue
+        if _get_hybrid_apc_bridge(candidate, input_dict) is not None:
+            return candidate
+    return fallback
 
 
 def _requires_external_hybrid_apc_metadata(
@@ -1620,6 +1688,16 @@ def prepare_hybrid_apc_request_for_execution(
                             cumulative_hashes_by_prefix_len=cumulative_hashes_by_prefix_len,
                             attention_block_refs_by_prefix_len=attention_block_refs_by_prefix_len,
                         )
+                        if (
+                            prepared is not None
+                            and same_request_chunk_continuation
+                        ):
+                            prepared = _replace_prepared_input_dict(
+                                prepared,
+                                _with_same_request_gdn_active_carry(
+                                    prepared.input_dict
+                                ),
+                            )
                     except ValueError as exc:
                         if os.environ.get("QWEN36_HYBRID_APC_DEBUG") == "1":
                             print(
@@ -1669,6 +1747,7 @@ def prepare_hybrid_apc_request_for_execution(
             cumulative_hashes_by_prefix_len=cumulative_hashes_by_prefix_len,
             attention_block_refs_by_prefix_len=attention_block_refs_by_prefix_len,
         )
+    setattr(neuron_base_instance, "_hybrid_apc_last_bridge", bridge)
     input_dict["_hybrid_apc_bridge"] = bridge
     input_dict["_hybrid_apc_prepared"] = prepared
     prepared.input_dict["_hybrid_apc_bridge"] = bridge
@@ -2016,6 +2095,52 @@ def _is_context_encoding_execution(
     return False
 
 
+def _is_cached_chunked_prefill_continuation(inputs: Dict[str, Any]) -> bool:
+    batch_size = _batch_size_from_input_dict(inputs)
+    if batch_size != 1:
+        return False
+
+    request_records = _hybrid_apc_request_records(inputs, batch_size=batch_size)
+    active_suffix_len = _first_present(
+        inputs.get("hybrid_active_suffix_len"),
+        inputs.get("active_suffix_len"),
+        _hybrid_apc_record_values(request_records, "active_suffix_len"),
+    )
+    active_suffix_len = _single_batch_value(active_suffix_len)
+    if active_suffix_len is None:
+        return False
+    active_suffix_len = _to_python_int(active_suffix_len)
+    if active_suffix_len <= 0:
+        return False
+
+    attention_hit_len = _first_present(
+        _hybrid_apc_record_values(request_records, "vllm_attention_hit_len"),
+        inputs.get("vllm_attention_hit_len"),
+        inputs.get("hybrid_attention_hit_len"),
+        inputs.get("attention_hit_len"),
+        inputs.get("computed_context_lens"),
+    )
+    attention_hit_len = _single_batch_value(attention_hit_len)
+    if attention_hit_len is None:
+        return False
+    attention_hit_len = _to_python_int(attention_hit_len)
+    if attention_hit_len <= 0:
+        return False
+
+    request_prefix_len = _first_present(
+        _hybrid_apc_record_values(request_records, "request_prefix_len"),
+        inputs.get("request_prefix_len"),
+        inputs.get("hybrid_request_prefix_len"),
+        inputs.get("prompt_len"),
+        _single_batch_value(inputs.get("full_context_lens")),
+    )
+    request_prefix_len = _single_batch_value(request_prefix_len)
+    if request_prefix_len is None:
+        return False
+
+    return _to_python_int(request_prefix_len) >= attention_hit_len + active_suffix_len
+
+
 def _is_chunked_prefill_execution(
     neuron_base_instance: "NeuronBaseForCausalLM",
     inputs: Dict[str, Any],
@@ -2027,11 +2152,38 @@ def _is_chunked_prefill_execution(
     if getattr(neuron_base_instance.neuron_config, "enable_eagle_speculation", False):
         return False
     input_ids = inputs.get("input_ids")
-    return (
+    if (
         isinstance(input_ids, torch.Tensor)
         and input_ids.ndim >= 2
         and input_ids.shape[-1] > 1
-    )
+    ):
+        return True
+    return _is_cached_chunked_prefill_continuation(inputs)
+
+
+def _debug_hybrid_apc_owner_metadata_summary(owner: Any) -> str:
+    if owner is None:
+        return "None"
+    parts = [type(owner).__name__]
+    for attr in (
+        "_qwen36_vllm_request_ids",
+        "_qwen36_vllm_cached_request_ids",
+        "_qwen36_vllm_prefill_completion_state",
+        "_qwen36_vllm_hybrid_apc_request_records",
+        "_qwen36_vllm_hybrid_apc_metadata_by_request_id",
+    ):
+        value = getattr(owner, attr, None)
+        if value is None:
+            continue
+        if isinstance(value, dict):
+            parts.append(f"{attr}=dict[{len(value)}]")
+        elif isinstance(value, (list, tuple)):
+            parts.append(f"{attr}=seq[{len(value)}]")
+        elif isinstance(value, torch.Tensor):
+            parts.append(f"{attr}=tensor{tuple(value.shape)}")
+        else:
+            parts.append(f"{attr}={type(value).__name__}")
+    return " ".join(parts)
 
 
 def _format_token_id(value: int) -> str:
@@ -2192,16 +2344,11 @@ def execute_model_prefix_caching(
     pad_type: str = "first_fit",
 ) -> Tuple[AsyncTensorWrapper, bool]:
     original_input_dict = input_dict
-    hybrid_apc_owner = neuron_base_instance
-    if (
-        getattr(hybrid_apc_owner, "hybrid_apc_bridge", None) is None
-        and getattr(model_to_execute, "hybrid_apc_bridge", None) is not None
-    ):
-        hybrid_apc_owner = model_to_execute
-    if not _is_hybrid_apc_enabled(hybrid_apc_owner) and _is_hybrid_apc_enabled(
-        model_to_execute
-    ):
-        hybrid_apc_owner = model_to_execute
+    hybrid_apc_owner = _select_hybrid_apc_owner(
+        neuron_base_instance,
+        model_to_execute,
+        input_dict,
+    )
     if os.environ.get("QWEN36_HYBRID_APC_DEBUG") == "1":
         print(
             "[hybrid_apc_debug] async-owner "
@@ -2226,6 +2373,20 @@ def execute_model_prefix_caching(
                 hybrid_apc_owner,
                 input_dict,
             )
+            prepared_bridge = input_dict.get("_hybrid_apc_bridge")
+            if prepared_bridge is not None:
+                for bridge_owner in (
+                    neuron_base_instance,
+                    model_to_execute,
+                    getattr(neuron_base_instance, "context_encoding_model", None),
+                    getattr(neuron_base_instance, "token_generation_model", None),
+                ):
+                    if bridge_owner is not None:
+                        setattr(
+                            bridge_owner,
+                            "_hybrid_apc_last_bridge",
+                            prepared_bridge,
+                        )
             if os.environ.get("QWEN36_HYBRID_APC_DEBUG") == "1":
                 print(
                     "[hybrid_apc_debug] async-prepared-return "
@@ -2381,16 +2542,49 @@ def causal_lm_async_execution(
 
     # PREFILL STAGE:
     is_prefill = neuron_base_instance._is_prefill(inputs["position_ids"])
+    prefill_probe_inputs = inputs
+    if is_prefix_caching:
+        prefill_probe_inputs = _with_hybrid_apc_candidate_owner_metadata(
+            inputs,
+            neuron_base_instance,
+            getattr(neuron_base_instance, "context_encoding_model", None),
+            getattr(neuron_base_instance, "token_generation_model", None),
+        )
+    probe_is_chunked_prefill = (
+        is_prefix_caching
+        and _is_chunked_prefill_execution(
+            neuron_base_instance,
+            prefill_probe_inputs,
+            is_fused_speculation=is_fused_speculation,
+        )
+    )
     if (
         is_prefix_caching
         and not is_prefill
-        and _is_chunked_prefill_execution(
-            neuron_base_instance,
-            inputs,
-            is_fused_speculation=is_fused_speculation,
+        and os.environ.get("QWEN36_HYBRID_APC_DEBUG") == "1"
+    ):
+        input_ids = inputs.get("input_ids")
+        records = prefill_probe_inputs.get("hybrid_request_records")
+        print(
+            "[hybrid_apc_debug] prefill-route-probe "
+            f"input_shape={tuple(input_ids.shape) if isinstance(input_ids, torch.Tensor) else None} "
+            f"probe_is_chunked_prefill={probe_is_chunked_prefill} "
+            f"probe_keys={sorted(k for k in prefill_probe_inputs if k.startswith('hybrid_') or k in ('request_prefix_len', 'active_suffix_len', 'vllm_attention_hit_len'))} "
+            f"records_len={len(records) if isinstance(records, tuple) else None} "
+            f"base={_debug_hybrid_apc_owner_metadata_summary(neuron_base_instance)} "
+            f"context={_debug_hybrid_apc_owner_metadata_summary(getattr(neuron_base_instance, 'context_encoding_model', None))} "
+            f"token={_debug_hybrid_apc_owner_metadata_summary(getattr(neuron_base_instance, 'token_generation_model', None))}",
+            flush=True,
         )
+    if (
+        is_prefix_caching
+        and not is_prefill
+        and probe_is_chunked_prefill
     ):
         is_prefill = True
+        inputs = prefill_probe_inputs
+    elif is_prefix_caching and is_prefill:
+        inputs = prefill_probe_inputs
     neuron_base_instance.async_should_stop = False
     prefill_outputs = None
     is_run_on_neuron = None

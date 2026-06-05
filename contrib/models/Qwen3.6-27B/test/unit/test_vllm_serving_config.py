@@ -154,6 +154,17 @@ class TestVllmServingConfig(unittest.TestCase):
         self.assertTrue(config["use_hybrid_apc_manager"])
         self.assertEqual(config["max_gdn_checkpoint_slots"], 3)
 
+    def test_hybrid_apc_rejects_bfloat16_recurrent_checkpoint_cache(self):
+        with self.assertRaisesRegex(ValueError, "requires float32 recurrent GDN"):
+            self.runner._override_config(
+                _args(
+                    enable_hybrid_apc=True,
+                    block_size=256,
+                    gdn_checkpoint_interval=256,
+                    gdn_recurrent_cache_dtype="bfloat16",
+                )
+            )
+
     def test_hybrid_apc_can_require_vllm_metadata(self):
         config = self.runner._override_config(
             _args(

@@ -678,27 +678,54 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
             )
             mlp_prev = residual
 
-        QKV = qkv_kernel[self.logical_nc_config](
-            input=hidden_states,
-            fused_qkv_weights=self.Wqkv.weight.data,
-            output_layout=qkv_output_layout,
-            bias=self.Wqkv.bias.data.unsqueeze(0) if self.bias else None,
-            fused_residual_add=fused_residual_add,
-            mlp_prev=mlp_prev,
-            attention_prev=attention_prev,
-            fused_norm_type=qkv_norm_type,
-            gamma_norm_weights=rmsnorm.weight.data.unsqueeze(0) if fused_rmsnorm else None,
-            norm_eps=self.rms_norm_eps,
-            fused_rope=fuse_rope,
-            cos_cache=cos_cache,
-            sin_cache=sin_cache,
-            quantization_type=quantization_type,
-            qkv_w_scale=qkv_w_scale,
-            qkv_in_scale=qkv_in_scale,
-            d_head=self.head_dim,
-            num_q_heads=self.num_attention_heads // self.tp_degree,
-            num_kv_heads=self.num_key_value_heads // self.tp_degree,
-        )
+        # --- Qwen3.6 FP8 qkv_cte workaround (sequence tiling) ---
+        # The nkilib `qkv` kernel routes S > SEQLEN_THRESHOLD_FOR_QKV_CTE (=96) or
+        # B*S > pmax (=128) to the `qkv_cte` sub-kernel, whose FP8 path corrupts the
+        # projection for prefills beyond ~96 tokens (validated: coherent <=96, garbage
+        # >96). The `qkv_tkg` sub-kernel (B*S <= 128, S <= 96, no fused_rope) is correct.
+        # The QKV projection is per-token (per-token RMSNorm + per-token residual add,
+        # NO cross-token mixing here), so slicing the sequence into <=96-token tiles and
+        # concatenating reproduces the full-S result exactly while routing every sub-call
+        # to the correct qkv_tkg path. Only valid when fused_rope is off (qkv_tkg has no
+        # RoPE); for the Qwen3.6 attention path RoPE is applied after this projection.
+        def _qkv_kernel_call(_input, _mlp_prev, _attention_prev):
+            return qkv_kernel[self.logical_nc_config](
+                input=_input,
+                fused_qkv_weights=self.Wqkv.weight.data,
+                output_layout=qkv_output_layout,
+                bias=self.Wqkv.bias.data.unsqueeze(0) if self.bias else None,
+                fused_residual_add=fused_residual_add,
+                mlp_prev=_mlp_prev,
+                attention_prev=_attention_prev,
+                fused_norm_type=qkv_norm_type,
+                gamma_norm_weights=rmsnorm.weight.data.unsqueeze(0) if fused_rmsnorm else None,
+                norm_eps=self.rms_norm_eps,
+                fused_rope=fuse_rope,
+                cos_cache=cos_cache,
+                sin_cache=sin_cache,
+                quantization_type=quantization_type,
+                qkv_w_scale=qkv_w_scale,
+                qkv_in_scale=qkv_in_scale,
+                d_head=self.head_dim,
+                num_q_heads=self.num_attention_heads // self.tp_degree,
+                num_kv_heads=self.num_key_value_heads // self.tp_degree,
+            )
+
+        _qkv_tile = min(96, max(1, 128 // bs))
+        if (not fuse_rope) and (seqlen > _qkv_tile or bs * seqlen > 128):
+            _qkv_parts = []
+            for _ts in range(0, seqlen, _qkv_tile):
+                _te = min(_ts + _qkv_tile, seqlen)
+                _inp = hidden_states[:, _ts:_te, :].contiguous()
+                if fused_residual_add:
+                    _mp = mlp_prev[:, _ts:_te, :].contiguous()
+                    _ap = attention_prev[:, _ts:_te, :].contiguous()
+                else:
+                    _mp, _ap = mlp_prev, attention_prev
+                _qkv_parts.append(_qkv_kernel_call(_inp, _mp, _ap))
+            QKV = torch.cat(_qkv_parts, dim=(2 if self.qkv_kernel_nbsd_layout else 1))
+        else:
+            QKV = _qkv_kernel_call(hidden_states, mlp_prev, attention_prev)
         if fused_residual_add:
             residual = hidden_states
 

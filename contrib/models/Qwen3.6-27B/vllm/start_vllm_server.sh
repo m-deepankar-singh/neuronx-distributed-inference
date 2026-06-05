@@ -40,6 +40,9 @@ HYBRID_APC_ENABLE_BACKED_PREFIX_READS="0"
 HYBRID_APC_ALLOW_MIXED_PREFILL_DECODE="0"
 HYBRID_APC_PREFILL_CHUNK_TOKENS="0"
 NUM_GPU_BLOCKS_OVERRIDE=""
+GPU_MEMORY_UTILIZATION=""
+KV_CACHE_DTYPE=""
+KV_CACHE_MEMORY_BYTES=""
 KERNEL_Q_TILE_SIZE="128"
 KERNEL_KV_TILE_SIZE="1024"
 TEXT_ONLY_CTE="1"
@@ -92,6 +95,9 @@ while [[ $# -gt 0 ]]; do
     --no-hybrid-apc-allow-mixed-prefill-decode) HYBRID_APC_ALLOW_MIXED_PREFILL_DECODE="0"; shift ;;
     --hybrid-apc-prefill-chunk-tokens) HYBRID_APC_PREFILL_CHUNK_TOKENS="$2"; shift 2 ;;
     --num-gpu-blocks-override) NUM_GPU_BLOCKS_OVERRIDE="$2"; shift 2 ;;
+    --gpu-memory-utilization) GPU_MEMORY_UTILIZATION="$2"; shift 2 ;;
+    --kv-cache-dtype) KV_CACHE_DTYPE="$2"; shift 2 ;;
+    --kv-cache-memory-bytes) KV_CACHE_MEMORY_BYTES="$2"; shift 2 ;;
     --kernel-q-tile-size) KERNEL_Q_TILE_SIZE="$2"; shift 2 ;;
     --kernel-kv-tile-size) KERNEL_KV_TILE_SIZE="$2"; shift 2 ;;
     --text-only-cte) TEXT_ONLY_CTE="1"; shift ;;
@@ -144,6 +150,22 @@ fi
 if [[ -z "${HYBRID_GDN_CONV_CACHE_DTYPE}" ]]; then
   HYBRID_GDN_CONV_CACHE_DTYPE="${GDN_CONV_CACHE_DTYPE}"
 fi
+case "${HYBRID_GDN_RECURRENT_CACHE_DTYPE}" in
+  fp32|float32|torch.float32)
+    HYBRID_GDN_RECURRENT_CACHE_DTYPE="float32"
+    ;;
+  bf16|bfloat16|torch.bfloat16)
+    if [[ "${ENABLE_HYBRID_APC}" == "1" && "${HYBRID_CACHE_MODE}" == "all" ]]; then
+      echo "ERROR: Hybrid APC all-mode requires float32 recurrent GDN checkpoint cache state; use --gdn-recurrent-cache-dtype float32." >&2
+      exit 2
+    fi
+    HYBRID_GDN_RECURRENT_CACHE_DTYPE="bfloat16"
+    ;;
+  *)
+    echo "ERROR: unsupported --hybrid-gdn-recurrent-cache-dtype ${HYBRID_GDN_RECURRENT_CACHE_DTYPE}; expected float32 or bfloat16" >&2
+    exit 2
+    ;;
+esac
 if [[ "${ENABLE_PREFIX_CACHING}" == "1" || "${ENABLE_HYBRID_APC}" == "1" ]]; then
   ENABLE_PREFIX_CACHING="1"
 fi
@@ -425,6 +447,16 @@ if compiled_artifacts:
             "k_cache_transposed",
             "kv_cache_quant",
             "kv_quant_config",
+            "quantized",
+            "quantization_dtype",
+            "quantization_type",
+            "quantization_block_size",
+            "quantization_block_axis",
+            "quantization_scale_dtype",
+            "quantized_checkpoints_path",
+            "modules_to_not_convert",
+            "draft_model_modules_to_not_convert",
+            "activation_quantization_type",
         ):
             if flag_name in compiled_config:
                 compiled_decode_memory_flags[flag_name] = compiled_config[flag_name]
@@ -607,6 +639,9 @@ echo "HYBRID_APC_DISABLE_UNBACKED_PREFIX_READS=${HYBRID_APC_DISABLE_UNBACKED_PRE
 echo "HYBRID_APC_ENABLE_BACKED_PREFIX_READS=${HYBRID_APC_ENABLE_BACKED_PREFIX_READS}"
 echo "HYBRID_APC_ALLOW_MIXED_PREFILL_DECODE=${HYBRID_APC_ALLOW_MIXED_PREFILL_DECODE}"
 echo "HYBRID_APC_PREFILL_CHUNK_TOKENS=${HYBRID_APC_PREFILL_CHUNK_TOKENS}"
+echo "GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION}"
+echo "KV_CACHE_DTYPE=${KV_CACHE_DTYPE}"
+echo "KV_CACHE_MEMORY_BYTES=${KV_CACHE_MEMORY_BYTES}"
 echo "ADDITIONAL_CONFIG=${ADDITIONAL_CONFIG}"
 
 VLLM_ARGS=(
@@ -637,6 +672,15 @@ if [[ -n "${MAMBA_SSM_CACHE_DTYPE}" ]]; then
 fi
 if [[ -n "${NUM_GPU_BLOCKS_OVERRIDE}" ]]; then
   VLLM_ARGS+=(--num-gpu-blocks-override "${NUM_GPU_BLOCKS_OVERRIDE}")
+fi
+if [[ -n "${GPU_MEMORY_UTILIZATION}" ]]; then
+  VLLM_ARGS+=(--gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}")
+fi
+if [[ -n "${KV_CACHE_DTYPE}" ]]; then
+  VLLM_ARGS+=(--kv-cache-dtype "${KV_CACHE_DTYPE}")
+fi
+if [[ -n "${KV_CACHE_MEMORY_BYTES}" ]]; then
+  VLLM_ARGS+=(--kv-cache-memory-bytes "${KV_CACHE_MEMORY_BYTES}")
 fi
 if [[ "${ENABLE_PREFIX_CACHING}" == "1" || "${ENABLE_HYBRID_APC}" == "1" || "${ENABLE_CHUNKED_PREFILL}" == "1" ]]; then
   VLLM_ARGS+=(--block-size "${BLOCK_SIZE}")

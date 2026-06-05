@@ -1448,7 +1448,7 @@ class ModelWrapper(torch.nn.Module):
                     "[hybrid_apc_debug] pad-pre "
                     f"tag={self.tag} input_shape={tuple(args[0].shape)} "
                     f"attention_shape={tuple(args[1].shape)} "
-                    f"position_shape={tuple(args[2].shape)} "
+                    f"position_shape={tuple(args[2].shape)} position_minmax={_debug_minmax(args[2])} "
                     f"slot_shape={tuple(slot_mapping.shape)} slot_minmax={_debug_minmax(slot_mapping)} "
                     f"block_shape={tuple(block_table.shape)} block_minmax={_debug_minmax(block_table)} "
                     f"prefill_len={_debug_int(prefill_len)} prefix_len={_debug_int(prefix_len)} "
@@ -1557,7 +1557,7 @@ class ModelWrapper(torch.nn.Module):
                         if row_prefix_len:
                             padded_attn_mask[row_idx, :row_prefix_len] = 1
 
-                if prefix_bucket_int == 0:
+                if prefix_bucket_int == 0 and not use_segmented_prefix_cte:
                     padded_block_table = torch.zeros(
                         1, dtype=torch.int32, device=block_table.device
                     )

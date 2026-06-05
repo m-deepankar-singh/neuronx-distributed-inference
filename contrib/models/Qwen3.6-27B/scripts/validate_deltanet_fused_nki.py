@@ -52,6 +52,29 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--validate-restored-suffix-carry",
+        action="store_true",
+        help=(
+            "Validate the serving-style GDN carry boundary: run one full padded "
+            "sequence and compare it with restored calls over split CTE buckets."
+        ),
+    )
+    parser.add_argument(
+        "--restore-split-lens",
+        default="512,512,201",
+        help=(
+            "Comma-separated real token counts for "
+            "--validate-restored-suffix-carry. Each segment is padded to "
+            "--restore-bucket-size before the next restored call."
+        ),
+    )
+    parser.add_argument(
+        "--restore-bucket-size",
+        type=int,
+        default=512,
+        help="Per-call padded CTE bucket size for --validate-restored-suffix-carry.",
+    )
+    parser.add_argument(
         "--validate-autocp-affine",
         action="store_true",
         help=(
@@ -1252,6 +1275,312 @@ def validate_cpu_chunk_invariance(torch: Any, args: argparse.Namespace) -> int:
     return 0
 
 
+def parse_restore_split_lens(spec: str) -> list[int]:
+    try:
+        values = [int(part.strip()) for part in spec.split(",") if part.strip()]
+    except ValueError as exc:
+        raise ValueError(f"Invalid --restore-split-lens {spec!r}") from exc
+    if not values or any(value <= 0 for value in values):
+        raise ValueError(
+            "--restore-split-lens must contain positive integer lengths; "
+            f"got {spec!r}"
+        )
+    return values
+
+
+def zero_sequence_tail(torch: Any, inputs: dict[str, Any], real_seq_len: int) -> None:
+    sequence_keys = ("query", "key", "value", "g_raw", "beta")
+    for key in sequence_keys:
+        tensor = inputs[key]
+        if tensor.dim() == 2:
+            tensor[real_seq_len:] = 0
+        else:
+            tensor[:, real_seq_len:] = 0
+
+
+def slice_sequence_tensor(tensor: Any, start: int, end: int) -> Any:
+    if tensor.dim() == 2:
+        return tensor[start:end].contiguous()
+    return tensor[:, start:end].contiguous()
+
+
+def slice_sequence_for_compare(tensor: Any, end: int) -> Any:
+    if tensor.dim() == 2:
+        return tensor[:end]
+    return tensor[:, :end]
+
+
+def cat_sequence_outputs(torch: Any, tensors: list[Any]) -> Any:
+    if not tensors:
+        raise ValueError("No output tensors to concatenate")
+    if tensors[0].dim() == 2:
+        return torch.cat(tensors, dim=0)
+    return torch.cat(tensors, dim=1)
+
+
+def copy_inputs_with_state_and_slice(
+    inputs: dict[str, Any],
+    *,
+    start: int,
+    end: int,
+    state: Any,
+) -> dict[str, Any]:
+    return {
+        "chunk_size": inputs.get("chunk_size", P_MAX),
+        "query": slice_sequence_tensor(inputs["query"], start, end),
+        "key": slice_sequence_tensor(inputs["key"], start, end),
+        "value": slice_sequence_tensor(inputs["value"], start, end),
+        "g_raw": slice_sequence_tensor(inputs["g_raw"], start, end),
+        "beta": slice_sequence_tensor(inputs["beta"], start, end),
+        "state_in": state,
+        "lower_mask": inputs["lower_mask"],
+        "identity": inputs["identity"],
+        "lower_mask_diag": inputs["lower_mask_diag"],
+    }
+
+
+def run_fused_kernel_once(
+    torch: Any,
+    deltanet_fused_chunked_fwd: Any,
+    inputs: dict[str, Any],
+    args: argparse.Namespace,
+) -> tuple[Any, Any, list[str]]:
+    if args.multihead:
+        pair_outputs = []
+        pair_states = []
+        launch_spec_labels = []
+        head_group_size = min(args.head_group_size, args.heads)
+        for head_start in range(0, args.heads, head_group_size):
+            head_end = min(head_start + head_group_size, args.heads)
+            launch_heads = head_end - head_start
+            launch_spec = multihead_launch_spec(launch_heads, args.lnc)
+            launch_spec_labels.append(launch_spec_label(launch_spec))
+            out_pair, state_pair = deltanet_fused_chunked_fwd[launch_spec](
+                inputs["query"][head_start:head_end],
+                inputs["key"][head_start:head_end],
+                inputs["value"][head_start:head_end],
+                inputs["g_raw"][head_start:head_end],
+                inputs["beta"][head_start:head_end],
+                inputs["state_in"][head_start:head_end],
+                inputs["lower_mask"],
+                inputs["identity"],
+                inputs["lower_mask_diag"],
+            )
+            pair_outputs.append(out_pair)
+            pair_states.append(state_pair)
+        return torch.cat(pair_outputs, dim=0), torch.cat(pair_states, dim=0), launch_spec_labels
+
+    out_dev, state_dev = deltanet_fused_chunked_fwd(
+        inputs["query"],
+        inputs["key"],
+        inputs["value"],
+        inputs["g_raw"],
+        inputs["beta"],
+        inputs["state_in"],
+        inputs["lower_mask"],
+        inputs["identity"],
+        inputs["lower_mask_diag"],
+    )
+    return out_dev, state_dev, []
+
+
+def validate_restored_suffix_carry(
+    torch: Any,
+    xm: Any,
+    args: argparse.Namespace,
+    inspect_dir: Path,
+) -> int:
+    split_lens = parse_restore_split_lens(args.restore_split_lens)
+    bucket_size = int(args.restore_bucket_size)
+    chunk_size = int(args.chunk_size)
+    if bucket_size <= 0:
+        raise ValueError("--restore-bucket-size must be positive")
+    if bucket_size % chunk_size != 0:
+        raise ValueError(
+            "--restore-bucket-size must be a multiple of --chunk-size; "
+            f"got bucket_size={bucket_size}, chunk_size={chunk_size}"
+        )
+    if any(length > bucket_size for length in split_lens):
+        raise ValueError(
+            "Each --restore-split-lens value must fit in --restore-bucket-size; "
+            f"split_lens={split_lens}, bucket_size={bucket_size}"
+        )
+
+    real_seq_len = sum(split_lens)
+    padded_seq_len = len(split_lens) * bucket_size
+    input_args = argparse.Namespace(**{**vars(args), "seq_len": padded_seq_len})
+    inputs = make_inputs(torch, input_args)
+    zero_sequence_tail(torch, inputs, real_seq_len)
+    ref_out, ref_state = reference_math(torch, inputs)
+
+    deltanet_fused_chunked_fwd = load_fused_kernel(args.multihead)
+    device = xm.xla_device()
+    xla_inputs = move_tensor_inputs_to_device(inputs, device)
+
+    full_out_cpu = full_state_cpu = None
+    split_out_cpu = split_state_cpu = None
+    run_elapsed_seconds = []
+    launch_spec_labels = []
+    for _ in range(args.runs):
+        run_start = time.perf_counter()
+        full_out_dev, full_state_dev, full_launch_specs = run_fused_kernel_once(
+            torch,
+            deltanet_fused_chunked_fwd,
+            xla_inputs,
+            args,
+        )
+        if full_launch_specs and not launch_spec_labels:
+            launch_spec_labels = full_launch_specs
+
+        state_dev = xla_inputs["state_in"]
+        split_outputs = []
+        offset = 0
+        for real_len in split_lens:
+            segment_inputs = copy_inputs_with_state_and_slice(
+                xla_inputs,
+                start=offset,
+                end=offset + bucket_size,
+                state=state_dev,
+            )
+            out_dev, state_dev, segment_launch_specs = run_fused_kernel_once(
+                torch,
+                deltanet_fused_chunked_fwd,
+                segment_inputs,
+                args,
+            )
+            if segment_launch_specs and not launch_spec_labels:
+                launch_spec_labels = segment_launch_specs
+            split_outputs.append(out_dev)
+            offset += bucket_size
+
+        split_out_dev = cat_sequence_outputs(torch, split_outputs)
+        split_state_dev = state_dev
+        xm.mark_step()
+        full_out_cpu = full_out_dev.detach().cpu().float()
+        full_state_cpu = full_state_dev.detach().cpu().float()
+        split_out_cpu = split_out_dev.detach().cpu().float()
+        split_state_cpu = split_state_dev.detach().cpu().float()
+        run_elapsed_seconds.append(time.perf_counter() - run_start)
+
+    assert full_out_cpu is not None
+    assert full_state_cpu is not None
+    assert split_out_cpu is not None
+    assert split_state_cpu is not None
+
+    ref_real = slice_sequence_for_compare(ref_out, real_seq_len)
+    full_real = slice_sequence_for_compare(full_out_cpu, real_seq_len)
+    split_real = slice_sequence_for_compare(split_out_cpu, real_seq_len)
+
+    full_output_close = bool(
+        torch.allclose(full_real, ref_real, atol=args.atol, rtol=args.rtol)
+    )
+    full_state_close = bool(
+        torch.allclose(full_state_cpu, ref_state, atol=args.atol, rtol=args.rtol)
+    )
+    split_output_close = bool(
+        torch.allclose(split_real, ref_real, atol=args.atol, rtol=args.rtol)
+    )
+    split_state_close = bool(
+        torch.allclose(split_state_cpu, ref_state, atol=args.atol, rtol=args.rtol)
+    )
+    split_vs_full_output_close = bool(
+        torch.allclose(split_real, full_real, atol=args.atol, rtol=args.rtol)
+    )
+    split_vs_full_state_close = bool(
+        torch.allclose(split_state_cpu, full_state_cpu, atol=args.atol, rtol=args.rtol)
+    )
+    finite = {
+        "full_output": bool(torch.isfinite(full_real).all().item()),
+        "full_state": bool(torch.isfinite(full_state_cpu).all().item()),
+        "split_output": bool(torch.isfinite(split_real).all().item()),
+        "split_state": bool(torch.isfinite(split_state_cpu).all().item()),
+    }
+    passed = bool(
+        full_output_close
+        and full_state_close
+        and split_output_close
+        and split_state_close
+        and split_vs_full_output_close
+        and split_vs_full_state_close
+        and all(finite.values())
+    )
+
+    result = {
+        "passed": passed,
+        "validate_restored_suffix_carry": True,
+        "seed": args.seed,
+        "split_lens": split_lens,
+        "restore_bucket_size": bucket_size,
+        "real_seq_len": real_seq_len,
+        "padded_seq_len": padded_seq_len,
+        "chunk_size": chunk_size,
+        "heads": args.heads if args.multihead else 1,
+        "head_group_size": args.head_group_size if args.multihead else 1,
+        "launch_specs": launch_spec_labels if args.multihead else [],
+        "multihead": args.multihead,
+        "runs": args.runs,
+        "run_elapsed_seconds": run_elapsed_seconds,
+        "cached_run_elapsed_seconds": run_elapsed_seconds[1:],
+        "atol": args.atol,
+        "rtol": args.rtol,
+        "inspect": args.inspect,
+        "dge": args.dge,
+        "finite": finite,
+        "close": {
+            "full_output": full_output_close,
+            "full_state": full_state_close,
+            "split_output": split_output_close,
+            "split_state": split_state_close,
+            "split_vs_full_output": split_vs_full_output_close,
+            "split_vs_full_state": split_vs_full_state_close,
+        },
+        "inspect_dir": str(inspect_dir),
+        "environment": {
+            key: os.environ.get(key)
+            for key in (
+                "NEURON_CC_FLAGS",
+                "NEURON_PLATFORM_TARGET_OVERRIDE",
+                "NEURON_RT_VISIBLE_CORES",
+                "NEURON_RT_INSPECT_ENABLE",
+                "NEURON_RT_ENABLE_DGE_NOTIFICATIONS",
+                "QWEN36_DELTANET_CHUNK_SIZE",
+                "QWEN36_DELTANET_SOLVE_BLOCK_SIZE",
+                "QWEN36_DELTANET_SOLVE_SCAN_STEPS",
+                "QWEN36_DELTANET_SOLVE_ACTIVE_PREFIX_K",
+                "QWEN36_DELTANET_SOLVE_MODE",
+            )
+        },
+        "nki_vs_reference": {
+            "full_output_real": tensor_metrics(torch, full_real, ref_real),
+            "full_state": tensor_metrics(torch, full_state_cpu, ref_state),
+            "split_output_real": tensor_metrics(torch, split_real, ref_real),
+            "split_state": tensor_metrics(torch, split_state_cpu, ref_state),
+            "split_vs_full_output_real": tensor_metrics(torch, split_real, full_real),
+            "split_vs_full_state": tensor_metrics(
+                torch,
+                split_state_cpu,
+                full_state_cpu,
+            ),
+        },
+    }
+    if args.multihead:
+        result["nki_vs_reference"]["split_output_per_head"] = multihead_tensor_metrics(
+            torch,
+            split_real,
+            ref_real,
+        )
+        result["nki_vs_reference"]["split_state_per_head"] = multihead_tensor_metrics(
+            torch,
+            split_state_cpu,
+            ref_state,
+        )
+    print(json.dumps(result, indent=2, sort_keys=True))
+
+    if args.fail_on_mismatch and not passed:
+        return 2
+    return 0
+
+
 def validate_autocp_affine_chunk(torch: Any, xm: Any, args: argparse.Namespace, inspect_dir: Path) -> int:
     if args.multihead:
         raise ValueError("--validate-autocp-affine expects single-head inputs")
@@ -2181,6 +2510,8 @@ def main() -> int:
         return validate_autocp_state_summary(torch, xm, args, inspect_dir)
     if args.validate_autocp_compact_chain:
         return validate_autocp_compact_chain(torch, xm, args, inspect_dir)
+    if args.validate_restored_suffix_carry:
+        return validate_restored_suffix_carry(torch, xm, args, inspect_dir)
 
     deltanet_fused_chunked_fwd = load_fused_kernel(args.multihead)
 

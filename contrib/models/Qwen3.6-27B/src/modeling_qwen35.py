@@ -91,6 +91,9 @@ from src.nki_kernels.nki_deltanet_fused import (
     deltanet_fused_chunked_fwd as _deltanet_fused_kernel,
     deltanet_fused_chunked_fwd_multihead as _deltanet_fused_multihead_kernel,
 )
+from src.nki_kernels.nki_deltanet_fused_legacy import (
+    deltanet_fused_chunked_fwd as _deltanet_fused_legacy_direct_kernel,
+)
 from src.nki_kernels.nki_deltanet_fused import (
     _make_lower_mask,
     _make_lower_mask_diag,
@@ -228,6 +231,60 @@ def _qwen35_grouped_prefix_attention(
 
     attn_output = torch.matmul(attn_weights, V_cache.unsqueeze(2))
     return attn_output.reshape(B, q_heads, q_len, head_dim)
+
+
+def _qwen35_expanded_prefix_attention(
+    Q,
+    K_cache,
+    V_cache,
+    query_positions,
+    cache_positions,
+    key_valid_mask=None,
+):
+    B, q_heads, q_len, head_dim = Q.shape
+    kv_heads = K_cache.shape[1]
+    cache_len = K_cache.shape[2]
+
+    if q_heads != kv_heads:
+        kv_rep = q_heads // kv_heads
+        K_full = (
+            K_cache.unsqueeze(2)
+            .expand(-1, -1, kv_rep, -1, -1)
+            .reshape(B, q_heads, cache_len, head_dim)
+        )
+        V_full = (
+            V_cache.unsqueeze(2)
+            .expand(-1, -1, kv_rep, -1, -1)
+            .reshape(B, q_heads, cache_len, head_dim)
+        )
+    else:
+        K_full = K_cache
+        V_full = V_cache
+
+    attn_weights = torch.matmul(Q, K_full.transpose(-1, -2)) / math.sqrt(head_dim)
+    causal_mask = cache_positions <= query_positions[:, None, :, None]
+    if key_valid_mask is not None:
+        causal_mask = causal_mask & key_valid_mask
+    attn_weights = attn_weights.masked_fill(~causal_mask, -65504.0)
+    attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(Q.dtype)
+    return torch.matmul(attn_weights, V_full)
+
+
+def _qwen36_prefix_attention_impl() -> str:
+    raw = os.environ.get("QWEN36_PREFIX_ATTENTION_IMPL", "grouped").strip().lower()
+    aliases = {
+        "grouped": "grouped",
+        "current": "grouped",
+        "expanded": "expanded",
+        "legacy": "expanded",
+        "legacy_expanded": "expanded",
+    }
+    if raw not in aliases:
+        raise ValueError(
+            "QWEN36_PREFIX_ATTENTION_IMPL must be grouped/current or "
+            f"expanded/legacy, got {raw!r}"
+        )
+    return aliases[raw]
 
 
 def _resolve_deltanet_autocp_lnc(num_chunks: int) -> int:
@@ -958,7 +1015,15 @@ class NeuronGatedDeltaNet(nn.Module):
         return output, last_recurrent_state
 
     def _fused_chunked_forward(
-        self, query, key, value, g, beta, output_final_state=False, initial_state=None
+        self,
+        query,
+        key,
+        value,
+        g,
+        beta,
+        output_final_state=False,
+        initial_state=None,
+        _segment_disabled=False,
     ):
         """Fused single-kernel chunked forward for CTE — SSD-style.
 
@@ -982,8 +1047,22 @@ class NeuronGatedDeltaNet(nn.Module):
                 f"got {chunk_size}"
             )
 
-        # The fused CTE kernel owns Q/K l2-normalization and Q scaling so
-        # those vector ops stay fused with the DeltaNet chunk work.
+        cte_impl = os.environ.get("QWEN36_DELTANET_CTE_IMPL", "current").lower()
+        if cte_impl in ("legacy", "legacy_direct", "direct"):
+            use_legacy_direct_cte = True
+        elif cte_impl in ("current", "optimized"):
+            use_legacy_direct_cte = False
+        else:
+            raise ValueError(
+                "QWEN36_DELTANET_CTE_IMPL must be current or legacy_direct; "
+                f"got {cte_impl!r}"
+            )
+        if use_legacy_direct_cte and chunk_size != 128:
+            raise ValueError(
+                "QWEN36_DELTANET_CTE_IMPL=legacy_direct requires "
+                f"QWEN36_DELTANET_CHUNK_SIZE=128; got {chunk_size}"
+            )
+
         B, H, S, k_dim = query.shape
         v_dim = value.shape[-1]
 
@@ -996,6 +1075,43 @@ class NeuronGatedDeltaNet(nn.Module):
             beta = F.pad(beta, (0, pad_size))
             g = F.pad(g, (0, pad_size))
         total_seq_len = S + pad_size
+
+        segment_tokens = int(
+            os.environ.get("QWEN36_DELTANET_FUSED_SEGMENT_TOKENS", "0") or "0"
+        )
+        if (
+            not _segment_disabled
+            and segment_tokens > 0
+            and total_seq_len > segment_tokens
+        ):
+            if segment_tokens < chunk_size or segment_tokens % chunk_size != 0:
+                raise ValueError(
+                    "QWEN36_DELTANET_FUSED_SEGMENT_TOKENS must be a positive "
+                    "multiple of QWEN36_DELTANET_CHUNK_SIZE; "
+                    f"got segment_tokens={segment_tokens}, chunk_size={chunk_size}"
+                )
+            segment_outputs = []
+            state = initial_state
+            for start in range(0, total_seq_len, segment_tokens):
+                end = min(start + segment_tokens, total_seq_len)
+                segment_output, state = self._fused_chunked_forward(
+                    query[:, :, start:end, :],
+                    key[:, :, start:end, :],
+                    value[:, :, start:end, :],
+                    g[:, :, start:end],
+                    beta[:, :, start:end],
+                    output_final_state=True,
+                    initial_state=state,
+                    _segment_disabled=True,
+                )
+                segment_outputs.append(segment_output)
+            output = torch.cat(segment_outputs, dim=2)[:, :, :S, :]
+            return output, state if output_final_state else None
+
+        if use_legacy_direct_cte:
+            query = l2norm(query, dim=-1)
+            key = l2norm(key, dim=-1)
+            query = query * (1.0 / (k_dim ** 0.5))
 
         BH = B * H
         # Flatten to (BH, S, dim). Grouped multihead launches are opt-in
@@ -1026,7 +1142,10 @@ class NeuronGatedDeltaNet(nn.Module):
             _make_lower_mask_diag(), dtype=torch.float32, device=device
         )
 
-        use_multihead_cte = os.environ.get("QWEN36_DELTANET_MULTIHEAD_CTE", "1") != "0"
+        use_multihead_cte = (
+            not use_legacy_direct_cte
+            and os.environ.get("QWEN36_DELTANET_MULTIHEAD_CTE", "1") != "0"
+        )
         if use_multihead_cte:
             pair_outputs = []
             pair_states = []
@@ -1052,10 +1171,15 @@ class NeuronGatedDeltaNet(nn.Module):
             output = torch.cat(pair_outputs, dim=0)
             final_state = torch.cat(pair_states, dim=0)
         else:
+            fused_singlehead_kernel = (
+                _deltanet_fused_legacy_direct_kernel
+                if use_legacy_direct_cte
+                else _deltanet_fused_kernel
+            )
             all_outputs = []
             all_states = []
             for bh in range(BH):
-                out_bh, state_bh = _deltanet_fused_kernel(
+                out_bh, state_bh = fused_singlehead_kernel(
                     query_flat[bh],  # (S, 128)
                     key_flat[bh],  # (S, 128)
                     value_flat[bh],  # (S, 128)
@@ -2151,6 +2275,12 @@ class Qwen35InferenceConfig(InferenceConfig):
         if self.use_hybrid_apc_manager and self.hybrid_cache_mode != "all":
             raise ValueError("use_hybrid_apc_manager requires hybrid_cache_mode='all'")
         if self.use_hybrid_apc_manager:
+            if self.hybrid_recurrent_cache_dtype != "float32":
+                raise ValueError(
+                    "use_hybrid_apc_manager requires float32 recurrent GDN "
+                    "checkpoint cache state; bf16 checkpoint roundtrips are not "
+                    "coherent for all-mode prefix caching"
+                )
             pa_block_size = getattr(self.neuron_config, "pa_block_size", None)
             if pa_block_size is not None and self.gdn_checkpoint_interval != int(
                 pa_block_size
@@ -3122,17 +3252,26 @@ class NeuronQwen35Attention(NeuronAttentionBase):
             ).view(1, 1, 1, -1)
             key_valid_mask = None
 
-        return (
-            _qwen35_grouped_prefix_attention(
+        prefix_attention_impl = _qwen36_prefix_attention_impl()
+        if prefix_attention_impl == "grouped":
+            attn_output = _qwen35_grouped_prefix_attention(
                 Q,
                 k_cache,
                 v_cache,
                 pos,
                 cache_positions,
                 key_valid_mask,
-            ),
-            None,
-        )
+            )
+        else:
+            attn_output = _qwen35_expanded_prefix_attention(
+                Q,
+                k_cache,
+                v_cache,
+                pos,
+                cache_positions,
+                key_valid_mask,
+            )
+        return attn_output, None
 
     def forward(
         self,
@@ -4079,6 +4218,7 @@ class HybridGDNCheckpointCache(nn.Module):
         seq_ids: torch.Tensor | None,
         checkpoint_slot_ids: torch.Tensor | None,
         restore_mask: torch.Tensor | None,
+        zero_inactive: bool = False,
     ) -> dict[int, tuple[torch.Tensor, torch.Tensor]] | None:
         if checkpoint_slot_ids is None or restore_mask is None:
             return None
@@ -4107,16 +4247,59 @@ class HybridGDNCheckpointCache(nn.Module):
             active_conv = self._active_rows(
                 linear_attn.conv_state_buffer, seq_ids, batch_size
             )
+            if zero_inactive:
+                inactive_recurrent = torch.zeros_like(active_recurrent)
+                inactive_conv = torch.zeros_like(active_conv)
+            else:
+                inactive_recurrent = active_recurrent
+                inactive_conv = active_conv
             slot_recurrent = torch.index_select(
                 self.recurrent_slots[bank_idx], 0, slot_ids
             ).to(active_recurrent.dtype)
             slot_conv = torch.index_select(self.conv_slots[bank_idx], 0, slot_ids).to(
                 active_conv.dtype
             )
-            restored[layer_id] = (
-                torch.where(rec_mask, slot_recurrent, active_recurrent),
-                torch.where(conv_mask, slot_conv, active_conv),
+            _debug_qwen36_hybrid_gdn_state(
+                "restore_slot_recurrent",
+                slot_recurrent,
+                layer_id=layer_id,
+                bank_idx=bank_idx,
+                slot_ids=slot_ids,
+                mask=restore_mask,
+                seq_ids=seq_ids,
             )
+            _debug_qwen36_hybrid_gdn_state(
+                "restore_slot_conv",
+                slot_conv,
+                layer_id=layer_id,
+                bank_idx=bank_idx,
+                slot_ids=slot_ids,
+                mask=restore_mask,
+                seq_ids=seq_ids,
+            )
+            restored_recurrent = torch.where(
+                rec_mask, slot_recurrent, inactive_recurrent
+            )
+            restored_conv = torch.where(conv_mask, slot_conv, inactive_conv)
+            _debug_qwen36_hybrid_gdn_state(
+                "restore_active_recurrent",
+                restored_recurrent,
+                layer_id=layer_id,
+                bank_idx=bank_idx,
+                slot_ids=slot_ids,
+                mask=restore_mask,
+                seq_ids=seq_ids,
+            )
+            _debug_qwen36_hybrid_gdn_state(
+                "restore_active_conv",
+                restored_conv,
+                layer_id=layer_id,
+                bank_idx=bank_idx,
+                slot_ids=slot_ids,
+                mask=restore_mask,
+                seq_ids=seq_ids,
+            )
+            restored[layer_id] = (restored_recurrent, restored_conv)
         return restored
 
     def commit_from_active_rows(
@@ -4181,9 +4364,54 @@ class HybridGDNCheckpointCache(nn.Module):
             conv_rows = self._active_rows(conv_state, seq_ids, batch_size).to(
                 conv_slots.dtype
             )
+            _debug_qwen36_hybrid_gdn_state(
+                "commit_input_recurrent",
+                recurrent_rows,
+                layer_id=layer_id,
+                bank_idx=bank_idx,
+                slot_ids=slot_ids,
+                mask=commit_mask,
+                seq_ids=seq_ids,
+            )
+            _debug_qwen36_hybrid_gdn_state(
+                "commit_input_conv",
+                conv_rows,
+                layer_id=layer_id,
+                bank_idx=bank_idx,
+                slot_ids=slot_ids,
+                mask=commit_mask,
+                seq_ids=seq_ids,
+            )
 
-            outputs.append(_commit_rows(recurrent_slots, recurrent_rows, commit_mask))
-            outputs.append(_commit_rows(conv_slots, conv_rows, commit_mask))
+            committed_recurrent = _commit_rows(
+                recurrent_slots, recurrent_rows, commit_mask
+            )
+            committed_conv = _commit_rows(conv_slots, conv_rows, commit_mask)
+            committed_recurrent_rows = torch.index_select(
+                committed_recurrent, 0, slot_ids
+            )
+            committed_conv_rows = torch.index_select(committed_conv, 0, slot_ids)
+            _debug_qwen36_hybrid_gdn_state(
+                "commit_slot_recurrent",
+                committed_recurrent_rows,
+                layer_id=layer_id,
+                bank_idx=bank_idx,
+                slot_ids=slot_ids,
+                mask=commit_mask,
+                seq_ids=seq_ids,
+            )
+            _debug_qwen36_hybrid_gdn_state(
+                "commit_slot_conv",
+                committed_conv_rows,
+                layer_id=layer_id,
+                bank_idx=bank_idx,
+                slot_ids=slot_ids,
+                mask=commit_mask,
+                seq_ids=seq_ids,
+            )
+
+            outputs.append(committed_recurrent)
+            outputs.append(committed_conv)
         return outputs
 
     def identity_outputs(self) -> list[torch.Tensor]:
@@ -4490,6 +4718,80 @@ def _debug_qwen36_arg_contract(stage: str, tag: str, config, args) -> None:
         )
 
 
+def _debug_qwen36_flat_values(value) -> str:
+    if value is None:
+        return "None"
+    if not hasattr(value, "reshape"):
+        return repr(value)
+    try:
+        flat = value.detach().reshape(-1) if hasattr(value, "detach") else value.reshape(-1)
+        return repr(flat.tolist())
+    except Exception as exc:
+        return f"error:{type(exc).__name__}"
+
+
+def _debug_qwen36_hybrid_gdn_state(
+    tag: str,
+    tensor: torch.Tensor,
+    *,
+    layer_id: int,
+    bank_idx: int,
+    slot_ids: torch.Tensor,
+    mask: torch.Tensor,
+    seq_ids: torch.Tensor | None,
+) -> None:
+    if os.environ.get("QWEN36_HYBRID_GDN_STATE_DEBUG") != "1":
+        return
+    shape = _debug_tensor_shape(tensor)
+    dtype = getattr(tensor, "dtype", None)
+    total = 0
+    finite_count = "error"
+    nan_count = "error"
+    posinf_count = "error"
+    neginf_count = "error"
+    max_abs = "error"
+    mean_abs = "error"
+    try:
+        flat = tensor.detach().float().reshape(-1)
+        total = int(flat.numel())
+        if total > 0:
+            finite = torch.isfinite(flat)
+            finite_i = finite.to(torch.int32)
+            finite_count = int(finite_i.sum().item())
+            nan_count = int(torch.isnan(flat).to(torch.int32).sum().item())
+            posinf_count = int(torch.isposinf(flat).to(torch.int32).sum().item())
+            neginf_count = int(torch.isneginf(flat).to(torch.int32).sum().item())
+            safe = torch.where(finite, flat, torch.zeros_like(flat)).abs()
+            max_abs = float(safe.max().item())
+            mean_abs = float((safe.sum() / max(finite_count, 1)).item())
+        else:
+            finite_count = 0
+            nan_count = 0
+            posinf_count = 0
+            neginf_count = 0
+            max_abs = "empty"
+            mean_abs = "empty"
+    except Exception as exc:
+        finite_count = f"error:{type(exc).__name__}"
+        nan_count = f"error:{type(exc).__name__}"
+        posinf_count = f"error:{type(exc).__name__}"
+        neginf_count = f"error:{type(exc).__name__}"
+        max_abs = f"error:{type(exc).__name__}"
+        mean_abs = f"error:{type(exc).__name__}"
+
+    print(
+        "[qwen36_hybrid_gdn_state] "
+        f"tag={tag} layer={layer_id} bank={bank_idx} "
+        f"slot_ids={_debug_qwen36_flat_values(slot_ids)} "
+        f"mask={_debug_qwen36_flat_values(mask)} "
+        f"seq_ids={_debug_qwen36_flat_values(seq_ids)} "
+        f"shape={shape} dtype={dtype} finite={finite_count}/{total} "
+        f"nan={nan_count} posinf={posinf_count} neginf={neginf_count} "
+        f"max_abs={max_abs} mean_abs={mean_abs}",
+        flush=True,
+    )
+
+
 def _validate_qwen36_tkg_input_ids(input_ids, vocab_size) -> None:
     if input_ids is None or not hasattr(input_ids, "numel") or input_ids.numel() == 0:
         raise ValueError("Qwen3.6 TKG input_ids must be a non-empty tensor")
@@ -4571,6 +4873,17 @@ def _qwen36_hybrid_apc_controls_need_prepare(
         _qwen36_hybrid_apc_mask_has_active_row(hybrid_restore_mask)
         or _qwen36_hybrid_apc_mask_has_active_row(hybrid_commit_mask)
     )
+
+
+def _qwen36_hybrid_apc_controls_materialized(
+    hybrid_restore_mask,
+    hybrid_restore_prefix_lens,
+    hybrid_commit_mask,
+) -> bool:
+    return not _qwen36_hybrid_apc_controls_need_prepare(
+        hybrid_restore_mask,
+        hybrid_commit_mask,
+    ) or _qwen36_hybrid_apc_mask_has_active_row(hybrid_restore_prefix_lens)
 
 
 def _qwen36_is_prefill_request(
@@ -5163,6 +5476,7 @@ def _qwen36_add_vllm_hybrid_apc_metadata(
         "request_prefix_len",
         "vllm_attention_hit_len",
         "active_suffix_len",
+        "full_input_ids",
     ):
         value = _qwen36_request_metadata_values(
             metadata_by_request_id,
@@ -5170,6 +5484,19 @@ def _qwen36_add_vllm_hybrid_apc_metadata(
             key,
         )
         if value is not None:
+            if key == "full_input_ids" and not isinstance(value, torch.Tensor):
+                input_ids = hybrid_apc_request_dict.get("input_ids")
+                dtype = (
+                    input_ids.dtype
+                    if isinstance(input_ids, torch.Tensor)
+                    else torch.int64
+                )
+                device = (
+                    input_ids.device
+                    if isinstance(input_ids, torch.Tensor)
+                    else None
+                )
+                value = torch.tensor([list(value)], dtype=dtype, device=device)
             hybrid_apc_request_dict[key] = value
 
 
@@ -5489,6 +5816,12 @@ class NeuronQwen35Model(NeuronBaseModel):
                     seq_ids=seq_ids,
                     checkpoint_slot_ids=hybrid_restore_slot_ids,
                     restore_mask=hybrid_restore_mask,
+                    zero_inactive=(
+                        is_for_context_encoding
+                        and not _qwen36_hybrid_apc_mask_has_active_row(
+                            hybrid_restore_prefix_lens
+                        )
+                    ),
                 )
             )
 
@@ -5823,6 +6156,11 @@ class NeuronQwen35Model(NeuronBaseModel):
                     self.neuron_config,
                 )
             ]
+        _qwen36_validate_alias_output_counts(
+            self,
+            updated_kv_cache,
+            is_for_context_encoding=is_for_context_encoding,
+        )
         outputs += updated_kv_cache
 
         # Append DeltaNet state tensors (for input_output_aliases)
@@ -6162,8 +6500,128 @@ def convert_qwen35_hf_to_neuron_state_dict(neuron_state_dict, config):
 # ============================================================
 
 
+def _reassert_hybrid_gdn_checkpoint_param_dtypes(module):
+    config = getattr(module, "config", None)
+    if config is None:
+        return
+
+    recurrent_dtype = _torch_dtype_from_hybrid_cache_dtype(
+        getattr(config, "hybrid_recurrent_cache_dtype", "float32")
+    )
+    conv_dtype = _torch_dtype_from_hybrid_cache_dtype(
+        getattr(config, "hybrid_conv_cache_dtype", "bfloat16")
+    )
+
+    def _retarget(params, dtype):
+        for param in params:
+            if param.dtype != dtype:
+                param.data = param.data.to(dtype)
+
+    for layer in getattr(module, "layers", []):
+        linear_attn = getattr(layer, "linear_attn", None)
+        if linear_attn is None:
+            continue
+        recurrent_buffer = getattr(linear_attn, "recurrent_state_buffer", None)
+        conv_buffer = getattr(linear_attn, "conv_state_buffer", None)
+        if recurrent_buffer is not None and recurrent_buffer.dtype != recurrent_dtype:
+            recurrent_buffer.data = recurrent_buffer.data.to(recurrent_dtype)
+        if conv_buffer is not None and conv_buffer.dtype != conv_dtype:
+            conv_buffer.data = conv_buffer.data.to(conv_dtype)
+
+    cache = getattr(module, "hybrid_gdn_checkpoint_cache", None)
+    if cache is not None:
+        _retarget(cache.recurrent_slots, recurrent_dtype)
+        _retarget(cache.conv_slots, conv_dtype)
+        cache.recurrent_dtype = recurrent_dtype
+        cache.conv_dtype = conv_dtype
+
+
+def _qwen36_is_context_encoding_trace(
+    n_active_tokens: int | None,
+    neuron_config,
+) -> bool:
+    n_active_tokens = int(n_active_tokens or 0)
+    speculation_length = getattr(neuron_config, "speculation_length", None)
+    return n_active_tokens != 1 and not (
+        speculation_length is not None and n_active_tokens == speculation_length
+    )
+
+
+def _qwen36_include_hybrid_gdn_checkpoint_outputs(
+    config,
+    *,
+    is_for_context_encoding: bool | None = None,
+    n_active_tokens: int | None = None,
+    neuron_config=None,
+) -> bool:
+    if is_for_context_encoding is None:
+        is_for_context_encoding = _qwen36_is_context_encoding_trace(
+            n_active_tokens,
+            neuron_config,
+        )
+    if not getattr(config, "use_hybrid_apc_manager", False):
+        return True
+    if is_for_context_encoding:
+        return True
+    return bool(getattr(config, "hybrid_apc_commit_during_token_generation", False))
+
+
+def _qwen36_validate_alias_output_counts(
+    module,
+    updated_kv_cache,
+    *,
+    is_for_context_encoding: bool,
+):
+    kv_mgr = getattr(module, "kv_mgr", None)
+    if kv_mgr is not None:
+        expected_kv = len(kv_mgr.past_key_values)
+    else:
+        expected_kv = 0
+    actual_kv = len(updated_kv_cache)
+    if actual_kv != expected_kv:
+        raise RuntimeError(
+            "Qwen3.6 output alias count mismatch: "
+            f"updated_kv_cache has {actual_kv} tensors but kv_mgr.past_key_values "
+            f"has {expected_kv}"
+        )
+
+    expected_states = 0
+    if not getattr(module.config, "use_hybrid_cache_manager", False):
+        expected_states = len(getattr(module, "_deltanet_state_params", []))
+    actual_states = len(getattr(module, "_deltanet_updated_states", []))
+    if actual_states != expected_states:
+        raise RuntimeError(
+            "Qwen3.6 output alias count mismatch: "
+            f"_deltanet_updated_states has {actual_states} tensors but "
+            f"_deltanet_state_params has {expected_states}"
+        )
+
+    checkpoint_outputs_expected = _qwen36_include_hybrid_gdn_checkpoint_outputs(
+        module.config,
+        is_for_context_encoding=is_for_context_encoding,
+    )
+    expected_checkpoints = (
+        len(getattr(module, "_hybrid_gdn_checkpoint_params", []))
+        if checkpoint_outputs_expected
+        else 0
+    )
+    actual_checkpoints = len(
+        getattr(module, "_hybrid_gdn_checkpoint_updated_states", [])
+    )
+    if actual_checkpoints != expected_checkpoints:
+        raise RuntimeError(
+            "Qwen3.6 output alias count mismatch: "
+            f"_hybrid_gdn_checkpoint_updated_states has {actual_checkpoints} tensors "
+            f"but _hybrid_gdn_checkpoint_params expects {expected_checkpoints}"
+        )
+
+
 class Qwen35DecoderModelInstance(DecoderModelInstance):
     """Custom DecoderModelInstance that adds DeltaNet state buffers to input_output_aliases."""
+
+    def load_module(self):
+        super().load_module()
+        _reassert_hybrid_gdn_checkpoint_param_dtypes(self.module)
 
     @staticmethod
     def _num_trace_outputs_before_aliases(neuron_config):
@@ -6202,16 +6660,10 @@ class Qwen35DecoderModelInstance(DecoderModelInstance):
                 input_output_aliases[param] = state_start_idx + i
 
             checkpoint_start_idx = state_start_idx + len(module._deltanet_state_params)
-            include_checkpoint_aliases = not (
-                getattr(module.config, "use_hybrid_apc_manager", False)
-                and int(getattr(module, "n_active_tokens", 0) or 0) == 1
-                and not bool(
-                    getattr(
-                        module.config,
-                        "hybrid_apc_commit_during_token_generation",
-                        False,
-                    )
-                )
+            include_checkpoint_aliases = _qwen36_include_hybrid_gdn_checkpoint_outputs(
+                module.config,
+                n_active_tokens=getattr(module, "n_active_tokens", 0),
+                neuron_config=self.neuron_config,
             )
             if include_checkpoint_aliases:
                 for i, param in enumerate(
@@ -6402,7 +6854,11 @@ class Qwen35ModelWrapper(ModelWrapper):
                 self.neuron_config,
                 "use_hybrid_apc_manager",
             )
-            or not _qwen36_hybrid_apc_controls_need_prepare(args[25], args[28])
+            or _qwen36_hybrid_apc_controls_materialized(
+                args[25],
+                args[26],
+                args[28],
+            )
         ):
             return args
 
@@ -6579,16 +7035,11 @@ class Qwen35ModelWrapper(ModelWrapper):
                     current_mrope.ndim == 3
                     and current_mrope.shape[-1] != padded_seq_len
                 ):
-                    orig_len = current_mrope.shape[-1]
-                    pad_size = padded_seq_len - orig_len
+                    pad_size = padded_seq_len - current_mrope.shape[-1]
                     last_pos = current_mrope[:, :, -1:]
-                    pad_offsets = torch.arange(
-                        1, pad_size + 1, dtype=current_mrope.dtype
-                    )
-                    pad_offsets = (
-                        pad_offsets.unsqueeze(0).unsqueeze(0).expand(3, batch_size, -1)
-                    )
-                    mrope_pad = last_pos + pad_offsets
+                    # Padded tokens are masked out of the active CTE, so do not
+                    # advance mRoPE into fake future positions.
+                    mrope_pad = last_pos.expand(3, batch_size, pad_size)
                     mrope_position_ids = torch.cat([current_mrope, mrope_pad], dim=-1)
                 elif current_mrope.ndim == 3:
                     mrope_position_ids = current_mrope
@@ -7065,6 +7516,7 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
                 "computed_context_lens",
                 computed_context_lens,
             )
+            num_queries = prepared_inputs.get("num_queries", num_queries)
             hybrid_restore_slot_ids = prepared_inputs.get("hybrid_restore_slot_ids")
             hybrid_restore_mask = prepared_inputs.get("hybrid_restore_mask")
             hybrid_restore_prefix_lens = prepared_inputs.get(

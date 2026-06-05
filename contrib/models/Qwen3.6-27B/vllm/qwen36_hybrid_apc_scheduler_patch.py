@@ -1726,6 +1726,57 @@ def _logits_argmax_token_ids_for_sample_shape(
     )
 
 
+def _summarize_logits_for_fallback(logits_source: Any) -> str:
+    logits_tensor = _first_tensor_like(logits_source)
+    if logits_tensor is None or not hasattr(logits_tensor, "dim"):
+        return "logits=unavailable"
+    if not torch.is_floating_point(logits_tensor):
+        return (
+            f"logits_shape={tuple(getattr(logits_tensor, 'shape', ())) } "
+            f"logits_dtype={getattr(logits_tensor, 'dtype', None)} non_float"
+        )
+    try:
+        logits_float = logits_tensor.detach().float()
+        flat = logits_float.reshape(-1)
+        finite_mask = torch.isfinite(flat)
+        finite_count = int(finite_mask.sum().item())
+        nan_count = int(torch.isnan(flat).sum().item())
+        posinf_count = int(
+            torch.logical_and(torch.isinf(flat), flat > 0).sum().item()
+        )
+        neginf_count = int(
+            torch.logical_and(torch.isinf(flat), flat < 0).sum().item()
+        )
+        finite_min = finite_max = None
+        if finite_count:
+            finite_values = flat[finite_mask]
+            finite_min = float(finite_values.min().item())
+            finite_max = float(finite_values.max().item())
+        logits_for_argmax = (
+            logits_float[:, -1, :] if logits_float.dim() >= 3 else logits_float
+        )
+        argmax = logits_for_argmax.argmax(dim=-1).detach().cpu().reshape(-1)
+        argmax_values = (
+            logits_for_argmax.gather(
+                dim=-1,
+                index=logits_for_argmax.argmax(dim=-1, keepdim=True),
+            )
+            .detach()
+            .cpu()
+            .reshape(-1)
+        )
+        return (
+            f"logits_shape={tuple(logits_tensor.shape)} logits_dtype={logits_tensor.dtype} "
+            f"finite={finite_count}/{int(flat.numel())} nan={nan_count} "
+            f"posinf={posinf_count} neginf={neginf_count} "
+            f"finite_min={finite_min} finite_max={finite_max} "
+            f"argmax={argmax[:4].tolist()} "
+            f"argmax_values={[float(item) for item in argmax_values[:4].tolist()]}"
+        )
+    except Exception as exc:  # pragma: no cover - diagnostic only
+        return f"logits_summary_error={type(exc).__name__}: {exc}"
+
+
 def _mask_incomplete_prefill_sampled_tokens(
     sampler_output: Any,
     prefill_completion_state: Any,
@@ -1820,6 +1871,7 @@ def _mask_incomplete_prefill_sampled_tokens(
                 "reason": reason,
                 "token_id": invalid_id,
                 "fallback": int(fallback_token_ids[row_idx].reshape(-1)[0].item()),
+                "logits_summary": _summarize_logits_for_fallback(logits_source),
             }
         )
 
@@ -1859,6 +1911,12 @@ def _mask_incomplete_prefill_sampled_tokens(
             _format_token_id(int(row["token_id"])),
             row["fallback"],
             values,
+        )
+        logger.warning(
+            "Qwen3.6 fallback logits summary: stage=%s row=%s %s",
+            stage,
+            row["row"],
+            row["logits_summary"],
         )
     if _env_flag("QWEN36_HYBRID_APC_DEBUG"):
         try:
@@ -1943,6 +2001,16 @@ def _split_sample_logits_output(value: Any) -> tuple[Any, Any, str]:
     return value, None, type(value).__name__
 
 
+def _json_float_value(value: float) -> float | str:
+    if value != value:
+        return "nan"
+    if value == float("inf"):
+        return "inf"
+    if value == float("-inf"):
+        return "-inf"
+    return float(value)
+
+
 def _log_sample_logits_comparison(
     hidden_states: Any,
     model_input: Any,
@@ -1966,13 +2034,51 @@ def _log_sample_logits_comparison(
             "sampler_output_type": type(sampler_output).__name__,
         }
         if token_tensor is not None and logits_tensor is not None:
+            row["sampled_dtype"] = str(token_tensor.dtype)
+            row["logits_dtype"] = str(logits_tensor.dtype)
             logits_tensor = logits_tensor.detach().float()
+            flat_logits = logits_tensor.reshape(-1)
+            finite_mask = torch.isfinite(flat_logits)
+            finite_count = int(finite_mask.sum().item())
+            row.update(
+                {
+                    "logits_numel": int(flat_logits.numel()),
+                    "logits_finite": finite_count,
+                    "logits_nan": int(torch.isnan(flat_logits).sum().item()),
+                    "logits_posinf": int(
+                        torch.logical_and(torch.isinf(flat_logits), flat_logits > 0)
+                        .sum()
+                        .item()
+                    ),
+                    "logits_neginf": int(
+                        torch.logical_and(torch.isinf(flat_logits), flat_logits < 0)
+                        .sum()
+                        .item()
+                    ),
+                }
+            )
+            if finite_count:
+                finite_flat = flat_logits[finite_mask]
+                row["logits_finite_min"] = float(finite_flat.min().item())
+                row["logits_finite_max"] = float(finite_flat.max().item())
+            else:
+                row["logits_finite_min"] = None
+                row["logits_finite_max"] = None
             logits_for_argmax = (
                 logits_tensor[:, -1, :]
                 if logits_tensor.dim() >= 3
                 else logits_tensor
             )
             argmax_tokens = logits_for_argmax.argmax(dim=-1).detach().cpu().reshape(-1)
+            argmax_values = (
+                logits_for_argmax.gather(
+                    dim=-1,
+                    index=logits_for_argmax.argmax(dim=-1, keepdim=True),
+                )
+                .detach()
+                .cpu()
+                .reshape(-1)
+            )
             sampled_tokens = token_tensor.detach().cpu().reshape(-1)
             count = min(int(argmax_tokens.numel()), int(sampled_tokens.numel()))
             row.update(
@@ -1982,6 +2088,10 @@ def _log_sample_logits_comparison(
                     ],
                     "logits_argmax_tokens": [
                         int(item) for item in argmax_tokens[: min(count, 8)].tolist()
+                    ],
+                    "logits_argmax_values": [
+                        _json_float_value(float(item))
+                        for item in argmax_values[: min(count, 8)].tolist()
                     ],
                     "num_compared": count,
                     "num_matches": int(

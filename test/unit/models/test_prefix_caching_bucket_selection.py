@@ -423,6 +423,100 @@ class TestPrefixCachingBucketSelection:
             torch.tensor([[0, 1, 2, 4]], dtype=torch.int32),
         )
 
+    def test_segmented_cte_padding_fills_short_suffix_block_after_prefix_hit(self):
+        model_wrapper = self.setup_context_encoding()
+        model_wrapper.neuron_config.buckets = [
+            [512, 512],
+        ]
+        model_wrapper.neuron_config.pa_block_size = 256
+        model_wrapper.neuron_config.max_context_length = 1024
+        model_wrapper.neuron_config.prefix_cte_attention_backend = "segmented_cte"
+
+        suffix_len = 14
+        prefix_len = 512
+        suffix_physical_block = 9
+        inp_args = [
+            torch.arange(suffix_len, dtype=torch.int32).reshape(1, suffix_len),
+            torch.ones((1, suffix_len), dtype=torch.int32),
+            torch.arange(
+                prefix_len,
+                prefix_len + suffix_len,
+                dtype=torch.int32,
+            ).reshape(1, suffix_len),
+            torch.zeros((1,), dtype=torch.int32),
+            torch.ones((1, 3), dtype=torch.float32),
+            torch.empty(0),
+            torch.zeros((1,), dtype=torch.int32),
+            torch.empty(0),
+            torch.empty(0),
+            torch.empty(0),
+            torch.empty(0),
+            torch.arange(
+                suffix_physical_block * 256,
+                suffix_physical_block * 256 + suffix_len,
+                dtype=torch.int32,
+            ).reshape(1, suffix_len),
+            torch.tensor([[0, 1, -1]], dtype=torch.int32),
+            torch.tensor([[suffix_len]], dtype=torch.int32),
+            torch.tensor([[prefix_len]], dtype=torch.int32),
+        ]
+
+        padded_args = model_wrapper._pad_prefix_caching_inputs(*inp_args)
+
+        assert torch.equal(
+            padded_args[12],
+            torch.tensor([[0, 1, suffix_physical_block, 0]], dtype=torch.int32),
+        )
+
+    def test_segmented_cte_cold_cte2048_keeps_active_block_table_when_batched(self):
+        model_wrapper = self.setup_context_encoding()
+        model_wrapper.neuron_config.buckets = [
+            [2048, 0],
+        ]
+        model_wrapper.neuron_config.pa_block_size = 256
+        model_wrapper.neuron_config.max_context_length = 32768
+        model_wrapper.neuron_config.prefix_cte_attention_backend = "segmented_cte"
+
+        active_len = 2048
+        input_ids = torch.arange(active_len, dtype=torch.int32).repeat(2, 1)
+        attention_mask = torch.ones((2, active_len), dtype=torch.int32)
+        position_ids = torch.arange(active_len, dtype=torch.int32).repeat(2, 1)
+        slot_mapping = torch.stack(
+            (
+                torch.arange(0, active_len, dtype=torch.int32),
+                torch.arange(4096, 4096 + active_len, dtype=torch.int32),
+            )
+        )
+        inp_args = [
+            input_ids,
+            attention_mask,
+            position_ids,
+            torch.zeros((2,), dtype=torch.int32),
+            torch.ones((2, 3), dtype=torch.float32),
+            torch.empty(0),
+            torch.zeros((2,), dtype=torch.int32),
+            torch.empty(0),
+            torch.empty(0),
+            torch.empty(0),
+            torch.empty(0),
+            slot_mapping,
+            torch.full((2, 8), -1, dtype=torch.int32),
+            torch.full((2, 1), active_len, dtype=torch.int32),
+            torch.zeros((2, 1), dtype=torch.int32),
+        ]
+
+        padded_args = model_wrapper._pad_prefix_caching_inputs(*inp_args)
+
+        assert padded_args[12].shape == (2, 8)
+        assert torch.equal(
+            padded_args[12][0],
+            torch.arange(8, dtype=torch.int32),
+        )
+        assert torch.equal(
+            padded_args[12][1],
+            torch.arange(16, 24, dtype=torch.int32),
+        )
+
     def test_cte_batched_hybrid_apc_restore_padding_uses_full_attention_mask(self):
         model_wrapper = self.setup_context_encoding()
         model_wrapper.neuron_config.buckets = [
