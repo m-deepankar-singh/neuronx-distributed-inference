@@ -74,6 +74,7 @@ def test_render_prompt_contains_compile_validation_and_runtime_gates():
     assert "`negative token_id`" in prompt
     assert "`fallback argmax`" in prompt
     assert "usage.prompt_tokens / TTFT" in prompt
+    assert "--min-prefill-tok-s 3000" in prompt
     assert "Do not launch a duplicate compile" in prompt
 
 

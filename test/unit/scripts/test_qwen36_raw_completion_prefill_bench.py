@@ -76,3 +76,28 @@ def test_row_gate_requires_status_ttft_and_prefill_tokens():
     empty_text = dict(good, text="")
     assert not _SCRIPT._row_passed(empty_text, require_text=True)
     assert _SCRIPT._row_passed(empty_text, require_text=False)
+
+
+def test_speed_gate_disabled_by_zero_threshold():
+    gate = _SCRIPT._speed_gate(speeds=[600.0], min_prefill_tok_s=0.0)
+
+    assert not gate["enabled"]
+    assert gate["passed"]
+    assert gate["mean_prefill_tok_s"] == 600.0
+
+
+def test_speed_gate_fails_when_mean_below_threshold():
+    gate = _SCRIPT._speed_gate(speeds=[600.0, 700.0], min_prefill_tok_s=3000.0)
+
+    assert gate["enabled"]
+    assert not gate["passed"]
+    assert gate["mean_prefill_tok_s"] == 650.0
+    assert gate["failure_reason"] == "mean_prefill_tok_s_below_threshold"
+
+
+def test_speed_gate_fails_when_no_speeds_exist():
+    gate = _SCRIPT._speed_gate(speeds=[], min_prefill_tok_s=3000.0)
+
+    assert gate["enabled"]
+    assert not gate["passed"]
+    assert gate["failure_reason"] == "no_valid_prefill_speed"

@@ -674,3 +674,8 @@ bash tmp_compile_qwen32k_segcte2048_gdnseg512.sh
    - Added `validation_scripts/qwen36_context_neff_profile.py` to replace the durable parts of `tmp_profile_qwen36_context_neffs_from_inspect.sh`. It discovers loose `context_encoding_model/_tp*_bk*/graph.neff` files, labels buckets as `context_bkN_pfxM`, writes a dry-run capture plan by default, and runs `neuron-explorer capture/view` only when `--run` is explicit.
    - The runner intentionally does not stop or relaunch vLLM. Direct NEFF profiling should be done on an idle Trainium host or after the monitor/validator has stopped the server; the script avoids `pkill`/server cleanup because prior cleanup commands dropped SSH sessions and obscured the profile result.
    - Intended use on the runtime host after copying loose context NEFFs: `python3 validation_scripts/qwen36_context_neff_profile.py --context-neff-root <context_encoding_model> --output-dir <profile-dir> --buckets 0,7 --run`; then compare summary JSON files with `qwen36_profile_summary_compare.py`.
+
+51. 3k cold-prefill speed gate is now explicit.
+   - `validation_scripts/qwen36_raw_completion_prefill_bench.py` now accepts `--min-prefill-tok-s`; when set above zero it records `speed_gate` in the output JSON and returns nonzero if mean measured prefill tok/s is below the threshold.
+   - `validation_scripts/qwen36_runtime_validation_matrix.py` defaults `--min-prefill-tok-s` to `3000.0` and passes it to the raw speed benchmark, so a coherent/log-clean artifact at ~600 tok/s is a validation failure rather than a pass with a disappointing number.
+   - The compile automation prompt generator now tells monitors to run the runtime matrix and raw benchmark with `--min-prefill-tok-s 3000`.

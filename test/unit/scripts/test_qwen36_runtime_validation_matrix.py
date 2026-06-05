@@ -42,6 +42,7 @@ def _args(**overrides):
         speed_repeats=3,
         speed_max_tokens=1,
         speed_timeout=1200.0,
+        min_prefill_tok_s=3000.0,
         timeout=900.0,
     )
     defaults.update(overrides)
@@ -72,6 +73,8 @@ def test_build_steps_orders_coherence_log_scan_then_speed():
     assert chat_step.command[chat_step.command.index("--model") + 1] == "auto"
     assert "--lengths" in steps[-1].command
     assert "16384" in steps[-1].command
+    assert "--min-prefill-tok-s" in steps[-1].command
+    assert "3000.0" in steps[-1].command
 
 
 def test_build_steps_requires_log_scan_unless_explicitly_skipped():

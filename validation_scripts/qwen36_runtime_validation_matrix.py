@@ -197,6 +197,8 @@ def build_steps(args: argparse.Namespace) -> list[ValidationStep]:
                     str(args.speed_max_tokens),
                     "--timeout",
                     str(args.speed_timeout),
+                    "--min-prefill-tok-s",
+                    str(args.min_prefill_tok_s),
                     "--output-json",
                     str(out / "raw_prefill_speed.json"),
                 ],
@@ -306,6 +308,12 @@ def main() -> int:
     parser.add_argument("--speed-repeats", type=int, default=3)
     parser.add_argument("--speed-max-tokens", type=int, default=1)
     parser.add_argument("--speed-timeout", type=float, default=1200.0)
+    parser.add_argument(
+        "--min-prefill-tok-s",
+        type=float,
+        default=3000.0,
+        help="Minimum mean 16k cold-prefill tok/s required by the speed gate.",
+    )
     parser.add_argument("--timeout", type=float, default=900.0)
     args = parser.parse_args()
 

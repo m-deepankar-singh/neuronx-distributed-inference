@@ -186,6 +186,42 @@ def _mean(values: list[float]) -> float | None:
     return statistics.fmean(values) if values else None
 
 
+def _speed_gate(
+    *,
+    speeds: list[float],
+    min_prefill_tok_s: float,
+) -> dict[str, Any]:
+    mean_speed = _mean(speeds)
+    min_speed = min(speeds) if speeds else None
+    if min_prefill_tok_s <= 0:
+        return {
+            "enabled": False,
+            "passed": True,
+            "min_prefill_tok_s": min_prefill_tok_s,
+            "mean_prefill_tok_s": mean_speed,
+            "min_observed_prefill_tok_s": min_speed,
+            "failure_reason": None,
+        }
+    if mean_speed is None:
+        return {
+            "enabled": True,
+            "passed": False,
+            "min_prefill_tok_s": min_prefill_tok_s,
+            "mean_prefill_tok_s": None,
+            "min_observed_prefill_tok_s": None,
+            "failure_reason": "no_valid_prefill_speed",
+        }
+    passed = mean_speed >= min_prefill_tok_s
+    return {
+        "enabled": True,
+        "passed": passed,
+        "min_prefill_tok_s": min_prefill_tok_s,
+        "mean_prefill_tok_s": mean_speed,
+        "min_observed_prefill_tok_s": min_speed,
+        "failure_reason": None if passed else "mean_prefill_tok_s_below_threshold",
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-url", default="http://127.0.0.1:8000")
@@ -197,6 +233,12 @@ def main() -> int:
     parser.add_argument("--timeout", type=float, default=1200.0)
     parser.add_argument("--allow-usage-fallback", action="store_true")
     parser.add_argument("--require-text", action="store_true")
+    parser.add_argument(
+        "--min-prefill-tok-s",
+        type=float,
+        default=0.0,
+        help="Fail when mean prefill tok/s is below this threshold. 0 disables.",
+    )
     parser.add_argument("--output-json", required=True)
     args = parser.parse_args()
 
@@ -253,6 +295,11 @@ def main() -> int:
         for row in rows
         if row.get("prefill_tok_s") is not None
     ]
+    speed_gate = _speed_gate(
+        speeds=speeds,
+        min_prefill_tok_s=args.min_prefill_tok_s,
+    )
+    row_gate_passed = all(_row_passed(row, require_text=args.require_text) for row in rows)
     output = {
         "base_url": base_url,
         "model": model,
@@ -261,7 +308,10 @@ def main() -> int:
         "max_tokens": args.max_tokens,
         "allow_usage_fallback": args.allow_usage_fallback,
         "require_text": args.require_text,
-        "passed": all(_row_passed(row, require_text=args.require_text) for row in rows),
+        "min_prefill_tok_s": args.min_prefill_tok_s,
+        "row_gate_passed": row_gate_passed,
+        "speed_gate": speed_gate,
+        "passed": row_gate_passed and bool(speed_gate["passed"]),
         "prefill_tok_s_mean": _mean(speeds),
         "prefill_tok_s_min": min(speeds) if speeds else None,
         "prefill_tok_s_max": max(speeds) if speeds else None,
