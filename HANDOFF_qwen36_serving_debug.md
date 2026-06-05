@@ -83,7 +83,29 @@ Ported rebuild commits:
    - Mitigation: replace the `raise ValueError` with `kernel_assert(not k_pre_transposed, ...)`.
    - Verification: pending retry compile.
 
+8. Completed standard-QKV CTE2048 compile produced BF16 recurrent checkpoint-bank slots.
+   - Artifact base: `qwen36_32k_fp8_fp8all_lmheadfp8_gatesfp8_kvbf16_standard_qkv_segmented_cte512_gdnseg512_cte2048_pfx32k_slots64_20260605T132739Z_coherent_rebuild_stdqkv2_direct_scan0`
+   - Log: `/home/ubuntu/validation_logs/fp8_256k_decode_nki/qwen36_32k_fp8_fp8all_lmheadfp8_gatesfp8_kvbf16_standard_qkv_segmented_cte512_gdnseg512_cte2048_pfx32k_slots64_20260605T132739Z_coherent_rebuild_stdqkv2_direct_scan0_compile.log`
+   - Evidence: `COMPILE_DONE` was present and safetensor inspection showed each TP shard had 48 recurrent checkpoint tensors with dtype `torch.bfloat16` and 48 conv checkpoint tensors with dtype `torch.bfloat16`.
+   - Inputs/flags: `--gdn-recurrent-cache-dtype float32`, `--gdn-conv-cache-dtype bfloat16`, `ENABLE_QKV_NKI_KERNELS=0`, `CTE_BUCKETS_RAW=2048`, `PREFIX_CTE_ATTENTION_BACKEND=segmented_cte`.
+   - Root cause: `_ensure_hybrid_checkpoint_weights` used `NeuronConfig.torch_dtype` for both recurrent and conv checkpoint-bank tensors and skipped existing checkpoint-bank keys, so postprocess-only could not correct an already-added BF16 recurrent bank.
+   - Mitigation: make `_ensure_hybrid_checkpoint_weights` derive recurrent and conv dtypes from `gdn_recurrent_cache_dtype` / `gdn_conv_cache_dtype`, and rewrite existing checkpoint-bank tensors when their dtype does not match.
+   - Verification: pending postprocess-only repair of the completed artifact.
+
 ### Current next step
+
+Repair the completed standard-QKV artifact before runtime validation:
+
+```bash
+python contrib/models/Qwen3.6-27B/test/integration/qwen36_27b_compile_fp8.py \
+  --postprocess-only \
+  --compiled-path /mnt/trainium_artifacts/qwen_artifacts/qwen36_32k_fp8_fp8all_lmheadfp8_gatesfp8_kvbf16_standard_qkv_segmented_cte512_gdnseg512_cte2048_pfx32k_slots64_20260605T132739Z_coherent_rebuild_stdqkv2_direct_scan0 \
+  --quantized-checkpoints-path /mnt/trainium_artifacts/qwen_artifacts/_quantized/qwen36_27b_fp8_full_fp8all_lmheadfp8_gatesfp8 \
+  --weight-dtype fp8_full \
+  --gdn-recurrent-cache-dtype float32 \
+  --gdn-conv-cache-dtype bfloat16 \
+  ...
+```
 
 Compile the same coherent-speed anchor with standard QKV after the segmented CTE `kernel_assert` fix:
 

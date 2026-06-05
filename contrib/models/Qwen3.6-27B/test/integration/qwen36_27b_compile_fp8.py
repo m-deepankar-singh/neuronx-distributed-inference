@@ -99,8 +99,8 @@ def _sanitize_reloadable_neuron_config(compiled_path: Path) -> None:
     config_path.write_text(json.dumps(config, indent=2, sort_keys=True) + "\n")
 
 
-def _compiled_parameter_dtype(inf_config) -> torch.dtype:
-    dtype = getattr(inf_config.neuron_config, "torch_dtype", torch.bfloat16)
+def _torch_dtype_from_config(value, default: torch.dtype) -> torch.dtype:
+    dtype = value
     if isinstance(dtype, torch.dtype):
         return dtype
     if isinstance(dtype, str):
@@ -109,8 +109,15 @@ def _compiled_parameter_dtype(inf_config) -> torch.dtype:
             "bfloat16": torch.bfloat16,
             "float16": torch.float16,
             "float32": torch.float32,
-        }.get(dtype_name, torch.bfloat16)
-    return torch.bfloat16
+        }.get(dtype_name, default)
+    return default
+
+
+def _compiled_parameter_dtype(inf_config) -> torch.dtype:
+    return _torch_dtype_from_config(
+        getattr(inf_config.neuron_config, "torch_dtype", torch.bfloat16),
+        torch.bfloat16,
+    )
 
 
 def _ensure_hybrid_checkpoint_weights(compiled_path: Path, inf_config) -> None:
@@ -135,7 +142,22 @@ def _ensure_hybrid_checkpoint_weights(compiled_path: Path, inf_config) -> None:
     slots = int(inf_config.max_gdn_checkpoint_slots)
     conv_dim = 2 * local_num_key_heads * key_dim + local_num_value_heads * value_dim
     conv_state_len = int(inf_config.linear_conv_kernel_dim) - 1
-    param_dtype = _compiled_parameter_dtype(inf_config)
+    recurrent_dtype = _torch_dtype_from_config(
+        getattr(
+            inf_config,
+            "gdn_recurrent_cache_dtype",
+            getattr(inf_config, "hybrid_recurrent_cache_dtype", None),
+        ),
+        torch.float32,
+    )
+    conv_dtype = _torch_dtype_from_config(
+        getattr(
+            inf_config,
+            "gdn_conv_cache_dtype",
+            getattr(inf_config, "hybrid_conv_cache_dtype", None),
+        ),
+        torch.bfloat16,
+    )
 
     recurrent_shape = (slots, local_num_value_heads, key_dim, value_dim)
     conv_shape = (slots, conv_dim, conv_state_len)
@@ -152,16 +174,28 @@ def _ensure_hybrid_checkpoint_weights(compiled_path: Path, inf_config) -> None:
         with safe_open(shard, framework="pt", device="cpu") as handle:
             existing = set(handle.keys())
             metadata = handle.metadata()
+            wrong_recurrent = [
+                key
+                for key in recurrent_keys
+                if key in existing and handle.get_tensor(key).dtype != recurrent_dtype
+            ]
+            wrong_conv = [
+                key
+                for key in conv_keys
+                if key in existing and handle.get_tensor(key).dtype != conv_dtype
+            ]
         missing_recurrent = [key for key in recurrent_keys if key not in existing]
         missing_conv = [key for key in conv_keys if key not in existing]
-        if not missing_recurrent and not missing_conv:
+        recurrent_to_write = missing_recurrent + wrong_recurrent
+        conv_to_write = missing_conv + wrong_conv
+        if not recurrent_to_write and not conv_to_write:
             continue
 
         tensors = load_file(shard, device="cpu")
-        for key in missing_recurrent:
-            tensors[key] = torch.zeros(recurrent_shape, dtype=param_dtype)
-        for key in missing_conv:
-            tensors[key] = torch.zeros(conv_shape, dtype=param_dtype)
+        for key in recurrent_to_write:
+            tensors[key] = torch.zeros(recurrent_shape, dtype=recurrent_dtype)
+        for key in conv_to_write:
+            tensors[key] = torch.zeros(conv_shape, dtype=conv_dtype)
 
         tmp_path = shard.with_suffix(shard.suffix + ".tmp")
         save_file(tensors, tmp_path, metadata=metadata)
@@ -169,9 +203,10 @@ def _ensure_hybrid_checkpoint_weights(compiled_path: Path, inf_config) -> None:
         print(
             "CHECKPOINT_BANK_WEIGHTS_ADDED",
             shard.name,
-            len(missing_recurrent),
-            len(missing_conv),
-            str(param_dtype),
+            len(recurrent_to_write),
+            len(conv_to_write),
+            str(recurrent_dtype),
+            str(conv_dtype),
             flush=True,
         )
 
