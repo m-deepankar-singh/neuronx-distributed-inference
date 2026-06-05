@@ -66,6 +66,7 @@ def test_render_prompt_contains_compile_validation_and_runtime_gates():
     assert "`CHECKPOINT_BANK_WEIGHTS_ADDED` for tp0..tp3" in prompt
     assert "`COMPILE_DONE`" in prompt
     assert "rsync EC2-to-EC2" in prompt
+    assert "qwen36_runtime_validation_matrix.py" in prompt
     assert "exact boundary lengths 146,160" in prompt
     assert "`negative token_id`" in prompt
     assert "`fallback argmax`" in prompt

@@ -70,6 +70,7 @@ def render_prompt(
     envlog = _required(values, "ENVLOG")
     pidfile = _required(values, "PIDFILE")
     base = _required(values, "BASE")
+    model_path = values.get("MODEL", "<model path>")
 
     flags = [
         "SAMPLING",
@@ -119,6 +120,8 @@ Expected compile shape:
 Success requires: compile process exited cleanly, `Finished Compilation for all HLOs`, no exception, `CHECKPOINT_BANK_WEIGHTS_ADDED` for tp0..tp3, `COMPILE_DONE`, `{artifact}/model.pt`, and `{artifact}/neuron_config.json`.
 
 If successful: verify artifact files and neuron_config, rsync EC2-to-EC2 from {compile_host} to {runtime_host}, launch on {runtime_host} with `{launch_script}` using the artifact and dtype settings from the env log, wait for `/health`, then run the coherence matrix before any speed claim.
+
+Preferred validation driver after launch: `validation_scripts/qwen36_runtime_validation_matrix.py --base-url http://127.0.0.1:<port> --model-path {model_path} --serve-log <serve.log> --output-dir <validation-output-dir>`. It runs the coherence/log-scan/speed gates in order and skips speed automatically if coherence or log scan fails.
 
 Coherence matrix: `/tmp/tmp_bisect_probe3.py`; exact boundary lengths {boundary_lengths}; unique 4k sweep around 4088..4104; repeated 2500 prompt; multi-turn probes at 160, 1225, and 2500; long probes at 8192 and 16384 where the artifact supports them. Runtime log scan must use `validation_scripts/qwen36_runtime_log_scan.py` and show zero matches for {scan}.
 
