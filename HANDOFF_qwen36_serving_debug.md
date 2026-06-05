@@ -482,6 +482,49 @@ The next useful step is profiling/diffing, not another blind speed kernel:
 2. Diff the compile-time config and generated HLO/NEFF set between the old fast CTE2048 artifact and the coherent artifacts, focusing on context graph shape, number of 2048 calls per 16k request, modular flow flags, qkv kernel selection, attention implementation, and hidden fallback to standard/dense kernels.
 3. Only after profiling identifies the heavy kernel, add the next speed slice. Candidate slices should be one-variable and coherence-gated. Do not enable packed qkvgate, quantized MLP NKI, multihead DeltaNet CTE, FP8 KV, full-head fused RoPE, or output-proj NKI by default.
 
+37. Output-projection NKI weight-layout fix compiled, but runtime coherence failed; output-proj NKI is now ruled out as a safe speed slice.
+   - Source branch/workdir: `/private/tmp/inferentia-gdn-prefill-speed-coherent`, branch `codex/qwen36-prefill-speed-coherent`.
+   - Fix commit: `a0e93a5 Fix output projection NKI weight layout`.
+   - What changed: `GroupQueryAttention_O` now preserves/normalizes the NKI output-projection weight contract as `[local_heads * head_dim, hidden_size]` and recovers transposed weights before calling `output_projection_cte`. Unit coverage added in `test/unit/modules/attention/test_gqa.py`.
+   - Local/remote test verification:
+     - Local `py_compile` passed.
+     - Local pytest failed because this workstation lacks Neuron deps: first `ModuleNotFoundError: No module named 'neuronx_distributed_inference'`, then with `PYTHONPATH=src`, `ModuleNotFoundError: No module named 'neuronx_distributed'`. This is an environment gap, not a code failure.
+     - Remote focused test initially failed because direct venv Python did not have `libneuronpjrt-path` on `PATH`: `FileNotFoundError: [Errno 2] No such file or directory: 'libneuronpjrt-path'`. Mitigation: sourced `/opt/aws_neuronx_venv_pytorch_inference_vllm_0_16/bin/activate`.
+     - Remote focused output-proj tests passed: `2 passed, 14 deselected`.
+     - Remote full GQA tests passed: `16 passed, 11 warnings`.
+   - Compile host/source: `ubuntu@16.26.135.243`, `/home/ubuntu/inferentia-gdn-prefill-speed-coherent`, remote HEAD `8c308e4` plus synced local source changes from commits `3465373` and `a0e93a5`.
+   - Compile PID/log/env:
+     - PID `111592`
+     - `/home/ubuntu/validation_logs/fp8_256k_decode_nki/qwen36_32k_fp8_fp8all_lmheadfp8_gatesfp8_kvbf16_qkvnki_qknorm_outprojnki_attention_cte512_gdnseg0_cte2048_pfx32k_slots64_20260605T210828Z_outprojfix_direct_scan0_compile.log`
+     - `/home/ubuntu/validation_logs/fp8_256k_decode_nki/qwen36_32k_fp8_fp8all_lmheadfp8_gatesfp8_kvbf16_qkvnki_qknorm_outprojnki_attention_cte512_gdnseg0_cte2048_pfx32k_slots64_20260605T210828Z_outprojfix_direct_scan0_env.txt`
+   - Artifact:
+     - Compile host and runtime host: `/mnt/trainium_artifacts/qwen_artifacts/qwen36_32k_fp8_fp8all_lmheadfp8_gatesfp8_kvbf16_qkvnki_qknorm_outprojnki_attention_cte512_gdnseg0_cte2048_pfx32k_slots64_20260605T210828Z_outprojfix_direct_scan0`
+     - `model.pt` size `748992330`, `neuron_config.json` size `106590`.
+   - Compile shape: one-variable delta from the coherent qk-norm anchor: `ENABLE_OUT_PROJ_NKI_KERNEL=1`, `ENABLE_QKV_NKI_KERNELS=1`, `ENABLE_QKV_CTE_NKI_KERNEL_FUSE_QK_NORM=1`, `ENABLE_QKV_CTE_NKI_KERNEL_FUSE_ROPE=0`, `PREFIX_CTE_ATTENTION_BACKEND=attention_cte`, `QWEN36_DELTANET_FUSED_SEGMENT_TOKENS=0`, `QWEN36_DELTANET_MULTIHEAD_CTE=0`, `QWEN36_DELTANET_SOLVE_MODE=direct`, `QWEN36_DELTANET_SOLVE_SCAN_STEPS=0`, `GDN_RECURRENT_CACHE_DTYPE=bfloat16`, `GDN_CONV_CACHE_DTYPE=bfloat16`, `CTE_BUCKETS_RAW=2048`, `MAX_CONTEXT_LENGTH=32768`, `ENABLE_KV_CACHE_QUANT=0`, `QUANTIZE_LM_HEAD=1`, and `FP8_QUANTIZE_LINEAR_ATTN_GATES=1`.
+   - Compile result: success. Log shows `Finished Compilation for all HLOs in 421.13827085494995 seconds`, `CHECKPOINT_BANK_WEIGHTS_ADDED` for `tp0`..`tp3` with `48 48 torch.bfloat16 torch.bfloat16`, and `COMPILE_DONE`.
+   - Transfer: EC2-to-EC2 `rsync` from compile host to runtime host `ubuntu@16.26.184.190` completed, `34,035,465,912` bytes transferred.
+   - Runtime launch:
+     - First launch command failed before touching the server because it passed the artifact through `env ART=... "$ART"`; shell expansion occurred before `env` set `ART`, so the launch script printed `usage: tmp_launch_qwen36_segcte2048.sh ARTIFACT [LOG]`. Mitigation: reran with literal artifact/log arguments.
+     - Successful output-proj runtime log: `/home/ubuntu/validation_logs/fp8_256k_decode_nki/qwen36_outprojfix_runtime_20260605T2140Z.log`.
+     - Runtime loaded the artifact successfully and reported hybrid KV allocation for `16/64` attention layers.
+   - Boundary validation:
+     - First validation invocation failed before request because system Python lacked Transformers: `ModuleNotFoundError: No module named 'transformers'`. Mitigation: reran after sourcing the Neuron/vLLM venv.
+     - Second validation invocation hit HTTP 404 for every row because `--base-url http://127.0.0.1:8001/v1` caused the script to request `/v1/v1/chat/completions`. Mitigation: reran with `--base-url http://127.0.0.1:8001`.
+     - Correct boundary JSONL: `/home/ubuntu/validation_logs/fp8_256k_decode_nki/qwen36_outprojfix_boundary_20260605T2150Z.jsonl`.
+     - HTTP/OpenAI body validity passed for all 22 rows, but content was incoherent from short context:
+       - `146` and `160`: repeated `.swap`.
+       - `485`: mixed Thai/Chinese/English fragments such as `.swap`, `一条龙`, `把好`, `Specifier`, `finn`, `Pant`, `Bota`.
+       - `505`/`526`: mojibake-like multilingual fragments and repeated `把好`.
+       - `1225+`: degenerate repeated `把好`, `_quit_quit`, `finn`, and similar fragments.
+       - Repeats with prefix-cache hits stayed incoherent, so this is not just a cold-cache artifact.
+   - Runtime log scan: no `negative token_id`, `out-of-vocab token_id`, `fallback argmax`, `finite=0`, `nan=`, or `NRT_RESOURCE` matches. This is a clean wrong-output/logit corruption, not a sampler fallback or invalid-token path.
+   - Conclusion: the weight-layout fix fixed compile-time shape assembly, but the generic output-projection NKI kernel is still numerically/semantically wrong for Qwen3.6 in this path. Keep `ENABLE_OUT_PROJ_NKI_KERNEL=0`; do not revisit output-proj NKI as a speed lever until there is a separate CPU/device equivalence test for the exact Qwen attention output layout and FP8 scale handling.
+   - Restore state: runtime host `ubuntu@16.26.184.190` is restored to the coherent qk-norm anchor on port `8001`.
+     - Artifact: `/mnt/trainium_artifacts/qwen_artifacts/qwen36_32k_fp8_fp8all_lmheadfp8_gatesfp8_kvbf16_qkvnki_qknorm_attention_cte512_gdnseg0_cte2048_pfx32k_slots64_20260605T195500Z_qknorm_direct_scan0`.
+     - Restore log: `/home/ubuntu/validation_logs/fp8_256k_decode_nki/qwen36_qknorm_restore_runtime_20260605T2158Z.log`.
+     - Sanity JSONL: `/home/ubuntu/validation_logs/fp8_256k_decode_nki/qwen36_qknorm_restore_sanity_20260605T2202Z.jsonl`.
+     - Sanity passed at `146` and `485`, with coherent text and valid OpenAI bodies.
+
 For this completed attention-CTE artifact, launch with BF16 recurrent banks:
 
 ```bash
