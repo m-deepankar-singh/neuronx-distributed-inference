@@ -176,11 +176,11 @@ def load_kv_cache(
         k_pre_transposed: If True, K cache is already stored in transposed layout
             (head_dim, block_size) per block, so no transpose is needed during loading.
     """
-    if k_pre_transposed:
-        raise ValueError(
-            "qwen_segcte256 supports only k_pre_transposed=False; "
-            "the transposed-K path has not been production validated"
-        )
+    kernel_assert(
+        not k_pre_transposed,
+        "qwen_segcte256 supports only k_pre_transposed=False; "
+        "the transposed-K path has not been production validated",
+    )
 
     num_kv_head = v_cache.shape[1]
     block_size = v_cache.shape[2]

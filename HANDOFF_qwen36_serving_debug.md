@@ -72,9 +72,20 @@ Ported rebuild commits:
    - Mitigation: do not use stock `--enable-qkv-nki-kernels` for the first coherent-speed anchor. Relaunch the same CTE2048 segmented-attention/GDN candidate with `ENABLE_QKV_NKI_KERNELS=0`, then revisit QKV speed as a separate kernel-port task.
    - Verification: pending fallback compile.
 
+7. Standard-QKV fallback compile exposed a remaining Python `raise` inside the segmented CTE NKI kernel.
+   - Artifact base: `qwen36_32k_fp8_fp8all_lmheadfp8_gatesfp8_kvbf16_standard_qkv_segmented_cte512_gdnseg512_cte2048_pfx32k_slots64_20260605T132507Z_coherent_rebuild_stdqkv_direct_scan0`
+   - PID: `47806`
+   - Log: `/home/ubuntu/validation_logs/fp8_256k_decode_nki/qwen36_32k_fp8_fp8all_lmheadfp8_gatesfp8_kvbf16_standard_qkv_segmented_cte512_gdnseg512_cte2048_pfx32k_slots64_20260605T132507Z_coherent_rebuild_stdqkv_direct_scan0_compile.log`
+   - Failing path: `src/neuronx_distributed_inference/modules/attention/nki_kernels/qwen_segcte256/attention_segmented_cte_256.py:180`
+   - Error: `NKI does not support 'raise' statements; use 'if/else' control flow within kernels, or 'assert' for fatal errors`
+   - Inputs/flags: `ENABLE_QKV_NKI_KERNELS=0`, `CTE_BUCKETS_RAW=2048`, `PREFIX_CTE_ATTENTION_BACKEND=segmented_cte`, `PREFIX_CTE_ATTENTION_SEGMENT_SIZE=512`, `QWEN36_DELTANET_FUSED_SEGMENT_TOKENS=512`, `ENABLE_KV_CACHE_QUANT=0`, `QUANTIZE_LM_HEAD=1`, `FP8_QUANTIZE_LINEAR_ATTN_GATES=1`.
+   - Root cause: Slice C replaced some NKI-hostile raises, but missed the `k_pre_transposed` guard in the segmented CTE load helper.
+   - Mitigation: replace the `raise ValueError` with `kernel_assert(not k_pre_transposed, ...)`.
+   - Verification: pending retry compile.
+
 ### Current next step
 
-Compile the same coherent-speed anchor with standard QKV:
+Compile the same coherent-speed anchor with standard QKV after the segmented CTE `kernel_assert` fix:
 
 ```bash
 ENABLE_QKV_NKI_KERNELS=0 \
