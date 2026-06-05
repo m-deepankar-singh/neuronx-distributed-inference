@@ -107,6 +107,15 @@ def test_slow_sample_token_slice_advances_to_hostlogits():
         "run_launch_command_after_automation_exists",
     ]
     assert preflight["ts"] == "20260606T010203Z_hostlogits"
+    assert preflight["compile_driver"] == "tmp_compile_qwen32k_segcte2048_gdnseg512.sh"
+    assert preflight["dry_run_env"]["COMPILE_DRY_RUN"] == "1"
+    assert preflight["launch_env"]["COMPILE_DRY_RUN"] == "0"
+    assert preflight["dry_run_env"]["TS"] == "20260606T010203Z_hostlogits"
+    assert preflight["launch_env"]["TS"] == "20260606T010203Z_hostlogits"
+    assert preflight["dry_run_env"]["PREFIX_CTE_ATTENTION_BACKEND"] == "attention_cte"
+    assert preflight["dry_run_env"]["QWEN36_DELTANET_FUSED_SEGMENT_TOKENS"] == "0"
+    assert preflight["dry_run_env"]["ENABLE_KV_CACHE_QUANT"] == "0"
+    assert preflight["dry_run_env"]["SPEED_SLICE"] == "hostlogits"
     dry_run = preflight["dry_run_command"]
     launch = preflight["launch_command_after_automation"]
     assert "TS=20260606T010203Z_hostlogits" in dry_run
@@ -146,6 +155,7 @@ def test_slow_hostlogits_advances_to_lmhead_bf16_only():
     assert "TS=20260606T010203Z_lmhead" in decision["next_preflight"][
         "launch_command_after_automation"
     ]
+    assert decision["next_preflight"]["launch_env"]["QUANTIZE_LM_HEAD"] == "0"
 
 
 def test_decision_automation_name_preserves_long_timestamp_suffix():
@@ -198,4 +208,5 @@ def test_main_finds_speed_path_from_runtime_summary(tmp_path, monkeypatch, capsy
     assert payload["decision"] == "launch_next_speed_slice"
     assert payload["next_speed_slice"] == "hostlogits"
     assert payload["next_preflight"]["ts"] == "20260606T010203Z_cli"
+    assert payload["next_preflight"]["dry_run_env"]["TS"] == "20260606T010203Z_cli"
     assert "COMPILE_DRY_RUN=1" in payload["next_preflight"]["dry_run_command"]

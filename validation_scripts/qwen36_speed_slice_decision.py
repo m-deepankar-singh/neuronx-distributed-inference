@@ -184,7 +184,10 @@ def next_preflight(
     automation_name = _automation_name(next_slice, ts)
     return {
         "ts": ts,
+        "compile_driver": "tmp_compile_qwen32k_segcte2048_gdnseg512.sh",
+        "dry_run_env": dict(env),
         "dry_run_command": dry_run_command,
+        "launch_env": dict(launch_env),
         "automation_payload_command_template": (
             "python3 validation_scripts/qwen36_compile_monitor_prompt.py "
             "--env-log <ENVLOG_FROM_DRY_RUN> "
