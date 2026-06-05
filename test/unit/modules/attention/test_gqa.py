@@ -19,6 +19,69 @@ def _bind_qkv_kernel_helpers(qkv_proj):
         setattr(qkv_proj, method_name, method)
 
 
+def _mock_o_proj(weight, hidden_size, head_dim=4, num_attention_heads=8, tp_degree=2):
+    o_proj = Mock(spec=gqa.GroupQueryAttention_O)
+    o_proj.num_attention_heads = num_attention_heads
+    o_proj.tp_degree = tp_degree
+    o_proj.head_dim = head_dim
+    o_proj.logical_nc_config = 1
+    o_proj.rpl_reduce_dtype = torch.float32
+    o_proj.sequence_parallel_enabled = False
+    o_proj.tensor_model_parallel_group = None
+    o_proj.bias = False
+    o_proj.o_proj = Mock()
+    o_proj.o_proj.weight = torch.nn.Parameter(weight, requires_grad=False)
+    o_proj.o_proj.bias = None
+    o_proj.hidden_size = hidden_size
+    return o_proj
+
+
+@patch("neuronx_distributed_inference.modules.attention.gqa.reduce_from_tensor_model_parallel_region")
+@patch("neuronx_distributed_inference.modules.attention.gqa.output_projection_cte")
+def test_kernel_o_proj_keeps_contract_weight_layout(mock_output_projection_cte, mock_reduce):
+    batch_size = 1
+    seq_len = 8
+    local_nd = 16
+    hidden_size = 32
+    attention_output = torch.rand((batch_size, seq_len, local_nd), dtype=torch.float32)
+    weight = torch.rand((local_nd, hidden_size), dtype=torch.float32)
+
+    mock_reduce.side_effect = lambda x, process_group=None: x
+    mock_kernel_call = MagicMock(return_value=torch.zeros((batch_size, seq_len, hidden_size)))
+    mock_output_projection_cte.__getitem__ = MagicMock(return_value=mock_kernel_call)
+
+    o_proj = _mock_o_proj(weight, hidden_size)
+    result = gqa.GroupQueryAttention_O._kernel_o_proj(o_proj, attention_output)
+
+    assert result.shape == (batch_size, seq_len, hidden_size)
+    kernel_kwargs = mock_kernel_call.call_args.kwargs
+    assert kernel_kwargs["attention"].shape == (batch_size, 4, 4, seq_len)
+    assert kernel_kwargs["weight"].shape == (local_nd, hidden_size)
+
+
+@patch("neuronx_distributed_inference.modules.attention.gqa.reduce_from_tensor_model_parallel_region")
+@patch("neuronx_distributed_inference.modules.attention.gqa.output_projection_cte")
+def test_kernel_o_proj_recovers_transposed_weight_layout(mock_output_projection_cte, mock_reduce):
+    batch_size = 1
+    seq_len = 8
+    local_nd = 16
+    hidden_size = 32
+    attention_output = torch.rand((batch_size, seq_len, local_nd), dtype=torch.float32)
+    weight = torch.rand((hidden_size, local_nd), dtype=torch.float32)
+
+    mock_reduce.side_effect = lambda x, process_group=None: x
+    mock_kernel_call = MagicMock(return_value=torch.zeros((batch_size, seq_len, hidden_size)))
+    mock_output_projection_cte.__getitem__ = MagicMock(return_value=mock_kernel_call)
+
+    o_proj = _mock_o_proj(weight, hidden_size)
+    result = gqa.GroupQueryAttention_O._kernel_o_proj(o_proj, attention_output)
+
+    assert result.shape == (batch_size, seq_len, hidden_size)
+    kernel_kwargs = mock_kernel_call.call_args.kwargs
+    assert kernel_kwargs["attention"].shape == (batch_size, 4, 4, seq_len)
+    assert kernel_kwargs["weight"].shape == (local_nd, hidden_size)
+
+
 @pytest.mark.parametrize(
     "batch_size, seq_len, fuse_rope",
     # fmt: off

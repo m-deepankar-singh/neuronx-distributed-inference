@@ -1231,8 +1231,22 @@ class GroupQueryAttention_O(BaseGroupQueryAttention):
             )
             if self.out_proj_kernel_enabled:
                 # we need to transpose the weights on the CPU side to avoid
-                # needing to transpose on the device when using out proj kernel
-                self.o_proj.weight = transpose_parallel_linear_layer(self.o_proj.weight)
+                # needing to transpose on the device when using out proj kernel.
+                # Some RowParallelLinear implementations already store this
+                # weight in the NKI contract layout [local_heads * head_dim, H].
+                # Transposing those weights would make the kernel return the
+                # local attention width instead of hidden_size.
+                expected_nd = (self.num_attention_heads // self.tp_degree) * self.head_dim
+                weight_shape = tuple(self.o_proj.weight.shape)
+                if weight_shape[0] == expected_nd:
+                    pass
+                elif len(weight_shape) >= 2 and weight_shape[1] == expected_nd:
+                    self.o_proj.weight = transpose_parallel_linear_layer(self.o_proj.weight)
+                else:
+                    raise ValueError(
+                        "Output projection kernel requires o_proj.weight to have "
+                        f"one axis equal to local N*D={expected_nd}, got {weight_shape}"
+                    )
         else:
             self.o_proj = nn.Linear(
                 self.num_attention_heads * self.head_dim, self.hidden_size, bias=self.bias
@@ -1249,12 +1263,24 @@ class GroupQueryAttention_O(BaseGroupQueryAttention):
             f"Output projection weight - shape: {self.o_proj.weight.shape}, dtype: {self.o_proj.weight.dtype}"
         )
         # The compute is: out(B, S, H) = attention_output(B, S, n, d) @ out_proj_weight(n * d, H)
-        nd, H = self.o_proj.weight.shape
-        B, S, nd = attention_output.shape
+        B, S, attention_nd = attention_output.shape
         heads_per_core = self.num_attention_heads // self.tp_degree
+        expected_nd = heads_per_core * self.head_dim
         assert (
-            nd == heads_per_core * self.head_dim
+            attention_nd == expected_nd
         ), f"attention_output.shape = {attention_output.shape}, heads_per_core = {heads_per_core}, head_dim = {self.head_dim}"
+
+        kernel_weight = self.o_proj.weight.data
+        if kernel_weight.shape[0] == expected_nd:
+            H = kernel_weight.shape[1]
+        elif len(kernel_weight.shape) >= 2 and kernel_weight.shape[1] == expected_nd:
+            kernel_weight = kernel_weight.transpose(0, 1)
+            H = kernel_weight.shape[1]
+        else:
+            raise ValueError(
+                "Output projection kernel requires weight layout [local_heads * head_dim, H]; "
+                f"got weight shape {tuple(kernel_weight.shape)} and local N*D={expected_nd}"
+            )
 
         # Kernel wants BndS layout for input.
         attention_output = attention_output.reshape(B, S, heads_per_core, self.head_dim)
@@ -1264,7 +1290,7 @@ class GroupQueryAttention_O(BaseGroupQueryAttention):
 
         out = output_projection_cte[self.logical_nc_config](
             attention=kernel_attn_in,
-            weight=self.o_proj.weight.data,
+            weight=kernel_weight,
             bias=self.o_proj.bias.data.unsqueeze(0) / self.tp_degree if self.bias else None,
         )
 
