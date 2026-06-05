@@ -117,7 +117,7 @@ Workdir: {workdir}.
 Expected compile shape:
 {flag_lines}
 
-Success requires: compile process exited cleanly, `Finished Compilation for all HLOs`, no exception, `CHECKPOINT_BANK_WEIGHTS_ADDED` for tp0..tp3, `COMPILE_DONE`, `{artifact}/model.pt`, and `{artifact}/neuron_config.json`.
+Success requires: compile process exited cleanly, `Finished Compilation for all HLOs`, no exception, `CHECKPOINT_BANK_WEIGHTS_ADDED` for tp0..tp3, `COMPILE_DONE`, `{artifact}/model.pt`, and `{artifact}/neuron_config.json`. Use `validation_scripts/qwen36_compile_status.py --env-log {envlog}` for the structured readiness verdict before rsync.
 
 If successful: verify artifact files and neuron_config, rsync EC2-to-EC2 from {compile_host} to {runtime_host}, launch on {runtime_host} with `{launch_script}` using the artifact and dtype settings from the env log, wait for `/health`, then run the coherence matrix before any speed claim.
 

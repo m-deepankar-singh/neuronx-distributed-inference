@@ -65,6 +65,7 @@ def test_render_prompt_contains_compile_validation_and_runtime_gates():
     assert "`Finished Compilation for all HLOs`" in prompt
     assert "`CHECKPOINT_BANK_WEIGHTS_ADDED` for tp0..tp3" in prompt
     assert "`COMPILE_DONE`" in prompt
+    assert "qwen36_compile_status.py" in prompt
     assert "rsync EC2-to-EC2" in prompt
     assert "qwen36_runtime_validation_matrix.py" in prompt
     assert "exact boundary lengths 146,160" in prompt

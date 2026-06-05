@@ -651,3 +651,9 @@ bash tmp_compile_qwen32k_segcte2048_gdnseg512.sh
 46. Chat validation model-id auto-detection.
    - Prior runtime validation had a real failure mode where the chat multi-turn probe used a stale hard-coded model id and had to be rerun with the served model id. To avoid repeating that, `validation_scripts/qwen36_chat_completion_context_bench.py` now supports `--model auto`, matching the raw boundary and raw speed probes.
    - `validation_scripts/qwen36_runtime_validation_matrix.py` now defaults `--chat-model auto`, so the matrix driver detects `/v1/models` for chat requests by default.
+
+47. Compile readiness status checker.
+   - Added `validation_scripts/qwen36_compile_status.py`, which reads `LOG`, `ARTIFACT`, and `PIDFILE` from a compile env log and emits a structured JSON verdict: `ready`, `running`, `failed`, or `incomplete`.
+   - Ready requires `Finished Compilation for all HLOs`, `COMPILE_DONE`, no configured failure markers, `CHECKPOINT_BANK_WEIGHTS_ADDED` for tp0..tp3, and artifact files `model.pt` plus `neuron_config.json`.
+   - The compile automation prompt generator now instructs future monitors to run `validation_scripts/qwen36_compile_status.py --env-log <env-log>` before rsync/runtime validation.
+   - Verification passed locally: `python3 -m py_compile validation_scripts/qwen36_compile_status.py test/unit/scripts/test_qwen36_compile_status.py validation_scripts/qwen36_compile_monitor_prompt.py test/unit/scripts/test_qwen36_compile_monitor_prompt.py`; `python3 -m pytest test/unit/scripts/test_qwen36_compile_status.py test/unit/scripts/test_qwen36_compile_monitor_prompt.py`; `python3 validation_scripts/qwen36_compile_status.py --help`; and a synthetic env/log/artifact CLI smoke that returned `state=ready`.
