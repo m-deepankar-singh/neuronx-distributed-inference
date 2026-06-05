@@ -854,6 +854,8 @@ def _build_config(args: argparse.Namespace):
         neuron_config_kwargs["qkv_nki_kernel_enabled"] = True
     if args.enable_qkv_cte_nki_kernel_fuse_rope:
         neuron_config_kwargs["qkv_cte_nki_kernel_fuse_rope"] = True
+    if args.enable_qkv_cte_nki_kernel_fuse_qk_norm:
+        neuron_config_kwargs["qkv_cte_nki_kernel_fuse_qk_norm"] = True
     if args.enable_split_qkv_tkg_nki_kernel:
         neuron_config_kwargs["qkv_tkg_nki_kernel_enabled"] = True
     if args.enable_attn_block_tkg_nki_kernel:
@@ -1137,6 +1139,15 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--enable-qkv-cte-nki-kernel-fuse-qk-norm",
+        action="store_true",
+        help=(
+            "Fuse pre-RoPE Q/K RMSNorm into the stock QKV NKI context kernel "
+            "without requiring RoPE to be fused. This is the safe path for "
+            "Qwen partial-RoPE heads."
+        ),
+    )
+    parser.add_argument(
         "--enable-split-qkv-tkg-nki-kernel",
         action="store_true",
         help=(
@@ -1342,6 +1353,10 @@ def main() -> int:
         parser.error(
             "--enable-qkv-cte-nki-kernel-fuse-rope requires --enable-qkv-nki-kernels"
         )
+    if args.enable_qkv_cte_nki_kernel_fuse_qk_norm and not args.enable_qkv_nki_kernels:
+        parser.error(
+            "--enable-qkv-cte-nki-kernel-fuse-qk-norm requires --enable-qkv-nki-kernels"
+        )
     if (
         args.context_encoding_bucket_pairs is not None
         and not (args.enable_prefix_caching or args.enable_hybrid_apc)
@@ -1467,6 +1482,9 @@ def main() -> int:
                 "enable_qkv_nki_kernels": args.enable_qkv_nki_kernels,
                 "enable_qkv_cte_nki_kernel_fuse_rope": (
                     args.enable_qkv_cte_nki_kernel_fuse_rope
+                ),
+                "enable_qkv_cte_nki_kernel_fuse_qk_norm": (
+                    args.enable_qkv_cte_nki_kernel_fuse_qk_norm
                 ),
                 "enable_split_qkv_tkg_nki_kernel": (
                     args.enable_split_qkv_tkg_nki_kernel

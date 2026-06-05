@@ -659,6 +659,97 @@ def test_prep_qkv_tensors_fused_rope_passes_qwen_pre_rope_qk_norm(
     mock_apply_rotary_pos_emb.assert_not_called()
 
 
+@patch("neuronx_distributed_inference.modules.attention.attention_base.apply_rotary_pos_emb")
+def test_prep_qkv_tensors_fuses_qk_norm_without_fusing_rope(
+    mock_apply_rotary_pos_emb, attn_module
+):
+    batch_size = 1
+    seq_len = 8
+    attn_module.qkv_cte_nki_kernel_fuse_rope = False
+    attn_module.qkv_cte_nki_kernel_fuse_qk_norm = True
+    attn_module.neuron_config.is_prefill_stage = True
+    attn_module.qk_norm_placement = QKNormPlacement.PRE_ROPE
+
+    q_norm = MockTorchModule()
+    k_norm = MockTorchModule()
+    q_norm.weight = torch.nn.Parameter(torch.rand(attn_module.head_dim), requires_grad=False)
+    k_norm.weight = torch.nn.Parameter(torch.rand(attn_module.head_dim), requires_grad=False)
+    q_norm.side_effect = AssertionError("q_layernorm should be fused in qkv kernel")
+    k_norm.side_effect = AssertionError("k_layernorm should be fused in qkv kernel")
+    attn_module.q_layernorm = q_norm
+    attn_module.k_layernorm = k_norm
+
+    q = torch.rand((batch_size, seq_len, attn_module.num_heads * attn_module.head_dim))
+    k = torch.rand((batch_size, seq_len, attn_module.num_key_value_heads * attn_module.head_dim))
+    v = torch.rand((batch_size, seq_len, attn_module.num_key_value_heads * attn_module.head_dim))
+    attn_module.qkv_proj = MockTorchModule(return_value=(q, k, v, None))
+
+    cos_cache = torch.rand((batch_size, seq_len, attn_module.head_dim))
+    sin_cache = torch.rand((batch_size, seq_len, attn_module.head_dim))
+    attn_module.rotary_emb = MagicMock(return_value=(cos_cache, sin_cache))
+    mock_apply_rotary_pos_emb.side_effect = lambda q, k, *_: (q, k)
+
+    position_ids = torch.ones((batch_size, seq_len))
+    hidden_states = torch.rand((batch_size, seq_len, attn_module.hidden_size))
+    attn_module.prep_qkv_tensors(
+        position_ids=position_ids,
+        hidden_states=hidden_states,
+        past_key_value=None,
+    )
+
+    qkv_proj_kwargs = attn_module.qkv_proj.call_args.kwargs
+    assert qkv_proj_kwargs["cos_cache"] is None
+    assert qkv_proj_kwargs["sin_cache"] is None
+    assert qkv_proj_kwargs["q_layernorm"] is q_norm
+    assert qkv_proj_kwargs["k_layernorm"] is k_norm
+    assert qkv_proj_kwargs["qk_norm_pre_rope_enabled"] is True
+    q_norm.assert_not_called()
+    k_norm.assert_not_called()
+    mock_apply_rotary_pos_emb.assert_called_once()
+
+
+@patch("neuronx_distributed_inference.modules.attention.attention_base.apply_rotary_pos_emb")
+def test_prep_qkv_tensors_does_not_fuse_partial_rope_cache(
+    mock_apply_rotary_pos_emb, attn_module
+):
+    batch_size = 1
+    seq_len = 8
+    attn_module.qkv_cte_nki_kernel_fuse_rope = True
+    attn_module.neuron_config.is_prefill_stage = True
+    attn_module.qk_norm_placement = QKNormPlacement.PRE_ROPE
+
+    q_norm = MockTorchModule()
+    k_norm = MockTorchModule()
+    q_norm.weight = torch.nn.Parameter(torch.rand(attn_module.head_dim), requires_grad=False)
+    k_norm.weight = torch.nn.Parameter(torch.rand(attn_module.head_dim), requires_grad=False)
+    attn_module.q_layernorm = q_norm
+    attn_module.k_layernorm = k_norm
+
+    q = torch.rand((batch_size, seq_len, attn_module.num_heads * attn_module.head_dim))
+    k = torch.rand((batch_size, seq_len, attn_module.num_key_value_heads * attn_module.head_dim))
+    v = torch.rand((batch_size, seq_len, attn_module.num_key_value_heads * attn_module.head_dim))
+    attn_module.qkv_proj = MockTorchModule(return_value=(q, k, v, None))
+
+    cos_cache = torch.rand((batch_size, seq_len, attn_module.head_dim // 2))
+    sin_cache = torch.rand((batch_size, seq_len, attn_module.head_dim // 2))
+    attn_module.rotary_emb = MagicMock(return_value=(cos_cache, sin_cache))
+    mock_apply_rotary_pos_emb.side_effect = lambda q, k, *_: (q, k)
+
+    position_ids = torch.ones((batch_size, seq_len))
+    hidden_states = torch.rand((batch_size, seq_len, attn_module.hidden_size))
+    attn_module.prep_qkv_tensors(
+        position_ids=position_ids,
+        hidden_states=hidden_states,
+        past_key_value=None,
+    )
+
+    qkv_proj_kwargs = attn_module.qkv_proj.call_args.kwargs
+    assert qkv_proj_kwargs["cos_cache"] is None
+    assert qkv_proj_kwargs["sin_cache"] is None
+    assert qkv_proj_kwargs["qk_norm_pre_rope_enabled"] is True
+    mock_apply_rotary_pos_emb.assert_called_once()
+
+
 def _check_qkv_proj_call(attn_module, hidden_states, is_context_parallel = False, is_cte = True):
     if is_context_parallel and is_cte:
         qkv_proj = attn_module.cte_qkv_proj

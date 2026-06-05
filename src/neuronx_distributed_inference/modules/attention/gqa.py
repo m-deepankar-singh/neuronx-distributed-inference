@@ -782,10 +782,10 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
         pre_rope_qk_norm_config = None
         pre_rope_q_gamma = None
         pre_rope_k_gamma = None
-        if fuse_rope and qk_norm_pre_rope_enabled:
+        if qk_norm_pre_rope_enabled:
             if q_layernorm is None or k_layernorm is None:
                 raise RuntimeError(
-                    "QKV CTE fused RoPE requested pre-RoPE QK norm but q/k layernorms "
+                    "QKV CTE requested pre-RoPE QK norm but q/k layernorms "
                     "were not provided"
                 )
             pre_rope_q_gamma = self._qk_rmsnorm_gamma(q_layernorm, "q_layernorm")

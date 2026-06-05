@@ -233,6 +233,7 @@ class NeuronAttentionBase(nn.Module):
         self.torch_dtype = config.neuron_config.attention_dtype if config.neuron_config.attention_dtype is not None else config.neuron_config.torch_dtype
         self.fused_qkv = self.neuron_config.fused_qkv
         self.qkv_cte_nki_kernel_fuse_rope = self.neuron_config.qkv_cte_nki_kernel_fuse_rope
+        self.qkv_cte_nki_kernel_fuse_qk_norm = self.neuron_config.qkv_cte_nki_kernel_fuse_qk_norm
 
         # Accounts for cases where some sub-modules always have SP enabled / disabled
         self.sequence_parallel_enabled = self.neuron_config.sequence_parallel_enabled if sequence_parallel_enabled is None else sequence_parallel_enabled
@@ -533,14 +534,17 @@ class NeuronAttentionBase(nn.Module):
         """take care of the shape, layout, group query, custom position encoding, etc.
            also return residual for MLP """
         is_qkv_cte_fuse_rope_nki_kernel_enabled = self.neuron_config.is_prefill_stage and self.qkv_cte_nki_kernel_fuse_rope
-        assert not (is_qkv_cte_fuse_rope_nki_kernel_enabled and self.use_qk_norm and self.qk_norm_placement == QKNormPlacement.PRE_ROPE), "qkv cte nki kernel fuse rope is not compatible with pre rope qk norm"
+        is_qkv_cte_fuse_qk_norm_nki_kernel_enabled = self.neuron_config.is_prefill_stage and (
+            self.qkv_cte_nki_kernel_fuse_qk_norm or self.qkv_cte_nki_kernel_fuse_rope
+        )
+        assert not (is_qkv_cte_fuse_qk_norm_nki_kernel_enabled and self.use_qk_norm and self.qk_norm_placement == QKNormPlacement.PRE_ROPE), "qkv cte nki kernel fuse qk norm is not compatible with generic pre rope qk norm"
         has_pre_rope_qk_layernorm = (
             self.q_layernorm is not None
             and self.k_layernorm is not None
             and self.qk_norm_placement == QKNormPlacement.PRE_ROPE
         )
         qk_norm_in_qkv_kernel = (
-            is_qkv_cte_fuse_rope_nki_kernel_enabled and has_pre_rope_qk_layernorm
+            is_qkv_cte_fuse_qk_norm_nki_kernel_enabled and has_pre_rope_qk_layernorm
         )
         if qk_norm_in_qkv_kernel and (
             isinstance(self.q_layernorm, nn.LayerNorm)
@@ -550,16 +554,22 @@ class NeuronAttentionBase(nn.Module):
                 "qkv_cte_nki_kernel_fuse_rope with pre-RoPE QK norm requires "
                 "RMSNorm-style q_layernorm/k_layernorm modules"
             )
-        if is_qkv_cte_fuse_rope_nki_kernel_enabled:
+        rope_fused_in_qkv_kernel = False
+        if is_qkv_cte_fuse_rope_nki_kernel_enabled or qk_norm_in_qkv_kernel:
             if cos_cache is None or sin_cache is None:
                 cos_cache, sin_cache = self.rotary_emb(hidden_states, position_ids)
+            rope_fused_in_qkv_kernel = (
+                is_qkv_cte_fuse_rope_nki_kernel_enabled
+                and cos_cache.shape[-1] == self.head_dim
+                and sin_cache.shape[-1] == self.head_dim
+            )
             Q, K, V, residual = self.get_qkv_proj()(
                 hidden_states=hidden_states,
                 rmsnorm=rmsnorm,
                 adapter_ids=adapter_ids,
                 residual=residual,
-                cos_cache=cos_cache,
-                sin_cache=sin_cache,
+                cos_cache=cos_cache if rope_fused_in_qkv_kernel else None,
+                sin_cache=sin_cache if rope_fused_in_qkv_kernel else None,
                 q_layernorm=self.q_layernorm if qk_norm_in_qkv_kernel else None,
                 k_layernorm=self.k_layernorm if qk_norm_in_qkv_kernel else None,
                 qk_norm_pre_rope_enabled=qk_norm_in_qkv_kernel,
@@ -589,7 +599,7 @@ class NeuronAttentionBase(nn.Module):
         )
         V = move_heads_front(V, bsz, q_len, self.num_key_value_heads, self.head_dim, layernorm=None)
 
-        if not skip_rope and not is_qkv_cte_fuse_rope_nki_kernel_enabled:
+        if not skip_rope and not rope_fused_in_qkv_kernel:
             # Rotate Q and K
             Q, K, cos_cache, sin_cache = self.apply_rotary_embedding(Q, K, V,
                                                                      position_ids,

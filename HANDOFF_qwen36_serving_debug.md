@@ -388,6 +388,21 @@ Ported rebuild commits:
      - Local syntax: `python3 -m py_compile` passed for `gqa.py`, `attention_base.py`, and `qwen36_27b_compile_fp8.py`; `bash -n tmp_compile_qwen32k_segcte2048_gdnseg512.sh` passed.
      - Remote targeted tests under compile venv with `NEURON_PLATFORM_TARGET_OVERRIDE=trn2`: `python -m pytest test/unit/modules/attention/test_gqa.py -q` passed `13 passed`; targeted attention-base tests `test_prep_qkv_tensors_qkv_cte_fuse_rope_nki_kernel` and `test_prep_qkv_tensors_fused_rope_passes_qwen_pre_rope_qk_norm` passed `7 passed`.
 
+34. Full-head QKV CTE fused RoPE is not directly usable for Qwen3.6 partial RoPE; added qk-norm-only fallback.
+   - Failed compile: `qwen36_32k_fp8_fp8all_lmheadfp8_gatesfp8_kvbf16_qkvnki_qknormrope_attention_cte512_gdnseg0_cte2048_pfx32k_slots64_20260605T194451Z_qknormrope_direct_scan0`
+   - PID: `92686`
+   - Compile log: `/home/ubuntu/validation_logs/fp8_256k_decode_nki/qwen36_32k_fp8_fp8all_lmheadfp8_gatesfp8_kvbf16_qkvnki_qknormrope_attention_cte512_gdnseg0_cte2048_pfx32k_slots64_20260605T194451Z_qknormrope_direct_scan0_compile.log`
+   - Env evidence: `ENABLE_QKV_CTE_NKI_KERNEL_FUSE_ROPE=1`, `ENABLE_QKV_NKI_KERNELS=1`, `PREFIX_CTE_ATTENTION_BACKEND=attention_cte`, `QWEN36_DELTANET_FUSED_SEGMENT_TOKENS=0`, `GDN_RECURRENT_CACHE_DTYPE=bfloat16`.
+   - Failure stage: first context HLO trace, inside `qkv_kernel[self.logical_nc_config]` before neuron-cc compilation.
+   - Exact error: `AssertionError: error: failed to compile NKI kernel: ... [NCC_INKI016] Kernel validation exception: [QKV CTE Kernel] cos_cache and sin_cache must have the shape of (B, S, d_head) where S = 2048, but got cos_cache.shape = (1, 2048, 64), sin_cache.shape = (1, 2048, 64).`
+   - Root cause: stock NKI QKV CTE fused RoPE expects full-head RoPE caches `[B, S, d_head]` and rotates the head by splitting `d_head` into two halves. Qwen3.6 uses partial RoPE: `rope_dim=64` with pass-through dimensions, as shown in `contrib/models/Qwen3.6-27B/src/modeling_qwen35.py` where only `Q[..., :self.rope_dim]` and `K[..., :self.rope_dim]` are rotated. Expanding the cache to full width would still be mathematically wrong because the NKI full-head pairing is different from Qwen's partial-RoPE pairing.
+   - Automation: `monitor-qwen-qknormrope-compile` was deleted after this compile failure was fully identified and reported.
+   - Fix/mitigation: added a separate `qkv_cte_nki_kernel_fuse_qk_norm` config/CLI/script flag. The wrapper can now fuse Qwen's pre-RoPE Q/K RMSNorm into the QKV CTE kernel while keeping Qwen partial RoPE in the existing post-QKV path. If full-head fused RoPE is requested for a model whose cache width equals `head_dim`, it still fuses RoPE; if cache width is partial, the wrapper deliberately passes `cos_cache=None` / `sin_cache=None` to the QKV kernel and applies RoPE afterward.
+   - Files changed: `src/neuronx_distributed_inference/models/config.py`, `src/neuronx_distributed_inference/modules/attention/attention_base.py`, `src/neuronx_distributed_inference/modules/attention/gqa.py`, `contrib/models/Qwen3.6-27B/test/integration/qwen36_27b_compile_fp8.py`, `tmp_compile_qwen32k_segcte2048_gdnseg512.sh`, and attention unit tests.
+   - Verification passed:
+     - Local syntax: `python3 -m py_compile` passed for `config.py`, `gqa.py`, `attention_base.py`, and `qwen36_27b_compile_fp8.py`; `bash -n tmp_compile_qwen32k_segcte2048_gdnseg512.sh` passed.
+     - Remote targeted tests under compile venv with `NEURON_PLATFORM_TARGET_OVERRIDE=trn2`: `python -m pytest test/unit/modules/attention/test_gqa.py -q` passed `14 passed`; focused attention-base tests including `test_prep_qkv_tensors_fuses_qk_norm_without_fusing_rope` and `test_prep_qkv_tensors_does_not_fuse_partial_rope_cache` passed `9 passed`.
+
 ### Current next step
 
 We now have four coherent CTE2048 artifacts in the same slow prefill class:
@@ -397,9 +412,9 @@ We now have four coherent CTE2048 artifacts in the same slow prefill class:
 - QKV NKI + segmented attention + GDN seg0: coherent, about `638 tok/s`.
 - QKV NKI + attention_cte + GDN seg0: coherent, about `627 tok/s`.
 
-The next compile should be exactly one variable from the coherent attention-CTE anchor: enable `ENABLE_QKV_CTE_NKI_KERNEL_FUSE_ROPE=1` with the new Qwen-safe pre-RoPE QK RMSNorm wiring. This tests the old fast `qknormrope` speed lever without changing Qwen's Q/K norm ordering. Do not combine it with output-proj NKI, MLP NKI, packed qkvgate, multihead DeltaNet CTE, or FP8 KV.
+The next compile should be exactly one variable from the coherent attention-CTE anchor: enable `ENABLE_QKV_CTE_NKI_KERNEL_FUSE_QK_NORM=1` and keep `ENABLE_QKV_CTE_NKI_KERNEL_FUSE_ROPE=0`. Full-head fused RoPE is now proven incompatible with Qwen3.6 partial RoPE in the stock NKI QKV kernel. Do not combine this qk-norm-only slice with output-proj NKI, MLP NKI, packed qkvgate, multihead DeltaNet CTE, or FP8 KV.
 
-If qkvnki_qknormrope is coherent, run the full coherence matrix and then 16k cold-prefill usage benchmark. If it is coherent but still slow, the next candidate speed slice is output projection NKI because it affects context and is more isolated than MLP/qkvgate.
+If qkvnki_qknorm is coherent, run the full coherence matrix and then 16k cold-prefill usage benchmark. If it is coherent but still slow, the next candidate speed slice is output projection NKI because it affects context and is more isolated than MLP/qkvgate.
 
 Older profiling/comparison follow-ups remain useful if the QK-norm/RoPE slice fails:
 

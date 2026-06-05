@@ -500,6 +500,10 @@ class NeuronConfig:
         if self.qkv_cte_nki_kernel_fuse_rope:
             assert self.qkv_kernel_enabled and self.qkv_nki_kernel_enabled, \
                 f"When qkv_cte_nki_kernel_fuse_rope is set to True, qkv_kernel_enabled (currently: {self.qkv_kernel_enabled}) and qkv_nki_kernel_enabled (currently: {self.qkv_nki_kernel_enabled}) must also be set to True."
+        self.qkv_cte_nki_kernel_fuse_qk_norm = kwargs.pop("qkv_cte_nki_kernel_fuse_qk_norm", False)
+        if self.qkv_cte_nki_kernel_fuse_qk_norm:
+            assert self.qkv_kernel_enabled and self.qkv_nki_kernel_enabled, \
+                f"When qkv_cte_nki_kernel_fuse_qk_norm is set to True, qkv_kernel_enabled (currently: {self.qkv_kernel_enabled}) and qkv_nki_kernel_enabled (currently: {self.qkv_nki_kernel_enabled}) must also be set to True."
         self.qkv_kernel_nbsd_layout = kwargs.pop("qkv_kernel_nbsd_layout", False)
         self.mlp_kernel_enabled = kwargs.pop("mlp_kernel_enabled", False)
         self.mlp_tkg_nki_kernel_enabled = kwargs.pop("mlp_tkg_nki_kernel_enabled", False)
