@@ -69,6 +69,7 @@ def test_render_prompt_contains_compile_validation_and_runtime_gates():
     assert "return a quiet/DONT_NOTIFY heartbeat status" in prompt
     assert "rsync EC2-to-EC2" in prompt
     assert "qwen36_runtime_validation_matrix.py" in prompt
+    assert "qwen36_validation_tool_manifest.py" in prompt
     assert "not the old ad hoc `/tmp/tmp_bisect_probe3.py`" in prompt
     assert "exact boundary lengths 146,160" in prompt
     assert "`negative token_id`" in prompt

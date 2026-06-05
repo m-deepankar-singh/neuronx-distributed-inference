@@ -679,3 +679,9 @@ bash tmp_compile_qwen32k_segcte2048_gdnseg512.sh
    - `validation_scripts/qwen36_raw_completion_prefill_bench.py` now accepts `--min-prefill-tok-s`; when set above zero it records `speed_gate` in the output JSON and returns nonzero if mean measured prefill tok/s is below the threshold.
    - `validation_scripts/qwen36_runtime_validation_matrix.py` defaults `--min-prefill-tok-s` to `3000.0` and passes it to the raw speed benchmark, so a coherent/log-clean artifact at ~600 tok/s is a validation failure rather than a pass with a disappointing number.
    - The compile automation prompt generator now tells monitors to run the runtime matrix and raw benchmark with `--min-prefill-tok-s 3000`.
+
+52. Validation-tool manifest for remote/source drift.
+   - Added `validation_scripts/qwen36_validation_tool_manifest.py` to build/verify SHA256 manifests for the maintained Qwen validation/profiling scripts. This addresses the current EC2 workflow where the compile-host clone often receives source changes via manual `scp` instead of a reliable git remote branch.
+   - Default manifest coverage includes compile readiness, monitor prompt generation, runtime coherence matrix, log scan, raw prefill speed gate, boundary/chat probes, direct context-NEFF profiling, profile summary comparison, and the manifest tool itself. `--include-tests` adds the matching unit tests.
+   - Intended workflow before remote validation: build a local manifest, sync/copy the listed files if needed, then run `python3 validation_scripts/qwen36_validation_tool_manifest.py --repo <remote-source> --manifest <manifest.json> --mode verify` on the host that will run validators. `--mode file-list` emits the repo-relative files for a copy command.
+   - Verification passed locally: manifest build for 10 files, self-verify with `mismatch_count=0`, file-list output, and `python3 -m pytest test/unit/scripts` (`56 passed`).

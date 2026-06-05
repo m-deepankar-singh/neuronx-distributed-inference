@@ -125,6 +125,8 @@ If successful: verify artifact files and neuron_config, rsync EC2-to-EC2 from {c
 
 Preferred validation driver after launch: `validation_scripts/qwen36_runtime_validation_matrix.py --base-url http://127.0.0.1:<port> --model-path {model_path} --serve-log <serve.log> --output-dir <validation-output-dir> --min-prefill-tok-s 3000`. It runs the coherence/log-scan/speed gates in order and skips speed automatically if coherence or log scan fails.
 
+Before runtime validation, if `validation_scripts/qwen36_validation_tool_manifest.py` is present, use it to build or verify a validation-tool manifest for the source checkout so the verdict is tied to the expected coherence/speed gates.
+
 Coherence matrix: use the maintained `validation_scripts/qwen36_runtime_validation_matrix.py` driver, not the old ad hoc `/tmp/tmp_bisect_probe3.py` helper that has been missing on runtime hosts. It must cover exact boundary lengths {boundary_lengths}, the unique 4k sweep around 4088..4104, repeated 2500 prompt, multi-turn probes at 160, 1225, and 2500, and long probes at 8192 and 16384 where the artifact supports them. Runtime log scan must use `validation_scripts/qwen36_runtime_log_scan.py` and show zero matches for {scan}.
 
 Speed validation only after coherence passes: run `validation_scripts/qwen36_raw_completion_prefill_bench.py --lengths 16384 --repeats 3 --max-tokens 1 --min-prefill-tok-s 3000`; it requests `stream_options.include_usage=true`, computes tok/s from `usage.prompt_tokens / TTFT`, and fails the speed gate when mean 16k cold-prefill throughput is below 3000 tok/s. Report coherence verdict, log-scan result, cold-prefill tok/s, and all JSON/log paths.
