@@ -122,7 +122,7 @@ If successful: verify artifact files and neuron_config, rsync EC2-to-EC2 from {c
 
 Coherence matrix: `/tmp/tmp_bisect_probe3.py`; exact boundary lengths {boundary_lengths}; unique 4k sweep around 4088..4104; repeated 2500 prompt; multi-turn probes at 160, 1225, and 2500; long probes at 8192 and 16384 where the artifact supports them. Runtime log scan must use `validation_scripts/qwen36_runtime_log_scan.py` and show zero matches for {scan}.
 
-Speed validation only after coherence passes: run a 16k cold-prefill benchmark with `max_tokens=1` and `stream_options.include_usage=true`; compute tok/s from `usage.prompt_tokens / TTFT`. Report coherence verdict, log-scan result, cold-prefill tok/s, and all JSON/log paths.
+Speed validation only after coherence passes: run `validation_scripts/qwen36_raw_completion_prefill_bench.py --lengths 16384 --repeats 3 --max-tokens 1`; it requests `stream_options.include_usage=true` and computes tok/s from `usage.prompt_tokens / TTFT`. Report coherence verdict, log-scan result, cold-prefill tok/s, and all JSON/log paths.
 
 If failed: report the exact command/log path/error text, failing stage, disk usage, and best current root-cause hypothesis. Do not launch a duplicate compile if the PID in `{pidfile}` is still running."""
 

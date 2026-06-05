@@ -633,3 +633,9 @@ bash tmp_compile_qwen32k_segcte2048_gdnseg512.sh
    - Default markers: `negative token_id`, `out-of-vocab token_id`, `fallback argmax`, `finite=0`, `nan=`, `NaN`, `NRT_RESOURCE`, `Traceback`, `RuntimeError`, `Internal Server Error`, `InternalServerError`, and `EngineDeadError`.
    - Usage: `python3 validation_scripts/qwen36_runtime_log_scan.py --json <serve.log>` exits `0` only when all scanned files are clean; exits `1` and reports line numbers/text when any marker is present.
    - The compile automation prompt generator now explicitly instructs future monitors to use this scanner before reporting speed.
+
+44. Maintained raw completion cold-prefill benchmark.
+   - Added `validation_scripts/qwen36_raw_completion_prefill_bench.py` to replace the exact raw benchmark that was previously embedded only in `tmp_profile_qwen36_qkvnki_16k_prefill.sh`.
+   - It sends exact token-id prompts to `/v1/completions`, streams with `stream_options: {"include_usage": true}`, records TTFT, and computes `prefill_tok_s` from `usage.prompt_tokens / TTFT`.
+   - By default, missing usage is a failure. `--allow-usage-fallback` exists but labels token source as `actual_prompt_tokens`; do not use fallback numbers as the primary speed claim unless usage is genuinely unavailable and that limitation is stated.
+   - The compile automation prompt generator now tells future monitors to run `validation_scripts/qwen36_raw_completion_prefill_bench.py --lengths 16384 --repeats 3 --max-tokens 1` only after coherence and log scan pass.
