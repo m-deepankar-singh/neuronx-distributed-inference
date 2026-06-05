@@ -627,3 +627,9 @@ bash tmp_compile_qwen32k_segcte2048_gdnseg512.sh
    - Added unit coverage in `test/unit/scripts/test_qwen36_compile_monitor_prompt.py` for env-log parsing, prompt content, and missing required path validation.
    - Error encountered during smoke test: rendering a prompt from the dry-run env log failed with `ValueError: env log is missing required key 'ENVLOG'` because the compile driver printed `ENVLOG` to stdout but did not write `ENVLOG` into the env log itself. Mitigation: the driver now writes `ENVLOG=${ENVLOG}` to env logs, and the prompt generator falls back to the `--env-log` argument for older env logs that lack the key.
    - Verification passed locally after mitigation: `python3 -m py_compile validation_scripts/qwen36_compile_monitor_prompt.py test/unit/scripts/test_qwen36_compile_monitor_prompt.py`; `python3 -m pytest test/unit/scripts/test_qwen36_compile_monitor_prompt.py`; `COMPILE_DRY_RUN=1 ... bash tmp_compile_qwen32k_segcte2048_gdnseg512.sh`; and prompt rendering from the generated env log.
+
+43. Reusable runtime log scan gate.
+   - Added `validation_scripts/qwen36_runtime_log_scan.py` to replace ad hoc remote `grep`/inline Python log scans. This matters because a prior multi-word `grep` scan split patterns like `negative token_id` into shell path arguments and failed with `grep: token_id: No such file or directory`.
+   - Default markers: `negative token_id`, `out-of-vocab token_id`, `fallback argmax`, `finite=0`, `nan=`, `NaN`, `NRT_RESOURCE`, `Traceback`, `RuntimeError`, `Internal Server Error`, `InternalServerError`, and `EngineDeadError`.
+   - Usage: `python3 validation_scripts/qwen36_runtime_log_scan.py --json <serve.log>` exits `0` only when all scanned files are clean; exits `1` and reports line numbers/text when any marker is present.
+   - The compile automation prompt generator now explicitly instructs future monitors to use this scanner before reporting speed.

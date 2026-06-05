@@ -120,7 +120,7 @@ Success requires: compile process exited cleanly, `Finished Compilation for all 
 
 If successful: verify artifact files and neuron_config, rsync EC2-to-EC2 from {compile_host} to {runtime_host}, launch on {runtime_host} with `{launch_script}` using the artifact and dtype settings from the env log, wait for `/health`, then run the coherence matrix before any speed claim.
 
-Coherence matrix: `/tmp/tmp_bisect_probe3.py`; exact boundary lengths {boundary_lengths}; unique 4k sweep around 4088..4104; repeated 2500 prompt; multi-turn probes at 160, 1225, and 2500; long probes at 8192 and 16384 where the artifact supports them. Runtime log scan must show zero matches for {scan}.
+Coherence matrix: `/tmp/tmp_bisect_probe3.py`; exact boundary lengths {boundary_lengths}; unique 4k sweep around 4088..4104; repeated 2500 prompt; multi-turn probes at 160, 1225, and 2500; long probes at 8192 and 16384 where the artifact supports them. Runtime log scan must use `validation_scripts/qwen36_runtime_log_scan.py` and show zero matches for {scan}.
 
 Speed validation only after coherence passes: run a 16k cold-prefill benchmark with `max_tokens=1` and `stream_options.include_usage=true`; compute tok/s from `usage.prompt_tokens / TTFT`. Report coherence verdict, log-scan result, cold-prefill tok/s, and all JSON/log paths.
 
