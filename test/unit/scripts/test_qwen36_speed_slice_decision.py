@@ -17,8 +17,39 @@ sys.modules[_SPEC.name] = _SCRIPT
 _SPEC.loader.exec_module(_SCRIPT)
 
 
-def _summary(*, coherence_ok=True, passed=False, speed_path="/tmp/raw_speed.json"):
-    return {
+def _contract(**overrides):
+    payload = {
+        "schema": "qwen36-runtime-validation-contract-v1",
+        "source": "qwen36_runtime_validation_matrix.py",
+        "speed_eligible": True,
+        "boundary_lengths": _SCRIPT.DEFAULT_BOUNDARY_LENGTHS,
+        "repeated_lengths": _SCRIPT.REQUIRED_REPEATED_LENGTHS,
+        "repeated_repeats": 3,
+        "sweep_start": _SCRIPT.REQUIRED_SWEEP_START,
+        "sweep_end": _SCRIPT.REQUIRED_SWEEP_END,
+        "long_lengths": _SCRIPT.REQUIRED_LONG_LENGTHS,
+        "skip_long_boundary": False,
+        "skip_chat": False,
+        "chat_lengths": _SCRIPT.REQUIRED_CHAT_LENGTHS,
+        "chat_turns": 8,
+        "chat_repeats": 1,
+        "speed_lengths": _SCRIPT.REQUIRED_SPEED_LENGTHS,
+        "speed_repeats": _SCRIPT.REQUIRED_SPEED_REPEATS,
+        "speed_max_tokens": _SCRIPT.REQUIRED_SPEED_MAX_TOKENS,
+        "min_prefill_tok_s": _SCRIPT.REQUIRED_MIN_PREFILL_TOK_S,
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _summary(
+    *,
+    coherence_ok=True,
+    passed=False,
+    speed_path="/tmp/raw_speed.json",
+    contract=True,
+):
+    payload = {
         "passed": passed,
         "coherence_and_log_scan_passed": coherence_ok,
         "output_dir": "/tmp/validation",
@@ -32,6 +63,11 @@ def _summary(*, coherence_ok=True, passed=False, speed_path="/tmp/raw_speed.json
             }
         ],
     }
+    if contract is True:
+        payload["validation_contract"] = _contract()
+    elif isinstance(contract, dict):
+        payload["validation_contract"] = contract
+    return payload
 
 
 def _speed(*, passed=False, mean=628.0, row_gate_passed=True):
@@ -168,6 +204,33 @@ def test_missing_speed_json_requests_speed_rerun_not_compile():
     assert decision["reason"] == "missing_or_unreadable_speed_output"
 
 
+def test_missing_runtime_contract_reruns_runtime_validation():
+    decision = _SCRIPT.decide(
+        env_values={"SPEED_SLICE": "sampletokonly"},
+        runtime_summary=_summary(coherence_ok=True, contract=False),
+        speed_output=_speed(passed=False, mean=640.0),
+        speed_json_path=Path("/tmp/raw_speed.json"),
+    )
+
+    assert decision["decision"] == "rerun_runtime_validation"
+    assert decision["reason"] == "missing_runtime_validation_contract"
+
+
+def test_incomplete_runtime_contract_reruns_runtime_validation():
+    decision = _SCRIPT.decide(
+        env_values={"SPEED_SLICE": "sampletokonly"},
+        runtime_summary=_summary(
+            coherence_ok=True,
+            contract=_contract(boundary_lengths="146,160"),
+        ),
+        speed_output=_speed(passed=False, mean=640.0),
+        speed_json_path=Path("/tmp/raw_speed.json"),
+    )
+
+    assert decision["decision"] == "rerun_runtime_validation"
+    assert decision["reason"] == "runtime_validation_contract_incomplete"
+
+
 def test_speed_pass_keeps_candidate():
     decision = _SCRIPT.decide(
         env_values={"SPEED_SLICE": "hostlogits_lmheadbf16"},
@@ -206,7 +269,7 @@ def test_slow_sample_token_slice_advances_to_hostlogits():
         "run_compile_command_after_automation_exists",
     ]
     assert preflight["ts"] == "20260606T010203Z_hostlogits"
-    assert preflight["boundary_lengths"] == "146,160"
+    assert preflight["boundary_lengths"] == _SCRIPT.DEFAULT_BOUNDARY_LENGTHS
     assert preflight["compile_driver"] == "tmp_compile_qwen32k_segcte2048_gdnseg512.sh"
     assert preflight["dry_run_env"]["COMPILE_DRY_RUN"] == "1"
     assert preflight["launch_env"]["COMPILE_DRY_RUN"] == "0"
@@ -231,7 +294,7 @@ def test_slow_sample_token_slice_advances_to_hostlogits():
     assert "monitor-qwen-hostlogits-20260606t010203z-hostlogits-compile" in preflight[
         "automation_payload_command_template"
     ]
-    assert "--boundary-lengths 146,160" in preflight[
+    assert f"--boundary-lengths {_SCRIPT.DEFAULT_BOUNDARY_LENGTHS}" in preflight[
         "automation_payload_command_template"
     ]
     assert "qwen36_next_compile_preflight.py" in preflight[
@@ -243,13 +306,13 @@ def test_slow_sample_token_slice_advances_to_hostlogits():
     assert "<AUTOMATION_PAYLOAD_JSON>" in preflight[
         "next_compile_preflight_command_template"
     ]
-    assert "--boundary-lengths 146,160" in preflight[
+    assert f"--boundary-lengths {_SCRIPT.DEFAULT_BOUNDARY_LENGTHS}" in preflight[
         "next_compile_preflight_command_template"
     ]
     assert "<CREATED_AUTOMATION_NAME>" in preflight[
         "compile_command_release_command_template"
     ]
-    assert "--boundary-lengths 146,160" in preflight[
+    assert f"--boundary-lengths {_SCRIPT.DEFAULT_BOUNDARY_LENGTHS}" in preflight[
         "compile_command_release_command_template"
     ]
     assert preflight["compile_command_after_automation"] is None
@@ -407,9 +470,9 @@ def test_main_finds_speed_path_from_runtime_summary(tmp_path, monkeypatch, capsy
     assert payload["decision"] == "launch_next_speed_slice"
     assert payload["next_speed_slice"] == "hostlogits"
     assert payload["next_preflight"]["ts"] == "20260606T010203Z_cli"
-    assert payload["next_preflight"]["boundary_lengths"] == "146,160"
+    assert payload["next_preflight"]["boundary_lengths"] == _SCRIPT.DEFAULT_BOUNDARY_LENGTHS
     assert payload["next_preflight"]["dry_run_env"]["TS"] == "20260606T010203Z_cli"
     assert "COMPILE_DRY_RUN=1" in payload["next_preflight"]["dry_run_command"]
-    assert "--boundary-lengths 146,160" in payload["next_preflight"][
+    assert f"--boundary-lengths {_SCRIPT.DEFAULT_BOUNDARY_LENGTHS}" in payload["next_preflight"][
         "next_compile_preflight_command_template"
     ]

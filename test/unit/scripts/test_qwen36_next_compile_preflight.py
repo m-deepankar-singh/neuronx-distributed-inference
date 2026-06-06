@@ -25,10 +25,34 @@ sys.modules[_SPEED_SPEC.name] = _SPEED_SCRIPT
 _SPEED_SPEC.loader.exec_module(_SPEED_SCRIPT)
 
 
+def _runtime_contract():
+    return {
+        "schema": "qwen36-runtime-validation-contract-v1",
+        "source": "qwen36_runtime_validation_matrix.py",
+        "speed_eligible": True,
+        "boundary_lengths": _SPEED_SCRIPT.DEFAULT_BOUNDARY_LENGTHS,
+        "repeated_lengths": _SPEED_SCRIPT.REQUIRED_REPEATED_LENGTHS,
+        "repeated_repeats": 3,
+        "sweep_start": _SPEED_SCRIPT.REQUIRED_SWEEP_START,
+        "sweep_end": _SPEED_SCRIPT.REQUIRED_SWEEP_END,
+        "long_lengths": _SPEED_SCRIPT.REQUIRED_LONG_LENGTHS,
+        "skip_long_boundary": False,
+        "skip_chat": False,
+        "chat_lengths": _SPEED_SCRIPT.REQUIRED_CHAT_LENGTHS,
+        "chat_turns": 8,
+        "chat_repeats": 1,
+        "speed_lengths": _SPEED_SCRIPT.REQUIRED_SPEED_LENGTHS,
+        "speed_repeats": _SPEED_SCRIPT.REQUIRED_SPEED_REPEATS,
+        "speed_max_tokens": _SPEED_SCRIPT.REQUIRED_SPEED_MAX_TOKENS,
+        "min_prefill_tok_s": _SPEED_SCRIPT.REQUIRED_MIN_PREFILL_TOK_S,
+    }
+
+
 def _runtime_summary():
     return {
         "passed": False,
         "coherence_and_log_scan_passed": True,
+        "validation_contract": _runtime_contract(),
         "results": [
             {
                 "name": "raw_prefill_speed",
@@ -80,7 +104,7 @@ def _decision(tmp_path, *, boundary_lengths=None):
 
 
 def test_build_preflight_runs_dry_run_and_builds_automation_payload(tmp_path):
-    decision = _decision(tmp_path, boundary_lengths="146,160")
+    decision = _decision(tmp_path)
     decision_path = tmp_path / "speed_slice_decision.json"
     decision_path.write_text(json.dumps(decision) + "\n")
 
@@ -96,7 +120,7 @@ def test_build_preflight_runs_dry_run_and_builds_automation_payload(tmp_path):
         automation_created_name=None,
         automation_interval_minutes=7,
         launch_script="tmp_launch_qwen36_segcte2048.sh",
-        boundary_lengths="146,160",
+        boundary_lengths=_SCRIPT.monitor_prompt.DEFAULT_BOUNDARY_LENGTHS,
     )
 
     assert result["passed"] is True
@@ -135,7 +159,7 @@ def test_build_preflight_runs_dry_run_and_builds_automation_payload(tmp_path):
         "compiled artifact identity remains governed by the copied compile env log"
         in payload["prompt"]
     )
-    assert "--boundary-lengths 146,160" in payload["prompt"]
+    assert f"--boundary-lengths {_SCRIPT.monitor_prompt.DEFAULT_BOUNDARY_LENGTHS}" in payload["prompt"]
     release = result["compile_command_release_command_template"]
     assert payload["name"] in release
     assert f"--repo-root {str(_REPO_ROOT)}" in release
@@ -145,17 +169,19 @@ def test_build_preflight_runs_dry_run_and_builds_automation_payload(tmp_path):
     assert "--source-commit" in release
     assert "--automation-interval-minutes 7" in release
     assert "--launch-script tmp_launch_qwen36_segcte2048.sh" in release
-    assert "--boundary-lengths 146,160" in release
+    assert f"--boundary-lengths {_SCRIPT.monitor_prompt.DEFAULT_BOUNDARY_LENGTHS}" in release
     assert "NEXT_COMPILE_RELEASE_JSON" in release
     assert result["release_preflight_context"]["repo_root"] == str(_REPO_ROOT)
     assert result["release_preflight_context"]["automation_name"] == payload["name"]
     assert result["release_preflight_context"]["compile_host"] == "ubuntu@compile"
     assert result["release_preflight_context"]["runtime_host"] == "ubuntu@runtime"
-    assert result["release_preflight_context"]["boundary_lengths"] == "146,160"
+    assert result["release_preflight_context"]["boundary_lengths"] == (
+        _SCRIPT.monitor_prompt.DEFAULT_BOUNDARY_LENGTHS
+    )
 
 
 def test_build_preflight_uses_decision_boundary_lengths_when_cli_default(tmp_path):
-    decision = _decision(tmp_path, boundary_lengths="146,160")
+    decision = _decision(tmp_path)
     decision_path = tmp_path / "speed_slice_decision.json"
     decision_path.write_text(json.dumps(decision) + "\n")
 
@@ -174,8 +200,10 @@ def test_build_preflight_uses_decision_boundary_lengths_when_cli_default(tmp_pat
         boundary_lengths=_SCRIPT.monitor_prompt.DEFAULT_BOUNDARY_LENGTHS,
     )
 
-    assert result["release_preflight_context"]["boundary_lengths"] == "146,160"
-    assert "--boundary-lengths 146,160" in result[
+    assert result["release_preflight_context"]["boundary_lengths"] == (
+        _SCRIPT.monitor_prompt.DEFAULT_BOUNDARY_LENGTHS
+    )
+    assert f"--boundary-lengths {_SCRIPT.monitor_prompt.DEFAULT_BOUNDARY_LENGTHS}" in result[
         "compile_command_release_command_template"
     ]
 
@@ -209,7 +237,7 @@ def test_build_preflight_rejects_conflicting_boundary_lengths(tmp_path):
 def test_build_preflight_releases_compile_command_after_matching_automation_ack(
     tmp_path,
 ):
-    decision = _decision(tmp_path, boundary_lengths="146,160")
+    decision = _decision(tmp_path)
     decision_path = tmp_path / "speed_slice_decision.json"
     decision_path.write_text(json.dumps(decision) + "\n")
     automation_name = "monitor-explicit-hostlogits-compile"
@@ -226,7 +254,7 @@ def test_build_preflight_releases_compile_command_after_matching_automation_ack(
         automation_created_name=automation_name,
         automation_interval_minutes=7,
         launch_script="tmp_launch_qwen36_segcte2048.sh",
-        boundary_lengths="146,160",
+        boundary_lengths=_SCRIPT.monitor_prompt.DEFAULT_BOUNDARY_LENGTHS,
     )
 
     assert result["automation_payload"]["name"] == automation_name
@@ -243,7 +271,7 @@ def test_build_preflight_releases_compile_command_after_matching_automation_ack(
 
 
 def test_build_preflight_rejects_mismatched_automation_ack(tmp_path):
-    decision = _decision(tmp_path, boundary_lengths="146,160")
+    decision = _decision(tmp_path)
     decision_path = tmp_path / "speed_slice_decision.json"
     decision_path.write_text(json.dumps(decision) + "\n")
 
@@ -260,7 +288,7 @@ def test_build_preflight_rejects_mismatched_automation_ack(tmp_path):
             automation_created_name="monitor-wrong",
             automation_interval_minutes=7,
             launch_script="tmp_launch_qwen36_segcte2048.sh",
-            boundary_lengths="146,160",
+            boundary_lengths=_SCRIPT.monitor_prompt.DEFAULT_BOUNDARY_LENGTHS,
         )
     except ValueError as exc:
         assert "automation-created-name does not match" in str(exc)

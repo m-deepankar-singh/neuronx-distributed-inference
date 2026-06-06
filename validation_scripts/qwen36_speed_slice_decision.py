@@ -20,6 +20,15 @@ _NEXT_SLICE = {
 DEFAULT_BOUNDARY_LENGTHS = (
     "123,146,160,485,505,526,1225,1265,1346,2048,2049,2500,4092,4096"
 )
+REQUIRED_REPEATED_LENGTHS = "2500"
+REQUIRED_CHAT_LENGTHS = "160,1225,2500"
+REQUIRED_LONG_LENGTHS = "8192,16384"
+REQUIRED_SWEEP_START = 4088
+REQUIRED_SWEEP_END = 4104
+REQUIRED_SPEED_LENGTHS = "16384"
+REQUIRED_SPEED_REPEATS = 3
+REQUIRED_SPEED_MAX_TOKENS = 1
+REQUIRED_MIN_PREFILL_TOK_S = 3000.0
 
 _SLICE_FLAGS = {
     "sampletokonly": {
@@ -117,6 +126,97 @@ def _speed_gate(speed: dict[str, Any] | None) -> dict[str, Any] | None:
         return None
     gate = speed.get("speed_gate")
     return gate if isinstance(gate, dict) else None
+
+
+def _csv_ints(value: Any) -> set[int]:
+    items: set[int] = set()
+    for raw in str(value or "").split(","):
+        text = raw.strip()
+        if not text:
+            continue
+        items.add(int(text))
+    return items
+
+
+def _runtime_contract_gap_reason(summary: dict[str, Any]) -> str | None:
+    contract = summary.get("validation_contract")
+    if not isinstance(contract, dict):
+        return "missing_runtime_validation_contract"
+    if contract.get("schema") != "qwen36-runtime-validation-contract-v1":
+        return "runtime_validation_contract_schema_mismatch"
+    if not bool(contract.get("speed_eligible")):
+        return "runtime_validation_contract_not_speed_eligible"
+    required_checks = [
+        (
+            "boundary_lengths",
+            DEFAULT_BOUNDARY_LENGTHS,
+            True,
+        ),
+        (
+            "repeated_lengths",
+            REQUIRED_REPEATED_LENGTHS,
+            True,
+        ),
+        (
+            "long_lengths",
+            REQUIRED_LONG_LENGTHS,
+            True,
+        ),
+        (
+            "chat_lengths",
+            REQUIRED_CHAT_LENGTHS,
+            True,
+        ),
+        (
+            "speed_lengths",
+            REQUIRED_SPEED_LENGTHS,
+            False,
+        ),
+    ]
+    for key, required, allow_superset in required_checks:
+        actual = _csv_ints(contract.get(key))
+        expected = _csv_ints(required)
+        if allow_superset:
+            if expected - actual:
+                return "runtime_validation_contract_incomplete"
+        elif actual != expected:
+            return "runtime_validation_contract_incomplete"
+    numeric_minimums = [
+        ("repeated_repeats", REQUIRED_SPEED_REPEATS),
+        ("sweep_end", REQUIRED_SWEEP_END),
+        ("chat_turns", 8),
+        ("chat_repeats", 1),
+        ("speed_repeats", REQUIRED_SPEED_REPEATS),
+        ("min_prefill_tok_s", REQUIRED_MIN_PREFILL_TOK_S),
+    ]
+    for key, minimum in numeric_minimums:
+        try:
+            if float(contract.get(key)) < float(minimum):
+                return "runtime_validation_contract_incomplete"
+        except (TypeError, ValueError):
+            return "runtime_validation_contract_incomplete"
+    try:
+        if int(contract.get("sweep_start")) > REQUIRED_SWEEP_START:
+            return "runtime_validation_contract_incomplete"
+        if int(contract.get("speed_max_tokens")) != REQUIRED_SPEED_MAX_TOKENS:
+            return "runtime_validation_contract_incomplete"
+    except (TypeError, ValueError):
+        return "runtime_validation_contract_incomplete"
+    if bool(contract.get("skip_chat")) or bool(contract.get("skip_long_boundary")):
+        return "runtime_validation_contract_not_speed_eligible"
+    return None
+
+
+def _runtime_contract_boundary_lengths(
+    summary: dict[str, Any],
+    fallback: str | None,
+) -> str:
+    contract = summary.get("validation_contract")
+    if isinstance(contract, dict):
+        raw = contract.get("boundary_lengths")
+        if isinstance(raw, str) and raw.strip():
+            return raw
+    return fallback or DEFAULT_BOUNDARY_LENGTHS
 
 
 def _summary_results(summary: dict[str, Any]) -> list[dict[str, Any]]:
@@ -395,6 +495,16 @@ def decide(
                 "decision": "stop_incoherent",
                 "reason": "coherence_or_runtime_log_scan_failed",
             }
+            )
+        return result
+
+    contract_gap = _runtime_contract_gap_reason(runtime_summary)
+    if contract_gap is not None:
+        result.update(
+            {
+                "decision": "rerun_runtime_validation",
+                "reason": contract_gap,
+            }
         )
         return result
 
@@ -461,7 +571,10 @@ def decide(
                 env_values,
                 next_slice,
                 next_ts=next_ts,
-                boundary_lengths=boundary_lengths,
+                boundary_lengths=_runtime_contract_boundary_lengths(
+                    runtime_summary,
+                    boundary_lengths,
+                ),
             ),
             "reason": "coherent_but_prefill_speed_below_target",
         }

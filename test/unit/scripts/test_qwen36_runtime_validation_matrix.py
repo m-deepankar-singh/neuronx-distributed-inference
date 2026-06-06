@@ -61,6 +61,12 @@ def _args(**overrides):
     return argparse.Namespace(**defaults)
 
 
+def _contract(**overrides):
+    payload = _SCRIPT._validation_contract_from_args(_args())
+    payload.update(overrides)
+    return payload
+
+
 def test_csv_range_includes_endpoints():
     assert _SCRIPT._csv_range(4088, 4090) == "4088,4089,4090"
 
@@ -427,6 +433,7 @@ def test_attach_speed_slice_decision_writes_next_action(tmp_path):
     summary = {
         "passed": False,
         "coherence_and_log_scan_passed": True,
+        "validation_contract": _contract(),
         "output_dir": str(tmp_path),
         "results": [
             {
@@ -464,7 +471,7 @@ def test_attach_speed_slice_decision_writes_next_action(tmp_path):
         "20260606T010203Z_hostlogits"
     )
     assert rewritten["speed_slice_decision"]["next_preflight"]["boundary_lengths"] == (
-        "146,160"
+        _SCRIPT.DEFAULT_BOUNDARY_LENGTHS
     )
     assert rewritten["speed_slice_decision"]["profile_preflight"] is None
 
@@ -496,6 +503,7 @@ def test_attach_speed_slice_decision_surfaces_profile_preflight(tmp_path):
     summary = {
         "passed": False,
         "coherence_and_log_scan_passed": True,
+        "validation_contract": _contract(),
         "output_dir": str(tmp_path),
         "results": [
             {

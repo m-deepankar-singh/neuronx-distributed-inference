@@ -131,6 +131,45 @@ def _require_speed_eligible_coherence_contract(args: argparse.Namespace) -> None
         )
 
 
+def _validation_contract_from_args(args: argparse.Namespace) -> dict[str, object]:
+    return {
+        "schema": "qwen36-runtime-validation-contract-v1",
+        "source": "qwen36_runtime_validation_matrix.py",
+        "speed_eligible": not bool(args.skip_speed),
+        "boundary_lengths": str(args.boundary_lengths),
+        "required_boundary_lengths": DEFAULT_BOUNDARY_LENGTHS,
+        "allow_incomplete_boundary_lengths": bool(
+            args.allow_incomplete_boundary_lengths
+        ),
+        "repeated_lengths": str(args.repeated_lengths),
+        "required_repeated_lengths": REQUIRED_REPEATED_LENGTHS,
+        "repeated_repeats": int(args.repeated_repeats),
+        "required_repeated_repeats": 3,
+        "sweep_start": int(args.sweep_start),
+        "sweep_end": int(args.sweep_end),
+        "required_sweep_start": REQUIRED_SWEEP_START,
+        "required_sweep_end": REQUIRED_SWEEP_END,
+        "long_lengths": str(args.long_lengths),
+        "required_long_lengths": REQUIRED_LONG_LENGTHS,
+        "skip_long_boundary": bool(args.skip_long_boundary),
+        "skip_chat": bool(args.skip_chat),
+        "chat_lengths": str(args.chat_lengths),
+        "required_chat_lengths": REQUIRED_CHAT_LENGTHS,
+        "chat_turns": int(args.chat_turns),
+        "required_chat_turns": 8,
+        "chat_repeats": int(args.chat_repeats),
+        "required_chat_repeats": 1,
+        "speed_lengths": str(args.speed_lengths),
+        "required_speed_lengths": REQUIRED_SPEED_LENGTHS,
+        "speed_repeats": int(args.speed_repeats),
+        "required_speed_repeats": REQUIRED_SPEED_REPEATS,
+        "speed_max_tokens": int(args.speed_max_tokens),
+        "required_speed_max_tokens": REQUIRED_SPEED_MAX_TOKENS,
+        "min_prefill_tok_s": float(args.min_prefill_tok_s),
+        "required_min_prefill_tok_s": REQUIRED_MIN_PREFILL_TOK_S,
+    }
+
+
 def _common_model_args(args: argparse.Namespace) -> list[str]:
     return [
         "--base-url",
@@ -363,6 +402,7 @@ def run_matrix(
     steps: Sequence[ValidationStep],
     *,
     output_dir: Path,
+    validation_contract: dict[str, object] | None = None,
     runner: Callable[[ValidationStep, Path], dict[str, object]] = _run_step,
 ) -> dict[str, object]:
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -423,6 +463,7 @@ def run_matrix(
             "total_log_scan_steps": total_log_scan_steps,
             "passed_gate_steps": passed_gate_steps,
         },
+        "validation_contract": validation_contract,
         "output_dir": str(output_dir),
         "results": results,
     }
@@ -581,7 +622,11 @@ def main() -> int:
 
     steps = build_steps(args)
     output_dir = Path(args.output_dir)
-    summary = run_matrix(steps, output_dir=output_dir)
+    summary = run_matrix(
+        steps,
+        output_dir=output_dir,
+        validation_contract=_validation_contract_from_args(args),
+    )
     if args.compile_env_log is not None:
         decision_output = args.speed_slice_decision_json or (
             output_dir / "speed_slice_decision.json"
