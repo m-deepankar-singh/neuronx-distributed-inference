@@ -77,8 +77,13 @@ def test_render_prompt_contains_compile_validation_and_runtime_gates():
     assert "qwen36_compile_status.py" in prompt
     assert "return a quiet/DONT_NOTIFY heartbeat status" in prompt
     assert "rsync EC2-to-EC2" in prompt
+    assert "copy the compile env log to a runtime-local path" in prompt
+    assert "LAUNCH_DRY_RUN=1" in prompt
+    assert "qwen36_launch_env_audit.py" in prompt
+    assert "--require-launch-dry-run" in prompt
+    assert "A launch audit failure is a validation failure" in prompt
     assert "qwen36_runtime_validation_matrix.py" in prompt
-    assert "--compile-env-log /logs/env.txt" in prompt
+    assert "--compile-env-log <runtime-compile-env-log>" in prompt
     assert "speed_slice_decision.json" in prompt
     assert "qwen36_validation_tool_manifest.py" in prompt
     assert "not the old ad hoc `/tmp/tmp_bisect_probe3.py`" in prompt
