@@ -199,6 +199,34 @@ def test_build_steps_requires_full_coherence_contract_when_speed_enabled():
     assert "raw_prefill_speed" not in [step.name for step in steps]
 
 
+def test_build_steps_requires_16k_cold_prefill_speed_contract():
+    cases = [
+        (dict(speed_lengths="8192"), "--speed-lengths"),
+        (dict(speed_lengths="8192,16384"), "--speed-lengths"),
+        (dict(speed_repeats=2), "--speed-repeats"),
+        (dict(speed_max_tokens=2), "--speed-max-tokens"),
+        (dict(min_prefill_tok_s=2999.0), "--min-prefill-tok-s"),
+    ]
+    for overrides, expected in cases:
+        try:
+            _SCRIPT.build_steps(_args(**overrides))
+        except ValueError as exc:
+            assert expected in str(exc)
+        else:
+            raise AssertionError(f"{overrides} should fail before speed")
+
+    steps = _SCRIPT.build_steps(
+        _args(
+            speed_lengths="8192,16384",
+            speed_repeats=1,
+            speed_max_tokens=2,
+            min_prefill_tok_s=0.0,
+            skip_speed=True,
+        )
+    )
+    assert "raw_prefill_speed" not in [step.name for step in steps]
+
+
 def test_build_steps_requires_long_boundary_unless_explicitly_skipped():
     try:
         _SCRIPT.build_steps(_args(long_lengths=""))

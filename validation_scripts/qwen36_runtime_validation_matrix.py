@@ -24,6 +24,10 @@ REQUIRED_CHAT_LENGTHS = "160,1225,2500"
 REQUIRED_LONG_LENGTHS = "8192,16384"
 REQUIRED_SWEEP_START = 4088
 REQUIRED_SWEEP_END = 4104
+REQUIRED_SPEED_LENGTHS = "16384"
+REQUIRED_SPEED_REPEATS = 3
+REQUIRED_SPEED_MAX_TOKENS = 1
+REQUIRED_MIN_PREFILL_TOK_S = 3000.0
 
 
 @dataclass(frozen=True)
@@ -66,6 +70,18 @@ def _require_csv_contains(
         raise ValueError(f"{option_name} is missing required values: {missing_csv}")
 
 
+def _require_csv_exact(
+    *,
+    actual: str,
+    required: str,
+    option_name: str,
+) -> None:
+    actual_values = _csv_ints(actual)
+    required_values = _csv_ints(required)
+    if actual_values != required_values:
+        raise ValueError(f"{option_name} must be exactly {required}")
+
+
 def _require_speed_eligible_coherence_contract(args: argparse.Namespace) -> None:
     if args.skip_speed:
         return
@@ -96,6 +112,23 @@ def _require_speed_eligible_coherence_contract(args: argparse.Namespace) -> None
             raise ValueError("--chat-turns must be at least 8 when speed is enabled")
         if int(args.chat_repeats) < 1:
             raise ValueError("--chat-repeats must be at least 1 when speed is enabled")
+    _require_csv_exact(
+        actual=args.speed_lengths,
+        required=REQUIRED_SPEED_LENGTHS,
+        option_name="--speed-lengths",
+    )
+    if int(args.speed_repeats) < REQUIRED_SPEED_REPEATS:
+        raise ValueError(
+            f"--speed-repeats must be at least {REQUIRED_SPEED_REPEATS}"
+        )
+    if int(args.speed_max_tokens) != REQUIRED_SPEED_MAX_TOKENS:
+        raise ValueError(
+            f"--speed-max-tokens must be {REQUIRED_SPEED_MAX_TOKENS}"
+        )
+    if float(args.min_prefill_tok_s) < REQUIRED_MIN_PREFILL_TOK_S:
+        raise ValueError(
+            f"--min-prefill-tok-s must be at least {REQUIRED_MIN_PREFILL_TOK_S}"
+        )
 
 
 def _common_model_args(args: argparse.Namespace) -> list[str]:
