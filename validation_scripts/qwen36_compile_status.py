@@ -249,6 +249,11 @@ def main() -> int:
     parser.add_argument("--expected-recurrent-dtype")
     parser.add_argument("--expected-conv-dtype")
     parser.add_argument("--failure-marker", action="append", dest="failure_markers")
+    parser.add_argument(
+        "--zero-when-running",
+        action="store_true",
+        help="Exit 0 for state=running so heartbeat monitors can stay quiet.",
+    )
     args = parser.parse_args()
 
     env = parse_key_values(args.env_log) if args.env_log is not None else {}
@@ -272,6 +277,8 @@ def main() -> int:
         failure_markers=args.failure_markers or DEFAULT_FAILURE_MARKERS,
     )
     print(json.dumps(result, indent=2, sort_keys=True))
+    if args.zero_when_running and result["state"] == "running":
+        return 0
     return 0 if result["ready"] else 1
 
 

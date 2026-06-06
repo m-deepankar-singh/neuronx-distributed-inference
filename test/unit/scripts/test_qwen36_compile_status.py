@@ -148,6 +148,56 @@ def test_check_status_running_when_pid_is_live_and_not_ready(tmp_path):
     assert result["pid_running"] is True
 
 
+def test_cli_zero_when_running_keeps_monitor_poll_green(tmp_path):
+    artifact = _artifact(tmp_path)
+    log = tmp_path / "compile.log"
+    log.write_text("still compiling\n")
+    env = tmp_path / "compile_env.txt"
+    pid_file = tmp_path / "compile.pid"
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(5)"])
+    pid_file.write_text(str(proc.pid))
+    env.write_text(
+        f"LOG={log}\n"
+        f"ARTIFACT={artifact}\n"
+        f"PIDFILE={pid_file}\n"
+    )
+    try:
+        strict = subprocess.run(
+            [
+                sys.executable,
+                str(_SCRIPT_PATH),
+                "--env-log",
+                str(env),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        polling = subprocess.run(
+            [
+                sys.executable,
+                str(_SCRIPT_PATH),
+                "--env-log",
+                str(env),
+                "--zero-when-running",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=2)
+
+    assert strict.returncode == 1
+    assert polling.returncode == 0
+    assert json.loads(polling.stdout)["state"] == "running"
+
+
 def test_cli_reads_paths_from_env_log(tmp_path):
     artifact = _artifact(tmp_path)
     log = tmp_path / "compile.log"
