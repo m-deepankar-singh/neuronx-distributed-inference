@@ -531,6 +531,12 @@ def attach_speed_slice_decision(
         "next_required_flags": decision.get("next_required_flags"),
         "reason": decision.get("reason"),
         "failed_runtime_gate_count": decision.get("failed_runtime_gate_count"),
+        "speed_json": decision.get("speed_json"),
+        "speed_gate": decision.get("speed_gate"),
+        "prefill_tok_s_mean": decision.get("prefill_tok_s_mean"),
+        "speed_output_contract_errors": decision.get(
+            "speed_output_contract_errors",
+        ),
         "next_preflight": decision.get("next_preflight"),
         "profile_preflight": decision.get("profile_preflight"),
     }

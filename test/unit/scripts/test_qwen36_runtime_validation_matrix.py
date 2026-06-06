@@ -546,6 +546,51 @@ def test_attach_speed_slice_decision_surfaces_profile_preflight(tmp_path):
     assert rewritten["speed_slice_decision"]["next_preflight"] is None
 
 
+def test_attach_speed_slice_decision_surfaces_speed_contract_errors(tmp_path):
+    env_log = tmp_path / "compile_env.txt"
+    speed_json = tmp_path / "raw_prefill_speed.json"
+    decision_json = tmp_path / "speed_slice_decision.json"
+    env_log.write_text(
+        "SPEED_SLICE=sampletokonly\n"
+        "ARTIFACT=/artifact\n"
+        "BASE=qwen36_sampletokonly\n"
+    )
+    speed_output = _speed_output(mean=640.0)
+    speed_output["results"] = []
+    speed_json.write_text(json.dumps(speed_output) + "\n")
+    summary = {
+        "passed": False,
+        "coherence_and_log_scan_passed": True,
+        "validation_contract": _contract(),
+        "output_dir": str(tmp_path),
+        "results": [
+            {
+                "name": "raw_prefill_speed",
+                "phase": "speed",
+                "output_path": str(speed_json),
+                "passed": False,
+                "skipped": False,
+            }
+        ],
+    }
+
+    decision = _SCRIPT.attach_speed_slice_decision(
+        summary,
+        env_log=env_log,
+        output_path=decision_json,
+    )
+
+    assert decision["decision"] == "rerun_speed_validation"
+    assert decision["reason"] == "speed_output_contract_mismatch"
+    assert "results_count" in decision["speed_output_contract_errors"]
+    rewritten = json.loads((tmp_path / "runtime_validation_summary.json").read_text())
+    compact = rewritten["speed_slice_decision"]
+    assert compact["speed_json"] == str(speed_json)
+    assert compact["speed_gate"]["enabled"] is True
+    assert compact["prefill_tok_s_mean"] == 640.0
+    assert "results_count" in compact["speed_output_contract_errors"]
+
+
 def test_attach_speed_slice_decision_handles_skipped_speed_after_failure(tmp_path):
     env_log = tmp_path / "compile_env.txt"
     decision_json = tmp_path / "speed_slice_decision.json"
