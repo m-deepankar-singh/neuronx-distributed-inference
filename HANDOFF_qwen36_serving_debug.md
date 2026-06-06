@@ -824,3 +824,9 @@ bash tmp_compile_qwen32k_segcte2048_gdnseg512.sh
    - Reason: the earlier serve-log smoking gun showed token-id fallback to token 0 (`"!"`), and prior validation could accept valid non-empty HTTP responses even when the generated text was degenerate.
    - Added unit coverage for exact prompt-token usage parsing and degenerate text rejection in boundary and chat gates.
    - Verification passed locally: py_compile for boundary/chat validators and gate tests; focused validation-gates/runtime-matrix pytest (`19 passed`); full `python3 -m pytest test/unit/scripts` (`108 passed`); compile-driver unit test (`7 passed`); artifact config audit unit test (`5 passed`); validation-tool manifest build/verify with `file_count=32`, `mismatch_count=0`.
+
+74. Runtime validation checkout must fast-forward before launch.
+   - Updated `validation_scripts/qwen36_compile_monitor_prompt.py` so monitors safely sync the runtime validation/launch checkout before live vLLM launch: require clean `git status --short`, then `git fetch origin <branch>` and `git merge --ff-only origin/<branch>`.
+   - If the runtime checkout is dirty or cannot fast-forward, monitors must report `validation_source_sync_blocked` and not launch vLLM or run validation. This ensures the hardened validators from items 70-73 are actually used for post-compile runtime validation.
+   - The prompt explicitly states this sync updates validators and launch wrappers only; compiled artifact identity remains governed by the copied compile env log.
+   - Verification passed locally: `python3 -m pytest test/unit/scripts` (`108 passed`); compile-driver unit test (`7 passed`); artifact config audit unit test (`5 passed`); validation-tool manifest build/verify with `file_count=32`, `mismatch_count=0`.

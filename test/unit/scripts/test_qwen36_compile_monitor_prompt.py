@@ -86,6 +86,9 @@ def test_render_prompt_contains_compile_validation_and_runtime_gates():
     assert "return a quiet/DONT_NOTIFY heartbeat status" in prompt
     assert "rsync EC2-to-EC2" in prompt
     assert "copy the compile env log to a runtime-local path" in prompt
+    assert "runtime validation/launch checkout" in prompt
+    assert "validation_source_sync_blocked" in prompt
+    assert "compiled artifact identity remains governed by the copied compile env log" in prompt
     assert "qwen36_launch_preflight.py" in prompt
     assert "LAUNCH_DRY_RUN=1" in prompt
     assert "qwen36_launch_env_audit.py" in prompt
