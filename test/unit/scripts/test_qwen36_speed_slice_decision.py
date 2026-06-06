@@ -61,6 +61,77 @@ def test_incoherent_result_stops_speed_work():
     assert decision["next_speed_slice"] is None
 
 
+def test_missing_log_scan_reruns_runtime_validation_not_incoherent():
+    decision = _SCRIPT.decide(
+        env_values={"SPEED_SLICE": "sampletokonly"},
+        runtime_summary={
+            "passed": False,
+            "coherence_and_log_scan_passed": False,
+            "gate_counts": {
+                "total_gate_steps": 1,
+                "total_log_scan_steps": 0,
+                "passed_gate_steps": 1,
+            },
+            "results": [
+                {
+                    "name": "boundary_primary",
+                    "phase": "coherence",
+                    "passed": True,
+                    "skipped": False,
+                },
+                {
+                    "name": "raw_prefill_speed",
+                    "phase": "speed",
+                    "passed": False,
+                    "skipped": True,
+                    "skip_reason": "runtime_log_scan_not_run",
+                },
+            ],
+        },
+        speed_output=None,
+        speed_json_path=Path("/tmp/raw_speed.json"),
+    )
+
+    assert decision["decision"] == "rerun_runtime_validation"
+    assert decision["reason"] == "runtime_log_scan_not_run"
+    assert decision["failed_runtime_gate_count"] == 0
+
+
+def test_failed_runtime_gate_still_stops_speed_work():
+    decision = _SCRIPT.decide(
+        env_values={"SPEED_SLICE": "sampletokonly"},
+        runtime_summary={
+            "passed": False,
+            "coherence_and_log_scan_passed": False,
+            "gate_counts": {
+                "total_gate_steps": 2,
+                "total_log_scan_steps": 1,
+                "passed_gate_steps": 1,
+            },
+            "results": [
+                {
+                    "name": "boundary_primary",
+                    "phase": "coherence",
+                    "passed": False,
+                    "skipped": False,
+                },
+                {
+                    "name": "runtime_log_scan",
+                    "phase": "log_scan",
+                    "passed": True,
+                    "skipped": False,
+                },
+            ],
+        },
+        speed_output=None,
+        speed_json_path=Path("/tmp/raw_speed.json"),
+    )
+
+    assert decision["decision"] == "stop_incoherent"
+    assert decision["reason"] == "coherence_or_runtime_log_scan_failed"
+    assert decision["failed_runtime_gate_count"] == 1
+
+
 def test_missing_speed_json_requests_speed_rerun_not_compile():
     decision = _SCRIPT.decide(
         env_values={"SPEED_SLICE": "sampletokonly"},

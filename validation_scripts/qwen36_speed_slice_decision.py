@@ -116,6 +116,42 @@ def _speed_gate(speed: dict[str, Any] | None) -> dict[str, Any] | None:
     return gate if isinstance(gate, dict) else None
 
 
+def _summary_results(summary: dict[str, Any]) -> list[dict[str, Any]]:
+    rows = summary.get("results")
+    return [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
+
+
+def _failed_runtime_gate_rows(summary: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        row
+        for row in _summary_results(summary)
+        if row.get("phase") in {"coherence", "log_scan"}
+        and not bool(row.get("skipped"))
+        and not bool(row.get("passed"))
+    ]
+
+
+def _runtime_validation_gap_reason(summary: dict[str, Any]) -> str | None:
+    if _failed_runtime_gate_rows(summary):
+        return None
+    gate_counts = summary.get("gate_counts")
+    if isinstance(gate_counts, dict):
+        total_gate_steps = int(gate_counts.get("total_gate_steps") or 0)
+        total_log_scan_steps = int(gate_counts.get("total_log_scan_steps") or 0)
+        passed_gate_steps = int(gate_counts.get("passed_gate_steps") or 0)
+        if total_log_scan_steps == 0:
+            return "runtime_log_scan_not_run"
+        if passed_gate_steps < total_gate_steps:
+            return "coherence_or_log_scan_not_completed"
+    for row in _summary_results(summary):
+        if row.get("phase") != "speed" or not bool(row.get("skipped")):
+            continue
+        reason = str(row.get("skip_reason") or "")
+        if reason in {"runtime_log_scan_not_run", "coherence_or_log_scan_not_completed"}:
+            return reason
+    return None
+
+
 def _required_flags(next_slice: str | None) -> dict[str, str]:
     if next_slice is None:
         return {}
@@ -309,6 +345,7 @@ def decide(
         "current_speed_slice": current_slice,
         "runtime_summary_passed": runtime_passed,
         "coherence_and_log_scan_passed": coherence_ok,
+        "failed_runtime_gate_count": len(_failed_runtime_gate_rows(runtime_summary)),
         "speed_json": str(speed_json_path) if speed_json_path else None,
         "speed_gate": speed_gate,
         "prefill_tok_s_mean": mean_speed,
@@ -321,6 +358,15 @@ def decide(
     }
 
     if not coherence_ok:
+        validation_gap = _runtime_validation_gap_reason(runtime_summary)
+        if validation_gap is not None:
+            result.update(
+                {
+                    "decision": "rerun_runtime_validation",
+                    "reason": validation_gap,
+                }
+            )
+            return result
         result.update(
             {
                 "decision": "stop_incoherent",
