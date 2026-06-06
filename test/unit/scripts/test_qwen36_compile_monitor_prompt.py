@@ -104,6 +104,17 @@ def test_render_prompt_contains_compile_validation_and_runtime_gates():
     assert "`fallback argmax`" in prompt
     assert "usage.prompt_tokens / TTFT" in prompt
     assert "--min-prefill-tok-s 3000" in prompt
+    assert "raw speed JSON must contain exactly the 16k usage-accounted row evidence" in prompt
+    assert "speed_output_contract_errors" in prompt
+    assert "`stop_incoherent`" in prompt
+    assert "`rerun_runtime_validation`" in prompt
+    assert "`rerun_speed_validation`" in prompt
+    assert "`candidate_meets_target`" in prompt
+    assert "`launch_next_speed_slice`" in prompt
+    assert "`profile_slow_coherent`" in prompt
+    assert "Do not create another compile from this decision" in prompt
+    assert "rerun only the exact 16k usage-accounted speed validation" in prompt
+    assert "delete this automation because compile plus validation is complete" in prompt
     assert "do not launch that compile directly from this monitor" in prompt
     assert "git status --short" in prompt
     assert "git fetch origin codex/qwen36-prefill-speed-coherent" in prompt
@@ -121,6 +132,8 @@ def test_render_prompt_contains_compile_validation_and_runtime_gates():
     assert "codex_app.automation_update" in prompt
     assert "compile_command_after_automation" in prompt
     assert "Only after that automation creation succeeds" in prompt
+    assert "profile_summary_compare.py" in prompt
+    assert "enforces the same 16k usage-accounted speed JSON contract" in prompt
     assert "Do not launch a duplicate compile" in prompt
 
 
