@@ -206,10 +206,10 @@ def check_status(
     )
     if ready:
         state = "ready"
-    elif pid_running:
-        state = "running"
     elif failures:
         state = "failed"
+    elif pid_running:
+        state = "running"
     else:
         state = "incomplete"
 

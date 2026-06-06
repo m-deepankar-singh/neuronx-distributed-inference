@@ -198,6 +198,47 @@ def test_cli_zero_when_running_keeps_monitor_poll_green(tmp_path):
     assert json.loads(polling.stdout)["state"] == "running"
 
 
+def test_cli_zero_when_running_still_fails_on_failure_marker(tmp_path):
+    artifact = _artifact(tmp_path)
+    log = tmp_path / "compile.log"
+    log.write_text("still compiling\nTraceback\nRuntimeError: boom\n")
+    env = tmp_path / "compile_env.txt"
+    pid_file = tmp_path / "compile.pid"
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(5)"])
+    pid_file.write_text(str(proc.pid))
+    env.write_text(
+        f"LOG={log}\n"
+        f"ARTIFACT={artifact}\n"
+        f"PIDFILE={pid_file}\n"
+    )
+    try:
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(_SCRIPT_PATH),
+                "--env-log",
+                str(env),
+                "--zero-when-running",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=2)
+
+    assert completed.returncode == 1
+    payload = json.loads(completed.stdout)
+    assert payload["state"] == "failed"
+    assert payload["pid_running"] is True
+    assert payload["failure_lines"][0]["marker"] == "Traceback"
+
+
 def test_cli_reads_paths_from_env_log(tmp_path):
     artifact = _artifact(tmp_path)
     log = tmp_path / "compile.log"
