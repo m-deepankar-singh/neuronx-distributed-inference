@@ -67,11 +67,20 @@ def test_prefill_token_count_missing_usage_fails_without_fallback():
 
 
 def test_row_gate_requires_status_ttft_and_prefill_tokens():
-    good = {"status": 200, "ttft_seconds": 1.0, "prefill_tokens": 16, "text": "x"}
+    good = {
+        "status": 200,
+        "ttft_seconds": 1.0,
+        "prefill_tokens": 16,
+        "prefill_tokens_match_actual": True,
+        "text": "x",
+    }
     assert _SCRIPT._row_passed(good, require_text=True)
 
     missing_usage = dict(good, prefill_tokens=None)
     assert not _SCRIPT._row_passed(missing_usage, require_text=False)
+
+    mismatched_usage = dict(good, prefill_tokens_match_actual=False)
+    assert not _SCRIPT._row_passed(mismatched_usage, require_text=False)
 
     empty_text = dict(good, text="")
     assert not _SCRIPT._row_passed(empty_text, require_text=True)
@@ -84,6 +93,29 @@ def test_speed_gate_disabled_by_zero_threshold():
     assert not gate["enabled"]
     assert gate["passed"]
     assert gate["mean_prefill_tok_s"] == 600.0
+
+
+def test_valid_prefill_speeds_excludes_usage_mismatches():
+    rows = [
+        {
+            "status": 200,
+            "ttft_seconds": 1.0,
+            "prefill_tokens": 16384,
+            "prefill_tokens_match_actual": True,
+            "prefill_tok_s": 16384.0,
+            "text": "",
+        },
+        {
+            "status": 200,
+            "ttft_seconds": 1.0,
+            "prefill_tokens": 4096,
+            "prefill_tokens_match_actual": False,
+            "prefill_tok_s": 4096.0,
+            "text": "",
+        },
+    ]
+
+    assert _SCRIPT._valid_prefill_speeds(rows, require_text=False) == [16384.0]
 
 
 def test_speed_gate_fails_when_mean_below_threshold():

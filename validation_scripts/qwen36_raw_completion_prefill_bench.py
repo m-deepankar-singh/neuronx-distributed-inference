@@ -177,6 +177,8 @@ def _row_passed(row: dict[str, Any], *, require_text: bool) -> bool:
         return False
     if row.get("prefill_tokens") is None:
         return False
+    if row.get("prefill_tokens_match_actual") is not True:
+        return False
     if require_text and not row.get("text"):
         return False
     return True
@@ -184,6 +186,19 @@ def _row_passed(row: dict[str, Any], *, require_text: bool) -> bool:
 
 def _mean(values: list[float]) -> float | None:
     return statistics.fmean(values) if values else None
+
+
+def _valid_prefill_speeds(
+    rows: list[dict[str, Any]],
+    *,
+    require_text: bool,
+) -> list[float]:
+    return [
+        float(row["prefill_tok_s"])
+        for row in rows
+        if row.get("prefill_tok_s") is not None
+        and _row_passed(row, require_text=require_text)
+    ]
 
 
 def _speed_gate(
@@ -281,6 +296,11 @@ def main() -> int:
                 **result,
                 "prefill_tokens": prefill_tokens,
                 "prefill_token_source": token_source,
+                "prefill_tokens_match_actual": (
+                    prefill_tokens == len(prompt_ids)
+                    if prefill_tokens is not None
+                    else False
+                ),
                 "prefill_tok_s": (
                     prefill_tokens / ttft
                     if prefill_tokens is not None and ttft and ttft > 0
@@ -290,16 +310,14 @@ def main() -> int:
             rows.append(row)
             print(json.dumps(row, sort_keys=True), flush=True)
 
-    speeds = [
-        float(row["prefill_tok_s"])
-        for row in rows
-        if row.get("prefill_tok_s") is not None
-    ]
+    row_gate_passed = all(
+        _row_passed(row, require_text=args.require_text) for row in rows
+    )
+    speeds = _valid_prefill_speeds(rows, require_text=args.require_text)
     speed_gate = _speed_gate(
         speeds=speeds,
         min_prefill_tok_s=args.min_prefill_tok_s,
     )
-    row_gate_passed = all(_row_passed(row, require_text=args.require_text) for row in rows)
     output = {
         "base_url": base_url,
         "model": model,
@@ -310,6 +328,9 @@ def main() -> int:
         "require_text": args.require_text,
         "min_prefill_tok_s": args.min_prefill_tok_s,
         "row_gate_passed": row_gate_passed,
+        "prefill_tokens_all_match_actual": all(
+            bool(row.get("prefill_tokens_match_actual")) for row in rows
+        ),
         "speed_gate": speed_gate,
         "passed": row_gate_passed and bool(speed_gate["passed"]),
         "prefill_tok_s_mean": _mean(speeds),
