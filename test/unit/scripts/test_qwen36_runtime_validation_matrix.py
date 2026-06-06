@@ -1,5 +1,6 @@
 import argparse
 import importlib.util
+import json
 import sys
 from pathlib import Path
 
@@ -143,3 +144,84 @@ def test_run_matrix_passes_when_all_steps_pass(tmp_path):
 
     assert summary["passed"]
     assert summary["coherence_and_log_scan_passed"]
+
+
+def test_attach_speed_slice_decision_writes_next_action(tmp_path):
+    env_log = tmp_path / "compile_env.txt"
+    speed_json = tmp_path / "raw_prefill_speed.json"
+    decision_json = tmp_path / "speed_slice_decision.json"
+    env_log.write_text(
+        "SPEED_SLICE=sampletokonly\n"
+        "ARTIFACT=/artifact\n"
+        "BASE=qwen36_sampletokonly\n"
+    )
+    speed_json.write_text(
+        json.dumps(
+            {
+                "row_gate_passed": True,
+                "prefill_tok_s_mean": 640.0,
+                "speed_gate": {
+                    "passed": False,
+                    "failure_reason": "mean_prefill_tok_s_below_threshold",
+                },
+            }
+        )
+        + "\n"
+    )
+    summary = {
+        "passed": False,
+        "coherence_and_log_scan_passed": True,
+        "output_dir": str(tmp_path),
+        "results": [
+            {
+                "name": "raw_prefill_speed",
+                "phase": "speed",
+                "output_path": str(speed_json),
+                "passed": False,
+                "skipped": False,
+            }
+        ],
+    }
+
+    decision = _SCRIPT.attach_speed_slice_decision(
+        summary,
+        env_log=env_log,
+        output_path=decision_json,
+        next_ts="20260606T010203Z_hostlogits",
+    )
+
+    assert decision["decision"] == "launch_next_speed_slice"
+    assert decision["next_speed_slice"] == "hostlogits"
+    assert decision_json.exists()
+    rewritten = json.loads((tmp_path / "runtime_validation_summary.json").read_text())
+    assert rewritten["speed_slice_decision_path"] == str(decision_json)
+    assert rewritten["speed_slice_decision"]["decision"] == "launch_next_speed_slice"
+
+
+def test_attach_speed_slice_decision_handles_skipped_speed_after_failure(tmp_path):
+    env_log = tmp_path / "compile_env.txt"
+    decision_json = tmp_path / "speed_slice_decision.json"
+    env_log.write_text("SPEED_SLICE=sampletokonly\n")
+    summary = {
+        "passed": False,
+        "coherence_and_log_scan_passed": False,
+        "output_dir": str(tmp_path),
+        "results": [
+            {
+                "name": "raw_prefill_speed",
+                "phase": "speed",
+                "output_path": str(tmp_path / "raw_prefill_speed.json"),
+                "passed": False,
+                "skipped": True,
+            }
+        ],
+    }
+
+    decision = _SCRIPT.attach_speed_slice_decision(
+        summary,
+        env_log=env_log,
+        output_path=decision_json,
+    )
+
+    assert decision["decision"] == "stop_incoherent"
+    assert decision_json.exists()

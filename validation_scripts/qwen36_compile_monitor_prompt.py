@@ -179,7 +179,7 @@ If the compile is still running and the status helper or log scan shows no new f
 
 If successful: verify artifact files and neuron_config, rsync EC2-to-EC2 from {compile_host} to {runtime_host}, launch on {runtime_host} with `{launch_script}` using the artifact and dtype settings from the env log, wait for `/health`, then run the coherence matrix before any speed claim.
 
-Preferred validation driver after launch: `validation_scripts/qwen36_runtime_validation_matrix.py --base-url http://127.0.0.1:<port> --model-path {model_path} --serve-log <serve.log> --output-dir <validation-output-dir> --min-prefill-tok-s 3000`. It runs the coherence/log-scan/speed gates in order and skips speed automatically if coherence or log scan fails.
+Preferred validation driver after launch: `validation_scripts/qwen36_runtime_validation_matrix.py --base-url http://127.0.0.1:<port> --model-path {model_path} --serve-log <serve.log> --output-dir <validation-output-dir> --min-prefill-tok-s 3000 --compile-env-log {envlog}`. It runs the coherence/log-scan/speed gates in order, skips speed automatically if coherence or log scan fails, and writes `<validation-output-dir>/speed_slice_decision.json`.
 
 Before runtime validation, if `validation_scripts/qwen36_validation_tool_manifest.py` is present, use it to build or verify a validation-tool manifest for the source checkout so the verdict is tied to the expected coherence/speed gates.
 
@@ -187,7 +187,7 @@ Coherence matrix: use the maintained `validation_scripts/qwen36_runtime_validati
 
 Speed validation only after coherence passes: run `validation_scripts/qwen36_raw_completion_prefill_bench.py --lengths 16384 --repeats 3 --max-tokens 1 --min-prefill-tok-s 3000`; it requests `stream_options.include_usage=true`, computes tok/s from `usage.prompt_tokens / TTFT`, and fails the speed gate when mean 16k cold-prefill throughput is below 3000 tok/s. Report coherence verdict, log-scan result, cold-prefill tok/s, and all JSON/log paths.
 
-After the runtime matrix writes `runtime_validation_summary.json`, run `validation_scripts/qwen36_speed_slice_decision.py --env-log {envlog} --runtime-summary <validation-output-dir>/runtime_validation_summary.json` and report its `decision`. If it says `launch_next_speed_slice`, do not launch that compile directly from this monitor; create a fresh compile automation first using a new dry-run env log and this prompt generator.
+After the runtime matrix writes `runtime_validation_summary.json`, read `<validation-output-dir>/speed_slice_decision.json` and report its `decision`. If it says `launch_next_speed_slice`, do not launch that compile directly from this monitor; create a fresh compile automation first using a new dry-run env log and this prompt generator.
 
 If failed: report the exact command/log path/error text, failing stage, disk usage, and best current root-cause hypothesis. Do not launch a duplicate compile if the PID in `{pidfile}` is still running."""
 
