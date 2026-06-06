@@ -250,8 +250,8 @@ ENVLOG="${LOGDIR}/${BASE}_env.txt"
 
 mkdir -p "${LOGDIR}"
 cd "${REPO}"
-SOURCE_COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
-SOURCE_BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
+SOURCE_COMMIT="$(git -C "${REPO}" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+SOURCE_BRANCH="$(git -C "${REPO}" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
 
 export NEURON_PLATFORM_TARGET_OVERRIDE="${NEURON_PLATFORM_TARGET_OVERRIDE:-trn2}"
 export NEURON_CC_FLAGS="${NEURON_CC_FLAGS:---target trn2 --lnc 2}"

@@ -23,6 +23,34 @@ def _parse_key_values(text):
 
 
 class TestQwen36CompileDriver(unittest.TestCase):
+    def _init_git_repo(self, path, filename, content):
+        subprocess.run(["git", "init"], cwd=path, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "config", "user.email", "qwen-test@example.com"],
+            cwd=path,
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "Qwen Test"],
+            cwd=path,
+            check=True,
+            capture_output=True,
+        )
+        (path / filename).write_text(content)
+        subprocess.run(["git", "add", filename], cwd=path, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", "init"],
+            cwd=path,
+            check=True,
+            capture_output=True,
+        )
+        return subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=path,
+            text=True,
+        ).strip()
+
     def _speed_anchor_overrides(self):
         return {
             "ENABLE_QKV_NKI_KERNELS": "1",
@@ -95,6 +123,52 @@ class TestQwen36CompileDriver(unittest.TestCase):
         self.assertTrue(envlog["SOURCE_COMMIT"])
         self.assertTrue(envlog["SOURCE_BRANCH"])
         self.assertFalse(pidfile.exists())
+
+    def test_source_commit_comes_from_repo_env_not_caller_cwd(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source_repo = root / "source"
+            caller_repo = root / "caller"
+            model = root / "model"
+            art_root = root / "artifacts"
+            logdir = root / "logs"
+            source_repo.mkdir()
+            caller_repo.mkdir()
+            model.mkdir()
+            expected_source_commit = self._init_git_repo(source_repo, "source.txt", "source")
+            expected_source_branch = subprocess.check_output(
+                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                cwd=source_repo,
+                text=True,
+            ).strip()
+            caller_commit = self._init_git_repo(caller_repo, "caller.txt", "caller")
+            self.assertNotEqual(expected_source_commit, caller_commit)
+
+            env = os.environ.copy()
+            env.update(
+                {
+                    "REPO": str(source_repo),
+                    "MODEL": str(model),
+                    "ART_ROOT": str(art_root),
+                    "LOGDIR": str(logdir),
+                    "TS": "sourceidentity",
+                    "COMPILE_DRY_RUN": "1",
+                }
+            )
+            completed = subprocess.run(
+                ["bash", str(_DRIVER)],
+                cwd=caller_repo,
+                check=True,
+                capture_output=True,
+                env=env,
+                text=True,
+            )
+            stdout = _parse_key_values(completed.stdout)
+            envlog = _parse_key_values(Path(stdout["ENVLOG"]).read_text())
+
+            self.assertEqual(stdout["SOURCE_COMMIT"], expected_source_commit)
+            self.assertEqual(envlog["SOURCE_COMMIT"], expected_source_commit)
+            self.assertEqual(envlog["SOURCE_BRANCH"], expected_source_branch)
 
     def test_host_logits_mode_is_tagged_without_on_device_label(self):
         stdout, envlog, pidfile = self._run_dry_driver(
