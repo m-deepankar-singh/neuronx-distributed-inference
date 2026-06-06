@@ -7,8 +7,13 @@ import argparse
 import json
 import os
 import re
+import sys
 from pathlib import Path
 from typing import Any
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 
 DEFAULT_FAILURE_MARKERS = [
@@ -161,17 +166,75 @@ def _dtype_mismatches(
     return mismatches
 
 
+def _artifact_policy_result(
+    *,
+    required: bool,
+    basic_ready: bool,
+    artifact: Path,
+    log: Path,
+    env_log: Path | None,
+    output_path: Path | None,
+    recommended_block_size: int,
+    min_usable_headroom_blocks: int,
+    strict_hybrid_gate: bool,
+) -> dict[str, Any]:
+    if not required:
+        return {
+            "required": False,
+            "passed": None,
+            "skipped_reason": "not_requested",
+            "summary": None,
+            "output_path": str(output_path) if output_path is not None else None,
+        }
+    if not basic_ready:
+        return {
+            "required": True,
+            "passed": None,
+            "skipped_reason": "compile_not_ready",
+            "summary": None,
+            "output_path": str(output_path) if output_path is not None else None,
+        }
+
+    from validation_scripts.qwen36_artifact_config_audit import audit
+
+    summary = audit(
+        artifact=artifact,
+        compile_log=log,
+        env_log=env_log,
+        recommended_block_size=recommended_block_size,
+        min_usable_headroom_blocks=min_usable_headroom_blocks,
+        strict_hybrid_gate=strict_hybrid_gate,
+    )
+    encoded = json.dumps(summary, indent=2, sort_keys=True) + "\n"
+    if output_path is not None:
+        output_path.expanduser().parent.mkdir(parents=True, exist_ok=True)
+        output_path.expanduser().write_text(encoded)
+    return {
+        "required": True,
+        "passed": bool(summary.get("policy_passed")),
+        "skipped_reason": None,
+        "summary": summary,
+        "output_path": str(output_path) if output_path is not None else None,
+    }
+
+
 def check_status(
     *,
     log: Path,
     artifact: Path,
     pid_file: Path | None,
+    env_log: Path | None = None,
     required_ranks: list[str],
     expected_recurrent_dtype: str | None = None,
     expected_conv_dtype: str | None = None,
     source_commit: str | None = None,
     source_branch: str | None = None,
     failure_markers: list[str] = DEFAULT_FAILURE_MARKERS,
+    require_artifact_policy: bool = False,
+    artifact_policy_output: Path | None = None,
+    artifact_policy_recommended_block_size: int = 256,
+    artifact_policy_min_usable_headroom_blocks: int = 0,
+    artifact_policy_strict_hybrid_gate: bool = False,
 ) -> dict[str, Any]:
     try:
         log_text = log.read_text(errors="replace")
@@ -197,7 +260,7 @@ def check_status(
     ]
     pid_running = _pid_running(pid_file)
 
-    ready = (
+    basic_ready = (
         log_exists
         and finished_hlos
         and compile_done
@@ -206,9 +269,25 @@ def check_status(
         and not dtype_mismatches
         and not missing_files
     )
+    artifact_policy = _artifact_policy_result(
+        required=require_artifact_policy,
+        basic_ready=basic_ready,
+        artifact=artifact,
+        log=log,
+        env_log=env_log,
+        output_path=artifact_policy_output,
+        recommended_block_size=artifact_policy_recommended_block_size,
+        min_usable_headroom_blocks=artifact_policy_min_usable_headroom_blocks,
+        strict_hybrid_gate=artifact_policy_strict_hybrid_gate,
+    )
+    ready = basic_ready and (
+        not require_artifact_policy or bool(artifact_policy.get("passed"))
+    )
     if ready:
         state = "ready"
     elif failures:
+        state = "failed"
+    elif basic_ready and require_artifact_policy and not artifact_policy.get("passed"):
         state = "failed"
     elif pid_running:
         state = "running"
@@ -218,6 +297,7 @@ def check_status(
     return {
         "state": state,
         "ready": ready,
+        "basic_ready": basic_ready,
         "log": str(log),
         "artifact": str(artifact),
         "pid_file": str(pid_file) if pid_file is not None else None,
@@ -240,6 +320,7 @@ def check_status(
         "checkpoint_dtype_mismatches": dtype_mismatches,
         "artifact_files": artifact_files,
         "missing_artifact_files": missing_files,
+        "artifact_policy": artifact_policy,
         "failure_lines": failures,
         "tail": log_text.splitlines()[-40:],
     }
@@ -255,6 +336,22 @@ def main() -> int:
     parser.add_argument("--expected-recurrent-dtype")
     parser.add_argument("--expected-conv-dtype")
     parser.add_argument("--failure-marker", action="append", dest="failure_markers")
+    parser.add_argument(
+        "--require-artifact-policy",
+        action="store_true",
+        help="Require neuron_config.json policy to match the compile env log.",
+    )
+    parser.add_argument("--artifact-policy-output", type=Path, default=None)
+    parser.add_argument("--artifact-policy-recommended-block-size", type=int, default=256)
+    parser.add_argument(
+        "--artifact-policy-min-usable-headroom-blocks",
+        type=int,
+        default=0,
+    )
+    parser.add_argument(
+        "--artifact-policy-strict-hybrid-gate",
+        action="store_true",
+    )
     parser.add_argument(
         "--zero-when-running",
         action="store_true",
@@ -275,6 +372,7 @@ def main() -> int:
         log=log,
         artifact=artifact,
         pid_file=pid_file,
+        env_log=args.env_log,
         required_ranks=_parse_ranks(args.required_tp_ranks),
         expected_recurrent_dtype=(
             args.expected_recurrent_dtype or env.get("GDN_RECURRENT_CACHE_DTYPE")
@@ -283,6 +381,15 @@ def main() -> int:
         source_commit=env.get("SOURCE_COMMIT"),
         source_branch=env.get("SOURCE_BRANCH"),
         failure_markers=args.failure_markers or DEFAULT_FAILURE_MARKERS,
+        require_artifact_policy=args.require_artifact_policy,
+        artifact_policy_output=args.artifact_policy_output,
+        artifact_policy_recommended_block_size=(
+            args.artifact_policy_recommended_block_size
+        ),
+        artifact_policy_min_usable_headroom_blocks=(
+            args.artifact_policy_min_usable_headroom_blocks
+        ),
+        artifact_policy_strict_hybrid_gate=args.artifact_policy_strict_hybrid_gate,
     )
     print(json.dumps(result, indent=2, sort_keys=True))
     if args.zero_when_running and result["state"] == "running":

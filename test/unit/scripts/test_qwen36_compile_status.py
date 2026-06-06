@@ -20,6 +20,80 @@ def _artifact(tmp_path):
     return artifact
 
 
+def _policy_artifact(tmp_path, *, output_logits=False):
+    artifact = tmp_path / "artifact"
+    artifact.mkdir(exist_ok=True)
+    (artifact / "model.pt").write_bytes(b"model")
+    (artifact / "neuron_config.json").write_text(
+        json.dumps(
+            {
+                "seq_len": 32768,
+                "max_context_length": 32768,
+                "batch_size": 1,
+                "ctx_batch_size": 1,
+                "pa_block_size": 256,
+                "pa_num_blocks": 128,
+                "max_gdn_checkpoint_slots": 64,
+                "context_encoding_buckets": [2048],
+                "token_generation_buckets": [512, 16384, 16640, 32768],
+                "prefix_buckets": [
+                    256,
+                    512,
+                    1024,
+                    2048,
+                    4096,
+                    8192,
+                    16384,
+                    32768,
+                ],
+                "context_encoding_bucket_pairs": [[2048, 256], [2048, 32768]],
+                "gdn_recurrent_cache_dtype": "bfloat16",
+                "gdn_conv_cache_dtype": "bfloat16",
+                "qkv_nki_kernel_enabled": True,
+                "qkv_cte_nki_kernel_fuse_rope": False,
+                "qkv_cte_nki_kernel_fuse_qk_norm": True,
+                "out_proj_kernel_enabled": False,
+                "kv_cache_quant": False,
+                "prefix_cte_attention_backend": "attention_cte",
+                "prefix_cte_attention_segment_size": 512,
+                "output_logits": output_logits,
+                "on_device_sampling_config": {"do_sample": False, "top_k": 1},
+                "vocab_parallel": True,
+                "modules_to_not_convert": ["model.embed_tokens", "model.norm"],
+            }
+        )
+        + "\n"
+    )
+    return artifact
+
+
+def _policy_env_text(log, artifact, pid_file):
+    return (
+        f"LOG={log}\n"
+        f"ARTIFACT={artifact}\n"
+        f"PIDFILE={pid_file}\n"
+        "SEQ_LEN=32768\n"
+        "MAX_CONTEXT_LENGTH=32768\n"
+        "CTE_BUCKETS=2048\n"
+        "TOKEN_GENERATION_BUCKETS=512 16384 16640 32768\n"
+        "PREFIX_BUCKETS=256 512 1024 2048 4096 8192 16384 32768\n"
+        "CONTEXT_ENCODING_BUCKET_PAIRS=2048:256 2048:32768\n"
+        "MAX_GDN_CHECKPOINT_SLOTS=64\n"
+        "GDN_RECURRENT_CACHE_DTYPE=bfloat16\n"
+        "GDN_CONV_CACHE_DTYPE=bfloat16\n"
+        "ENABLE_QKV_NKI_KERNELS=1\n"
+        "ENABLE_QKV_CTE_NKI_KERNEL_FUSE_ROPE=0\n"
+        "ENABLE_QKV_CTE_NKI_KERNEL_FUSE_QK_NORM=1\n"
+        "ENABLE_OUT_PROJ_NKI_KERNEL=0\n"
+        "ENABLE_KV_CACHE_QUANT=0\n"
+        "PREFIX_CTE_ATTENTION_BACKEND=attention_cte\n"
+        "PREFIX_CTE_ATTENTION_SEGMENT_SIZE=512\n"
+        "DISABLE_ON_DEVICE_SAMPLING=0\n"
+        "OUTPUT_LOGITS_WITH_ON_DEVICE_SAMPLING=0\n"
+        "QUANTIZE_LM_HEAD=1\n"
+    )
+
+
 def _success_log() -> str:
     return "\n".join(
         [
@@ -47,6 +121,7 @@ def test_check_status_ready_when_all_compile_markers_and_files_exist(tmp_path):
     )
 
     assert result["ready"]
+    assert result["basic_ready"]
     assert result["state"] == "ready"
     assert result["markers"]["finished_hlos"]
     assert result["markers"]["compile_done"]
@@ -55,6 +130,7 @@ def test_check_status_ready_when_all_compile_markers_and_files_exist(tmp_path):
     assert result["missing_artifact_files"] == []
     assert result["checkpoint_dtype_mismatches"] == []
     assert result["expected_checkpoint_dtypes"]["recurrent_dtype"] == "bfloat16"
+    assert result["artifact_policy"]["required"] is False
 
 
 def test_check_status_reports_missing_checkpoint_rank(tmp_path):
@@ -278,6 +354,109 @@ def test_cli_reads_paths_from_env_log(tmp_path):
         "branch": "codex/qwen36-prefill-speed-coherent",
         "commit": "envcommit",
     }
+
+
+def test_cli_require_artifact_policy_passes_for_matching_config(tmp_path):
+    log = tmp_path / "compile.log"
+    log.write_text(_success_log())
+    artifact = _policy_artifact(tmp_path)
+    env = tmp_path / "compile_env.txt"
+    policy_output = tmp_path / "artifact_policy.json"
+    env.write_text(_policy_env_text(log, artifact, tmp_path / "compile.pid"))
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(_SCRIPT_PATH),
+            "--env-log",
+            str(env),
+            "--require-artifact-policy",
+            "--artifact-policy-output",
+            str(policy_output),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    payload = json.loads(completed.stdout)
+    assert payload["ready"]
+    assert payload["artifact_policy"]["required"]
+    assert payload["artifact_policy"]["passed"]
+    assert payload["artifact_policy"]["summary"]["policy_passed"]
+    assert json.loads(policy_output.read_text())["policy_passed"]
+
+
+def test_cli_require_artifact_policy_fails_ready_compile_on_policy_error(tmp_path):
+    log = tmp_path / "compile.log"
+    log.write_text(_success_log())
+    artifact = _policy_artifact(tmp_path, output_logits=True)
+    env = tmp_path / "compile_env.txt"
+    env.write_text(_policy_env_text(log, artifact, tmp_path / "compile.pid"))
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(_SCRIPT_PATH),
+            "--env-log",
+            str(env),
+            "--require-artifact-policy",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    payload = json.loads(completed.stdout)
+    assert completed.returncode == 1
+    assert payload["basic_ready"]
+    assert not payload["ready"]
+    assert payload["state"] == "failed"
+    assert payload["artifact_policy"]["required"]
+    assert not payload["artifact_policy"]["passed"]
+    error_codes = {
+        error["code"]
+        for error in payload["artifact_policy"]["summary"]["policy_errors"]
+    }
+    assert "output_logits_mismatch" in error_codes
+
+
+def test_cli_require_artifact_policy_skips_while_running(tmp_path):
+    artifact = _policy_artifact(tmp_path)
+    log = tmp_path / "compile.log"
+    log.write_text("still compiling\n")
+    env = tmp_path / "compile_env.txt"
+    pid_file = tmp_path / "compile.pid"
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(5)"])
+    pid_file.write_text(str(proc.pid))
+    env.write_text(_policy_env_text(log, artifact, pid_file))
+    try:
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(_SCRIPT_PATH),
+                "--env-log",
+                str(env),
+                "--require-artifact-policy",
+                "--zero-when-running",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=2)
+
+    payload = json.loads(completed.stdout)
+    assert completed.returncode == 0
+    assert payload["state"] == "running"
+    assert payload["artifact_policy"]["required"]
+    assert payload["artifact_policy"]["skipped_reason"] == "compile_not_ready"
 
 
 def test_cli_fails_when_env_log_expected_dtype_disagrees(tmp_path):
