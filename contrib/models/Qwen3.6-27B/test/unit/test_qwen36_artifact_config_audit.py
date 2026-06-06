@@ -201,6 +201,42 @@ class TestQwen36ArtifactConfigAudit(unittest.TestCase):
         self.assertTrue(summary["policy_passed"])
         self.assertEqual(summary["policy_errors"], [])
         self.assertEqual(summary["speed_slice"], "sampletokonly")
+        self.assertEqual(summary["speed_slice_source"], "speed_slice")
+
+    def test_policy_infers_sample_token_slice_from_legacy_env_log(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            artifact = root / "artifact"
+            artifact.mkdir()
+            env_log = root / "compile_env.txt"
+            env = self._sampletok_env()
+            env.pop("SPEED_SLICE")
+            env.pop("DISABLE_ON_DEVICE_SAMPLING")
+            env["BASE"] = (
+                "qwen36_32k_fp8_fp8all_lmheadfp8_gatesfp8_kvbf16_"
+                "qkvnki_qknorm_outprojstd_sampletokonly_attention_cte512_"
+                "gdnseg0_cte2048_pfx32k_slots64_20260605T221059Z_"
+                "sampletokonly_direct_scan0"
+            )
+            env["SAMPLING"] = "on_device_greedy_sampletokonly"
+            (artifact / "neuron_config.json").write_text(
+                json.dumps(self._sampletok_config())
+            )
+            self._write_env(env_log, env)
+
+            summary = _AUDIT.audit(
+                artifact=artifact,
+                compile_log=None,
+                env_log=env_log,
+                recommended_block_size=256,
+                min_usable_headroom_blocks=0,
+                strict_hybrid_gate=False,
+            )
+
+        self.assertTrue(summary["policy_passed"])
+        self.assertEqual(summary["policy_errors"], [])
+        self.assertEqual(summary["speed_slice"], "sampletokonly")
+        self.assertEqual(summary["speed_slice_source"], "base")
 
     def test_policy_fails_when_speed_slice_env_is_confounded(self):
         with tempfile.TemporaryDirectory() as tmpdir:

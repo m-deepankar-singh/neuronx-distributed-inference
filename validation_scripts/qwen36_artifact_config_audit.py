@@ -203,9 +203,39 @@ _SPEED_SLICE_SPECIFIC_ENV = {
 }
 
 
-def _speed_slice_policy_errors(env_values: dict[str, str]) -> list[dict[str, Any]]:
-    errors: list[dict[str, Any]] = []
+def _speed_slice_from_env(env_values: dict[str, str]) -> tuple[str, str]:
     speed_slice = env_values.get("SPEED_SLICE", "").strip()
+    if speed_slice and speed_slice != "none":
+        return speed_slice, "speed_slice"
+    base = env_values.get("BASE", "").lower()
+    sampling = env_values.get("SAMPLING", "").lower()
+    if "hostlogits_lmheadbf16" in base:
+        return "hostlogits_lmheadbf16", "base"
+    if "hostlogits" in base or sampling == "host_logits":
+        return "hostlogits", "base" if "hostlogits" in base else "sampling"
+    if "sampletokonly" in base or "sampletokonly" in sampling:
+        return "sampletokonly", "base" if "sampletokonly" in base else "sampling"
+    return "none", "none"
+
+
+def _env_policy_value(env_values: dict[str, str], key: str) -> str | None:
+    if key in env_values:
+        return env_values[key].strip()
+    if key == "DISABLE_ON_DEVICE_SAMPLING":
+        sampling = env_values.get("SAMPLING", "").strip().lower()
+        if sampling == "host_logits":
+            return "1"
+        if sampling.startswith("on_device"):
+            return "0"
+    return None
+
+
+def _speed_slice_policy_errors(
+    env_values: dict[str, str],
+    *,
+    speed_slice: str,
+) -> list[dict[str, Any]]:
+    errors: list[dict[str, Any]] = []
     if not speed_slice or speed_slice == "none":
         return errors
     specific = _SPEED_SLICE_SPECIFIC_ENV.get(speed_slice)
@@ -223,8 +253,8 @@ def _speed_slice_policy_errors(env_values: dict[str, str]) -> list[dict[str, Any
         **_SPEED_SLICE_COMMON_ENV,
         **specific,
     }.items():
-        actual = env_values.get(key)
-        if actual is None or actual.strip() != expected:
+        actual = _env_policy_value(env_values, key)
+        if actual is None or actual != expected:
             _policy_error(
                 errors,
                 code=f"speed_slice_{key.lower()}_mismatch",
@@ -253,7 +283,8 @@ def _policy_errors_from_env(
     errors: list[dict[str, Any]] = []
     if not env_values:
         return errors
-    errors.extend(_speed_slice_policy_errors(env_values))
+    speed_slice, _ = _speed_slice_from_env(env_values)
+    errors.extend(_speed_slice_policy_errors(env_values, speed_slice=speed_slice))
 
     int_fields = [
         ("SEQ_LEN", "seq_len", summary["seq_len"]),
@@ -627,7 +658,10 @@ def audit(
         "async_mode": async_mode,
         "output_logits": output_logits,
         "on_device_sampling": on_device_sampling_config is not None,
-        "speed_slice": env_values.get("SPEED_SLICE", "none") if env_values else None,
+        "speed_slice": _speed_slice_from_env(env_values)[0] if env_values else None,
+        "speed_slice_source": _speed_slice_from_env(env_values)[1]
+        if env_values
+        else None,
         "prefix_buckets": prefix_buckets,
         "is_prefix_caching": _bool_config(config, "is_prefix_caching"),
         "use_hybrid_apc_manager": _bool_config(config, "use_hybrid_apc_manager"),
