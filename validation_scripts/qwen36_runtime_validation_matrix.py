@@ -19,6 +19,11 @@ _DECISION_SCRIPT = _SCRIPT_DIR / "qwen36_speed_slice_decision.py"
 DEFAULT_BOUNDARY_LENGTHS = (
     "123,146,160,485,505,526,1225,1265,1346,2048,2049,2500,4092,4096"
 )
+REQUIRED_REPEATED_LENGTHS = "2500"
+REQUIRED_CHAT_LENGTHS = "160,1225,2500"
+REQUIRED_LONG_LENGTHS = "8192,16384"
+REQUIRED_SWEEP_START = 4088
+REQUIRED_SWEEP_END = 4104
 
 
 @dataclass(frozen=True)
@@ -47,6 +52,50 @@ def _csv_ints(value: str) -> set[int]:
 
 def _script(name: str) -> str:
     return str(_SCRIPT_DIR / name)
+
+
+def _require_csv_contains(
+    *,
+    actual: str,
+    required: str,
+    option_name: str,
+) -> None:
+    missing = sorted(_csv_ints(required) - _csv_ints(actual))
+    if missing:
+        missing_csv = ",".join(str(value) for value in missing)
+        raise ValueError(f"{option_name} is missing required values: {missing_csv}")
+
+
+def _require_speed_eligible_coherence_contract(args: argparse.Namespace) -> None:
+    if args.skip_speed:
+        return
+    _require_csv_contains(
+        actual=args.repeated_lengths,
+        required=REQUIRED_REPEATED_LENGTHS,
+        option_name="--repeated-lengths",
+    )
+    if int(args.repeated_repeats) < 3:
+        raise ValueError("--repeated-repeats must be at least 3 when speed is enabled")
+    if int(args.sweep_start) > REQUIRED_SWEEP_START or int(args.sweep_end) < REQUIRED_SWEEP_END:
+        raise ValueError(
+            "--sweep-start/--sweep-end must cover "
+            f"{REQUIRED_SWEEP_START}..{REQUIRED_SWEEP_END} when speed is enabled"
+        )
+    _require_csv_contains(
+        actual=args.long_lengths,
+        required=REQUIRED_LONG_LENGTHS,
+        option_name="--long-lengths",
+    )
+    if not args.skip_chat:
+        _require_csv_contains(
+            actual=args.chat_lengths,
+            required=REQUIRED_CHAT_LENGTHS,
+            option_name="--chat-lengths",
+        )
+        if int(args.chat_turns) < 8:
+            raise ValueError("--chat-turns must be at least 8 when speed is enabled")
+        if int(args.chat_repeats) < 1:
+            raise ValueError("--chat-repeats must be at least 1 when speed is enabled")
 
 
 def _common_model_args(args: argparse.Namespace) -> list[str]:
@@ -180,6 +229,7 @@ def build_steps(args: argparse.Namespace) -> list[ValidationStep]:
             raise ValueError("--skip-chat-reason is required when --skip-chat is set")
         if not args.skip_speed:
             raise ValueError("--skip-chat requires --skip-speed")
+    _require_speed_eligible_coherence_contract(args)
     if not args.skip_chat:
         steps.append(
             ValidationStep(

@@ -38,7 +38,7 @@ def _args(**overrides):
         repeated_lengths="2500",
         repeated_repeats=3,
         sweep_start=4088,
-        sweep_end=4090,
+        sweep_end=4104,
         long_lengths="8192,16384",
         skip_long_boundary=False,
         skip_long_boundary_reason=None,
@@ -141,6 +141,58 @@ def test_build_steps_rejects_incomplete_boundary_lengths_when_speed_could_run():
             boundary_lengths="146,160",
             allow_incomplete_boundary_lengths=True,
             incomplete_boundary_reason="diagnostic short-context run",
+            skip_speed=True,
+        )
+    )
+    assert "raw_prefill_speed" not in [step.name for step in steps]
+
+
+def test_build_steps_requires_full_coherence_contract_when_speed_enabled():
+    cases = [
+        (
+            dict(repeated_lengths="160"),
+            "--repeated-lengths",
+        ),
+        (
+            dict(repeated_repeats=2),
+            "--repeated-repeats",
+        ),
+        (
+            dict(sweep_start=4089),
+            "--sweep-start/--sweep-end",
+        ),
+        (
+            dict(sweep_end=4103),
+            "--sweep-start/--sweep-end",
+        ),
+        (
+            dict(long_lengths="8192"),
+            "--long-lengths",
+        ),
+        (
+            dict(chat_lengths="160,2500"),
+            "--chat-lengths",
+        ),
+        (
+            dict(chat_turns=7),
+            "--chat-turns",
+        ),
+    ]
+    for overrides, expected in cases:
+        try:
+            _SCRIPT.build_steps(_args(**overrides))
+        except ValueError as exc:
+            assert expected in str(exc)
+        else:
+            raise AssertionError(f"{overrides} should fail before speed")
+
+    steps = _SCRIPT.build_steps(
+        _args(
+            repeated_lengths="160",
+            sweep_start=4090,
+            sweep_end=4092,
+            long_lengths="8192",
+            chat_lengths="160",
             skip_speed=True,
         )
     )
