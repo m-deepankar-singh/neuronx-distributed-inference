@@ -78,6 +78,8 @@ def launch_env_from_compile(compile_env: dict[str, str]) -> dict[str, str]:
             "DISABLE_HYBRID_KV_CACHE_MANAGER": "0",
         }
     )
+    if compile_env.get("ENABLE_KV_CACHE_QUANT", "0").strip() == "1":
+        env["KV_CACHE_DTYPE"] = "fp8"
     return env
 
 

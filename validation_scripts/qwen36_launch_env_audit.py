@@ -55,6 +55,29 @@ def _normal_dtype(value: str | None) -> str:
     return raw
 
 
+def _normal_kv_cache_dtype(value: str | None) -> str:
+    raw = (value or "").strip().lower()
+    if raw.startswith("torch."):
+        raw = raw.split(".", 1)[1]
+    if raw in {"", "none"}:
+        return ""
+    if raw in {"bf16", "bfloat16"}:
+        return "bfloat16"
+    return raw
+
+
+def _kv_cache_dtype_from_args(value: str | None) -> str:
+    tokens = (value or "").strip().split()
+    if not tokens:
+        return ""
+    for index, token in enumerate(tokens):
+        if token == "--kv-cache-dtype" and index + 1 < len(tokens):
+            return tokens[index + 1]
+        if token.startswith("--kv-cache-dtype="):
+            return token.split("=", 1)[1]
+    return ""
+
+
 def _format_int_set(values: set[int]) -> list[int]:
     return sorted(values)
 
@@ -108,6 +131,7 @@ def audit(
 ) -> dict[str, Any]:
     errors: list[str] = []
     warnings: list[str] = []
+    fp8_kv_dtypes = {"fp8", "fp8_e4m3", "fp8_e5m2"}
 
     _require_equal(errors, compile_env, launch_env, "ARTIFACT")
     for key in (
@@ -155,7 +179,42 @@ def audit(
     if launch_seq is None:
         errors.append("SEQ_LEN is missing or invalid in launch env log")
     if compile_seq is not None and launch_seq is not None and launch_seq != compile_seq:
-        errors.append(f"SEQ_LEN must match compiled SEQ_LEN: compile={compile_seq} launch={launch_seq}")
+        errors.append(
+            "SEQ_LEN must match compiled SEQ_LEN: "
+            f"compile={compile_seq} launch={launch_seq}"
+        )
+
+    compile_kv_quant = compile_env.get("ENABLE_KV_CACHE_QUANT", "0").strip()
+    launch_kv_dtype = _normal_kv_cache_dtype(launch_env.get("KV_CACHE_DTYPE"))
+    launch_kv_dtype_arg = _normal_kv_cache_dtype(
+        _kv_cache_dtype_from_args(launch_env.get("KV_CACHE_DTYPE_ARGS"))
+    )
+    if (
+        launch_kv_dtype
+        and launch_kv_dtype_arg
+        and launch_kv_dtype != launch_kv_dtype_arg
+    ):
+        errors.append(
+            "KV_CACHE_DTYPE and KV_CACHE_DTYPE_ARGS disagree: "
+            f"KV_CACHE_DTYPE={launch_env.get('KV_CACHE_DTYPE')!r} "
+            f"KV_CACHE_DTYPE_ARGS={launch_env.get('KV_CACHE_DTYPE_ARGS')!r}"
+        )
+    effective_launch_kv_dtype = launch_kv_dtype or launch_kv_dtype_arg
+    if compile_kv_quant == "0" and effective_launch_kv_dtype in fp8_kv_dtypes:
+        errors.append(
+            "KV_CACHE_DTYPE must not be fp8 when compile ENABLE_KV_CACHE_QUANT=0: "
+            f"launch={effective_launch_kv_dtype!r}"
+        )
+    elif compile_kv_quant == "1" and effective_launch_kv_dtype not in fp8_kv_dtypes:
+        errors.append(
+            "KV_CACHE_DTYPE must be fp8 when compile ENABLE_KV_CACHE_QUANT=1: "
+            f"launch={effective_launch_kv_dtype or '<unset>'!r}"
+        )
+    elif compile_kv_quant not in {"0", "1"}:
+        errors.append(
+            "ENABLE_KV_CACHE_QUANT must be '0' or '1', "
+            f"got {compile_env.get('ENABLE_KV_CACHE_QUANT')!r}"
+        )
 
     compile_cte = _int_set(compile_env.get("CTE_BUCKETS"))
     launch_cte = _int_set(launch_env.get("CTE_BUCKETS"))
@@ -239,6 +298,7 @@ def audit(
             "context_encoding_bucket_pairs": _format_pairs(compile_pairs),
             "gdn_recurrent_cache_dtype": compile_env.get("GDN_RECURRENT_CACHE_DTYPE"),
             "gdn_conv_cache_dtype": compile_env.get("GDN_CONV_CACHE_DTYPE"),
+            "enable_kv_cache_quant": compile_env.get("ENABLE_KV_CACHE_QUANT"),
         },
         "launch": {
             "env_log": launch_env.get("ENVLOG"),
@@ -250,6 +310,8 @@ def audit(
             "context_encoding_bucket_pairs": _format_pairs(launch_pairs),
             "gdn_recurrent_cache_dtype": launch_env.get("GDN_RECURRENT_CACHE_DTYPE"),
             "gdn_conv_cache_dtype": launch_env.get("GDN_CONV_CACHE_DTYPE"),
+            "kv_cache_dtype": launch_env.get("KV_CACHE_DTYPE"),
+            "kv_cache_dtype_args": launch_env.get("KV_CACHE_DTYPE_ARGS"),
             "launch_dry_run": launch_env.get("LAUNCH_DRY_RUN"),
         },
     }

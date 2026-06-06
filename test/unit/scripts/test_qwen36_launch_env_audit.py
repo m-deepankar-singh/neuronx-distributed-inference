@@ -32,6 +32,7 @@ def _compile_env(**overrides):
         "QWEN36_DELTANET_FUSED_SEGMENT_TOKENS": "0",
         "QWEN36_DELTANET_SOLVE_MODE": "direct",
         "QWEN36_DELTANET_SOLVE_SCAN_STEPS": "0",
+        "ENABLE_KV_CACHE_QUANT": "0",
     }
     values.update(overrides)
     return values
@@ -63,6 +64,8 @@ def _launch_env(**overrides):
         "HYBRID_APC_ENABLE_BACKED_PREFIX_READS": "1",
         "BLOCK_SIZE": "256",
         "GDN_CHECKPOINT_INTERVAL": "256",
+        "KV_CACHE_DTYPE": "",
+        "KV_CACHE_DTYPE_ARGS": "",
     }
     values.update(overrides)
     return values
@@ -116,6 +119,71 @@ def test_audit_fails_on_gdn_dtype_or_hybrid_kv_drift():
     assert any("GDN_RECURRENT_CACHE_DTYPE mismatch" in error for error in result["errors"])
     assert any(
         "DISABLE_HYBRID_KV_CACHE_MANAGER must be '0'" in error
+        for error in result["errors"]
+    )
+
+
+def test_audit_rejects_fp8_runtime_kv_when_compile_uses_bf16_kv():
+    result = _SCRIPT.audit(
+        compile_env=_compile_env(ENABLE_KV_CACHE_QUANT="0"),
+        launch_env=_launch_env(
+            KV_CACHE_DTYPE="fp8",
+            KV_CACHE_DTYPE_ARGS="--kv-cache-dtype fp8",
+        ),
+    )
+
+    assert not result["passed"]
+    assert any("KV_CACHE_DTYPE must not be fp8" in error for error in result["errors"])
+
+
+def test_audit_allows_auto_or_bf16_runtime_kv_when_compile_uses_bf16_kv():
+    for dtype, args in (
+        ("", ""),
+        ("auto", "--kv-cache-dtype auto"),
+        ("bfloat16", "--kv-cache-dtype bfloat16"),
+        ("bf16", "--kv-cache-dtype bf16"),
+    ):
+        result = _SCRIPT.audit(
+            compile_env=_compile_env(ENABLE_KV_CACHE_QUANT="0"),
+            launch_env=_launch_env(KV_CACHE_DTYPE=dtype, KV_CACHE_DTYPE_ARGS=args),
+        )
+
+        assert result["passed"], (dtype, args, result["errors"])
+
+
+def test_audit_requires_fp8_runtime_kv_when_compile_uses_fp8_kv():
+    missing_runtime_fp8 = _SCRIPT.audit(
+        compile_env=_compile_env(ENABLE_KV_CACHE_QUANT="1"),
+        launch_env=_launch_env(KV_CACHE_DTYPE="", KV_CACHE_DTYPE_ARGS=""),
+    )
+    matching_runtime_fp8 = _SCRIPT.audit(
+        compile_env=_compile_env(ENABLE_KV_CACHE_QUANT="1"),
+        launch_env=_launch_env(
+            KV_CACHE_DTYPE="fp8_e5m2",
+            KV_CACHE_DTYPE_ARGS="--kv-cache-dtype fp8_e5m2",
+        ),
+    )
+
+    assert not missing_runtime_fp8["passed"]
+    assert any(
+        "KV_CACHE_DTYPE must be fp8" in error
+        for error in missing_runtime_fp8["errors"]
+    )
+    assert matching_runtime_fp8["passed"]
+
+
+def test_audit_rejects_kv_dtype_env_and_args_disagreement():
+    result = _SCRIPT.audit(
+        compile_env=_compile_env(),
+        launch_env=_launch_env(
+            KV_CACHE_DTYPE="auto",
+            KV_CACHE_DTYPE_ARGS="--kv-cache-dtype fp8",
+        ),
+    )
+
+    assert not result["passed"]
+    assert any(
+        "KV_CACHE_DTYPE and KV_CACHE_DTYPE_ARGS disagree" in error
         for error in result["errors"]
     )
 

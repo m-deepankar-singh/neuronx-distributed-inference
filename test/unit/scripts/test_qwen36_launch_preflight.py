@@ -32,6 +32,7 @@ def _compile_env(**overrides):
         "QWEN36_DELTANET_FUSED_SEGMENT_TOKENS": "0",
         "QWEN36_DELTANET_SOLVE_MODE": "direct",
         "QWEN36_DELTANET_SOLVE_SCAN_STEPS": "0",
+        "ENABLE_KV_CACHE_QUANT": "0",
     }
     values.update(overrides)
     return values
@@ -103,6 +104,7 @@ def test_build_preflight_derives_launch_contract_from_compile_env(tmp_path):
     assert "2048:32768" in plan["launch_env"]["CONTEXT_ENCODING_BUCKET_PAIRS"]
     assert "MAX_MODEL_LEN=32768" in plan["dry_run_command"]
     assert "LAUNCH_DRY_RUN=1" in plan["dry_run_command"]
+    assert "KV_CACHE_DTYPE" not in plan["launch_env"]
     assert plan["live_launch_env"]["LAUNCH_DRY_RUN"] == "0"
     assert "qwen36_launch_env_audit.py" in plan["audit_command"]
     assert plan["run_order"] == [
@@ -110,6 +112,24 @@ def test_build_preflight_derives_launch_contract_from_compile_env(tmp_path):
         "run_audit_command",
         "run_live_launch_command_only_if_audit_passes",
     ]
+
+
+def test_build_preflight_derives_fp8_runtime_kv_from_fp8_kv_compile_env(tmp_path):
+    compile_env_log = tmp_path / "compile_env.txt"
+    serve_log = tmp_path / "serve.log"
+    compile_env = _compile_env(ENABLE_KV_CACHE_QUANT="1")
+    _write_env(compile_env_log, compile_env)
+
+    plan = _SCRIPT.build_preflight(
+        compile_env=compile_env,
+        compile_env_log=compile_env_log,
+        serve_log=serve_log,
+        launch_script="tmp_launch_qwen36_segcte2048.sh",
+    )
+
+    assert plan["launch_env"]["KV_CACHE_DTYPE"] == "fp8"
+    assert "KV_CACHE_DTYPE=fp8" in plan["dry_run_command"]
+    assert plan["live_launch_env"]["KV_CACHE_DTYPE"] == "fp8"
 
 
 def test_run_preflight_runs_launch_dry_run_and_audit(tmp_path):

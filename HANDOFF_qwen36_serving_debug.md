@@ -847,3 +847,10 @@ bash tmp_compile_qwen32k_segcte2048_gdnseg512.sh
    - Reason: chat coherence is part of the runtime matrix. If runtime launch flags clamp or drop prompt context, text can still look coherent for short replies; server usage must prove the intended prompt length was processed before a candidate can advance to another speed slice.
    - Added regression coverage in `test/unit/scripts/test_qwen36_validation_gates.py` for prompt-token usage parsing plus missing/mismatched usage rejection.
    - Verification passed locally: py_compile for changed scripts/tests; focused validation-gates/runtime-matrix pytest (`20 passed`); full `python3 -m pytest test/unit/scripts` (`110 passed`); compile-driver unit test (`7 passed`); artifact config audit unit test (`5 passed`); validation-tool manifest build/verify with `file_count=32`, `mismatch_count=0`.
+
+78. Launch preflight/audit now enforces KV-cache dtype policy.
+   - Updated `validation_scripts/qwen36_launch_env_audit.py` so BF16-KV compile logs (`ENABLE_KV_CACHE_QUANT=0`) reject runtime `KV_CACHE_DTYPE` / `KV_CACHE_DTYPE_ARGS` values of `fp8`, `fp8_e4m3`, or `fp8_e5m2`, and FP8-KV compile logs require an FP8 runtime KV dtype.
+   - Updated `validation_scripts/qwen36_launch_preflight.py` to derive `KV_CACHE_DTYPE=fp8` only when the compile env log explicitly has `ENABLE_KV_CACHE_QUANT=1`; coherent-speed BF16-KV slices keep runtime KV dtype unset/auto unless explicitly audited as non-FP8.
+   - Reason: the current coherent-speed rebuild treats KV BF16 as the invariant. Sneaking `--kv-cache-dtype fp8` into launch would confound coherence validation and memory-admission experiments.
+   - Added regression coverage in `test/unit/scripts/test_qwen36_launch_env_audit.py` and `test/unit/scripts/test_qwen36_launch_preflight.py`.
+   - Verification passed locally: py_compile for changed scripts/tests; focused launch audit/preflight/driver pytest (`15 passed`); full `python3 -m pytest test/unit/scripts` (`115 passed`); compile-driver unit test (`7 passed`); artifact config audit unit test (`5 passed`); validation-tool manifest build/verify with `file_count=32`, `mismatch_count=0`.
