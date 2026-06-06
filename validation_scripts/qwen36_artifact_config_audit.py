@@ -179,7 +179,6 @@ _SPEED_SLICE_COMMON_ENV = {
     "QWEN36_DELTANET_SOLVE_SCAN_STEPS": "0",
     "GDN_RECURRENT_CACHE_DTYPE": "bfloat16",
     "GDN_CONV_CACHE_DTYPE": "bfloat16",
-    "CTE_BUCKETS_RAW": "2048",
     "SEQ_LEN": "32768",
     "MAX_CONTEXT_LENGTH": "32768",
     "FP8_QUANTIZE_LINEAR_ATTN_GATES": "1",
@@ -233,6 +232,15 @@ def _speed_slice_policy_errors(env_values: dict[str, str]) -> list[dict[str, Any
                 expected=expected,
                 actual="<missing>" if actual is None else actual,
             )
+    cte_buckets = _ints(env_values.get("CTE_BUCKETS"))
+    if cte_buckets != [2048]:
+        _policy_error(
+            errors,
+            code="speed_slice_cte_buckets_mismatch",
+            message=f"SPEED_SLICE={speed_slice} requires CTE_BUCKETS=2048",
+            expected=[2048],
+            actual="<missing>" if "CTE_BUCKETS" not in env_values else cte_buckets,
+        )
     return errors
 
 

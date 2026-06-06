@@ -69,7 +69,6 @@ class TestQwen36ArtifactConfigAudit(unittest.TestCase):
             "SPEED_SLICE": "sampletokonly",
             "SEQ_LEN": "32768",
             "MAX_CONTEXT_LENGTH": "32768",
-            "CTE_BUCKETS_RAW": "2048",
             "CTE_BUCKETS": "2048",
             "TOKEN_GENERATION_BUCKETS": "512 16384 16640 32768",
             "PREFIX_BUCKETS": "256 512 1024 2048 4096 8192 16384 32768",
@@ -232,6 +231,32 @@ class TestQwen36ArtifactConfigAudit(unittest.TestCase):
             error_codes,
         )
         self.assertNotIn("prefix_cte_attention_backend_mismatch", error_codes)
+
+    def test_policy_fails_when_speed_slice_cte_bucket_is_not_2048(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            artifact = root / "artifact"
+            artifact.mkdir()
+            env_log = root / "compile_env.txt"
+            config = self._sampletok_config()
+            config["context_encoding_buckets"] = [1024]
+            env = self._sampletok_env()
+            env["CTE_BUCKETS"] = "1024"
+            (artifact / "neuron_config.json").write_text(json.dumps(config))
+            self._write_env(env_log, env)
+
+            summary = _AUDIT.audit(
+                artifact=artifact,
+                compile_log=None,
+                env_log=env_log,
+                recommended_block_size=256,
+                min_usable_headroom_blocks=0,
+                strict_hybrid_gate=False,
+            )
+
+        error_codes = {error["code"] for error in summary["policy_errors"]}
+        self.assertFalse(summary["policy_passed"])
+        self.assertIn("speed_slice_cte_buckets_mismatch", error_codes)
 
     def test_policy_fails_when_sample_token_artifact_outputs_logits(self):
         with tempfile.TemporaryDirectory() as tmpdir:
