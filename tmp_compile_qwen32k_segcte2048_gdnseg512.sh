@@ -250,6 +250,8 @@ ENVLOG="${LOGDIR}/${BASE}_env.txt"
 
 mkdir -p "${LOGDIR}"
 cd "${REPO}"
+SOURCE_COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+SOURCE_BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
 
 export NEURON_PLATFORM_TARGET_OVERRIDE="${NEURON_PLATFORM_TARGET_OVERRIDE:-trn2}"
 export NEURON_CC_FLAGS="${NEURON_CC_FLAGS:---target trn2 --lnc 2}"
@@ -274,6 +276,8 @@ printf "%s\n" \
   "PIDFILE=${PID}" \
   "REPO=${REPO}" \
   "MODEL=${MODEL}" \
+  "SOURCE_COMMIT=${SOURCE_COMMIT}" \
+  "SOURCE_BRANCH=${SOURCE_BRANCH}" \
   "NEURON_PLATFORM_TARGET_OVERRIDE=${NEURON_PLATFORM_TARGET_OVERRIDE}" \
   "NEURON_CC_FLAGS=${NEURON_CC_FLAGS}" \
   "NKI_LIBRARY_SRC=${NKI_LIBRARY_SRC}" \
@@ -327,6 +331,8 @@ if [[ "${COMPILE_DRY_RUN}" == "1" ]]; then
   echo "LOG=${LOG}"
   echo "ENVLOG=${ENVLOG}"
   echo "PIDFILE=${PID}"
+  echo "SOURCE_COMMIT=${SOURCE_COMMIT}"
+  echo "SOURCE_BRANCH=${SOURCE_BRANCH}"
   echo "TS=${TS}"
   echo "COMPILE_DRY_RUN=1"
   exit 0
@@ -407,5 +413,7 @@ echo "QUANTIZED_CHECKPOINTS=${QUANT}"
 echo "LOG=${LOG}"
 echo "ENVLOG=${ENVLOG}"
 echo "PIDFILE=${PID}"
+echo "SOURCE_COMMIT=${SOURCE_COMMIT}"
+echo "SOURCE_BRANCH=${SOURCE_BRANCH}"
 echo "TS=${TS}"
 echo "PID=$(cat "${PID}")"

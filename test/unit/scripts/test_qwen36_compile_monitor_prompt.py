@@ -38,6 +38,8 @@ def test_render_prompt_contains_compile_validation_and_runtime_gates():
         "PIDFILE": "/logs/compile.pid",
         "SAMPLING": "host_logits",
         "KERNELS": "decode_deltanet,qkvnki_qknorm,outprojstd,segmented_attention_cte",
+        "SOURCE_COMMIT": "envc0de",
+        "SOURCE_BRANCH": "codex/qwen36-prefill-speed-coherent",
         "SEQ_LEN": "32768",
         "MAX_CONTEXT_LENGTH": "32768",
         "TS": "20260606T010203Z_hostlogits",
@@ -62,6 +64,8 @@ def test_render_prompt_contains_compile_validation_and_runtime_gates():
     assert "ubuntu@compile" in prompt
     assert "ubuntu@runtime" in prompt
     assert "abc1234" in prompt
+    assert "- SOURCE_COMMIT=envc0de" in prompt
+    assert "- SOURCE_BRANCH=codex/qwen36-prefill-speed-coherent" in prompt
     assert "PID file: /logs/compile.pid" in prompt
     assert "- SAMPLING=host_logits" in prompt
     assert "- SPEED_SLICE=hostlogits" in prompt
@@ -85,6 +89,33 @@ def test_render_prompt_contains_compile_validation_and_runtime_gates():
     assert "--min-prefill-tok-s 3000" in prompt
     assert "do not launch that compile directly from this monitor" in prompt
     assert "Do not launch a duplicate compile" in prompt
+
+
+def test_cli_prefers_env_log_source_commit(tmp_path, monkeypatch, capsys):
+    env_log = tmp_path / "env.txt"
+    env_log.write_text(
+        "BASE=qwen36_source_identity\n"
+        "ARTIFACT=/artifact\n"
+        "WORKDIR=/work\n"
+        "LOG=/compile.log\n"
+        f"ENVLOG={env_log}\n"
+        "PIDFILE=/compile.pid\n"
+        "REPO=/missing/repo\n"
+        "SOURCE_COMMIT=envcommit\n"
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "qwen36_compile_monitor_prompt.py",
+            "--env-log",
+            str(env_log),
+        ],
+    )
+
+    assert _SCRIPT.main() == 0
+    prompt = capsys.readouterr().out
+    assert "Source: /missing/repo at commit envcommit" in prompt
 
 
 def test_render_prompt_rejects_missing_required_env_key():

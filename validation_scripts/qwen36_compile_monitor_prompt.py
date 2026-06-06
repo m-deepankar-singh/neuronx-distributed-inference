@@ -130,6 +130,8 @@ def render_prompt(
         "SAMPLING",
         "KERNELS",
         "MEMORY_FLAGS",
+        "SOURCE_COMMIT",
+        "SOURCE_BRANCH",
         "SEQ_LEN",
         "MAX_CONTEXT_LENGTH",
         "TS",
@@ -228,7 +230,7 @@ def main() -> int:
     values = parse_env_log(args.env_log)
     values.setdefault("ENVLOG", str(args.env_log))
     source_dir = args.source_dir or values.get("REPO", "unknown")
-    source_commit = args.source_commit or _git_commit(
+    source_commit = args.source_commit or values.get("SOURCE_COMMIT") or _git_commit(
         Path(source_dir) if source_dir != "unknown" else None
     )
     prompt = render_prompt(
