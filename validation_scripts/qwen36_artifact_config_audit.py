@@ -40,6 +40,70 @@ def _first_config_value(config: dict[str, Any], *keys: str, default: Any = None)
     return default
 
 
+def _parse_env_log(path: Path | None) -> dict[str, str]:
+    if path is None:
+        return {}
+    values: dict[str, str] = {}
+    for raw_line in path.read_text(errors="replace").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        values[key] = value
+    return values
+
+
+def _ints(value: Any) -> list[int]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        result: list[int] = []
+        for item in value:
+            result.extend(_ints(item))
+        return result
+    return [int(token) for token in str(value).replace(",", " ").split() if token]
+
+
+def _pair_tokens(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        if len(value) == 2 and not any(isinstance(item, (list, tuple)) for item in value):
+            return [f"{int(value[0])}:{int(value[1])}"]
+        pairs: list[str] = []
+        for item in value:
+            pairs.extend(_pair_tokens(item))
+        return pairs
+    tokens = []
+    for token in str(value).replace(",", " ").split():
+        if ":" in token:
+            active, prefix = token.split(":", 1)
+        elif "x" in token:
+            active, prefix = token.split("x", 1)
+        else:
+            continue
+        tokens.append(f"{int(active)}:{int(prefix)}")
+    return tokens
+
+
+def _normal_dtype(value: Any) -> str:
+    raw = str(value or "").strip().lower()
+    if raw.startswith("torch."):
+        raw = raw.split(".", 1)[1]
+    return {
+        "bf16": "bfloat16",
+        "fp32": "float32",
+        "float": "float32",
+    }.get(raw, raw)
+
+
+def _normal_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    raw = str(value or "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
 def _bool_config(config: dict[str, Any], *keys: str) -> bool:
     return bool(_first_config_value(config, *keys, default=False))
 
@@ -66,15 +130,265 @@ def _warning(
     warnings.append({"code": code, "message": message, "value": value})
 
 
+def _policy_error(
+    errors: list[dict[str, Any]],
+    *,
+    code: str,
+    message: str,
+    expected: Any = None,
+    actual: Any = None,
+):
+    errors.append(
+        {
+            "code": code,
+            "message": message,
+            "expected": expected,
+            "actual": actual,
+        }
+    )
+
+
+def _require_equal(
+    errors: list[dict[str, Any]],
+    *,
+    code: str,
+    message: str,
+    expected: Any,
+    actual: Any,
+):
+    if expected != actual:
+        _policy_error(
+            errors,
+            code=code,
+            message=message,
+            expected=expected,
+            actual=actual,
+        )
+
+
+def _policy_errors_from_env(
+    *,
+    config: dict[str, Any],
+    env_values: dict[str, str],
+    summary: dict[str, Any],
+) -> list[dict[str, Any]]:
+    errors: list[dict[str, Any]] = []
+    if not env_values:
+        return errors
+
+    int_fields = [
+        ("SEQ_LEN", "seq_len", summary["seq_len"]),
+        (
+            "MAX_CONTEXT_LENGTH",
+            "max_context_length",
+            _first_config_value(config, "max_context_length", default=None),
+        ),
+        (
+            "MAX_GDN_CHECKPOINT_SLOTS",
+            "max_gdn_checkpoint_slots",
+            summary["max_gdn_checkpoint_slots"],
+        ),
+    ]
+    for env_key, config_key, actual in int_fields:
+        if env_key in env_values and actual is not None:
+            _require_equal(
+                errors,
+                code=f"{config_key}_mismatch",
+                message=f"{config_key} does not match compile env {env_key}",
+                expected=int(env_values[env_key]),
+                actual=int(actual),
+            )
+
+    list_fields = [
+        ("CTE_BUCKETS", "context_encoding_buckets", summary["context_encoding_buckets"]),
+        (
+            "TOKEN_GENERATION_BUCKETS",
+            "token_generation_buckets",
+            summary["token_generation_buckets"],
+        ),
+        ("PREFIX_BUCKETS", "prefix_buckets", summary["prefix_buckets"]),
+    ]
+    for env_key, config_key, actual in list_fields:
+        if env_key in env_values:
+            _require_equal(
+                errors,
+                code=f"{config_key}_mismatch",
+                message=f"{config_key} does not match compile env {env_key}",
+                expected=sorted(_ints(env_values[env_key])),
+                actual=sorted(_ints(actual)),
+            )
+
+    if "CONTEXT_ENCODING_BUCKET_PAIRS" in env_values:
+        actual_pairs = _first_config_value(
+            config,
+            "context_encoding_bucket_pairs",
+            default=[],
+        )
+        _require_equal(
+            errors,
+            code="context_encoding_bucket_pairs_mismatch",
+            message="context_encoding_bucket_pairs do not match compile env",
+            expected=sorted(_pair_tokens(env_values["CONTEXT_ENCODING_BUCKET_PAIRS"])),
+            actual=sorted(_pair_tokens(actual_pairs)),
+        )
+
+    dtype_fields = [
+        (
+            "GDN_RECURRENT_CACHE_DTYPE",
+            "gdn_recurrent_cache_dtype",
+            _first_config_value(
+                config,
+                "gdn_recurrent_cache_dtype",
+                "hybrid_recurrent_cache_dtype",
+                default=None,
+            ),
+        ),
+        (
+            "GDN_CONV_CACHE_DTYPE",
+            "gdn_conv_cache_dtype",
+            _first_config_value(
+                config,
+                "gdn_conv_cache_dtype",
+                "hybrid_conv_cache_dtype",
+                default=None,
+            ),
+        ),
+    ]
+    for env_key, config_key, actual in dtype_fields:
+        if env_key in env_values:
+            _require_equal(
+                errors,
+                code=f"{config_key}_mismatch",
+                message=f"{config_key} does not match compile env {env_key}",
+                expected=_normal_dtype(env_values[env_key]),
+                actual=_normal_dtype(actual),
+            )
+
+    bool_fields = [
+        (
+            "ENABLE_QKV_NKI_KERNELS",
+            "qkv_nki_kernel_enabled",
+            _bool_config(config, "qkv_nki_kernel_enabled", "qkv_kernel_enabled"),
+        ),
+        (
+            "ENABLE_QKV_CTE_NKI_KERNEL_FUSE_ROPE",
+            "qkv_cte_nki_kernel_fuse_rope",
+            _bool_config(config, "qkv_cte_nki_kernel_fuse_rope"),
+        ),
+        (
+            "ENABLE_QKV_CTE_NKI_KERNEL_FUSE_QK_NORM",
+            "qkv_cte_nki_kernel_fuse_qk_norm",
+            _bool_config(config, "qkv_cte_nki_kernel_fuse_qk_norm"),
+        ),
+        (
+            "ENABLE_OUT_PROJ_NKI_KERNEL",
+            "out_proj_kernel_enabled",
+            _bool_config(config, "out_proj_kernel_enabled"),
+        ),
+        (
+            "ENABLE_KV_CACHE_QUANT",
+            "kv_cache_quant",
+            _bool_config(config, "kv_cache_quant"),
+        ),
+    ]
+    for env_key, config_key, actual in bool_fields:
+        if env_key in env_values:
+            _require_equal(
+                errors,
+                code=f"{config_key}_mismatch",
+                message=f"{config_key} does not match compile env {env_key}",
+                expected=_normal_bool(env_values[env_key]),
+                actual=actual,
+            )
+
+    if "PREFIX_CTE_ATTENTION_BACKEND" in env_values:
+        _require_equal(
+            errors,
+            code="prefix_cte_attention_backend_mismatch",
+            message="prefix_cte_attention_backend does not match compile env",
+            expected=env_values["PREFIX_CTE_ATTENTION_BACKEND"],
+            actual=_first_config_value(config, "prefix_cte_attention_backend", default=None),
+        )
+    if "PREFIX_CTE_ATTENTION_SEGMENT_SIZE" in env_values:
+        _require_equal(
+            errors,
+            code="prefix_cte_attention_segment_size_mismatch",
+            message="prefix_cte_attention_segment_size does not match compile env",
+            expected=int(env_values["PREFIX_CTE_ATTENTION_SEGMENT_SIZE"]),
+            actual=int(
+                _first_config_value(
+                    config,
+                    "prefix_cte_attention_segment_size",
+                    default=0,
+                )
+                or 0
+            ),
+        )
+
+    if "DISABLE_ON_DEVICE_SAMPLING" in env_values:
+        disable_on_device = _normal_bool(env_values["DISABLE_ON_DEVICE_SAMPLING"])
+        expected_on_device = not disable_on_device
+        _require_equal(
+            errors,
+            code="on_device_sampling_mismatch",
+            message="on-device sampling presence does not match compile env",
+            expected=expected_on_device,
+            actual=summary["on_device_sampling"],
+        )
+        expected_output_logits = (
+            True
+            if disable_on_device
+            else _normal_bool(env_values.get("OUTPUT_LOGITS_WITH_ON_DEVICE_SAMPLING"))
+        )
+        _require_equal(
+            errors,
+            code="output_logits_mismatch",
+            message="output_logits does not match sampling compile env",
+            expected=expected_output_logits,
+            actual=summary["output_logits"],
+        )
+        if expected_on_device:
+            _require_equal(
+                errors,
+                code="vocab_parallel_mismatch",
+                message="on-device sampling should compile vocab_parallel=true",
+                expected=True,
+                actual=_bool_config(config, "vocab_parallel"),
+            )
+
+    if "QUANTIZE_LM_HEAD" in env_values:
+        modules_to_not_convert = _first_config_value(
+            config,
+            "modules_to_not_convert",
+            default=[],
+        )
+        if isinstance(modules_to_not_convert, list):
+            excludes_lm_head = any(
+                str(item) in {"lm_head", "model.lm_head"}
+                for item in modules_to_not_convert
+            )
+            _require_equal(
+                errors,
+                code="lm_head_quant_policy_mismatch",
+                message="modules_to_not_convert lm_head policy does not match QUANTIZE_LM_HEAD",
+                expected=not _normal_bool(env_values["QUANTIZE_LM_HEAD"]),
+                actual=excludes_lm_head,
+            )
+
+    return errors
+
+
 def audit(
     *,
     artifact: Path,
     compile_log: Path | None,
+    env_log: Path | None = None,
     recommended_block_size: int,
     min_usable_headroom_blocks: int,
     strict_hybrid_gate: bool,
 ) -> dict[str, Any]:
     config = _load_config(artifact)
+    env_values = _parse_env_log(env_log)
     seq_len = int(_first_config_value(config, "seq_len", "max_length", default=0) or 0)
     max_num_seqs = int(_first_config_value(config, "batch_size", default=1) or 1)
     ctx_batch_size = int(_first_config_value(config, "ctx_batch_size", default=1) or 1)
@@ -210,7 +524,11 @@ def audit(
     summary = {
         "artifact": str(artifact),
         "compile_log": str(compile_log) if compile_log is not None else None,
+        "env_log": str(env_log) if env_log is not None else None,
         "seq_len": seq_len,
+        "max_context_length": int(
+            _first_config_value(config, "max_context_length", default=0) or 0
+        ),
         "max_num_seqs": max_num_seqs,
         "ctx_batch_size": ctx_batch_size,
         "pa_block_size": block_size,
@@ -235,6 +553,13 @@ def audit(
         "deltanet_cte_backend": compile_backend,
         "warnings": warnings,
     }
+    summary["policy_errors"] = _policy_errors_from_env(
+        config=config,
+        env_values=env_values,
+        summary=summary,
+    )
+    summary["policy_error_count"] = len(summary["policy_errors"])
+    summary["policy_passed"] = not summary["policy_errors"]
     summary["warning_count"] = len(warnings)
     return summary
 
@@ -243,6 +568,8 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("artifact", help="Artifact directory or neuron_config.json path")
     parser.add_argument("--compile-log", type=Path, default=None)
+    parser.add_argument("--env-log", type=Path, default=None)
+    parser.add_argument("--output-json", type=Path, default=None)
     parser.add_argument("--recommended-block-size", type=int, default=32)
     parser.add_argument("--min-usable-headroom-blocks", type=int, default=8)
     parser.add_argument(
@@ -258,11 +585,18 @@ def main() -> int:
         compile_log=args.compile_log.expanduser().resolve()
         if args.compile_log is not None
         else None,
+        env_log=args.env_log.expanduser().resolve() if args.env_log is not None else None,
         recommended_block_size=args.recommended_block_size,
         min_usable_headroom_blocks=args.min_usable_headroom_blocks,
         strict_hybrid_gate=not args.no_strict_hybrid_gate,
     )
-    print(json.dumps(summary, indent=2, sort_keys=True))
+    encoded = json.dumps(summary, indent=2, sort_keys=True) + "\n"
+    if args.output_json is not None:
+        args.output_json.expanduser().parent.mkdir(parents=True, exist_ok=True)
+        args.output_json.expanduser().write_text(encoded)
+    print(encoded, end="")
+    if summary["policy_errors"]:
+        return 1
     return 1 if args.strict and summary["warnings"] else 0
 
 

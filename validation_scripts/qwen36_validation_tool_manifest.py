@@ -16,6 +16,7 @@ DEFAULT_FILES = [
     "tmp_launch_qwen36_segcte2048.sh",
     "validation_scripts/qwen36_compile_status.py",
     "validation_scripts/qwen36_compile_monitor_prompt.py",
+    "validation_scripts/qwen36_artifact_config_audit.py",
     "validation_scripts/qwen36_runtime_validation_matrix.py",
     "validation_scripts/qwen36_runtime_log_scan.py",
     "validation_scripts/qwen36_raw_completion_prefill_bench.py",
@@ -31,6 +32,7 @@ DEFAULT_FILES = [
 
 DEFAULT_TEST_FILES = [
     "contrib/models/Qwen3.6-27B/test/unit/test_qwen36_compile_driver.py",
+    "contrib/models/Qwen3.6-27B/test/unit/test_qwen36_artifact_config_audit.py",
     "test/unit/scripts/test_qwen36_launch_driver.py",
     "test/unit/scripts/test_qwen36_compile_status.py",
     "test/unit/scripts/test_qwen36_compile_monitor_prompt.py",

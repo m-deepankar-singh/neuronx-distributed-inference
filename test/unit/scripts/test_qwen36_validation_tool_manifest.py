@@ -18,12 +18,17 @@ _SPEC.loader.exec_module(_SCRIPT)
 def test_default_manifest_covers_compile_driver_and_validation_tools():
     assert "tmp_compile_qwen32k_segcte2048_gdnseg512.sh" in _SCRIPT.DEFAULT_FILES
     assert "tmp_launch_qwen36_segcte2048.sh" in _SCRIPT.DEFAULT_FILES
+    assert "validation_scripts/qwen36_artifact_config_audit.py" in _SCRIPT.DEFAULT_FILES
     assert "validation_scripts/qwen36_runtime_validation_matrix.py" in _SCRIPT.DEFAULT_FILES
     assert "validation_scripts/qwen36_launch_env_audit.py" in _SCRIPT.DEFAULT_FILES
     assert "validation_scripts/qwen36_launch_preflight.py" in _SCRIPT.DEFAULT_FILES
     assert "validation_scripts/qwen36_speed_slice_decision.py" in _SCRIPT.DEFAULT_FILES
     assert (
         "contrib/models/Qwen3.6-27B/test/unit/test_qwen36_compile_driver.py"
+        in _SCRIPT.DEFAULT_TEST_FILES
+    )
+    assert (
+        "contrib/models/Qwen3.6-27B/test/unit/test_qwen36_artifact_config_audit.py"
         in _SCRIPT.DEFAULT_TEST_FILES
     )
     assert (

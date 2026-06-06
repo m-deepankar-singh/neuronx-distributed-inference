@@ -175,7 +175,7 @@ Workdir: {workdir}.
 Expected compile shape:
 {flag_lines}
 
-Success requires: compile process exited cleanly, `Finished Compilation for all HLOs`, no exception, `CHECKPOINT_BANK_WEIGHTS_ADDED` for tp0..tp3 with dtypes matching the env log, `COMPILE_DONE`, `{artifact}/model.pt`, and `{artifact}/neuron_config.json`. Use `validation_scripts/qwen36_compile_status.py --env-log {envlog} --zero-when-running` for heartbeat polling so `state=running` stays quiet; before rsync, require a strict `validation_scripts/qwen36_compile_status.py --env-log {envlog}` verdict with `ready=true`.
+Success requires: compile process exited cleanly, `Finished Compilation for all HLOs`, no exception, `CHECKPOINT_BANK_WEIGHTS_ADDED` for tp0..tp3 with dtypes matching the env log, `COMPILE_DONE`, `{artifact}/model.pt`, and `{artifact}/neuron_config.json`. Use `validation_scripts/qwen36_compile_status.py --env-log {envlog} --zero-when-running` for heartbeat polling so `state=running` stays quiet; before rsync, require a strict `validation_scripts/qwen36_compile_status.py --env-log {envlog}` verdict with `ready=true`, then run `validation_scripts/qwen36_artifact_config_audit.py {artifact} --env-log {envlog} --compile-log {log} --recommended-block-size 256 --min-usable-headroom-blocks 0 --no-strict-hybrid-gate` and require `policy_passed=true`.
 
 If the compile is still running and the status helper or log scan shows no new failure signal, return a quiet/DONT_NOTIFY heartbeat status instead of starting a manual monitoring loop. Notify only for terminal compile failure, completed compile readiness, runtime validation failure, or coherent speed results.
 
