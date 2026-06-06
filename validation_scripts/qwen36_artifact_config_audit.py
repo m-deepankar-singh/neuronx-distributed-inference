@@ -166,6 +166,76 @@ def _require_equal(
         )
 
 
+_SPEED_SLICE_COMMON_ENV = {
+    "ENABLE_QKV_NKI_KERNELS": "1",
+    "ENABLE_QKV_CTE_NKI_KERNEL_FUSE_QK_NORM": "1",
+    "ENABLE_QKV_CTE_NKI_KERNEL_FUSE_ROPE": "0",
+    "ENABLE_OUT_PROJ_NKI_KERNEL": "0",
+    "ENABLE_KV_CACHE_QUANT": "0",
+    "PREFIX_CTE_ATTENTION_BACKEND": "attention_cte",
+    "QWEN36_DELTANET_FUSED_SEGMENT_TOKENS": "0",
+    "QWEN36_DELTANET_MULTIHEAD_CTE": "0",
+    "QWEN36_DELTANET_SOLVE_MODE": "direct",
+    "QWEN36_DELTANET_SOLVE_SCAN_STEPS": "0",
+    "GDN_RECURRENT_CACHE_DTYPE": "bfloat16",
+    "GDN_CONV_CACHE_DTYPE": "bfloat16",
+    "CTE_BUCKETS_RAW": "2048",
+    "SEQ_LEN": "32768",
+    "MAX_CONTEXT_LENGTH": "32768",
+    "FP8_QUANTIZE_LINEAR_ATTN_GATES": "1",
+}
+
+_SPEED_SLICE_SPECIFIC_ENV = {
+    "sampletokonly": {
+        "DISABLE_ON_DEVICE_SAMPLING": "0",
+        "OUTPUT_LOGITS_WITH_ON_DEVICE_SAMPLING": "0",
+        "QUANTIZE_LM_HEAD": "1",
+    },
+    "hostlogits": {
+        "DISABLE_ON_DEVICE_SAMPLING": "1",
+        "OUTPUT_LOGITS_WITH_ON_DEVICE_SAMPLING": "0",
+        "QUANTIZE_LM_HEAD": "1",
+    },
+    "hostlogits_lmheadbf16": {
+        "DISABLE_ON_DEVICE_SAMPLING": "1",
+        "OUTPUT_LOGITS_WITH_ON_DEVICE_SAMPLING": "0",
+        "QUANTIZE_LM_HEAD": "0",
+    },
+}
+
+
+def _speed_slice_policy_errors(env_values: dict[str, str]) -> list[dict[str, Any]]:
+    errors: list[dict[str, Any]] = []
+    speed_slice = env_values.get("SPEED_SLICE", "").strip()
+    if not speed_slice or speed_slice == "none":
+        return errors
+    specific = _SPEED_SLICE_SPECIFIC_ENV.get(speed_slice)
+    if specific is None:
+        _policy_error(
+            errors,
+            code="unknown_speed_slice",
+            message="SPEED_SLICE is not a recognized coherent-speed slice",
+            expected=sorted(_SPEED_SLICE_SPECIFIC_ENV),
+            actual=speed_slice,
+        )
+        return errors
+
+    for key, expected in {
+        **_SPEED_SLICE_COMMON_ENV,
+        **specific,
+    }.items():
+        actual = env_values.get(key)
+        if actual is None or actual.strip() != expected:
+            _policy_error(
+                errors,
+                code=f"speed_slice_{key.lower()}_mismatch",
+                message=f"SPEED_SLICE={speed_slice} requires {key}={expected}",
+                expected=expected,
+                actual="<missing>" if actual is None else actual,
+            )
+    return errors
+
+
 def _policy_errors_from_env(
     *,
     config: dict[str, Any],
@@ -175,6 +245,7 @@ def _policy_errors_from_env(
     errors: list[dict[str, Any]] = []
     if not env_values:
         return errors
+    errors.extend(_speed_slice_policy_errors(env_values))
 
     int_fields = [
         ("SEQ_LEN", "seq_len", summary["seq_len"]),
@@ -548,6 +619,7 @@ def audit(
         "async_mode": async_mode,
         "output_logits": output_logits,
         "on_device_sampling": on_device_sampling_config is not None,
+        "speed_slice": env_values.get("SPEED_SLICE", "none") if env_values else None,
         "prefix_buckets": prefix_buckets,
         "is_prefix_caching": _bool_config(config, "is_prefix_caching"),
         "use_hybrid_apc_manager": _bool_config(config, "use_hybrid_apc_manager"),

@@ -66,8 +66,10 @@ class TestQwen36ArtifactConfigAudit(unittest.TestCase):
     def _sampletok_env(self):
         return {
             "ARTIFACT": "/artifact",
+            "SPEED_SLICE": "sampletokonly",
             "SEQ_LEN": "32768",
             "MAX_CONTEXT_LENGTH": "32768",
+            "CTE_BUCKETS_RAW": "2048",
             "CTE_BUCKETS": "2048",
             "TOKEN_GENERATION_BUCKETS": "512 16384 16640 32768",
             "PREFIX_BUCKETS": "256 512 1024 2048 4096 8192 16384 32768",
@@ -86,6 +88,11 @@ class TestQwen36ArtifactConfigAudit(unittest.TestCase):
             "DISABLE_CONTEXT_ENCODING_ARGMAX_KERNEL": "1",
             "PREFIX_CTE_ATTENTION_BACKEND": "attention_cte",
             "PREFIX_CTE_ATTENTION_SEGMENT_SIZE": "512",
+            "QWEN36_DELTANET_FUSED_SEGMENT_TOKENS": "0",
+            "QWEN36_DELTANET_MULTIHEAD_CTE": "0",
+            "QWEN36_DELTANET_SOLVE_MODE": "direct",
+            "QWEN36_DELTANET_SOLVE_SCAN_STEPS": "0",
+            "FP8_QUANTIZE_LINEAR_ATTN_GATES": "1",
             "DISABLE_ON_DEVICE_SAMPLING": "0",
             "OUTPUT_LOGITS_WITH_ON_DEVICE_SAMPLING": "0",
             "QUANTIZE_LM_HEAD": "1",
@@ -194,6 +201,37 @@ class TestQwen36ArtifactConfigAudit(unittest.TestCase):
 
         self.assertTrue(summary["policy_passed"])
         self.assertEqual(summary["policy_errors"], [])
+        self.assertEqual(summary["speed_slice"], "sampletokonly")
+
+    def test_policy_fails_when_speed_slice_env_is_confounded(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            artifact = root / "artifact"
+            artifact.mkdir()
+            env_log = root / "compile_env.txt"
+            config = self._sampletok_config()
+            config["prefix_cte_attention_backend"] = "segmented_cte"
+            env = self._sampletok_env()
+            env["PREFIX_CTE_ATTENTION_BACKEND"] = "segmented_cte"
+            (artifact / "neuron_config.json").write_text(json.dumps(config))
+            self._write_env(env_log, env)
+
+            summary = _AUDIT.audit(
+                artifact=artifact,
+                compile_log=None,
+                env_log=env_log,
+                recommended_block_size=256,
+                min_usable_headroom_blocks=0,
+                strict_hybrid_gate=False,
+            )
+
+        error_codes = {error["code"] for error in summary["policy_errors"]}
+        self.assertFalse(summary["policy_passed"])
+        self.assertIn(
+            "speed_slice_prefix_cte_attention_backend_mismatch",
+            error_codes,
+        )
+        self.assertNotIn("prefix_cte_attention_backend_mismatch", error_codes)
 
     def test_policy_fails_when_sample_token_artifact_outputs_logits(self):
         with tempfile.TemporaryDirectory() as tmpdir:
