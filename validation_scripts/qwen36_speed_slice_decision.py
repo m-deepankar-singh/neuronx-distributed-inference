@@ -295,16 +295,18 @@ def next_preflight(
     )
     launch_env = dict(env)
     launch_env["COMPILE_DRY_RUN"] = "0"
-    launch_command = _quote_env_command(
-        launch_env,
-        ["bash", "tmp_compile_qwen32k_segcte2048_gdnseg512.sh"],
-    )
     automation_name = _automation_name(next_slice, ts)
     next_compile_preflight_command = (
         "python3 validation_scripts/qwen36_next_compile_preflight.py "
         "--decision-json <SPEED_SLICE_DECISION_JSON> "
         "--output-json <NEXT_COMPILE_PREFLIGHT_JSON> "
         "--automation-json-output <AUTOMATION_PAYLOAD_JSON>"
+    )
+    compile_command_release_command = (
+        "python3 validation_scripts/qwen36_next_compile_preflight.py "
+        "--decision-json <SPEED_SLICE_DECISION_JSON> "
+        "--output-json <NEXT_COMPILE_RELEASE_JSON> "
+        "--automation-created-name <CREATED_AUTOMATION_NAME>"
     )
     return {
         "ts": ts,
@@ -313,16 +315,18 @@ def next_preflight(
         "dry_run_command": dry_run_command,
         "launch_env": dict(launch_env),
         "next_compile_preflight_command_template": next_compile_preflight_command,
+        "compile_command_release_command_template": compile_command_release_command,
         "automation_payload_command_template": (
             "python3 validation_scripts/qwen36_compile_monitor_prompt.py "
             "--env-log <ENVLOG_FROM_DRY_RUN> "
             f"--automation-json --automation-name {shlex.quote(automation_name)}"
         ),
-        "compile_command_after_automation": launch_command,
-        "launch_command_after_automation": launch_command,
+        "compile_command_after_automation": None,
+        "launch_command_after_automation": None,
         "run_order": [
             "run_next_compile_preflight_command",
             "create_heartbeat_automation_from_payload_json",
+            "run_compile_command_release_command",
             "run_compile_command_after_automation_exists",
         ],
     }

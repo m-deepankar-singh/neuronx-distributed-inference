@@ -98,9 +98,10 @@ def test_render_prompt_contains_compile_validation_and_runtime_gates():
     assert "do not launch that compile directly from this monitor" in prompt
     assert "qwen36_next_compile_preflight.py" in prompt
     assert "--automation-json-output <automation-payload.json>" in prompt
+    assert "--automation-created-name <created-automation-name>" in prompt
     assert "codex_app.automation_update" in prompt
     assert "compile_command_after_automation" in prompt
-    assert "only after that automation creation succeeds" in prompt
+    assert "Only after that automation creation succeeds" in prompt
     assert "Do not launch a duplicate compile" in prompt
 
 

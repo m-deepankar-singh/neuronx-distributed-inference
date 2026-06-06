@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -48,6 +49,12 @@ def _string_map(value: Any, *, key: str) -> dict[str, str]:
     if not isinstance(value, dict):
         raise ValueError(f"next_preflight.{key} must be an object")
     return {str(item_key): str(item_value) for item_key, item_value in value.items()}
+
+
+def _quote_env_command(env: dict[str, str], command: list[str]) -> str:
+    parts = [f"{key}={shlex.quote(value)}" for key, value in env.items()]
+    parts.extend(shlex.quote(item) for item in command)
+    return " ".join(parts)
 
 
 def _driver_path(repo_root: Path, driver: str) -> Path:
@@ -117,6 +124,7 @@ def build_preflight(
     source_dir: str | None,
     source_commit: str | None,
     automation_name: str | None,
+    automation_created_name: str | None,
     automation_interval_minutes: int,
     launch_script: str,
     boundary_lengths: str,
@@ -168,11 +176,19 @@ def build_preflight(
         name=automation_name,
         interval_minutes=automation_interval_minutes,
     )
-    compile_command = str(preflight.get("launch_command_after_automation") or "")
-    if not compile_command:
-        raise ValueError("next_preflight.launch_command_after_automation is required")
+    compile_command = _quote_env_command(
+        launch_env,
+        ["bash", driver],
+    )
 
-    return {
+    release_compile_command = automation_created_name is not None
+    if release_compile_command and automation_created_name != automation_payload["name"]:
+        raise ValueError(
+            "automation-created-name does not match generated automation payload "
+            f"name: {automation_created_name!r} != {automation_payload['name']!r}"
+        )
+
+    result: dict[str, Any] = {
         "schema": "qwen36-next-compile-preflight-v1",
         "passed": True,
         "decision_json": str(decision_path),
@@ -186,14 +202,33 @@ def build_preflight(
             "stdout_assignments": stdout_values,
         },
         "automation_payload": automation_payload,
+        "automation_ack": {
+            "required": True,
+            "created_name": automation_created_name,
+            "matched_payload_name": release_compile_command,
+        },
         "requires_automation_creation_before_compile": True,
-        "compile_command_after_automation": compile_command,
-        "launch_command_after_automation": compile_command,
+        "compile_command_after_automation": compile_command
+        if release_compile_command
+        else None,
+        "launch_command_after_automation": compile_command
+        if release_compile_command
+        else None,
+        "compile_command_release_command_template": (
+            "python3 validation_scripts/qwen36_next_compile_preflight.py "
+            f"--decision-json {shlex.quote(str(decision_path))} "
+            "--output-json <NEXT_COMPILE_RELEASE_JSON> "
+            f"--automation-created-name {shlex.quote(automation_payload['name'])}"
+        ),
         "run_order": [
             "create_heartbeat_automation_from_automation_payload",
+            "rerun_next_compile_preflight_with_automation_created_name",
             "run_compile_command_after_automation_exists",
         ],
     }
+    if release_compile_command:
+        result["run_order"] = ["run_compile_command_after_automation_exists"]
+    return result
 
 
 def _failure_payload(error: Exception) -> dict[str, Any]:
@@ -217,6 +252,15 @@ def main() -> int:
     parser.add_argument("--source-commit", default=None)
     parser.add_argument("--automation-name", default=None)
     parser.add_argument(
+        "--automation-created-name",
+        default=None,
+        help=(
+            "Name of the heartbeat automation after codex_app.automation_update "
+            "succeeds. The live compile command is emitted only when this matches "
+            "the generated payload name."
+        ),
+    )
+    parser.add_argument(
         "--automation-interval-minutes",
         type=int,
         default=10,
@@ -239,6 +283,7 @@ def main() -> int:
             source_dir=args.source_dir,
             source_commit=args.source_commit,
             automation_name=args.automation_name,
+            automation_created_name=args.automation_created_name,
             automation_interval_minutes=args.automation_interval_minutes,
             launch_script=args.launch_script,
             boundary_lengths=args.boundary_lengths,

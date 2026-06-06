@@ -201,6 +201,7 @@ def test_slow_sample_token_slice_advances_to_hostlogits():
     assert preflight["run_order"] == [
         "run_next_compile_preflight_command",
         "create_heartbeat_automation_from_payload_json",
+        "run_compile_command_release_command",
         "run_compile_command_after_automation_exists",
     ]
     assert preflight["ts"] == "20260606T010203Z_hostlogits"
@@ -214,9 +215,7 @@ def test_slow_sample_token_slice_advances_to_hostlogits():
     assert preflight["dry_run_env"]["ENABLE_KV_CACHE_QUANT"] == "0"
     assert preflight["dry_run_env"]["SPEED_SLICE"] == "hostlogits"
     dry_run = preflight["dry_run_command"]
-    launch = preflight["launch_command_after_automation"]
     assert "TS=20260606T010203Z_hostlogits" in dry_run
-    assert "TS=20260606T010203Z_hostlogits" in launch
     assert "COMPILE_DRY_RUN=1" in dry_run
     assert "SPEED_SLICE=hostlogits" in dry_run
     assert "PREFIX_CTE_ATTENTION_BACKEND=attention_cte" in dry_run
@@ -239,10 +238,11 @@ def test_slow_sample_token_slice_advances_to_hostlogits():
     assert "<AUTOMATION_PAYLOAD_JSON>" in preflight[
         "next_compile_preflight_command_template"
     ]
-    assert preflight["compile_command_after_automation"] == preflight[
-        "launch_command_after_automation"
+    assert "<CREATED_AUTOMATION_NAME>" in preflight[
+        "compile_command_release_command_template"
     ]
-    assert "COMPILE_DRY_RUN=0" in launch
+    assert preflight["compile_command_after_automation"] is None
+    assert preflight["launch_command_after_automation"] is None
 
 
 def test_slow_hostlogits_advances_to_lmhead_bf16_only():
@@ -261,8 +261,8 @@ def test_slow_hostlogits_advances_to_lmhead_bf16_only():
     assert "DISABLE_ON_DEVICE_SAMPLING=1" in decision["next_preflight"][
         "dry_run_command"
     ]
-    assert "TS=20260606T010203Z_lmhead" in decision["next_preflight"][
-        "launch_command_after_automation"
+    assert "<CREATED_AUTOMATION_NAME>" in decision["next_preflight"][
+        "compile_command_release_command_template"
     ]
     assert decision["next_preflight"]["launch_env"]["QUANTIZE_LM_HEAD"] == "0"
 

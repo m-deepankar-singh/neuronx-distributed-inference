@@ -92,6 +92,7 @@ def test_build_preflight_runs_dry_run_and_builds_automation_payload(tmp_path):
         source_dir=None,
         source_commit=None,
         automation_name=None,
+        automation_created_name=None,
         automation_interval_minutes=7,
         launch_script="tmp_launch_qwen36_segcte2048.sh",
         boundary_lengths="146,160",
@@ -103,12 +104,16 @@ def test_build_preflight_runs_dry_run_and_builds_automation_payload(tmp_path):
     assert result["requires_automation_creation_before_compile"] is True
     assert result["run_order"] == [
         "create_heartbeat_automation_from_automation_payload",
+        "rerun_next_compile_preflight_with_automation_created_name",
         "run_compile_command_after_automation_exists",
     ]
-    assert result["compile_command_after_automation"] == result[
-        "launch_command_after_automation"
-    ]
-    assert "COMPILE_DRY_RUN=0" in result["compile_command_after_automation"]
+    assert result["compile_command_after_automation"] is None
+    assert result["launch_command_after_automation"] is None
+    assert result["automation_ack"] == {
+        "required": True,
+        "created_name": None,
+        "matched_payload_name": False,
+    }
     assert result["dry_run"]["returncode"] == 0
     assert Path(result["dry_run"]["env_log"]).exists()
 
@@ -123,6 +128,69 @@ def test_build_preflight_runs_dry_run_and_builds_automation_payload(tmp_path):
     assert result["dry_run"]["env_log"] in payload["prompt"]
     assert "ubuntu@compile" in payload["prompt"]
     assert "ubuntu@runtime" in payload["prompt"]
+    assert payload["name"] in result["compile_command_release_command_template"]
+
+
+def test_build_preflight_releases_compile_command_after_matching_automation_ack(
+    tmp_path,
+):
+    decision = _decision(tmp_path)
+    decision_path = tmp_path / "speed_slice_decision.json"
+    decision_path.write_text(json.dumps(decision) + "\n")
+    automation_name = "monitor-explicit-hostlogits-compile"
+
+    result = _SCRIPT.build_preflight(
+        decision=decision,
+        decision_path=decision_path,
+        repo_root=_REPO_ROOT,
+        compile_host="ubuntu@compile",
+        runtime_host="ubuntu@runtime",
+        source_dir=None,
+        source_commit=None,
+        automation_name=automation_name,
+        automation_created_name=automation_name,
+        automation_interval_minutes=7,
+        launch_script="tmp_launch_qwen36_segcte2048.sh",
+        boundary_lengths="146,160",
+    )
+
+    assert result["automation_payload"]["name"] == automation_name
+    assert result["automation_ack"] == {
+        "required": True,
+        "created_name": automation_name,
+        "matched_payload_name": True,
+    }
+    assert result["run_order"] == ["run_compile_command_after_automation_exists"]
+    assert result["compile_command_after_automation"] == result[
+        "launch_command_after_automation"
+    ]
+    assert "COMPILE_DRY_RUN=0" in result["compile_command_after_automation"]
+
+
+def test_build_preflight_rejects_mismatched_automation_ack(tmp_path):
+    decision = _decision(tmp_path)
+    decision_path = tmp_path / "speed_slice_decision.json"
+    decision_path.write_text(json.dumps(decision) + "\n")
+
+    try:
+        _SCRIPT.build_preflight(
+            decision=decision,
+            decision_path=decision_path,
+            repo_root=_REPO_ROOT,
+            compile_host="ubuntu@compile",
+            runtime_host="ubuntu@runtime",
+            source_dir=None,
+            source_commit=None,
+            automation_name="monitor-expected",
+            automation_created_name="monitor-wrong",
+            automation_interval_minutes=7,
+            launch_script="tmp_launch_qwen36_segcte2048.sh",
+            boundary_lengths="146,160",
+        )
+    except ValueError as exc:
+        assert "automation-created-name does not match" in str(exc)
+    else:
+        raise AssertionError("mismatched automation ack should fail")
 
 
 def test_cli_writes_preflight_and_automation_payload_json(tmp_path, monkeypatch, capsys):
@@ -159,6 +227,46 @@ def test_cli_writes_preflight_and_automation_payload_json(tmp_path, monkeypatch,
     assert automation_payload["mode"] == "create"
     assert automation_payload["name"] == printed["automation_payload"]["name"]
     assert printed["run_order"][0] == "create_heartbeat_automation_from_automation_payload"
+    assert printed["compile_command_after_automation"] is None
+
+
+def test_cli_releases_compile_command_after_automation_ack(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    decision = _decision(tmp_path)
+    decision_path = tmp_path / "speed_slice_decision.json"
+    output_path = tmp_path / "next_compile_release.json"
+    decision_path.write_text(json.dumps(decision) + "\n")
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "qwen36_next_compile_preflight.py",
+            "--decision-json",
+            str(decision_path),
+            "--repo-root",
+            str(_REPO_ROOT),
+            "--output-json",
+            str(output_path),
+            "--automation-name",
+            "monitor-cli-release",
+            "--automation-created-name",
+            "monitor-cli-release",
+        ],
+    )
+
+    assert _SCRIPT.main() == 0
+    printed = json.loads(capsys.readouterr().out)
+    written = json.loads(output_path.read_text())
+
+    assert printed["automation_ack"]["matched_payload_name"] is True
+    assert written["compile_command_after_automation"] == printed[
+        "compile_command_after_automation"
+    ]
+    assert "COMPILE_DRY_RUN=0" in printed["compile_command_after_automation"]
 
 
 def test_cli_rejects_decision_that_does_not_request_compile(tmp_path, monkeypatch, capsys):
