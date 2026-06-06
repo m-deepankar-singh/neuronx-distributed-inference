@@ -78,10 +78,25 @@ def test_chat_context_row_gate_rejects_degenerate_text():
         "stream": True,
         "content_chunk_count": 1,
         "content_text": "ack",
+        "prompt_tokens_match": True,
     }
     assert _CHAT_BENCH._row_passed(good, max_tokens=1)
     assert not _CHAT_BENCH._row_passed(dict(good, content_text="!"), max_tokens=1)
     assert not _CHAT_BENCH._row_passed(dict(good, content_text=""), max_tokens=1)
+    assert not _CHAT_BENCH._row_passed(
+        dict(good, prompt_tokens_match=False),
+        max_tokens=1,
+    )
+    assert not _CHAT_BENCH._row_passed(
+        {key: value for key, value in good.items() if key != "prompt_tokens_match"},
+        max_tokens=1,
+    )
+
+
+def test_chat_context_prompt_token_usage_must_match_local_prompt_length():
+    assert _CHAT_BENCH._prompt_tokens_from_usage({"prompt_tokens": "2500"}) == 2500
+    assert _CHAT_BENCH._prompt_tokens_from_usage({"prompt_tokens": "bad"}) is None
+    assert _CHAT_BENCH._prompt_tokens_from_usage({}) is None
 
 
 def test_chat_context_bench_detects_advertised_model(monkeypatch):

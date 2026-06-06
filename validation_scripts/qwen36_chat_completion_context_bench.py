@@ -164,6 +164,18 @@ def _completion_tokens_from_usage(usage: Any) -> int | None:
         return None
 
 
+def _prompt_tokens_from_usage(usage: Any) -> int | None:
+    if not isinstance(usage, dict):
+        return None
+    prompt_tokens = usage.get("prompt_tokens")
+    if prompt_tokens is None:
+        return None
+    try:
+        return int(prompt_tokens)
+    except (TypeError, ValueError):
+        return None
+
+
 def _completion_tokens_from_text(tokenizer: Any, text: str) -> int:
     if not text:
         return 0
@@ -448,6 +460,8 @@ def _run_one(
 def _row_passed(row: dict[str, Any], *, max_tokens: int) -> bool:
     if int(row["status"]) >= 400:
         return False
+    if row.get("prompt_tokens_match") is not True:
+        return False
     if max_tokens > 0 and _coherence_text_failure(row.get("content_text")) is not None:
         return False
     if row.get("stream") and max_tokens > 0:
@@ -572,6 +586,10 @@ def main() -> int:
                     "group_effective_prompt_tokens_per_second": group_effective_tps,
                     **result,
                 }
+                row["usage_prompt_tokens"] = _prompt_tokens_from_usage(row.get("usage"))
+                row["prompt_tokens_match"] = (
+                    row["usage_prompt_tokens"] == row["prompt_tokens"]
+                )
                 print(json.dumps(row, sort_keys=True), flush=True)
                 results.append(row)
 
@@ -584,6 +602,9 @@ def main() -> int:
         "concurrency": args.concurrency,
         "max_tokens": args.max_tokens,
         "ignore_eos": args.ignore_eos,
+        "all_prompt_tokens_match": all(
+            bool(row.get("prompt_tokens_match")) for row in results
+        ),
         "passed": all(_row_passed(row, max_tokens=args.max_tokens) for row in results),
         "results": results,
     }
