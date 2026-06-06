@@ -318,11 +318,18 @@ def test_attach_speed_slice_decision_handles_skipped_speed_after_failure(tmp_pat
         "output_dir": str(tmp_path),
         "results": [
             {
+                "name": "boundary_primary",
+                "phase": "coherence",
+                "passed": False,
+                "skipped": False,
+            },
+            {
                 "name": "raw_prefill_speed",
                 "phase": "speed",
                 "output_path": str(tmp_path / "raw_prefill_speed.json"),
                 "passed": False,
                 "skipped": True,
+                "skip_reason": "coherence_or_log_scan_failed",
             }
         ],
     }
@@ -336,7 +343,7 @@ def test_attach_speed_slice_decision_handles_skipped_speed_after_failure(tmp_pat
     assert decision["decision"] == "stop_incoherent"
     assert decision_json.exists()
     rewritten = json.loads((tmp_path / "runtime_validation_summary.json").read_text())
-    assert rewritten["speed_slice_decision"]["failed_runtime_gate_count"] == 0
+    assert rewritten["speed_slice_decision"]["failed_runtime_gate_count"] == 1
     assert rewritten["speed_slice_decision"]["next_required_flags"] == {}
 
 

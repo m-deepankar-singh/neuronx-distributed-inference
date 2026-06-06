@@ -52,13 +52,37 @@ def _speed(*, passed=False, mean=628.0, row_gate_passed=True):
 def test_incoherent_result_stops_speed_work():
     decision = _SCRIPT.decide(
         env_values={"SPEED_SLICE": "sampletokonly"},
-        runtime_summary=_summary(coherence_ok=False),
+        runtime_summary={
+            "passed": False,
+            "coherence_and_log_scan_passed": False,
+            "results": [
+                {
+                    "name": "boundary_primary",
+                    "phase": "coherence",
+                    "passed": False,
+                    "skipped": False,
+                }
+            ],
+        },
         speed_output=_speed(),
         speed_json_path=Path("/tmp/raw_speed.json"),
     )
 
     assert decision["decision"] == "stop_incoherent"
     assert decision["next_speed_slice"] is None
+
+
+def test_ambiguous_legacy_summary_reruns_runtime_validation():
+    decision = _SCRIPT.decide(
+        env_values={"SPEED_SLICE": "sampletokonly"},
+        runtime_summary=_summary(coherence_ok=False),
+        speed_output=_speed(),
+        speed_json_path=Path("/tmp/raw_speed.json"),
+    )
+
+    assert decision["decision"] == "rerun_runtime_validation"
+    assert decision["reason"] == "coherence_or_log_scan_not_completed"
+    assert decision["failed_runtime_gate_count"] == 0
 
 
 def test_missing_log_scan_reruns_runtime_validation_not_incoherent():

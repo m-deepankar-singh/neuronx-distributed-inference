@@ -149,7 +149,7 @@ def _runtime_validation_gap_reason(summary: dict[str, Any]) -> str | None:
         reason = str(row.get("skip_reason") or "")
         if reason in {"runtime_log_scan_not_run", "coherence_or_log_scan_not_completed"}:
             return reason
-    return None
+    return "coherence_or_log_scan_not_completed"
 
 
 def _required_flags(next_slice: str | None) -> dict[str, str]:
