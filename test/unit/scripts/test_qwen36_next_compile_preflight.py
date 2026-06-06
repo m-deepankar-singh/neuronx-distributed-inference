@@ -129,6 +129,13 @@ def test_build_preflight_runs_dry_run_and_builds_automation_payload(tmp_path):
     assert result["dry_run"]["env_log"] in payload["prompt"]
     assert "ubuntu@compile" in payload["prompt"]
     assert "ubuntu@runtime" in payload["prompt"]
+    assert "runtime validation/launch checkout" in payload["prompt"]
+    assert "validation_source_sync_blocked" in payload["prompt"]
+    assert (
+        "compiled artifact identity remains governed by the copied compile env log"
+        in payload["prompt"]
+    )
+    assert "--boundary-lengths 146,160" in payload["prompt"]
     release = result["compile_command_release_command_template"]
     assert payload["name"] in release
     assert f"--repo-root {str(_REPO_ROOT)}" in release

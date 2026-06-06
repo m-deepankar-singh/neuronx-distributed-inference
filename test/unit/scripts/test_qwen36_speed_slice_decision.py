@@ -231,6 +231,9 @@ def test_slow_sample_token_slice_advances_to_hostlogits():
     assert "monitor-qwen-hostlogits-20260606t010203z-hostlogits-compile" in preflight[
         "automation_payload_command_template"
     ]
+    assert "--boundary-lengths 146,160" in preflight[
+        "automation_payload_command_template"
+    ]
     assert "qwen36_next_compile_preflight.py" in preflight[
         "next_compile_preflight_command_template"
     ]

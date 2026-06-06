@@ -328,7 +328,8 @@ def next_preflight(
         "automation_payload_command_template": (
             "python3 validation_scripts/qwen36_compile_monitor_prompt.py "
             "--env-log <ENVLOG_FROM_DRY_RUN> "
-            f"--automation-json --automation-name {shlex.quote(automation_name)}"
+            f"--automation-json --automation-name {shlex.quote(automation_name)} "
+            f"--boundary-lengths {boundary_arg}"
         ),
         "compile_command_after_automation": None,
         "launch_command_after_automation": None,
