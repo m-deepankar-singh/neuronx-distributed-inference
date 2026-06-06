@@ -356,7 +356,9 @@ def attach_speed_slice_decision(
     summary["speed_slice_decision"] = {
         "decision": decision.get("decision"),
         "next_speed_slice": decision.get("next_speed_slice"),
+        "next_required_flags": decision.get("next_required_flags"),
         "reason": decision.get("reason"),
+        "failed_runtime_gate_count": decision.get("failed_runtime_gate_count"),
         "next_preflight": decision.get("next_preflight"),
         "profile_preflight": decision.get("profile_preflight"),
     }

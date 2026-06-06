@@ -239,6 +239,13 @@ def test_attach_speed_slice_decision_writes_next_action(tmp_path):
     rewritten = json.loads((tmp_path / "runtime_validation_summary.json").read_text())
     assert rewritten["speed_slice_decision_path"] == str(decision_json)
     assert rewritten["speed_slice_decision"]["decision"] == "launch_next_speed_slice"
+    assert rewritten["speed_slice_decision"]["failed_runtime_gate_count"] == 0
+    assert rewritten["speed_slice_decision"]["next_required_flags"] == {
+        "DISABLE_ON_DEVICE_SAMPLING": "1",
+        "OUTPUT_LOGITS_WITH_ON_DEVICE_SAMPLING": "0",
+        "QUANTIZE_LM_HEAD": "1",
+        "SPEED_SLICE": "hostlogits",
+    }
     assert rewritten["speed_slice_decision"]["next_preflight"]["ts"] == (
         "20260606T010203Z_hostlogits"
     )
@@ -328,3 +335,57 @@ def test_attach_speed_slice_decision_handles_skipped_speed_after_failure(tmp_pat
 
     assert decision["decision"] == "stop_incoherent"
     assert decision_json.exists()
+    rewritten = json.loads((tmp_path / "runtime_validation_summary.json").read_text())
+    assert rewritten["speed_slice_decision"]["failed_runtime_gate_count"] == 0
+    assert rewritten["speed_slice_decision"]["next_required_flags"] == {}
+
+
+def test_attach_speed_slice_decision_surfaces_failed_gate_count(tmp_path):
+    env_log = tmp_path / "compile_env.txt"
+    decision_json = tmp_path / "speed_slice_decision.json"
+    env_log.write_text("SPEED_SLICE=sampletokonly\n")
+    summary = {
+        "passed": False,
+        "coherence_and_log_scan_passed": False,
+        "gate_counts": {
+            "total_gate_steps": 2,
+            "total_log_scan_steps": 1,
+            "passed_gate_steps": 1,
+        },
+        "output_dir": str(tmp_path),
+        "results": [
+            {
+                "name": "boundary_primary",
+                "phase": "coherence",
+                "passed": False,
+                "skipped": False,
+            },
+            {
+                "name": "runtime_log_scan",
+                "phase": "log_scan",
+                "passed": True,
+                "skipped": False,
+            },
+            {
+                "name": "raw_prefill_speed",
+                "phase": "speed",
+                "output_path": str(tmp_path / "raw_prefill_speed.json"),
+                "passed": False,
+                "skipped": True,
+                "skip_reason": "coherence_or_log_scan_failed",
+            },
+        ],
+    }
+
+    decision = _SCRIPT.attach_speed_slice_decision(
+        summary,
+        env_log=env_log,
+        output_path=decision_json,
+    )
+
+    assert decision["decision"] == "stop_incoherent"
+    rewritten = json.loads((tmp_path / "runtime_validation_summary.json").read_text())
+    assert rewritten["speed_slice_decision"]["failed_runtime_gate_count"] == 1
+    assert rewritten["speed_slice_decision"]["reason"] == (
+        "coherence_or_runtime_log_scan_failed"
+    )
