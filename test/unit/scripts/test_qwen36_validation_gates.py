@@ -57,6 +57,33 @@ def test_boundary_metric_snapshot_is_optional(monkeypatch):
     assert _BOUNDARY_APC._metric_snapshot("http://127.0.0.1:8000", 0.1) == {}
 
 
+def test_boundary_prompt_token_usage_must_match_exact_length():
+    assert _BOUNDARY_APC._usage_prompt_tokens({"prompt_tokens": "160"}) == 160
+    assert _BOUNDARY_APC._usage_prompt_tokens({"prompt_tokens": "bad"}) is None
+    assert _BOUNDARY_APC._usage_prompt_tokens({}) is None
+
+
+def test_boundary_text_gate_rejects_known_degenerate_outputs():
+    assert _BOUNDARY_APC._coherence_text_failure("ack") is None
+    assert _BOUNDARY_APC._coherence_text_failure("") == "empty_text"
+    assert _BOUNDARY_APC._coherence_text_failure("!") == "known_token0_exclamation"
+    assert _BOUNDARY_APC._coherence_text_failure("!!") == "repeated_exclamation"
+    assert _BOUNDARY_APC._coherence_text_failure("!!!!") == "repeated_exclamation"
+    assert _BOUNDARY_APC._coherence_text_failure("bad\ufffdtext") == "replacement_character"
+
+
+def test_chat_context_row_gate_rejects_degenerate_text():
+    good = {
+        "status": 200,
+        "stream": True,
+        "content_chunk_count": 1,
+        "content_text": "ack",
+    }
+    assert _CHAT_BENCH._row_passed(good, max_tokens=1)
+    assert not _CHAT_BENCH._row_passed(dict(good, content_text="!"), max_tokens=1)
+    assert not _CHAT_BENCH._row_passed(dict(good, content_text=""), max_tokens=1)
+
+
 def test_chat_context_bench_detects_advertised_model(monkeypatch):
     def fake_load_json(url, timeout):
         assert url == "http://127.0.0.1:8001/v1/models"

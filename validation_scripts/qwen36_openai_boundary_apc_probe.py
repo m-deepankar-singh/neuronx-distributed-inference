@@ -153,6 +153,31 @@ def _metric_delta(before: dict[str, float], after: dict[str, float]) -> dict[str
     }
 
 
+def _usage_prompt_tokens(usage: Any) -> int | None:
+    if not isinstance(usage, dict):
+        return None
+    raw = usage.get("prompt_tokens")
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _coherence_text_failure(text: Any) -> str | None:
+    if text is None:
+        return "missing_text"
+    stripped = str(text).strip()
+    if not stripped:
+        return "empty_text"
+    if stripped in {"!", "！"}:
+        return "known_token0_exclamation"
+    if "\ufffd" in stripped:
+        return "replacement_character"
+    if len(stripped) >= 2 and len(set(stripped)) == 1 and stripped[0] in {"!", "！"}:
+        return "repeated_exclamation"
+    return None
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--base-url", default="http://127.0.0.1:8000")
@@ -213,6 +238,9 @@ def main() -> int:
                 )
                 metrics_after = _metric_snapshot(base_url, args.timeout)
                 elapsed = float(result["elapsed_seconds"])
+                usage_prompt_tokens = _usage_prompt_tokens(result.get("usage"))
+                prompt_tokens_match = usage_prompt_tokens == length
+                text_failure = _coherence_text_failure(result.get("text"))
                 row = {
                     "phase": "case",
                     "label": f"boundary_{length}_repeat_{repeat}",
@@ -220,6 +248,10 @@ def main() -> int:
                     "repeat": repeat,
                     "prompt_tokens": length,
                     **result,
+                    "usage_prompt_tokens": usage_prompt_tokens,
+                    "prompt_tokens_match": prompt_tokens_match,
+                    "text_coherence_failure": text_failure,
+                    "text_coherence_passed": text_failure is None,
                     "effective_prompt_tokens_per_second": (
                         length / elapsed if elapsed > 0 and int(result["status"]) < 400 else None
                     ),
@@ -239,6 +271,8 @@ def main() -> int:
             "phase": "summary",
             "all_status_ok": all(int(row["status"]) < 400 for row in rows),
             "all_valid_openai_body": all(bool(row["valid_openai_body"]) for row in rows),
+            "all_prompt_tokens_match": all(bool(row["prompt_tokens_match"]) for row in rows),
+            "all_text_coherent": all(bool(row["text_coherence_passed"]) for row in rows),
             "total_rows": len(rows),
             "total_metric_delta": total_delta,
             "repeated_prefix_cache_query_delta": sum(
@@ -254,7 +288,12 @@ def main() -> int:
         print(json.dumps(summary, sort_keys=True), flush=True)
         handle.write(json.dumps(summary, sort_keys=True) + "\n")
 
-    failed = not summary["all_status_ok"] or not summary["all_valid_openai_body"]
+    failed = (
+        not summary["all_status_ok"]
+        or not summary["all_valid_openai_body"]
+        or not summary["all_prompt_tokens_match"]
+        or not summary["all_text_coherent"]
+    )
     if args.require_prefix_cache_query and summary["repeated_prefix_cache_query_delta"] <= 0:
         failed = True
     if args.require_prefix_cache_hit and summary["repeated_prefix_cache_hit_delta"] <= 0:

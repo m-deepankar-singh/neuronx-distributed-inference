@@ -240,6 +240,21 @@ def _response_text(response: dict[str, Any]) -> str:
     return "" if text is None else str(text)
 
 
+def _coherence_text_failure(text: Any) -> str | None:
+    if text is None:
+        return "missing_text"
+    stripped = str(text).strip()
+    if not stripped:
+        return "empty_text"
+    if stripped in {"!", "！"}:
+        return "known_token0_exclamation"
+    if "\ufffd" in stripped:
+        return "replacement_character"
+    if len(stripped) >= 2 and len(set(stripped)) == 1 and stripped[0] in {"!", "！"}:
+        return "repeated_exclamation"
+    return None
+
+
 def _stream_chat(
     url: str,
     payload: dict[str, Any],
@@ -432,6 +447,8 @@ def _run_one(
 
 def _row_passed(row: dict[str, Any], *, max_tokens: int) -> bool:
     if int(row["status"]) >= 400:
+        return False
+    if max_tokens > 0 and _coherence_text_failure(row.get("content_text")) is not None:
         return False
     if row.get("stream") and max_tokens > 0:
         return int(row.get("content_chunk_count") or 0) > 0
