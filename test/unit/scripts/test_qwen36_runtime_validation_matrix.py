@@ -67,6 +67,44 @@ def _contract(**overrides):
     return payload
 
 
+def _speed_output(*, mean: float = 640.0):
+    length = int(_SCRIPT.REQUIRED_SPEED_LENGTHS)
+    return {
+        "passed": False,
+        "lengths": [length],
+        "repeats": _SCRIPT.REQUIRED_SPEED_REPEATS,
+        "max_tokens": _SCRIPT.REQUIRED_SPEED_MAX_TOKENS,
+        "allow_usage_fallback": False,
+        "require_text": False,
+        "min_prefill_tok_s": _SCRIPT.REQUIRED_MIN_PREFILL_TOK_S,
+        "row_gate_passed": True,
+        "prefill_tokens_all_match_actual": True,
+        "prefill_tok_s_mean": mean,
+        "speed_gate": {
+            "enabled": True,
+            "passed": False,
+            "min_prefill_tok_s": _SCRIPT.REQUIRED_MIN_PREFILL_TOK_S,
+            "mean_prefill_tok_s": mean,
+            "failure_reason": "mean_prefill_tok_s_below_threshold",
+        },
+        "results": [
+            {
+                "target_prompt_tokens": length,
+                "actual_prompt_tokens": length,
+                "repeat": repeat,
+                "status": 200,
+                "ttft_seconds": length / mean,
+                "usage": {"prompt_tokens": length, "completion_tokens": 1},
+                "prefill_tokens": length,
+                "prefill_token_source": "usage",
+                "prefill_tokens_match_actual": True,
+                "prefill_tok_s": mean,
+            }
+            for repeat in range(_SCRIPT.REQUIRED_SPEED_REPEATS)
+        ],
+    }
+
+
 def test_csv_range_includes_endpoints():
     assert _SCRIPT._csv_range(4088, 4090) == "4088,4089,4090"
 
@@ -417,30 +455,7 @@ def test_attach_speed_slice_decision_writes_next_action(tmp_path):
         "ARTIFACT=/artifact\n"
         "BASE=qwen36_sampletokonly\n"
     )
-    speed_json.write_text(
-        json.dumps(
-            {
-                "passed": False,
-                "lengths": [16384],
-                "repeats": 3,
-                "max_tokens": 1,
-                "allow_usage_fallback": False,
-                "require_text": False,
-                "min_prefill_tok_s": 3000.0,
-                "row_gate_passed": True,
-                "prefill_tokens_all_match_actual": True,
-                "prefill_tok_s_mean": 640.0,
-                "speed_gate": {
-                    "enabled": True,
-                    "passed": False,
-                    "min_prefill_tok_s": 3000.0,
-                    "mean_prefill_tok_s": 640.0,
-                    "failure_reason": "mean_prefill_tok_s_below_threshold",
-                },
-            }
-        )
-        + "\n"
-    )
+    speed_json.write_text(json.dumps(_speed_output(mean=640.0)) + "\n")
     summary = {
         "passed": False,
         "coherence_and_log_scan_passed": True,
@@ -497,30 +512,7 @@ def test_attach_speed_slice_decision_surfaces_profile_preflight(tmp_path):
         f"LOGDIR={tmp_path / 'logs'}\n"
         "CTE_BUCKETS_RAW=2048\n"
     )
-    speed_json.write_text(
-        json.dumps(
-            {
-                "passed": False,
-                "lengths": [16384],
-                "repeats": 3,
-                "max_tokens": 1,
-                "allow_usage_fallback": False,
-                "require_text": False,
-                "min_prefill_tok_s": 3000.0,
-                "row_gate_passed": True,
-                "prefill_tokens_all_match_actual": True,
-                "prefill_tok_s_mean": 950.0,
-                "speed_gate": {
-                    "enabled": True,
-                    "passed": False,
-                    "min_prefill_tok_s": 3000.0,
-                    "mean_prefill_tok_s": 950.0,
-                    "failure_reason": "mean_prefill_tok_s_below_threshold",
-                },
-            }
-        )
-        + "\n"
-    )
+    speed_json.write_text(json.dumps(_speed_output(mean=950.0)) + "\n")
     summary = {
         "passed": False,
         "coherence_and_log_scan_passed": True,

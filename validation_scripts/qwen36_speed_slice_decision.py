@@ -247,7 +247,9 @@ def _speed_output_contract_errors(
     speed_gate: dict[str, Any],
 ) -> list[str]:
     errors: list[str] = []
-    if _int_list(speed_output.get("lengths")) != [int(REQUIRED_SPEED_LENGTHS)]:
+    required_lengths = [int(REQUIRED_SPEED_LENGTHS)]
+    lengths = _int_list(speed_output.get("lengths"))
+    if lengths != required_lengths:
         errors.append("lengths")
     repeats = _int_value(speed_output.get("repeats"))
     if repeats is None or repeats < REQUIRED_SPEED_REPEATS:
@@ -268,6 +270,69 @@ def _speed_output_contract_errors(
     gate_threshold = _float_value(speed_gate.get("min_prefill_tok_s"))
     if gate_threshold is None or gate_threshold < REQUIRED_MIN_PREFILL_TOK_S:
         errors.append("speed_gate_min_prefill_tok_s")
+    errors.extend(
+        _speed_output_result_errors(
+            speed_output.get("results"),
+            lengths=required_lengths,
+            repeats=repeats,
+        )
+    )
+    return errors
+
+
+def _speed_output_result_errors(
+    results: Any,
+    *,
+    lengths: list[int],
+    repeats: int | None,
+) -> list[str]:
+    if not isinstance(results, list):
+        return ["results_missing"]
+    if repeats is None or repeats < REQUIRED_SPEED_REPEATS:
+        return ["results_unverifiable_repeats"]
+    expected_count = len(lengths) * repeats
+    errors: list[str] = []
+    if len(results) != expected_count:
+        errors.append("results_count")
+    expected_repeats = set(range(repeats))
+    observed_repeats: set[int] = set()
+    required_length = lengths[0]
+    for index, row in enumerate(results):
+        if not isinstance(row, dict):
+            errors.append(f"result_{index}_not_object")
+            continue
+        repeat = _int_value(row.get("repeat"))
+        if repeat is not None:
+            observed_repeats.add(repeat)
+        checks = [
+            ("target_prompt_tokens", _int_value(row.get("target_prompt_tokens"))),
+            ("actual_prompt_tokens", _int_value(row.get("actual_prompt_tokens"))),
+            ("prefill_tokens", _int_value(row.get("prefill_tokens"))),
+        ]
+        for field, value in checks:
+            if value != required_length:
+                errors.append(f"result_{index}_{field}")
+        usage = row.get("usage")
+        usage_prompt_tokens = (
+            _int_value(usage.get("prompt_tokens")) if isinstance(usage, dict) else None
+        )
+        if usage_prompt_tokens != required_length:
+            errors.append(f"result_{index}_usage_prompt_tokens")
+        if row.get("prefill_token_source") != "usage":
+            errors.append(f"result_{index}_prefill_token_source")
+        if row.get("prefill_tokens_match_actual") is not True:
+            errors.append(f"result_{index}_prefill_tokens_match_actual")
+        status = _int_value(row.get("status"))
+        if status is None or status >= 400:
+            errors.append(f"result_{index}_status")
+        ttft = _float_value(row.get("ttft_seconds"))
+        if ttft is None or ttft <= 0:
+            errors.append(f"result_{index}_ttft_seconds")
+        speed = _float_value(row.get("prefill_tok_s"))
+        if speed is None or speed <= 0:
+            errors.append(f"result_{index}_prefill_tok_s")
+    if observed_repeats != expected_repeats:
+        errors.append("results_repeats")
     return errors
 
 

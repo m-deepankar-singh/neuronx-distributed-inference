@@ -66,9 +66,11 @@ def _runtime_summary():
 
 
 def _speed():
+    length = int(_SPEED_SCRIPT.REQUIRED_SPEED_LENGTHS)
+    mean = 640.0
     return {
         "passed": False,
-        "lengths": [int(_SPEED_SCRIPT.REQUIRED_SPEED_LENGTHS)],
+        "lengths": [length],
         "repeats": _SPEED_SCRIPT.REQUIRED_SPEED_REPEATS,
         "max_tokens": _SPEED_SCRIPT.REQUIRED_SPEED_MAX_TOKENS,
         "allow_usage_fallback": False,
@@ -76,14 +78,29 @@ def _speed():
         "min_prefill_tok_s": _SPEED_SCRIPT.REQUIRED_MIN_PREFILL_TOK_S,
         "row_gate_passed": True,
         "prefill_tokens_all_match_actual": True,
-        "prefill_tok_s_mean": 640.0,
+        "prefill_tok_s_mean": mean,
         "speed_gate": {
             "enabled": True,
             "passed": False,
             "min_prefill_tok_s": _SPEED_SCRIPT.REQUIRED_MIN_PREFILL_TOK_S,
-            "mean_prefill_tok_s": 640.0,
+            "mean_prefill_tok_s": mean,
             "failure_reason": "mean_prefill_tok_s_below_threshold",
         },
+        "results": [
+            {
+                "target_prompt_tokens": length,
+                "actual_prompt_tokens": length,
+                "repeat": repeat,
+                "status": 200,
+                "ttft_seconds": length / mean,
+                "usage": {"prompt_tokens": length, "completion_tokens": 1},
+                "prefill_tokens": length,
+                "prefill_token_source": "usage",
+                "prefill_tokens_match_actual": True,
+                "prefill_tok_s": mean,
+            }
+            for repeat in range(_SPEED_SCRIPT.REQUIRED_SPEED_REPEATS)
+        ],
     }
 
 
