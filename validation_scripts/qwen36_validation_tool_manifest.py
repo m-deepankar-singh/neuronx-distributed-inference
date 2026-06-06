@@ -24,6 +24,7 @@ DEFAULT_FILES = [
     "validation_scripts/qwen36_context_neff_profile.py",
     "validation_scripts/qwen36_profile_summary_compare.py",
     "validation_scripts/qwen36_launch_env_audit.py",
+    "validation_scripts/qwen36_launch_preflight.py",
     "validation_scripts/qwen36_speed_slice_decision.py",
     "validation_scripts/qwen36_validation_tool_manifest.py",
 ]
@@ -39,6 +40,7 @@ DEFAULT_TEST_FILES = [
     "test/unit/scripts/test_qwen36_context_neff_profile.py",
     "test/unit/scripts/test_qwen36_profile_summary_compare.py",
     "test/unit/scripts/test_qwen36_launch_env_audit.py",
+    "test/unit/scripts/test_qwen36_launch_preflight.py",
     "test/unit/scripts/test_qwen36_speed_slice_decision.py",
     "test/unit/scripts/test_qwen36_validation_tool_manifest.py",
 ]
