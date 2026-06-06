@@ -440,8 +440,12 @@ def _policy_errors_from_env(
             ),
         )
 
-    if "DISABLE_ON_DEVICE_SAMPLING" in env_values:
-        disable_on_device = _normal_bool(env_values["DISABLE_ON_DEVICE_SAMPLING"])
+    disable_on_device_value = _env_policy_value(
+        env_values,
+        "DISABLE_ON_DEVICE_SAMPLING",
+    )
+    if disable_on_device_value is not None:
+        disable_on_device = _normal_bool(disable_on_device_value)
         expected_on_device = not disable_on_device
         _require_equal(
             errors,

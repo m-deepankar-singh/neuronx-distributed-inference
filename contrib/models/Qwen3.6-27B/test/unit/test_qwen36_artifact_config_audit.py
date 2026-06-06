@@ -238,6 +238,37 @@ class TestQwen36ArtifactConfigAudit(unittest.TestCase):
         self.assertEqual(summary["speed_slice"], "sampletokonly")
         self.assertEqual(summary["speed_slice_source"], "base")
 
+    def test_policy_checks_sampling_config_for_legacy_env_log(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            artifact = root / "artifact"
+            artifact.mkdir()
+            env_log = root / "compile_env.txt"
+            config = self._sampletok_config()
+            config["output_logits"] = True
+            config["on_device_sampling_config"] = None
+            env = self._sampletok_env()
+            env.pop("SPEED_SLICE")
+            env.pop("DISABLE_ON_DEVICE_SAMPLING")
+            env["BASE"] = "qwen36_sampletokonly_attention_cte512_gdnseg0_cte2048"
+            env["SAMPLING"] = "on_device_greedy_sampletokonly"
+            (artifact / "neuron_config.json").write_text(json.dumps(config))
+            self._write_env(env_log, env)
+
+            summary = _AUDIT.audit(
+                artifact=artifact,
+                compile_log=None,
+                env_log=env_log,
+                recommended_block_size=256,
+                min_usable_headroom_blocks=0,
+                strict_hybrid_gate=False,
+            )
+
+        error_codes = {error["code"] for error in summary["policy_errors"]}
+        self.assertFalse(summary["policy_passed"])
+        self.assertIn("on_device_sampling_mismatch", error_codes)
+        self.assertIn("output_logits_mismatch", error_codes)
+
     def test_policy_fails_when_speed_slice_env_is_confounded(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
