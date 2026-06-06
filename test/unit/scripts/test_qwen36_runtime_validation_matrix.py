@@ -41,6 +41,7 @@ def _args(**overrides):
         skip_long_boundary=False,
         skip_long_boundary_reason=None,
         skip_chat=False,
+        skip_chat_reason=None,
         chat_lengths="160,1225,2500",
         chat_turns=8,
         chat_repeats=1,
@@ -123,6 +124,35 @@ def test_build_steps_requires_long_boundary_unless_explicitly_skipped():
         )
     )
     assert "boundary_long" not in [step.name for step in steps]
+
+
+def test_build_steps_rejects_skip_chat_when_speed_could_still_run():
+    try:
+        _SCRIPT.build_steps(_args(skip_chat=True))
+    except ValueError as exc:
+        assert "--skip-chat-reason" in str(exc)
+    else:
+        raise AssertionError("skip chat without reason should fail")
+
+    try:
+        _SCRIPT.build_steps(
+            _args(skip_chat=True, skip_chat_reason="debug boundary-only run")
+        )
+    except ValueError as exc:
+        assert "--skip-speed" in str(exc)
+    else:
+        raise AssertionError("skip chat with speed enabled should fail")
+
+    steps = _SCRIPT.build_steps(
+        _args(
+            skip_chat=True,
+            skip_chat_reason="debug boundary-only run",
+            skip_speed=True,
+        )
+    )
+    names = [step.name for step in steps]
+    assert "chat_multiturn" not in names
+    assert "raw_prefill_speed" not in names
 
 
 def test_run_matrix_skips_speed_after_coherence_failure(tmp_path):

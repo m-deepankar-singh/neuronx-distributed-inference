@@ -866,3 +866,9 @@ bash tmp_compile_qwen32k_segcte2048_gdnseg512.sh
    - Reason: the monitor prompt requires long probes at `8192,16384` where the artifact supports them. Previously a caller could pass `--long-lengths ""`, skip those probes, and still let speed run after the shorter coherence/log-scan gates passed. That is too weak for the coherent-speed target because the speed gate measures 16k cold prefill.
    - Added regression coverage in `test/unit/scripts/test_qwen36_runtime_validation_matrix.py`.
    - Verification passed locally: py_compile for changed scripts/tests; focused runtime matrix pytest (`12 passed`); full `python3 -m pytest test/unit/scripts` (`116 passed`); compile-driver unit test (`7 passed`); artifact config audit unit test (`6 passed`); validation-tool manifest build/verify with `file_count=32`, `mismatch_count=0`.
+
+81. Runtime matrix cannot use skipped multi-turn chat as speed evidence.
+   - Tightened `validation_scripts/qwen36_runtime_validation_matrix.py`: `--skip-chat` now requires `--skip-chat-reason` and also requires `--skip-speed`.
+   - Reason: multi-turn probes at `160,1225,2500` are part of the coherence contract. A diagnostic boundary-only run may skip chat, but that run must not advance to usage-accounted prefill speed or the next speed slice.
+   - Added regression coverage in `test/unit/scripts/test_qwen36_runtime_validation_matrix.py`.
+   - Verification passed locally: py_compile for changed scripts/tests; focused runtime matrix pytest (`13 passed`); full `python3 -m pytest test/unit/scripts` (`117 passed`); compile-driver unit test (`7 passed`); artifact config audit unit test (`6 passed`); validation-tool manifest build/verify with `file_count=32`, `mismatch_count=0`.

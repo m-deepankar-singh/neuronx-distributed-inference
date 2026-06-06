@@ -146,6 +146,11 @@ def build_steps(args: argparse.Namespace) -> list[ValidationStep]:
         raise ValueError(
             "--skip-long-boundary-reason is required when --skip-long-boundary is set"
         )
+    if args.skip_chat:
+        if not str(args.skip_chat_reason or "").strip():
+            raise ValueError("--skip-chat-reason is required when --skip-chat is set")
+        if not args.skip_speed:
+            raise ValueError("--skip-chat requires --skip-speed")
     if not args.skip_chat:
         steps.append(
             ValidationStep(
@@ -411,6 +416,11 @@ def main() -> int:
         help="Required explanation when --skip-long-boundary is used.",
     )
     parser.add_argument("--skip-chat", action="store_true")
+    parser.add_argument(
+        "--skip-chat-reason",
+        default=None,
+        help="Required explanation when --skip-chat is used.",
+    )
     parser.add_argument("--chat-lengths", default="160,1225,2500")
     parser.add_argument("--chat-turns", type=int, default=8)
     parser.add_argument("--chat-repeats", type=int, default=1)
