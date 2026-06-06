@@ -1020,3 +1020,9 @@ bash tmp_compile_qwen32k_segcte2048_gdnseg512.sh
    - Fix: `validation_scripts/qwen36_artifact_config_audit.py` now uses the same inferred `DISABLE_ON_DEVICE_SAMPLING` value for the on-device sampling, output-logits, and vocab-parallel config checks.
    - Added regression coverage where the active compile-era env log omits both `SPEED_SLICE` and `DISABLE_ON_DEVICE_SAMPLING` but the config has `output_logits=true` and no on-device sampler; the audit now reports `on_device_sampling_mismatch` and `output_logits_mismatch`.
    - Verification passed locally: py_compile for audit/status scripts and tests; focused audit/status pytest (`22 passed`); full `python3 -m pytest test/unit/scripts` (`130 passed`); compile-driver plus artifact-audit pytest (`17 passed`); validation-tool manifest build/verify with `file_count=32`, `mismatch_count=0`.
+
+105. Active sample-token automation now requires legacy sampling-config audit.
+   - Updated the existing app heartbeat automation `monitor-qwen-sampletokonly-compile` in place after commit `1f0b479`, preserving its 30-minute cadence and same sample-token artifact paths.
+   - The live prompt now requires source checkout fast-forward through `1f0b479` or newer before artifact readiness and explicitly says the inferred `DISABLE_ON_DEVICE_SAMPLING` value must be used for on-device sampling, output-logits, and vocab-parallel config checks.
+   - The live prompt treats `on_device_sampling_mismatch` and `output_logits_mismatch` as artifact validation failures before rsync/launch.
+   - No compile-host polling was performed for this update; the in-flight compile remains automation-owned.
