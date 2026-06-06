@@ -67,6 +67,18 @@ def _contract(**overrides):
     return payload
 
 
+def _manifest(**overrides):
+    payload = {
+        "schema": "qwen36-validation-tool-manifest-v1",
+        "git_commit": "abc1234",
+        "file_count": 32,
+        "missing": [],
+        "passed": True,
+    }
+    payload.update(overrides)
+    return payload
+
+
 def _speed_output(*, mean: float = 640.0):
     length = int(_SCRIPT.REQUIRED_SPEED_LENGTHS)
     return {
@@ -488,6 +500,7 @@ def test_attach_speed_slice_decision_writes_next_action(tmp_path):
         "passed": False,
         "coherence_and_log_scan_passed": True,
         "validation_contract": _contract(),
+        "validation_tool_manifest": _manifest(),
         "output_dir": str(tmp_path),
         "results": [
             {
@@ -545,6 +558,7 @@ def test_attach_speed_slice_decision_surfaces_profile_preflight(tmp_path):
         "passed": False,
         "coherence_and_log_scan_passed": True,
         "validation_contract": _contract(),
+        "validation_tool_manifest": _manifest(),
         "output_dir": str(tmp_path),
         "results": [
             {
@@ -590,6 +604,7 @@ def test_attach_speed_slice_decision_surfaces_speed_contract_errors(tmp_path):
         "passed": False,
         "coherence_and_log_scan_passed": True,
         "validation_contract": _contract(),
+        "validation_tool_manifest": _manifest(),
         "output_dir": str(tmp_path),
         "results": [
             {

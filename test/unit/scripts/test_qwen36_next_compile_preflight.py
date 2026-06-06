@@ -48,11 +48,22 @@ def _runtime_contract():
     }
 
 
+def _runtime_manifest():
+    return {
+        "schema": "qwen36-validation-tool-manifest-v1",
+        "git_commit": "abc1234",
+        "file_count": 32,
+        "missing": [],
+        "passed": True,
+    }
+
+
 def _runtime_summary():
     return {
         "passed": False,
         "coherence_and_log_scan_passed": True,
         "validation_contract": _runtime_contract(),
+        "validation_tool_manifest": _runtime_manifest(),
         "results": [
             {
                 "name": "raw_prefill_speed",

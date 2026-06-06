@@ -43,12 +43,25 @@ def _contract(**overrides):
     return payload
 
 
+def _manifest(**overrides):
+    payload = {
+        "schema": "qwen36-validation-tool-manifest-v1",
+        "git_commit": "abc1234",
+        "file_count": 32,
+        "missing": [],
+        "passed": True,
+    }
+    payload.update(overrides)
+    return payload
+
+
 def _summary(
     *,
     coherence_ok=True,
     passed=False,
     speed_path="/tmp/raw_speed.json",
     contract=True,
+    manifest=True,
 ):
     payload = {
         "passed": passed,
@@ -68,6 +81,10 @@ def _summary(
         payload["validation_contract"] = _contract()
     elif isinstance(contract, dict):
         payload["validation_contract"] = contract
+    if manifest is True:
+        payload["validation_tool_manifest"] = _manifest()
+    elif isinstance(manifest, dict):
+        payload["validation_tool_manifest"] = manifest
     return payload
 
 
@@ -254,6 +271,28 @@ def test_incomplete_runtime_contract_reruns_runtime_validation():
 
     assert decision["decision"] == "rerun_runtime_validation"
     assert decision["reason"] == "runtime_validation_contract_incomplete"
+
+
+def test_missing_or_failed_validation_tool_manifest_reruns_runtime_validation():
+    cases = [
+        (False, "missing_validation_tool_manifest"),
+        (
+            _manifest(schema="qwen36-validation-tool-manifest-v0"),
+            "validation_tool_manifest_schema_mismatch",
+        ),
+        (_manifest(passed=False, missing=["validation_scripts/x.py"]), "validation_tool_manifest_failed"),
+    ]
+
+    for manifest, expected_reason in cases:
+        decision = _SCRIPT.decide(
+            env_values={"SPEED_SLICE": "sampletokonly"},
+            runtime_summary=_summary(coherence_ok=True, manifest=manifest),
+            speed_output=_speed(passed=False, mean=640.0),
+            speed_json_path=Path("/tmp/raw_speed.json"),
+        )
+
+        assert decision["decision"] == "rerun_runtime_validation"
+        assert decision["reason"] == expected_reason
 
 
 def test_speed_output_contract_mismatch_reruns_speed_validation():

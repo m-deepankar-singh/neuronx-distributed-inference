@@ -242,6 +242,17 @@ def _runtime_contract_gap_reason(summary: dict[str, Any]) -> str | None:
     return None
 
 
+def _validation_tool_manifest_gap_reason(summary: dict[str, Any]) -> str | None:
+    manifest = summary.get("validation_tool_manifest")
+    if not isinstance(manifest, dict):
+        return "missing_validation_tool_manifest"
+    if manifest.get("schema") != "qwen36-validation-tool-manifest-v1":
+        return "validation_tool_manifest_schema_mismatch"
+    if not bool(manifest.get("passed")):
+        return "validation_tool_manifest_failed"
+    return None
+
+
 def _speed_output_contract_errors(
     speed_output: dict[str, Any],
     speed_gate: dict[str, Any],
@@ -633,6 +644,16 @@ def decide(
             {
                 "decision": "rerun_runtime_validation",
                 "reason": contract_gap,
+            }
+        )
+        return result
+
+    manifest_gap = _validation_tool_manifest_gap_reason(runtime_summary)
+    if manifest_gap is not None:
+        result.update(
+            {
+                "decision": "rerun_runtime_validation",
+                "reason": manifest_gap,
             }
         )
         return result
