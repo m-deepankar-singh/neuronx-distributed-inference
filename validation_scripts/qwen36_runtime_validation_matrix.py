@@ -16,6 +16,7 @@ from typing import Callable, Sequence
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
 _DECISION_SCRIPT = _SCRIPT_DIR / "qwen36_speed_slice_decision.py"
+_MANIFEST_SCRIPT = _SCRIPT_DIR / "qwen36_validation_tool_manifest.py"
 DEFAULT_BOUNDARY_LENGTHS = (
     "123,146,160,485,505,526,1225,1265,1346,2048,2049,2500,4092,4096"
 )
@@ -486,6 +487,54 @@ def _load_speed_slice_decision_module():
     return module
 
 
+def _load_validation_tool_manifest_module():
+    spec = importlib.util.spec_from_file_location(
+        "qwen36_validation_tool_manifest",
+        _MANIFEST_SCRIPT,
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load {_MANIFEST_SCRIPT}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def attach_validation_tool_manifest(
+    summary: dict[str, object],
+    *,
+    output_path: Path,
+    include_tests: bool = False,
+) -> dict[str, object]:
+    manifest_mod = _load_validation_tool_manifest_module()
+    repo = _SCRIPT_DIR.parent
+    files = list(manifest_mod.DEFAULT_FILES)
+    if include_tests:
+        files.extend(manifest_mod.DEFAULT_TEST_FILES)
+    manifest = manifest_mod.build_manifest(repo=repo, files=files)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+    missing = [
+        str(entry.get("path"))
+        for entry in manifest.get("files", [])
+        if isinstance(entry, dict) and not bool(entry.get("exists"))
+    ]
+    passed = not missing
+    summary["validation_tool_manifest_path"] = str(output_path)
+    summary["validation_tool_manifest"] = {
+        "schema": manifest.get("schema"),
+        "git_commit": manifest.get("git_commit"),
+        "file_count": len(manifest.get("files", [])),
+        "missing": missing,
+        "passed": passed,
+    }
+    if not passed:
+        summary["passed"] = False
+    summary_path = Path(str(summary["output_dir"])) / "runtime_validation_summary.json"
+    summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
+    return manifest
+
+
 def _speed_json_from_summary(summary: dict[str, object]) -> Path | None:
     results = summary.get("results", [])
     if isinstance(results, list):
@@ -623,6 +672,17 @@ def main() -> int:
         default=None,
         help="Optional fixed TS for generated next-slice preflight commands.",
     )
+    parser.add_argument(
+        "--validation-manifest-output",
+        type=Path,
+        default=None,
+        help="Output path for validation-tool manifest JSON. Defaults under output-dir.",
+    )
+    parser.add_argument(
+        "--validation-manifest-include-tests",
+        action="store_true",
+        help="Include unit-test files in the runtime validation tool manifest.",
+    )
     parser.add_argument("--timeout", type=float, default=900.0)
     args = parser.parse_args()
 
@@ -632,6 +692,14 @@ def main() -> int:
         steps,
         output_dir=output_dir,
         validation_contract=_validation_contract_from_args(args),
+    )
+    manifest_output = args.validation_manifest_output or (
+        output_dir / "validation_tool_manifest.json"
+    )
+    attach_validation_tool_manifest(
+        summary,
+        output_path=manifest_output,
+        include_tests=args.validation_manifest_include_tests,
     )
     if args.compile_env_log is not None:
         decision_output = args.speed_slice_decision_json or (

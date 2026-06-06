@@ -446,6 +446,34 @@ def test_run_matrix_passes_when_all_steps_pass(tmp_path):
     }
 
 
+def test_attach_validation_tool_manifest_records_tool_identity(tmp_path):
+    summary = {
+        "passed": True,
+        "coherence_and_log_scan_passed": True,
+        "output_dir": str(tmp_path),
+        "results": [],
+    }
+    (tmp_path / "runtime_validation_summary.json").write_text(
+        json.dumps(summary) + "\n"
+    )
+    manifest_path = tmp_path / "validation_tool_manifest.json"
+
+    manifest = _SCRIPT.attach_validation_tool_manifest(
+        summary,
+        output_path=manifest_path,
+        include_tests=True,
+    )
+
+    assert manifest_path.exists()
+    assert manifest["schema"] == "qwen36-validation-tool-manifest-v1"
+    assert summary["validation_tool_manifest_path"] == str(manifest_path)
+    assert summary["validation_tool_manifest"]["passed"] is True
+    assert summary["validation_tool_manifest"]["file_count"] >= 30
+    rewritten = json.loads((tmp_path / "runtime_validation_summary.json").read_text())
+    assert rewritten["validation_tool_manifest"]["passed"] is True
+    assert rewritten["validation_tool_manifest_path"] == str(manifest_path)
+
+
 def test_attach_speed_slice_decision_writes_next_action(tmp_path):
     env_log = tmp_path / "compile_env.txt"
     speed_json = tmp_path / "raw_prefill_speed.json"

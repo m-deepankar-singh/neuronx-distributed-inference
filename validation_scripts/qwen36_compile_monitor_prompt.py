@@ -193,7 +193,7 @@ After the launch audit passes, launch on {runtime_host} with `{launch_script}`, 
 
 Preferred validation driver after launch: `validation_scripts/qwen36_runtime_validation_matrix.py --base-url http://127.0.0.1:<port> --model-path {model_path} --serve-log <serve.log> --output-dir <validation-output-dir> --min-prefill-tok-s 3000 --compile-env-log <runtime-compile-env-log> --boundary-lengths {boundary_lengths}`. It runs the coherence/log-scan/speed gates in order, skips speed automatically if coherence or log scan fails, and writes `<validation-output-dir>/speed_slice_decision.json`.
 
-Before runtime validation, if `validation_scripts/qwen36_validation_tool_manifest.py` is present, use it to build or verify a validation-tool manifest for the source checkout so the verdict is tied to the expected coherence/speed gates.
+Runtime validation writes `<validation-output-dir>/validation_tool_manifest.json` by default through `validation_scripts/qwen36_validation_tool_manifest.py`, and `runtime_validation_summary.json` must include `validation_tool_manifest.passed=true`. If that manifest entry is missing or false, report the validator provenance failure and do not advance to another compile or coherent-speed claim.
 
 Coherence matrix: use the maintained `validation_scripts/qwen36_runtime_validation_matrix.py` driver, not the old ad hoc `/tmp/tmp_bisect_probe3.py` helper that has been missing on runtime hosts. It must cover exact boundary lengths {boundary_lengths}, the unique 4k sweep around 4088..4104, repeated 2500 prompt, multi-turn probes at 160, 1225, and 2500, and long probes at 8192 and 16384 where the artifact supports them. Runtime log scan must use `validation_scripts/qwen36_runtime_log_scan.py` and show zero matches for {scan}.
 

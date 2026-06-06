@@ -98,6 +98,9 @@ def test_render_prompt_contains_compile_validation_and_runtime_gates():
     assert "--compile-env-log <runtime-compile-env-log>" in prompt
     assert "speed_slice_decision.json" in prompt
     assert "qwen36_validation_tool_manifest.py" in prompt
+    assert "validation_tool_manifest.json" in prompt
+    assert "validation_tool_manifest.passed=true" in prompt
+    assert "validator provenance failure" in prompt
     assert "not the old ad hoc `/tmp/tmp_bisect_probe3.py`" in prompt
     assert "exact boundary lengths 146,160" in prompt
     assert "`negative token_id`" in prompt
