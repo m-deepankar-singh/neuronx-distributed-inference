@@ -48,6 +48,15 @@ def _as_float(value: Any) -> float | None:
     return parsed
 
 
+def _as_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _has_summary_metrics(value: dict[str, Any]) -> bool:
     return any(key in value for key in _METRIC_KEYS)
 
@@ -165,9 +174,83 @@ def _mean(values: list[float]) -> float | None:
     return sum(values) / len(values) if values else None
 
 
-def extract_speed_summary(payload: Any) -> dict[str, Any]:
+def _speed_summary_contract_errors(
+    payload: dict[str, Any],
+    *,
+    expected_prompt_tokens: int,
+    min_runs: int,
+) -> list[str]:
+    errors: list[str] = []
+    lengths = payload.get("lengths")
+    if lengths != [expected_prompt_tokens]:
+        errors.append("lengths")
+    repeats = _as_int(payload.get("repeats"))
+    if repeats is None or repeats < min_runs:
+        errors.append("repeats")
+    if payload.get("allow_usage_fallback") is not False:
+        errors.append("allow_usage_fallback")
+    if payload.get("prefill_tokens_all_match_actual") is not True:
+        errors.append("prefill_tokens_all_match_actual")
+    rows = payload.get("results")
+    if not isinstance(rows, list):
+        errors.append("results_missing")
+        return errors
+    if repeats is not None and len(rows) != repeats:
+        errors.append("results_count")
+    observed_repeats: set[int] = set()
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            errors.append(f"result_{index}_not_object")
+            continue
+        repeat = _as_int(row.get("repeat"))
+        if repeat is not None:
+            observed_repeats.add(repeat)
+        for field in ("target_prompt_tokens", "actual_prompt_tokens", "prefill_tokens"):
+            if _as_int(row.get(field)) != expected_prompt_tokens:
+                errors.append(f"result_{index}_{field}")
+        usage = row.get("usage")
+        usage_tokens = (
+            _as_int(usage.get("prompt_tokens")) if isinstance(usage, dict) else None
+        )
+        if usage_tokens != expected_prompt_tokens:
+            errors.append(f"result_{index}_usage_prompt_tokens")
+        if row.get("prefill_token_source") != "usage":
+            errors.append(f"result_{index}_prefill_token_source")
+        if row.get("prefill_tokens_match_actual") is not True:
+            errors.append(f"result_{index}_prefill_tokens_match_actual")
+        status = _as_int(row.get("status"))
+        if status is None or status >= 400:
+            errors.append(f"result_{index}_status")
+        ttft = _as_float(row.get("ttft_seconds"))
+        if ttft is None or ttft <= 0:
+            errors.append(f"result_{index}_ttft_seconds")
+        speed = _as_float(row.get("prefill_tok_s"))
+        if speed is None or speed <= 0:
+            errors.append(f"result_{index}_prefill_tok_s")
+    if repeats is not None and observed_repeats != set(range(repeats)):
+        errors.append("results_repeats")
+    return errors
+
+
+def extract_speed_summary(
+    payload: Any,
+    *,
+    expected_prompt_tokens: int | None = None,
+    min_runs: int = 1,
+) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError("speed JSON must be an object")
+    if expected_prompt_tokens is not None:
+        errors = _speed_summary_contract_errors(
+            payload,
+            expected_prompt_tokens=expected_prompt_tokens,
+            min_runs=min_runs,
+        )
+        if errors:
+            raise ValueError(
+                "speed JSON does not match the usage-accounted prompt contract: "
+                + ",".join(errors)
+            )
     rows = payload.get("results")
     speeds: list[float] = []
     ttfts: list[float] = []
@@ -251,7 +334,13 @@ def build_report(
         for label, path in (_parse_summary_arg(raw) for raw in summaries)
     ]
     speed_summary = (
-        extract_speed_summary(_load_json(speed_json)) if speed_json is not None else None
+        extract_speed_summary(
+            _load_json(speed_json),
+            expected_prompt_tokens=prompt_tokens,
+            min_runs=3,
+        )
+        if speed_json is not None
+        else None
     )
     return {
         "prompt_tokens": prompt_tokens,
