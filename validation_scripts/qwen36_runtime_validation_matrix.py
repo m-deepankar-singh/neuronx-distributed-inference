@@ -339,6 +339,7 @@ def attach_speed_slice_decision(
     env_log: Path,
     output_path: Path,
     next_ts: str | None = None,
+    boundary_lengths: str | None = None,
 ) -> dict[str, object]:
     decision_mod = _load_speed_slice_decision_module()
     speed_path = _speed_json_from_summary(summary)
@@ -352,6 +353,7 @@ def attach_speed_slice_decision(
         speed_output=speed_output,
         speed_json_path=speed_path,
         next_ts=next_ts,
+        boundary_lengths=boundary_lengths,
     )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(decision, indent=2, sort_keys=True) + "\n")
@@ -438,6 +440,7 @@ def main() -> int:
             env_log=args.compile_env_log,
             output_path=decision_output,
             next_ts=args.decision_next_ts,
+            boundary_lengths=args.boundary_lengths,
         )
     print(json.dumps(summary, sort_keys=True))
     return 0 if summary["passed"] else 1

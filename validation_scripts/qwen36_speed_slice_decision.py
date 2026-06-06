@@ -17,6 +17,9 @@ _NEXT_SLICE = {
     "sampletokonly": "hostlogits",
     "hostlogits": "hostlogits_lmheadbf16",
 }
+DEFAULT_BOUNDARY_LENGTHS = (
+    "123,146,160,485,505,526,1225,1265,1346,2048,2049,2500,4092,4096"
+)
 
 _SLICE_FLAGS = {
     "sampletokonly": {
@@ -279,6 +282,7 @@ def next_preflight(
     next_slice: str,
     *,
     next_ts: str | None = None,
+    boundary_lengths: str | None = None,
 ) -> dict[str, Any]:
     env: dict[str, str] = {
         key: env_values[key] for key in _INHERIT_ENV_KEYS if key in env_values
@@ -289,6 +293,8 @@ def next_preflight(
     env.update(_SLICE_FLAGS[next_slice])
     env["COMPILE_DRY_RUN"] = "1"
     env.setdefault("MAX_GDN_CHECKPOINT_SLOTS", "64")
+    resolved_boundary_lengths = boundary_lengths or DEFAULT_BOUNDARY_LENGTHS
+    boundary_arg = shlex.quote(resolved_boundary_lengths)
     dry_run_command = _quote_env_command(
         env,
         ["bash", "tmp_compile_qwen32k_segcte2048_gdnseg512.sh"],
@@ -300,16 +306,19 @@ def next_preflight(
         "python3 validation_scripts/qwen36_next_compile_preflight.py "
         "--decision-json <SPEED_SLICE_DECISION_JSON> "
         "--output-json <NEXT_COMPILE_PREFLIGHT_JSON> "
-        "--automation-json-output <AUTOMATION_PAYLOAD_JSON>"
+        "--automation-json-output <AUTOMATION_PAYLOAD_JSON> "
+        f"--boundary-lengths {boundary_arg}"
     )
     compile_command_release_command = (
         "python3 validation_scripts/qwen36_next_compile_preflight.py "
         "--decision-json <SPEED_SLICE_DECISION_JSON> "
         "--output-json <NEXT_COMPILE_RELEASE_JSON> "
-        "--automation-created-name <CREATED_AUTOMATION_NAME>"
+        "--automation-created-name <CREATED_AUTOMATION_NAME> "
+        f"--boundary-lengths {boundary_arg}"
     )
     return {
         "ts": ts,
+        "boundary_lengths": resolved_boundary_lengths,
         "compile_driver": "tmp_compile_qwen32k_segcte2048_gdnseg512.sh",
         "dry_run_env": dict(env),
         "dry_run_command": dry_run_command,
@@ -339,6 +348,7 @@ def decide(
     speed_output: dict[str, Any] | None,
     speed_json_path: Path | None,
     next_ts: str | None = None,
+    boundary_lengths: str | None = None,
 ) -> dict[str, Any]:
     current_slice = _normal_slice(env_values)
     coherence_ok = bool(runtime_summary.get("coherence_and_log_scan_passed"))
@@ -450,6 +460,7 @@ def decide(
                 env_values,
                 next_slice,
                 next_ts=next_ts,
+                boundary_lengths=boundary_lengths,
             ),
             "reason": "coherent_but_prefill_speed_below_target",
         }
@@ -472,6 +483,11 @@ def main() -> int:
         default=None,
         help="Timestamp/suffix to reuse for generated next-slice dry-run and launch commands.",
     )
+    parser.add_argument(
+        "--boundary-lengths",
+        default=DEFAULT_BOUNDARY_LENGTHS,
+        help="Exact boundary lengths to preserve in generated next-compile automation.",
+    )
     parser.add_argument("--output-json", type=Path, default=None)
     args = parser.parse_args()
 
@@ -487,6 +503,7 @@ def main() -> int:
         speed_output=speed_output,
         speed_json_path=speed_path,
         next_ts=args.next_ts,
+        boundary_lengths=args.boundary_lengths,
     )
     encoded = json.dumps(decision, indent=2, sort_keys=True) + "\n"
     if args.output_json is not None:

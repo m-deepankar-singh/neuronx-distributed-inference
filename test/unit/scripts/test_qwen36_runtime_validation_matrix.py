@@ -237,6 +237,7 @@ def test_attach_speed_slice_decision_writes_next_action(tmp_path):
         env_log=env_log,
         output_path=decision_json,
         next_ts="20260606T010203Z_hostlogits",
+        boundary_lengths="146,160",
     )
 
     assert decision["decision"] == "launch_next_speed_slice"
@@ -254,6 +255,9 @@ def test_attach_speed_slice_decision_writes_next_action(tmp_path):
     }
     assert rewritten["speed_slice_decision"]["next_preflight"]["ts"] == (
         "20260606T010203Z_hostlogits"
+    )
+    assert rewritten["speed_slice_decision"]["next_preflight"]["boundary_lengths"] == (
+        "146,160"
     )
     assert rewritten["speed_slice_decision"]["profile_preflight"] is None
 

@@ -191,6 +191,7 @@ def test_slow_sample_token_slice_advances_to_hostlogits():
         speed_output=_speed(passed=False, mean=640.0),
         speed_json_path=Path("/tmp/raw_speed.json"),
         next_ts="20260606T010203Z_hostlogits",
+        boundary_lengths="146,160",
     )
 
     assert decision["decision"] == "launch_next_speed_slice"
@@ -205,6 +206,7 @@ def test_slow_sample_token_slice_advances_to_hostlogits():
         "run_compile_command_after_automation_exists",
     ]
     assert preflight["ts"] == "20260606T010203Z_hostlogits"
+    assert preflight["boundary_lengths"] == "146,160"
     assert preflight["compile_driver"] == "tmp_compile_qwen32k_segcte2048_gdnseg512.sh"
     assert preflight["dry_run_env"]["COMPILE_DRY_RUN"] == "1"
     assert preflight["launch_env"]["COMPILE_DRY_RUN"] == "0"
@@ -238,7 +240,13 @@ def test_slow_sample_token_slice_advances_to_hostlogits():
     assert "<AUTOMATION_PAYLOAD_JSON>" in preflight[
         "next_compile_preflight_command_template"
     ]
+    assert "--boundary-lengths 146,160" in preflight[
+        "next_compile_preflight_command_template"
+    ]
     assert "<CREATED_AUTOMATION_NAME>" in preflight[
+        "compile_command_release_command_template"
+    ]
+    assert "--boundary-lengths 146,160" in preflight[
         "compile_command_release_command_template"
     ]
     assert preflight["compile_command_after_automation"] is None
@@ -386,6 +394,8 @@ def test_main_finds_speed_path_from_runtime_summary(tmp_path, monkeypatch, capsy
             str(summary_path),
             "--next-ts",
             "20260606T010203Z_cli",
+            "--boundary-lengths",
+            "146,160",
         ],
     )
 
@@ -394,5 +404,9 @@ def test_main_finds_speed_path_from_runtime_summary(tmp_path, monkeypatch, capsy
     assert payload["decision"] == "launch_next_speed_slice"
     assert payload["next_speed_slice"] == "hostlogits"
     assert payload["next_preflight"]["ts"] == "20260606T010203Z_cli"
+    assert payload["next_preflight"]["boundary_lengths"] == "146,160"
     assert payload["next_preflight"]["dry_run_env"]["TS"] == "20260606T010203Z_cli"
     assert "COMPILE_DRY_RUN=1" in payload["next_preflight"]["dry_run_command"]
+    assert "--boundary-lengths 146,160" in payload["next_preflight"][
+        "next_compile_preflight_command_template"
+    ]
