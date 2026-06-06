@@ -51,6 +51,7 @@ class TestQwen36ArtifactConfigAudit(unittest.TestCase):
             "qkv_cte_nki_kernel_fuse_qk_norm": True,
             "out_proj_kernel_enabled": False,
             "kv_cache_quant": False,
+            "disable_context_encoding_argmax_kernel": True,
             "prefix_cte_attention_backend": "attention_cte",
             "prefix_cte_attention_segment_size": 512,
             "output_logits": False,
@@ -82,6 +83,7 @@ class TestQwen36ArtifactConfigAudit(unittest.TestCase):
             "ENABLE_QKV_CTE_NKI_KERNEL_FUSE_QK_NORM": "1",
             "ENABLE_OUT_PROJ_NKI_KERNEL": "0",
             "ENABLE_KV_CACHE_QUANT": "0",
+            "DISABLE_CONTEXT_ENCODING_ARGMAX_KERNEL": "1",
             "PREFIX_CTE_ATTENTION_BACKEND": "attention_cte",
             "PREFIX_CTE_ATTENTION_SEGMENT_SIZE": "512",
             "DISABLE_ON_DEVICE_SAMPLING": "0",
@@ -218,6 +220,33 @@ class TestQwen36ArtifactConfigAudit(unittest.TestCase):
         self.assertFalse(summary["policy_passed"])
         self.assertIn("on_device_sampling_mismatch", error_codes)
         self.assertIn("output_logits_mismatch", error_codes)
+
+    def test_policy_fails_when_context_encoding_argmax_kernel_policy_mismatches(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            artifact = root / "artifact"
+            artifact.mkdir()
+            env_log = root / "compile_env.txt"
+            config = self._sampletok_config()
+            config["disable_context_encoding_argmax_kernel"] = False
+            (artifact / "neuron_config.json").write_text(json.dumps(config))
+            self._write_env(env_log, self._sampletok_env())
+
+            summary = _AUDIT.audit(
+                artifact=artifact,
+                compile_log=None,
+                env_log=env_log,
+                recommended_block_size=256,
+                min_usable_headroom_blocks=0,
+                strict_hybrid_gate=False,
+            )
+
+        error_codes = {error["code"] for error in summary["policy_errors"]}
+        self.assertFalse(summary["policy_passed"])
+        self.assertIn(
+            "disable_context_encoding_argmax_kernel_mismatch",
+            error_codes,
+        )
 
     def test_cli_returns_nonzero_for_policy_error(self):
         with tempfile.TemporaryDirectory() as tmpdir:

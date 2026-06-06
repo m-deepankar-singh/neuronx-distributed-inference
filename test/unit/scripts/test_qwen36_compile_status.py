@@ -54,6 +54,7 @@ def _policy_artifact(tmp_path, *, output_logits=False):
                 "qkv_cte_nki_kernel_fuse_qk_norm": True,
                 "out_proj_kernel_enabled": False,
                 "kv_cache_quant": False,
+                "disable_context_encoding_argmax_kernel": True,
                 "prefix_cte_attention_backend": "attention_cte",
                 "prefix_cte_attention_segment_size": 512,
                 "output_logits": output_logits,
@@ -86,6 +87,7 @@ def _policy_env_text(log, artifact, pid_file):
         "ENABLE_QKV_CTE_NKI_KERNEL_FUSE_QK_NORM=1\n"
         "ENABLE_OUT_PROJ_NKI_KERNEL=0\n"
         "ENABLE_KV_CACHE_QUANT=0\n"
+        "DISABLE_CONTEXT_ENCODING_ARGMAX_KERNEL=1\n"
         "PREFIX_CTE_ATTENTION_BACKEND=attention_cte\n"
         "PREFIX_CTE_ATTENTION_SEGMENT_SIZE=512\n"
         "DISABLE_ON_DEVICE_SAMPLING=0\n"

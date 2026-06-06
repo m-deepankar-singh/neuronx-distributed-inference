@@ -290,6 +290,11 @@ def _policy_errors_from_env(
             "kv_cache_quant",
             _bool_config(config, "kv_cache_quant"),
         ),
+        (
+            "DISABLE_CONTEXT_ENCODING_ARGMAX_KERNEL",
+            "disable_context_encoding_argmax_kernel",
+            _bool_config(config, "disable_context_encoding_argmax_kernel"),
+        ),
     ]
     for env_key, config_key, actual in bool_fields:
         if env_key in env_values:

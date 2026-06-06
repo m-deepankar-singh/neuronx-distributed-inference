@@ -854,3 +854,9 @@ bash tmp_compile_qwen32k_segcte2048_gdnseg512.sh
    - Reason: the current coherent-speed rebuild treats KV BF16 as the invariant. Sneaking `--kv-cache-dtype fp8` into launch would confound coherence validation and memory-admission experiments.
    - Added regression coverage in `test/unit/scripts/test_qwen36_launch_env_audit.py` and `test/unit/scripts/test_qwen36_launch_preflight.py`.
    - Verification passed locally: py_compile for changed scripts/tests; focused launch audit/preflight/driver pytest (`15 passed`); full `python3 -m pytest test/unit/scripts` (`115 passed`); compile-driver unit test (`7 passed`); artifact config audit unit test (`5 passed`); validation-tool manifest build/verify with `file_count=32`, `mismatch_count=0`.
+
+79. Artifact policy now enforces context-encoding argmax disablement.
+   - Updated `validation_scripts/qwen36_artifact_config_audit.py` so env logs with `DISABLE_CONTEXT_ENCODING_ARGMAX_KERNEL=1` require `neuron_config.json` to persist `disable_context_encoding_argmax_kernel=true`.
+   - Reason: the sampler/logits failure history included invalid token fallback and token-0 (`!`) false-coherence paths. A speed-slice artifact must prove the context-encoding argmax kernel policy matches the compile env before automation rsyncs and launches it.
+   - Added regression coverage in `contrib/models/Qwen3.6-27B/test/unit/test_qwen36_artifact_config_audit.py` and updated compile-status policy fixtures in `test/unit/scripts/test_qwen36_compile_status.py`.
+   - Verification passed locally: py_compile for changed scripts/tests; artifact config audit unit test (`6 passed`); focused compile-status pytest (`12 passed`); full `python3 -m pytest test/unit/scripts` (`115 passed`); compile-driver unit test (`7 passed`); validation-tool manifest build/verify with `file_count=32`, `mismatch_count=0`.
