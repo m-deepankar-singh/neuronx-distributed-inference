@@ -118,6 +118,23 @@ def _source_commit(source_dir: str, override: str | None, values: dict[str, str]
     return monitor_prompt._git_commit(path)
 
 
+def _resolve_boundary_lengths(preflight: dict[str, Any], requested: str) -> str:
+    raw = preflight.get("boundary_lengths")
+    if raw is None or str(raw).strip() == "":
+        return requested
+    resolved = str(raw)
+    if (
+        requested
+        and requested != monitor_prompt.DEFAULT_BOUNDARY_LENGTHS
+        and requested != resolved
+    ):
+        raise ValueError(
+            "boundary-lengths does not match decision next_preflight: "
+            f"{requested!r} != {resolved!r}"
+        )
+    return resolved
+
+
 def build_preflight(
     *,
     decision: dict[str, Any],
@@ -141,6 +158,7 @@ def build_preflight(
     preflight = decision.get("next_preflight")
     if not isinstance(preflight, dict):
         raise ValueError("decision JSON is missing next_preflight")
+    resolved_boundary_lengths = _resolve_boundary_lengths(preflight, boundary_lengths)
 
     dry_run_env = _string_map(preflight.get("dry_run_env"), key="dry_run_env")
     launch_env = _string_map(preflight.get("launch_env"), key="launch_env")
@@ -172,7 +190,7 @@ def build_preflight(
         source_dir=resolved_source_dir,
         source_commit=resolved_source_commit,
         launch_script=launch_script,
-        boundary_lengths=boundary_lengths,
+        boundary_lengths=resolved_boundary_lengths,
     )
     automation_payload = monitor_prompt.build_automation_payload(
         env_values,
@@ -217,7 +235,7 @@ def build_preflight(
         "--launch-script",
         launch_script,
         "--boundary-lengths",
-        boundary_lengths,
+        resolved_boundary_lengths,
     ]
 
     result: dict[str, Any] = {
@@ -258,7 +276,7 @@ def build_preflight(
             "automation_name": automation_payload["name"],
             "automation_interval_minutes": automation_interval_minutes,
             "launch_script": launch_script,
-            "boundary_lengths": boundary_lengths,
+            "boundary_lengths": resolved_boundary_lengths,
         },
         "run_order": [
             "create_heartbeat_automation_from_automation_payload",

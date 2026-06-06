@@ -56,7 +56,7 @@ def _speed():
     }
 
 
-def _decision(tmp_path):
+def _decision(tmp_path, *, boundary_lengths=None):
     model = tmp_path / "model"
     art_root = tmp_path / "artifacts"
     logdir = tmp_path / "logs"
@@ -75,11 +75,12 @@ def _decision(tmp_path):
         speed_output=_speed(),
         speed_json_path=Path("/tmp/raw_speed.json"),
         next_ts="20260606T010203Z_hostlogits",
+        boundary_lengths=boundary_lengths,
     )
 
 
 def test_build_preflight_runs_dry_run_and_builds_automation_payload(tmp_path):
-    decision = _decision(tmp_path)
+    decision = _decision(tmp_path, boundary_lengths="146,160")
     decision_path = tmp_path / "speed_slice_decision.json"
     decision_path.write_text(json.dumps(decision) + "\n")
 
@@ -143,12 +144,65 @@ def test_build_preflight_runs_dry_run_and_builds_automation_payload(tmp_path):
     assert result["release_preflight_context"]["automation_name"] == payload["name"]
     assert result["release_preflight_context"]["compile_host"] == "ubuntu@compile"
     assert result["release_preflight_context"]["runtime_host"] == "ubuntu@runtime"
+    assert result["release_preflight_context"]["boundary_lengths"] == "146,160"
+
+
+def test_build_preflight_uses_decision_boundary_lengths_when_cli_default(tmp_path):
+    decision = _decision(tmp_path, boundary_lengths="146,160")
+    decision_path = tmp_path / "speed_slice_decision.json"
+    decision_path.write_text(json.dumps(decision) + "\n")
+
+    result = _SCRIPT.build_preflight(
+        decision=decision,
+        decision_path=decision_path,
+        repo_root=_REPO_ROOT,
+        compile_host="ubuntu@compile",
+        runtime_host="ubuntu@runtime",
+        source_dir=None,
+        source_commit=None,
+        automation_name=None,
+        automation_created_name=None,
+        automation_interval_minutes=7,
+        launch_script="tmp_launch_qwen36_segcte2048.sh",
+        boundary_lengths=_SCRIPT.monitor_prompt.DEFAULT_BOUNDARY_LENGTHS,
+    )
+
+    assert result["release_preflight_context"]["boundary_lengths"] == "146,160"
+    assert "--boundary-lengths 146,160" in result[
+        "compile_command_release_command_template"
+    ]
+
+
+def test_build_preflight_rejects_conflicting_boundary_lengths(tmp_path):
+    decision = _decision(tmp_path)
+    decision_path = tmp_path / "speed_slice_decision.json"
+    decision_path.write_text(json.dumps(decision) + "\n")
+
+    try:
+        _SCRIPT.build_preflight(
+            decision=decision,
+            decision_path=decision_path,
+            repo_root=_REPO_ROOT,
+            compile_host="ubuntu@compile",
+            runtime_host="ubuntu@runtime",
+            source_dir=None,
+            source_commit=None,
+            automation_name=None,
+            automation_created_name=None,
+            automation_interval_minutes=7,
+            launch_script="tmp_launch_qwen36_segcte2048.sh",
+            boundary_lengths="146,160",
+        )
+    except ValueError as exc:
+        assert "boundary-lengths does not match" in str(exc)
+    else:
+        raise AssertionError("conflicting boundary lengths should fail")
 
 
 def test_build_preflight_releases_compile_command_after_matching_automation_ack(
     tmp_path,
 ):
-    decision = _decision(tmp_path)
+    decision = _decision(tmp_path, boundary_lengths="146,160")
     decision_path = tmp_path / "speed_slice_decision.json"
     decision_path.write_text(json.dumps(decision) + "\n")
     automation_name = "monitor-explicit-hostlogits-compile"
@@ -182,7 +236,7 @@ def test_build_preflight_releases_compile_command_after_matching_automation_ack(
 
 
 def test_build_preflight_rejects_mismatched_automation_ack(tmp_path):
-    decision = _decision(tmp_path)
+    decision = _decision(tmp_path, boundary_lengths="146,160")
     decision_path = tmp_path / "speed_slice_decision.json"
     decision_path.write_text(json.dumps(decision) + "\n")
 
