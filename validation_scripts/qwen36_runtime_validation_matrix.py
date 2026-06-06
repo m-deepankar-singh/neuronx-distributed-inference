@@ -334,6 +334,8 @@ def attach_speed_slice_decision(
         "decision": decision.get("decision"),
         "next_speed_slice": decision.get("next_speed_slice"),
         "reason": decision.get("reason"),
+        "next_preflight": decision.get("next_preflight"),
+        "profile_preflight": decision.get("profile_preflight"),
     }
     summary_path = Path(str(summary["output_dir"])) / "runtime_validation_summary.json"
     summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")

@@ -196,6 +196,66 @@ def test_attach_speed_slice_decision_writes_next_action(tmp_path):
     rewritten = json.loads((tmp_path / "runtime_validation_summary.json").read_text())
     assert rewritten["speed_slice_decision_path"] == str(decision_json)
     assert rewritten["speed_slice_decision"]["decision"] == "launch_next_speed_slice"
+    assert rewritten["speed_slice_decision"]["next_preflight"]["ts"] == (
+        "20260606T010203Z_hostlogits"
+    )
+    assert rewritten["speed_slice_decision"]["profile_preflight"] is None
+
+
+def test_attach_speed_slice_decision_surfaces_profile_preflight(tmp_path):
+    env_log = tmp_path / "compile_env.txt"
+    speed_json = tmp_path / "raw_prefill_speed.json"
+    decision_json = tmp_path / "speed_slice_decision.json"
+    env_log.write_text(
+        "SPEED_SLICE=hostlogits_lmheadbf16\n"
+        f"WORKDIR={tmp_path / 'work'}\n"
+        f"LOGDIR={tmp_path / 'logs'}\n"
+        "CTE_BUCKETS_RAW=2048\n"
+    )
+    speed_json.write_text(
+        json.dumps(
+            {
+                "row_gate_passed": True,
+                "prefill_tok_s_mean": 950.0,
+                "speed_gate": {
+                    "passed": False,
+                    "min_prefill_tok_s": 3000.0,
+                    "failure_reason": "mean_prefill_tok_s_below_threshold",
+                },
+            }
+        )
+        + "\n"
+    )
+    summary = {
+        "passed": False,
+        "coherence_and_log_scan_passed": True,
+        "output_dir": str(tmp_path),
+        "results": [
+            {
+                "name": "raw_prefill_speed",
+                "phase": "speed",
+                "output_path": str(speed_json),
+                "passed": False,
+                "skipped": False,
+            }
+        ],
+    }
+
+    decision = _SCRIPT.attach_speed_slice_decision(
+        summary,
+        env_log=env_log,
+        output_path=decision_json,
+        next_ts="20260606T010203Z_profile",
+    )
+
+    assert decision["decision"] == "profile_slow_coherent"
+    rewritten = json.loads((tmp_path / "runtime_validation_summary.json").read_text())
+    profile_preflight = rewritten["speed_slice_decision"]["profile_preflight"]
+    assert profile_preflight["ts"] == "20260606T010203Z_profile"
+    assert profile_preflight["do_not_profile_live_vllm"] is True
+    assert profile_preflight["context_tokens"] == 2048
+    assert "qwen36_context_neff_profile.py" in profile_preflight["run_command"]
+    assert rewritten["speed_slice_decision"]["next_preflight"] is None
 
 
 def test_attach_speed_slice_decision_handles_skipped_speed_after_failure(tmp_path):
