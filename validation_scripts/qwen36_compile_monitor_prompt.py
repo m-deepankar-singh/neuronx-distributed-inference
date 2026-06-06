@@ -189,7 +189,7 @@ Before the live vLLM launch on {runtime_host}, use the maintained preflight wrap
 
 After the launch audit passes, launch on {runtime_host} with `{launch_script}`, wait for `/health`, then run the coherence matrix before any speed claim.
 
-Preferred validation driver after launch: `validation_scripts/qwen36_runtime_validation_matrix.py --base-url http://127.0.0.1:<port> --model-path {model_path} --serve-log <serve.log> --output-dir <validation-output-dir> --min-prefill-tok-s 3000 --compile-env-log <runtime-compile-env-log>`. It runs the coherence/log-scan/speed gates in order, skips speed automatically if coherence or log scan fails, and writes `<validation-output-dir>/speed_slice_decision.json`.
+Preferred validation driver after launch: `validation_scripts/qwen36_runtime_validation_matrix.py --base-url http://127.0.0.1:<port> --model-path {model_path} --serve-log <serve.log> --output-dir <validation-output-dir> --min-prefill-tok-s 3000 --compile-env-log <runtime-compile-env-log> --boundary-lengths {boundary_lengths}`. It runs the coherence/log-scan/speed gates in order, skips speed automatically if coherence or log scan fails, and writes `<validation-output-dir>/speed_slice_decision.json`.
 
 Before runtime validation, if `validation_scripts/qwen36_validation_tool_manifest.py` is present, use it to build or verify a validation-tool manifest for the source checkout so the verdict is tied to the expected coherence/speed gates.
 

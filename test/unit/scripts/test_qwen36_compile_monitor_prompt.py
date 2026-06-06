@@ -110,6 +110,7 @@ def test_render_prompt_contains_compile_validation_and_runtime_gates():
     assert "qwen36_next_compile_preflight.py" in prompt
     assert "--automation-json-output <automation-payload.json>" in prompt
     assert "--boundary-lengths 146,160" in prompt
+    assert prompt.count("--boundary-lengths 146,160") >= 2
     assert "compile_command_release_command_template" in prompt
     assert "release_preflight_context" in prompt
     assert "<NEXT_COMPILE_RELEASE_JSON>" in prompt
