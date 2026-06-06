@@ -38,6 +38,8 @@ def _args(**overrides):
         sweep_start=4088,
         sweep_end=4090,
         long_lengths="8192,16384",
+        skip_long_boundary=False,
+        skip_long_boundary_reason=None,
         skip_chat=False,
         chat_lengths="160,1225,2500",
         chat_turns=8,
@@ -94,6 +96,33 @@ def test_build_steps_requires_log_scan_unless_explicitly_skipped():
 
     steps = _SCRIPT.build_steps(_args(serve_log=[], skip_log_scan=True))
     assert "runtime_log_scan" not in [step.name for step in steps]
+
+
+def test_build_steps_requires_long_boundary_unless_explicitly_skipped():
+    try:
+        _SCRIPT.build_steps(_args(long_lengths=""))
+    except ValueError as exc:
+        assert "--long-lengths" in str(exc)
+    else:
+        raise AssertionError("missing long boundary lengths should fail")
+
+    try:
+        _SCRIPT.build_steps(
+            _args(long_lengths="", skip_long_boundary=True, skip_long_boundary_reason="")
+        )
+    except ValueError as exc:
+        assert "--skip-long-boundary-reason" in str(exc)
+    else:
+        raise AssertionError("missing long boundary skip reason should fail")
+
+    steps = _SCRIPT.build_steps(
+        _args(
+            long_lengths="",
+            skip_long_boundary=True,
+            skip_long_boundary_reason="artifact max context below 8192",
+        )
+    )
+    assert "boundary_long" not in [step.name for step in steps]
 
 
 def test_run_matrix_skips_speed_after_coherence_failure(tmp_path):

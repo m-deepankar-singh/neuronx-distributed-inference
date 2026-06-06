@@ -114,7 +114,8 @@ def build_steps(args: argparse.Namespace) -> list[ValidationStep]:
             ],
         ),
     ]
-    if args.long_lengths:
+    long_lengths = str(args.long_lengths or "").strip()
+    if long_lengths:
         steps.append(
             ValidationStep(
                 name="boundary_long",
@@ -125,7 +126,7 @@ def build_steps(args: argparse.Namespace) -> list[ValidationStep]:
                     _script("qwen36_openai_boundary_apc_probe.py"),
                     *_common_model_args(args),
                     "--lengths",
-                    args.long_lengths,
+                    long_lengths,
                     "--repeats",
                     "1",
                     "--max-tokens",
@@ -136,6 +137,14 @@ def build_steps(args: argparse.Namespace) -> list[ValidationStep]:
                     str(out / "boundary_long.jsonl"),
                 ],
             )
+        )
+    elif not args.skip_long_boundary:
+        raise ValueError(
+            "--long-lengths must be non-empty unless --skip-long-boundary is set"
+        )
+    elif not str(args.skip_long_boundary_reason or "").strip():
+        raise ValueError(
+            "--skip-long-boundary-reason is required when --skip-long-boundary is set"
         )
     if not args.skip_chat:
         steps.append(
@@ -391,6 +400,16 @@ def main() -> int:
     parser.add_argument("--sweep-start", type=int, default=4088)
     parser.add_argument("--sweep-end", type=int, default=4104)
     parser.add_argument("--long-lengths", default="8192,16384")
+    parser.add_argument(
+        "--skip-long-boundary",
+        action="store_true",
+        help="Explicitly skip 8k/16k long-context coherence probes.",
+    )
+    parser.add_argument(
+        "--skip-long-boundary-reason",
+        default=None,
+        help="Required explanation when --skip-long-boundary is used.",
+    )
     parser.add_argument("--skip-chat", action="store_true")
     parser.add_argument("--chat-lengths", default="160,1225,2500")
     parser.add_argument("--chat-turns", type=int, default=8)
