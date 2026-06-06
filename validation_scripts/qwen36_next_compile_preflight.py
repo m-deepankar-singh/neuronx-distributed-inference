@@ -146,6 +146,7 @@ def build_preflight(
     source_commit: str | None,
     automation_name: str | None,
     automation_created_name: str | None,
+    automation_created_id: str | None,
     automation_interval_minutes: int,
     launch_script: str,
     boundary_lengths: str,
@@ -203,12 +204,21 @@ def build_preflight(
         ["bash", driver],
     )
 
-    release_compile_command = automation_created_name is not None
+    if (automation_created_name is None) != (automation_created_id is None):
+        raise ValueError(
+            "automation release requires both --automation-created-name and "
+            "--automation-created-id from codex_app.automation_update"
+        )
+    release_compile_command = (
+        automation_created_name is not None and automation_created_id is not None
+    )
     if release_compile_command and automation_created_name != automation_payload["name"]:
         raise ValueError(
             "automation-created-name does not match generated automation payload "
             f"name: {automation_created_name!r} != {automation_payload['name']!r}"
         )
+    if release_compile_command and not str(automation_created_id).strip():
+        raise ValueError("automation-created-id must be a non-empty automation id")
     release_command = [
         "python3",
         "validation_scripts/qwen36_next_compile_preflight.py",
@@ -230,6 +240,8 @@ def build_preflight(
         automation_payload["name"],
         "--automation-created-name",
         automation_payload["name"],
+        "--automation-created-id",
+        "<CREATED_AUTOMATION_ID_FROM_CODEX_APP>",
         "--automation-interval-minutes",
         str(automation_interval_minutes),
         "--launch-script",
@@ -255,7 +267,9 @@ def build_preflight(
         "automation_ack": {
             "required": True,
             "created_name": automation_created_name,
+            "created_id": automation_created_id,
             "matched_payload_name": release_compile_command,
+            "has_created_id": release_compile_command,
         },
         "requires_automation_creation_before_compile": True,
         "compile_command_after_automation": compile_command
@@ -280,7 +294,7 @@ def build_preflight(
         },
         "run_order": [
             "create_heartbeat_automation_from_automation_payload",
-            "rerun_next_compile_preflight_with_automation_created_name",
+            "rerun_next_compile_preflight_with_automation_created_name_and_id",
             "run_compile_command_after_automation_exists",
         ],
     }
@@ -319,6 +333,15 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--automation-created-id",
+        default=None,
+        help=(
+            "Automation id returned by codex_app.automation_update after the "
+            "heartbeat is created. The live compile command is emitted only "
+            "when this is present together with --automation-created-name."
+        ),
+    )
+    parser.add_argument(
         "--automation-interval-minutes",
         type=int,
         default=10,
@@ -342,6 +365,7 @@ def main() -> int:
             source_commit=args.source_commit,
             automation_name=args.automation_name,
             automation_created_name=args.automation_created_name,
+            automation_created_id=args.automation_created_id,
             automation_interval_minutes=args.automation_interval_minutes,
             launch_script=args.launch_script,
             boundary_lengths=args.boundary_lengths,

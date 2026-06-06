@@ -153,6 +153,7 @@ def test_build_preflight_runs_dry_run_and_builds_automation_payload(tmp_path):
         source_commit=None,
         automation_name=None,
         automation_created_name=None,
+        automation_created_id=None,
         automation_interval_minutes=7,
         launch_script="tmp_launch_qwen36_segcte2048.sh",
         boundary_lengths=_SCRIPT.monitor_prompt.DEFAULT_BOUNDARY_LENGTHS,
@@ -164,7 +165,7 @@ def test_build_preflight_runs_dry_run_and_builds_automation_payload(tmp_path):
     assert result["requires_automation_creation_before_compile"] is True
     assert result["run_order"] == [
         "create_heartbeat_automation_from_automation_payload",
-        "rerun_next_compile_preflight_with_automation_created_name",
+        "rerun_next_compile_preflight_with_automation_created_name_and_id",
         "run_compile_command_after_automation_exists",
     ]
     assert result["compile_command_after_automation"] is None
@@ -172,7 +173,9 @@ def test_build_preflight_runs_dry_run_and_builds_automation_payload(tmp_path):
     assert result["automation_ack"] == {
         "required": True,
         "created_name": None,
+        "created_id": None,
         "matched_payload_name": False,
+        "has_created_id": False,
     }
     assert result["dry_run"]["returncode"] == 0
     assert Path(result["dry_run"]["env_log"]).exists()
@@ -197,6 +200,7 @@ def test_build_preflight_runs_dry_run_and_builds_automation_payload(tmp_path):
     assert f"--boundary-lengths {_SCRIPT.monitor_prompt.DEFAULT_BOUNDARY_LENGTHS}" in payload["prompt"]
     release = result["compile_command_release_command_template"]
     assert payload["name"] in release
+    assert "--automation-created-id '<CREATED_AUTOMATION_ID_FROM_CODEX_APP>'" in release
     assert f"--repo-root {str(_REPO_ROOT)}" in release
     assert "--compile-host ubuntu@compile" in release
     assert "--runtime-host ubuntu@runtime" in release
@@ -230,6 +234,7 @@ def test_build_preflight_uses_decision_boundary_lengths_when_cli_default(tmp_pat
         source_commit=None,
         automation_name=None,
         automation_created_name=None,
+        automation_created_id=None,
         automation_interval_minutes=7,
         launch_script="tmp_launch_qwen36_segcte2048.sh",
         boundary_lengths=_SCRIPT.monitor_prompt.DEFAULT_BOUNDARY_LENGTHS,
@@ -259,6 +264,7 @@ def test_build_preflight_rejects_conflicting_boundary_lengths(tmp_path):
             source_commit=None,
             automation_name=None,
             automation_created_name=None,
+            automation_created_id=None,
             automation_interval_minutes=7,
             launch_script="tmp_launch_qwen36_segcte2048.sh",
             boundary_lengths="146,160",
@@ -287,6 +293,7 @@ def test_build_preflight_releases_compile_command_after_matching_automation_ack(
         source_commit=None,
         automation_name=automation_name,
         automation_created_name=automation_name,
+        automation_created_id="auto-explicit-hostlogits",
         automation_interval_minutes=7,
         launch_script="tmp_launch_qwen36_segcte2048.sh",
         boundary_lengths=_SCRIPT.monitor_prompt.DEFAULT_BOUNDARY_LENGTHS,
@@ -296,7 +303,9 @@ def test_build_preflight_releases_compile_command_after_matching_automation_ack(
     assert result["automation_ack"] == {
         "required": True,
         "created_name": automation_name,
+        "created_id": "auto-explicit-hostlogits",
         "matched_payload_name": True,
+        "has_created_id": True,
     }
     assert result["run_order"] == ["run_compile_command_after_automation_exists"]
     assert result["compile_command_after_automation"] == result[
@@ -321,6 +330,7 @@ def test_build_preflight_rejects_mismatched_automation_ack(tmp_path):
             source_commit=None,
             automation_name="monitor-expected",
             automation_created_name="monitor-wrong",
+            automation_created_id="auto-123",
             automation_interval_minutes=7,
             launch_script="tmp_launch_qwen36_segcte2048.sh",
             boundary_lengths=_SCRIPT.monitor_prompt.DEFAULT_BOUNDARY_LENGTHS,
@@ -329,6 +339,33 @@ def test_build_preflight_rejects_mismatched_automation_ack(tmp_path):
         assert "automation-created-name does not match" in str(exc)
     else:
         raise AssertionError("mismatched automation ack should fail")
+
+
+def test_build_preflight_rejects_partial_automation_ack(tmp_path):
+    decision = _decision(tmp_path)
+    decision_path = tmp_path / "speed_slice_decision.json"
+    decision_path.write_text(json.dumps(decision) + "\n")
+
+    try:
+        _SCRIPT.build_preflight(
+            decision=decision,
+            decision_path=decision_path,
+            repo_root=_REPO_ROOT,
+            compile_host="ubuntu@compile",
+            runtime_host="ubuntu@runtime",
+            source_dir=None,
+            source_commit=None,
+            automation_name="monitor-expected",
+            automation_created_name="monitor-expected",
+            automation_created_id=None,
+            automation_interval_minutes=7,
+            launch_script="tmp_launch_qwen36_segcte2048.sh",
+            boundary_lengths=_SCRIPT.monitor_prompt.DEFAULT_BOUNDARY_LENGTHS,
+        )
+    except ValueError as exc:
+        assert "requires both --automation-created-name" in str(exc)
+    else:
+        raise AssertionError("partial automation ack should fail")
 
 
 def test_cli_writes_preflight_and_automation_payload_json(tmp_path, monkeypatch, capsys):
@@ -397,6 +434,8 @@ def test_cli_releases_compile_command_after_automation_ack(
             "monitor-cli-release",
             "--automation-created-name",
             "monitor-cli-release",
+            "--automation-created-id",
+            "auto-monitor-cli-release",
         ],
     )
 
@@ -405,6 +444,8 @@ def test_cli_releases_compile_command_after_automation_ack(
     written = json.loads(output_path.read_text())
 
     assert printed["automation_ack"]["matched_payload_name"] is True
+    assert printed["automation_ack"]["created_id"] == "auto-monitor-cli-release"
+    assert printed["automation_ack"]["has_created_id"] is True
     assert written["compile_command_after_automation"] == printed[
         "compile_command_after_automation"
     ]

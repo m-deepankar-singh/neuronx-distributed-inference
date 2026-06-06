@@ -444,6 +444,9 @@ def test_slow_sample_token_slice_advances_to_hostlogits():
     assert "<CREATED_AUTOMATION_NAME>" in preflight[
         "compile_command_release_command_template"
     ]
+    assert "<CREATED_AUTOMATION_ID_FROM_CODEX_APP>" in preflight[
+        "compile_command_release_command_template"
+    ]
     assert f"--boundary-lengths {_SCRIPT.DEFAULT_BOUNDARY_LENGTHS}" in preflight[
         "compile_command_release_command_template"
     ]
@@ -468,6 +471,9 @@ def test_slow_hostlogits_advances_to_lmhead_bf16_only():
         "dry_run_command"
     ]
     assert "<CREATED_AUTOMATION_NAME>" in decision["next_preflight"][
+        "compile_command_release_command_template"
+    ]
+    assert "<CREATED_AUTOMATION_ID_FROM_CODEX_APP>" in decision["next_preflight"][
         "compile_command_release_command_template"
     ]
     assert decision["next_preflight"]["launch_env"]["QUANTIZE_LM_HEAD"] == "0"

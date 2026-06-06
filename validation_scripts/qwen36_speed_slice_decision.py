@@ -554,6 +554,7 @@ def next_preflight(
         "--decision-json <SPEED_SLICE_DECISION_JSON> "
         "--output-json <NEXT_COMPILE_RELEASE_JSON> "
         "--automation-created-name <CREATED_AUTOMATION_NAME> "
+        "--automation-created-id <CREATED_AUTOMATION_ID_FROM_CODEX_APP> "
         f"--boundary-lengths {boundary_arg}"
     )
     return {
