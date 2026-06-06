@@ -199,9 +199,9 @@ def test_slow_sample_token_slice_advances_to_hostlogits():
     assert decision["next_required_flags"]["QUANTIZE_LM_HEAD"] == "1"
     preflight = decision["next_preflight"]
     assert preflight["run_order"] == [
-        "run_dry_run_command",
-        "create_heartbeat_automation_from_template",
-        "run_launch_command_after_automation_exists",
+        "run_next_compile_preflight_command",
+        "create_heartbeat_automation_from_payload_json",
+        "run_compile_command_after_automation_exists",
     ]
     assert preflight["ts"] == "20260606T010203Z_hostlogits"
     assert preflight["compile_driver"] == "tmp_compile_qwen32k_segcte2048_gdnseg512.sh"
@@ -229,6 +229,18 @@ def test_slow_sample_token_slice_advances_to_hostlogits():
     assert "<ENVLOG_FROM_DRY_RUN>" in preflight["automation_payload_command_template"]
     assert "monitor-qwen-hostlogits-20260606t010203z-hostlogits-compile" in preflight[
         "automation_payload_command_template"
+    ]
+    assert "qwen36_next_compile_preflight.py" in preflight[
+        "next_compile_preflight_command_template"
+    ]
+    assert "<SPEED_SLICE_DECISION_JSON>" in preflight[
+        "next_compile_preflight_command_template"
+    ]
+    assert "<AUTOMATION_PAYLOAD_JSON>" in preflight[
+        "next_compile_preflight_command_template"
+    ]
+    assert preflight["compile_command_after_automation"] == preflight[
+        "launch_command_after_automation"
     ]
     assert "COMPILE_DRY_RUN=0" in launch
 
