@@ -178,9 +178,19 @@ Ported rebuild commits:
    - Command: SSH monitor for `/home/ubuntu/validation_logs/fp8_256k_decode_nki/qwen36_32k_fp8_fp8all_lmheadfp8_gatesfp8_kvbf16_qkvnki_tiled_segmented_cte512_gdnseg512_cte2048_pfx32k_slots64_20260605T152927Z_direct_scan0_compile.log`.
    - Error: `bash: -c: line 1: unexpected EOF while looking for matching "\""`.
    - Context: compile host `ubuntu@16.26.135.243`, source `/home/ubuntu/inferentia-gdn-prefill-speed-coherent` at commit `f2c46e6`, PID `65418`, artifact `/mnt/trainium_artifacts/qwen_artifacts/qwen36_32k_fp8_fp8all_lmheadfp8_gatesfp8_kvbf16_qkvnki_tiled_segmented_cte512_gdnseg512_cte2048_pfx32k_slots64_20260605T152927Z_direct_scan0`.
+
    - Root cause: the monitor command mixed single quotes and a mismatched double quote around the remote `tail -80 "$log"` expression.
    - Mitigation: reran the monitor command with balanced quoting.
    - Verification: corrected monitor showed the compile still running, all HLOs completed successfully, no `QKV NKI expects`, `row-scale layout`, `NCC_INKI016`, traceback, or runtime exception in the log, and checkpoint-bank sharding had started.
+
+### 2026-06-06 automation and launch-contract guardrails
+
+- Compile monitoring policy: compile launches must have a heartbeat automation created before the compile is started. The current active automation is `monitor-qwen-sampletokonly-compile`; it should return quiet while the compile is still running and report only final compile/runtime verdicts or concrete failure evidence. Do not manually poll the compile host unless explicitly asked.
+- Added `validation_scripts/qwen36_launch_env_audit.py` to compare a launch env log against the compile env log before starting vLLM. It fails on artifact mismatch, runtime context/sequence length drift, uncompiled CTE/TKG/context bucket advertisement, GDN dtype drift, disabled hybrid KV cache manager, or missing Hybrid APC/chunked-prefill guard flags. It allows only the synthetic prefix-0 context pair as launch-only metadata.
+- Intended preflight after a compile succeeds and before a runtime launch:
+  1. Run `LAUNCH_DRY_RUN=1` with `MAX_MODEL_LEN`, `SEQ_LEN`, bucket pairs, token-generation buckets, and GDN cache dtypes set from the compile env log.
+  2. Run `python3 validation_scripts/qwen36_launch_env_audit.py --compile-env-log <compile_env> --launch-env-log <launch_env> --require-launch-dry-run`.
+  3. Create/update the runtime validation automation or launch only if the audit passes.
 
 18. First EC2-to-EC2 rsync of the completed QKV NKI artifact failed because compile host could not authenticate to runtime host.
    - Command: from local SSH into `ubuntu@16.26.135.243`, run `rsync -aH --partial --info=progress2 -e "ssh -o StrictHostKeyChecking=no" /mnt/trainium_artifacts/qwen_artifacts/qwen36_32k_fp8_fp8all_lmheadfp8_gatesfp8_kvbf16_qkvnki_tiled_segmented_cte512_gdnseg512_cte2048_pfx32k_slots64_20260605T152927Z_direct_scan0/ ubuntu@16.26.184.190:/mnt/trainium_artifacts/qwen_artifacts/qwen36_32k_fp8_fp8all_lmheadfp8_gatesfp8_kvbf16_qkvnki_tiled_segmented_cte512_gdnseg512_cte2048_pfx32k_slots64_20260605T152927Z_direct_scan0/`.
