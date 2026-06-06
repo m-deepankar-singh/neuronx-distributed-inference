@@ -981,3 +981,9 @@ bash tmp_compile_qwen32k_segcte2048_gdnseg512.sh
    - Reason: previous artifact policy mostly checked config-vs-env consistency. A confounded artifact could still pass if both env and config agreed on a known-bad speed-slice setting such as segmented CTE. Now speed-slice labels imply the actual safe one-variable policy.
    - Added regression coverage where env and config both use `segmented_cte`; it no longer passes under `SPEED_SLICE=sampletokonly` and reports `speed_slice_prefix_cte_attention_backend_mismatch`.
    - Verification passed locally: py_compile for audit/status scripts and tests; focused audit/status pytest (`19 passed`); full `python3 -m pytest test/unit/scripts` (`130 passed`); compile-driver plus artifact-audit pytest (`14 passed`); validation-tool manifest build/verify with `file_count=32`, `mismatch_count=0`.
+
+99. Active sample-token automation now carries the speed-slice artifact policy.
+   - Updated the existing app heartbeat automation `monitor-qwen-sampletokonly-compile` in place after commit `8fff97a`, preserving its 30-minute cadence and same sample-token artifact paths.
+   - The live prompt now says validators/next-slice preflight must fast-forward clean source checkouts to `origin/codex/qwen36-prefill-speed-coherent` through `8fff97a` or newer before artifact readiness, runtime validation, or next compile decisions.
+   - The live prompt now requires `qwen36_compile_status.py --require-artifact-policy` to pass before rsync/launch and explicitly treats speed-slice policy errors, including `speed_slice_prefix_cte_attention_backend_mismatch`, as artifact validation failures.
+   - No compile-host polling was performed for this update; the in-flight compile remains automation-owned.
