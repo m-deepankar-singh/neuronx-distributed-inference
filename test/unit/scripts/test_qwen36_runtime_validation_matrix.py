@@ -16,6 +16,12 @@ sys.modules[_SPEC.name] = _SCRIPT
 _SPEC.loader.exec_module(_SCRIPT)
 
 
+def test_default_boundary_lengths_cover_known_failure_points():
+    assert _SCRIPT.DEFAULT_BOUNDARY_LENGTHS == (
+        "123,146,160,485,505,526,1225,1265,1346,2048,2049,2500,4092,4096"
+    )
+
+
 def _args(**overrides):
     defaults = dict(
         base_url="http://127.0.0.1:8001",

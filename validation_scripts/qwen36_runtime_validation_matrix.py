@@ -16,6 +16,9 @@ from typing import Callable, Sequence
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
 _DECISION_SCRIPT = _SCRIPT_DIR / "qwen36_speed_slice_decision.py"
+DEFAULT_BOUNDARY_LENGTHS = (
+    "123,146,160,485,505,526,1225,1265,1346,2048,2049,2500,4092,4096"
+)
 
 
 @dataclass(frozen=True)
@@ -377,7 +380,7 @@ def main() -> int:
     parser.add_argument("--serve-log", action="append", default=[])
     parser.add_argument(
         "--boundary-lengths",
-        default="146,160,485,505,526,1225,2048,2049,2500,4092,4096",
+        default=DEFAULT_BOUNDARY_LENGTHS,
     )
     parser.add_argument("--boundary-repeats", type=int, default=1)
     parser.add_argument("--boundary-max-tokens", type=int, default=1)

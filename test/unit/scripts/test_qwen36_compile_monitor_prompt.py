@@ -14,6 +14,12 @@ _SCRIPT = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(_SCRIPT)
 
 
+def test_default_boundary_lengths_cover_known_failure_points():
+    assert _SCRIPT.DEFAULT_BOUNDARY_LENGTHS == (
+        "123,146,160,485,505,526,1225,1265,1346,2048,2049,2500,4092,4096"
+    )
+
+
 def test_parse_env_log_skips_comments_and_blank_lines(tmp_path):
     env_log = tmp_path / "env.txt"
     env_log.write_text(

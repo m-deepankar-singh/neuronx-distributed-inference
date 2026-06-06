@@ -238,6 +238,10 @@ def test_cli_writes_preflight_and_automation_payload_json(tmp_path, monkeypatch,
     assert printed["passed"] is True
     assert written["passed"] is True
     assert printed["automation_payload_path"] == str(automation_payload_path)
+    assert (
+        "--boundary-lengths "
+        "123,146,160,485,505,526,1225,1265,1346,2048,2049,2500,4092,4096"
+    ) in printed["compile_command_release_command_template"]
     assert automation_payload["mode"] == "create"
     assert automation_payload["name"] == printed["automation_payload"]["name"]
     assert printed["run_order"][0] == "create_heartbeat_automation_from_automation_payload"

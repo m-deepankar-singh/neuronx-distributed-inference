@@ -308,7 +308,7 @@ def main() -> int:
     parser.add_argument("--launch-script", default="tmp_launch_qwen36_segcte2048.sh")
     parser.add_argument(
         "--boundary-lengths",
-        default="146,160,485,505,526,1225,2048,2049,2500,4092,4096",
+        default=monitor_prompt.DEFAULT_BOUNDARY_LENGTHS,
     )
     args = parser.parse_args()
 

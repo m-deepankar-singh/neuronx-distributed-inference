@@ -22,6 +22,9 @@ _LOG_SCAN_STRINGS = [
     "RuntimeError",
     "Internal Server Error",
 ]
+DEFAULT_BOUNDARY_LENGTHS = (
+    "123,146,160,485,505,526,1225,1265,1346,2048,2049,2500,4092,4096"
+)
 
 
 def parse_env_log(path: Path) -> dict[str, str]:
@@ -227,7 +230,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--boundary-lengths",
-        default="146,160,485,505,526,1225,2048,2049,2500,4092,4096",
+        default=DEFAULT_BOUNDARY_LENGTHS,
     )
     args = parser.parse_args()
 
