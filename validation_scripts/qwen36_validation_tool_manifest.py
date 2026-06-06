@@ -13,6 +13,7 @@ from typing import Any, Iterable
 
 DEFAULT_FILES = [
     "tmp_compile_qwen32k_segcte2048_gdnseg512.sh",
+    "tmp_launch_qwen36_segcte2048.sh",
     "validation_scripts/qwen36_compile_status.py",
     "validation_scripts/qwen36_compile_monitor_prompt.py",
     "validation_scripts/qwen36_runtime_validation_matrix.py",
@@ -28,6 +29,7 @@ DEFAULT_FILES = [
 
 DEFAULT_TEST_FILES = [
     "contrib/models/Qwen3.6-27B/test/unit/test_qwen36_compile_driver.py",
+    "test/unit/scripts/test_qwen36_launch_driver.py",
     "test/unit/scripts/test_qwen36_compile_status.py",
     "test/unit/scripts/test_qwen36_compile_monitor_prompt.py",
     "test/unit/scripts/test_qwen36_runtime_validation_matrix.py",

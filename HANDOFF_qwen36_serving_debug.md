@@ -736,3 +736,8 @@ bash tmp_compile_qwen32k_segcte2048_gdnseg512.sh
 
 60. Validation manifest path integrity.
    - Added unit coverage that every path in `qwen36_validation_tool_manifest.py` `DEFAULT_FILES` and `DEFAULT_TEST_FILES` exists in the current repo. This prevents a stale manifest entry from silently breaking remote source-drift verification or omitting the compile-driver dry-run tests from `--include-tests`.
+
+61. Launch dry-run/audit coverage.
+   - Added `LAUNCH_DRY_RUN=1` support to `tmp_launch_qwen36_segcte2048.sh`. Dry run writes a launch env log and prints `ARTIFACT`, `LOG`, `ENVLOG`, `PIDFILE`, and `LAUNCH_DRY_RUN=1` without running `pkill`, activating venv, starting vLLM, or polling `/health`.
+   - The launch env log records coherence-critical runtime settings: max model/seq length, CTE and token-generation buckets, GDN cache dtypes, GPU/KV memory flags, Hybrid APC flags, block/checkpoint interval, and DeltaNet env controls. The script rejects `DISABLE_HYBRID_KV_CACHE_MANAGER=1`, because disabling the hybrid KV manager would make Qwen hybrid cache budgeting look like a full-attention model.
+   - Added `test/unit/scripts/test_qwen36_launch_driver.py` and included both the launch script and launch test in `qwen36_validation_tool_manifest.py` so remote source-drift checks cover the runtime launch surface, not just compile and validation scripts.
