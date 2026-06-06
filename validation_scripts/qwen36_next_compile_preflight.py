@@ -57,6 +57,10 @@ def _quote_env_command(env: dict[str, str], command: list[str]) -> str:
     return " ".join(parts)
 
 
+def _quote_command(command: list[str]) -> str:
+    return " ".join(shlex.quote(item) for item in command)
+
+
 def _driver_path(repo_root: Path, driver: str) -> Path:
     raw = Path(driver)
     path = raw if raw.is_absolute() else repo_root / raw
@@ -187,6 +191,34 @@ def build_preflight(
             "automation-created-name does not match generated automation payload "
             f"name: {automation_created_name!r} != {automation_payload['name']!r}"
         )
+    release_command = [
+        "python3",
+        "validation_scripts/qwen36_next_compile_preflight.py",
+        "--decision-json",
+        str(decision_path),
+        "--repo-root",
+        str(repo_root),
+        "--output-json",
+        "<NEXT_COMPILE_RELEASE_JSON>",
+        "--compile-host",
+        compile_host,
+        "--runtime-host",
+        runtime_host,
+        "--source-dir",
+        resolved_source_dir,
+        "--source-commit",
+        resolved_source_commit,
+        "--automation-name",
+        automation_payload["name"],
+        "--automation-created-name",
+        automation_payload["name"],
+        "--automation-interval-minutes",
+        str(automation_interval_minutes),
+        "--launch-script",
+        launch_script,
+        "--boundary-lengths",
+        boundary_lengths,
+    ]
 
     result: dict[str, Any] = {
         "schema": "qwen36-next-compile-preflight-v1",
@@ -215,11 +247,19 @@ def build_preflight(
         if release_compile_command
         else None,
         "compile_command_release_command_template": (
-            "python3 validation_scripts/qwen36_next_compile_preflight.py "
-            f"--decision-json {shlex.quote(str(decision_path))} "
-            "--output-json <NEXT_COMPILE_RELEASE_JSON> "
-            f"--automation-created-name {shlex.quote(automation_payload['name'])}"
+            _quote_command(release_command)
         ),
+        "release_preflight_context": {
+            "repo_root": str(repo_root),
+            "compile_host": compile_host,
+            "runtime_host": runtime_host,
+            "source_dir": resolved_source_dir,
+            "source_commit": resolved_source_commit,
+            "automation_name": automation_payload["name"],
+            "automation_interval_minutes": automation_interval_minutes,
+            "launch_script": launch_script,
+            "boundary_lengths": boundary_lengths,
+        },
         "run_order": [
             "create_heartbeat_automation_from_automation_payload",
             "rerun_next_compile_preflight_with_automation_created_name",

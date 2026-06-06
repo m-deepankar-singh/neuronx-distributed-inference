@@ -128,7 +128,21 @@ def test_build_preflight_runs_dry_run_and_builds_automation_payload(tmp_path):
     assert result["dry_run"]["env_log"] in payload["prompt"]
     assert "ubuntu@compile" in payload["prompt"]
     assert "ubuntu@runtime" in payload["prompt"]
-    assert payload["name"] in result["compile_command_release_command_template"]
+    release = result["compile_command_release_command_template"]
+    assert payload["name"] in release
+    assert f"--repo-root {str(_REPO_ROOT)}" in release
+    assert "--compile-host ubuntu@compile" in release
+    assert "--runtime-host ubuntu@runtime" in release
+    assert "--source-dir" in release
+    assert "--source-commit" in release
+    assert "--automation-interval-minutes 7" in release
+    assert "--launch-script tmp_launch_qwen36_segcte2048.sh" in release
+    assert "--boundary-lengths 146,160" in release
+    assert "NEXT_COMPILE_RELEASE_JSON" in release
+    assert result["release_preflight_context"]["repo_root"] == str(_REPO_ROOT)
+    assert result["release_preflight_context"]["automation_name"] == payload["name"]
+    assert result["release_preflight_context"]["compile_host"] == "ubuntu@compile"
+    assert result["release_preflight_context"]["runtime_host"] == "ubuntu@runtime"
 
 
 def test_build_preflight_releases_compile_command_after_matching_automation_ack(
