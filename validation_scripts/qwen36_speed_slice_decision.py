@@ -122,6 +122,10 @@ def _required_flags(next_slice: str | None) -> dict[str, str]:
     return dict(_SLICE_FLAGS.get(next_slice, {}))
 
 
+def _quote_command(command: list[str]) -> str:
+    return " ".join(shlex.quote(item) for item in command)
+
+
 def _quote_env_command(env: dict[str, str], command: list[str]) -> str:
     parts = [f"{key}={shlex.quote(value)}" for key, value in env.items()]
     parts.extend(shlex.quote(item) for item in command)
@@ -136,6 +140,84 @@ def _default_next_ts(next_slice: str) -> str:
 def _automation_name(next_slice: str, ts: str) -> str:
     slug = _slug_with_suffix(f"qwen-{next_slice}", ts)
     return f"monitor-{slug}-compile"
+
+
+def _context_tokens_from_env(env_values: dict[str, str]) -> int:
+    raw = env_values.get("CTE_BUCKETS_RAW") or env_values.get("CTE_BUCKETS") or "2048"
+    buckets = [int(item) for item in re.findall(r"\d+", raw)]
+    return max(buckets) if buckets else 2048
+
+
+def profile_preflight(
+    env_values: dict[str, str],
+    *,
+    speed_json_path: Path | None,
+    target_prefill_tok_s: float,
+    profile_ts: str | None = None,
+) -> dict[str, Any]:
+    ts = profile_ts or _default_next_ts("profile")
+    workdir = env_values.get("WORKDIR")
+    logdir = env_values.get("LOGDIR")
+    context_neff_root = (
+        str(Path(workdir) / "context_encoding_model")
+        if workdir
+        else "<WORKDIR>/context_encoding_model"
+    )
+    output_dir = (
+        str(Path(logdir) / f"context_neff_profile_{ts}")
+        if logdir
+        else f"<PROFILE_OUTPUT_PARENT>/context_neff_profile_{ts}"
+    )
+    context_tokens = _context_tokens_from_env(env_values)
+    profile_base_command = [
+        "python3",
+        "validation_scripts/qwen36_context_neff_profile.py",
+        "--context-neff-root",
+        context_neff_root,
+        "--output-dir",
+        output_dir,
+        "--buckets",
+        "0,7",
+        "--enable-dge",
+    ]
+    profile_run_command = [*profile_base_command, "--run"]
+    compare_command = [
+        "python3",
+        "validation_scripts/qwen36_profile_summary_compare.py",
+        "--summary",
+        "current=<SUMMARY_JSON_FROM_context_neff_profile_results>",
+        "--prompt-tokens",
+        "16384",
+        "--context-tokens",
+        str(context_tokens),
+        "--target-prefill-tok-s",
+        str(float(target_prefill_tok_s)),
+        "--output-json",
+        str(Path(output_dir) / "profile_summary_compare.json"),
+    ]
+    if speed_json_path is not None:
+        compare_command.extend(["--speed-json", str(speed_json_path)])
+    return {
+        "ts": ts,
+        "reason": "coherent_but_all_planned_speed_slices_below_target",
+        "do_not_profile_live_vllm": True,
+        "profile_requires_idle_neuron_cores": True,
+        "context_neff_root": context_neff_root,
+        "output_dir": output_dir,
+        "buckets": [0, 7],
+        "context_tokens": context_tokens,
+        "target_prefill_tok_s": float(target_prefill_tok_s),
+        "plan_command": _quote_command(profile_base_command),
+        "run_command": _quote_command(profile_run_command),
+        "compare_command_template": _quote_command(compare_command),
+        "run_order": [
+            "stop_vllm_or_use_idle_trainium_host",
+            "run_plan_command_and_verify_targets",
+            "run_profile_command",
+            "choose_summary_json_from_context_neff_profile_results",
+            "run_compare_command_template_with_summary_json",
+        ],
+    }
 
 
 def _slug(value: str) -> str:
@@ -234,6 +316,7 @@ def decide(
         "next_speed_slice": None,
         "next_required_flags": {},
         "next_preflight": None,
+        "profile_preflight": None,
         "reason": None,
     }
 
@@ -287,6 +370,14 @@ def decide(
         result.update(
             {
                 "decision": "profile_slow_coherent",
+                "profile_preflight": profile_preflight(
+                    env_values,
+                    speed_json_path=speed_json_path,
+                    target_prefill_tok_s=float(
+                        speed_gate.get("min_prefill_tok_s") or 3000.0
+                    ),
+                    profile_ts=next_ts,
+                ),
                 "reason": "coherent_but_last_planned_speed_slice_is_still_slow",
             }
         )

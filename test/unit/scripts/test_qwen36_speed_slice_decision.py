@@ -226,14 +226,38 @@ def test_next_preflight_dry_run_env_matches_compile_driver(tmp_path):
 
 def test_slow_final_planned_slice_profiles_instead_of_branching():
     decision = _SCRIPT.decide(
-        env_values={"SPEED_SLICE": "hostlogits_lmheadbf16"},
+        env_values={
+            "SPEED_SLICE": "hostlogits_lmheadbf16",
+            "WORKDIR": "/mnt/work",
+            "LOGDIR": "/logs",
+            "CTE_BUCKETS_RAW": "2048",
+        },
         runtime_summary=_summary(coherence_ok=True),
         speed_output=_speed(passed=False, mean=950.0),
         speed_json_path=Path("/tmp/raw_speed.json"),
+        next_ts="20260606T010203Z_profile",
     )
 
     assert decision["decision"] == "profile_slow_coherent"
     assert decision["next_speed_slice"] is None
+    preflight = decision["profile_preflight"]
+    assert preflight["do_not_profile_live_vllm"] is True
+    assert preflight["context_neff_root"] == "/mnt/work/context_encoding_model"
+    assert preflight["output_dir"] == (
+        "/logs/context_neff_profile_20260606T010203Z_profile"
+    )
+    assert preflight["context_tokens"] == 2048
+    assert preflight["run_order"][0] == "stop_vllm_or_use_idle_trainium_host"
+    assert "--enable-dge" in preflight["run_command"]
+    assert "--run" in preflight["run_command"]
+    assert "qwen36_context_neff_profile.py" in preflight["run_command"]
+    assert "qwen36_profile_summary_compare.py" in preflight["compare_command_template"]
+    assert "--speed-json /tmp/raw_speed.json" in preflight[
+        "compare_command_template"
+    ]
+    assert "'current=<SUMMARY_JSON_FROM_context_neff_profile_results>'" in preflight[
+        "compare_command_template"
+    ]
 
 
 def test_main_finds_speed_path_from_runtime_summary(tmp_path, monkeypatch, capsys):
