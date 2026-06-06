@@ -68,12 +68,19 @@ def _runtime_summary():
 def _speed():
     return {
         "passed": False,
+        "lengths": [int(_SPEED_SCRIPT.REQUIRED_SPEED_LENGTHS)],
+        "repeats": _SPEED_SCRIPT.REQUIRED_SPEED_REPEATS,
+        "max_tokens": _SPEED_SCRIPT.REQUIRED_SPEED_MAX_TOKENS,
+        "allow_usage_fallback": False,
+        "require_text": False,
+        "min_prefill_tok_s": _SPEED_SCRIPT.REQUIRED_MIN_PREFILL_TOK_S,
         "row_gate_passed": True,
+        "prefill_tokens_all_match_actual": True,
         "prefill_tok_s_mean": 640.0,
         "speed_gate": {
             "enabled": True,
             "passed": False,
-            "min_prefill_tok_s": 3000.0,
+            "min_prefill_tok_s": _SPEED_SCRIPT.REQUIRED_MIN_PREFILL_TOK_S,
             "mean_prefill_tok_s": 640.0,
             "failure_reason": "mean_prefill_tok_s_below_threshold",
         },

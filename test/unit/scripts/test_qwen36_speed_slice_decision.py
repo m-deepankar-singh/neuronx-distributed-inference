@@ -1,4 +1,5 @@
 import importlib.util
+import copy
 import json
 import os
 import subprocess
@@ -73,12 +74,19 @@ def _summary(
 def _speed(*, passed=False, mean=628.0, row_gate_passed=True):
     return {
         "passed": passed,
+        "lengths": [int(_SCRIPT.REQUIRED_SPEED_LENGTHS)],
+        "repeats": _SCRIPT.REQUIRED_SPEED_REPEATS,
+        "max_tokens": _SCRIPT.REQUIRED_SPEED_MAX_TOKENS,
+        "allow_usage_fallback": False,
+        "require_text": False,
+        "min_prefill_tok_s": _SCRIPT.REQUIRED_MIN_PREFILL_TOK_S,
         "row_gate_passed": row_gate_passed,
+        "prefill_tokens_all_match_actual": True,
         "prefill_tok_s_mean": mean,
         "speed_gate": {
             "enabled": True,
             "passed": passed,
-            "min_prefill_tok_s": 3000.0,
+            "min_prefill_tok_s": _SCRIPT.REQUIRED_MIN_PREFILL_TOK_S,
             "mean_prefill_tok_s": mean,
             "failure_reason": None if passed else "mean_prefill_tok_s_below_threshold",
         },
@@ -229,6 +237,41 @@ def test_incomplete_runtime_contract_reruns_runtime_validation():
 
     assert decision["decision"] == "rerun_runtime_validation"
     assert decision["reason"] == "runtime_validation_contract_incomplete"
+
+
+def test_speed_output_contract_mismatch_reruns_speed_validation():
+    cases = [
+        {"lengths": [8192]},
+        {"lengths": [8192, 16384]},
+        {"repeats": _SCRIPT.REQUIRED_SPEED_REPEATS - 1},
+        {"max_tokens": _SCRIPT.REQUIRED_SPEED_MAX_TOKENS + 1},
+        {"allow_usage_fallback": True},
+        {"require_text": True},
+        {"min_prefill_tok_s": _SCRIPT.REQUIRED_MIN_PREFILL_TOK_S - 1.0},
+        {"prefill_tokens_all_match_actual": False},
+        {"speed_gate": {"enabled": False}},
+        {"speed_gate": {"min_prefill_tok_s": _SCRIPT.REQUIRED_MIN_PREFILL_TOK_S - 1.0}},
+    ]
+
+    for override in cases:
+        speed_output = _speed(passed=False, mean=640.0)
+        for key, value in override.items():
+            if isinstance(value, dict) and isinstance(speed_output.get(key), dict):
+                nested = copy.deepcopy(speed_output[key])
+                nested.update(value)
+                speed_output[key] = nested
+            else:
+                speed_output[key] = value
+        decision = _SCRIPT.decide(
+            env_values={"SPEED_SLICE": "sampletokonly"},
+            runtime_summary=_summary(coherence_ok=True),
+            speed_output=speed_output,
+            speed_json_path=Path("/tmp/raw_speed.json"),
+        )
+
+        assert decision["decision"] == "rerun_speed_validation"
+        assert decision["reason"] == "speed_output_contract_mismatch"
+        assert decision["speed_output_contract_errors"]
 
 
 def test_speed_pass_keeps_candidate():

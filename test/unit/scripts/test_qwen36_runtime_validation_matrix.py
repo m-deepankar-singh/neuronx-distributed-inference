@@ -420,10 +420,21 @@ def test_attach_speed_slice_decision_writes_next_action(tmp_path):
     speed_json.write_text(
         json.dumps(
             {
+                "passed": False,
+                "lengths": [16384],
+                "repeats": 3,
+                "max_tokens": 1,
+                "allow_usage_fallback": False,
+                "require_text": False,
+                "min_prefill_tok_s": 3000.0,
                 "row_gate_passed": True,
+                "prefill_tokens_all_match_actual": True,
                 "prefill_tok_s_mean": 640.0,
                 "speed_gate": {
+                    "enabled": True,
                     "passed": False,
+                    "min_prefill_tok_s": 3000.0,
+                    "mean_prefill_tok_s": 640.0,
                     "failure_reason": "mean_prefill_tok_s_below_threshold",
                 },
             }
@@ -489,11 +500,21 @@ def test_attach_speed_slice_decision_surfaces_profile_preflight(tmp_path):
     speed_json.write_text(
         json.dumps(
             {
+                "passed": False,
+                "lengths": [16384],
+                "repeats": 3,
+                "max_tokens": 1,
+                "allow_usage_fallback": False,
+                "require_text": False,
+                "min_prefill_tok_s": 3000.0,
                 "row_gate_passed": True,
+                "prefill_tokens_all_match_actual": True,
                 "prefill_tok_s_mean": 950.0,
                 "speed_gate": {
+                    "enabled": True,
                     "passed": False,
                     "min_prefill_tok_s": 3000.0,
+                    "mean_prefill_tok_s": 950.0,
                     "failure_reason": "mean_prefill_tok_s_below_threshold",
                 },
             }

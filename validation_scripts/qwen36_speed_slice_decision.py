@@ -138,6 +138,41 @@ def _csv_ints(value: Any) -> set[int]:
     return items
 
 
+def _int_value(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _float_value(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _int_list(value: Any) -> list[int] | None:
+    if isinstance(value, str):
+        try:
+            return [int(item) for item in value.replace(",", " ").split() if item]
+        except ValueError:
+            return None
+    if not isinstance(value, (list, tuple)):
+        return None
+    items: list[int] = []
+    for item in value:
+        parsed = _int_value(item)
+        if parsed is None:
+            return None
+        items.append(parsed)
+    return items
+
+
 def _runtime_contract_gap_reason(summary: dict[str, Any]) -> str | None:
     contract = summary.get("validation_contract")
     if not isinstance(contract, dict):
@@ -205,6 +240,35 @@ def _runtime_contract_gap_reason(summary: dict[str, Any]) -> str | None:
     if bool(contract.get("skip_chat")) or bool(contract.get("skip_long_boundary")):
         return "runtime_validation_contract_not_speed_eligible"
     return None
+
+
+def _speed_output_contract_errors(
+    speed_output: dict[str, Any],
+    speed_gate: dict[str, Any],
+) -> list[str]:
+    errors: list[str] = []
+    if _int_list(speed_output.get("lengths")) != [int(REQUIRED_SPEED_LENGTHS)]:
+        errors.append("lengths")
+    repeats = _int_value(speed_output.get("repeats"))
+    if repeats is None or repeats < REQUIRED_SPEED_REPEATS:
+        errors.append("repeats")
+    if _int_value(speed_output.get("max_tokens")) != REQUIRED_SPEED_MAX_TOKENS:
+        errors.append("max_tokens")
+    if speed_output.get("allow_usage_fallback") is not False:
+        errors.append("allow_usage_fallback")
+    if speed_output.get("require_text") is not False:
+        errors.append("require_text")
+    threshold = _float_value(speed_output.get("min_prefill_tok_s"))
+    if threshold is None or threshold < REQUIRED_MIN_PREFILL_TOK_S:
+        errors.append("min_prefill_tok_s")
+    if speed_output.get("prefill_tokens_all_match_actual") is not True:
+        errors.append("prefill_tokens_all_match_actual")
+    if speed_gate.get("enabled") is not True:
+        errors.append("speed_gate_enabled")
+    gate_threshold = _float_value(speed_gate.get("min_prefill_tok_s"))
+    if gate_threshold is None or gate_threshold < REQUIRED_MIN_PREFILL_TOK_S:
+        errors.append("speed_gate_min_prefill_tok_s")
+    return errors
 
 
 def _runtime_contract_boundary_lengths(
@@ -513,6 +577,17 @@ def decide(
             {
                 "decision": "rerun_speed_validation",
                 "reason": "missing_or_unreadable_speed_output",
+            }
+        )
+        return result
+
+    speed_contract_errors = _speed_output_contract_errors(speed_output, speed_gate)
+    if speed_contract_errors:
+        result.update(
+            {
+                "decision": "rerun_speed_validation",
+                "reason": "speed_output_contract_mismatch",
+                "speed_output_contract_errors": speed_contract_errors,
             }
         )
         return result
