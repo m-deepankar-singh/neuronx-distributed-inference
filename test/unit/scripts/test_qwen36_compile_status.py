@@ -248,6 +248,8 @@ def test_cli_reads_paths_from_env_log(tmp_path):
         f"LOG={log}\n"
         f"ARTIFACT={artifact}\n"
         f"PIDFILE={tmp_path / 'compile.pid'}\n"
+        "SOURCE_COMMIT=envcommit\n"
+        "SOURCE_BRANCH=codex/qwen36-prefill-speed-coherent\n"
         "GDN_RECURRENT_CACHE_DTYPE=bfloat16\n"
         "GDN_CONV_CACHE_DTYPE=bfloat16\n"
     )
@@ -271,6 +273,10 @@ def test_cli_reads_paths_from_env_log(tmp_path):
     assert payload["expected_checkpoint_dtypes"] == {
         "conv_dtype": "bfloat16",
         "recurrent_dtype": "bfloat16",
+    }
+    assert payload["source"] == {
+        "branch": "codex/qwen36-prefill-speed-coherent",
+        "commit": "envcommit",
     }
 
 

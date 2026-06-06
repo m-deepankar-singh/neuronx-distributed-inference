@@ -169,6 +169,8 @@ def check_status(
     required_ranks: list[str],
     expected_recurrent_dtype: str | None = None,
     expected_conv_dtype: str | None = None,
+    source_commit: str | None = None,
+    source_branch: str | None = None,
     failure_markers: list[str] = DEFAULT_FAILURE_MARKERS,
 ) -> dict[str, Any]:
     try:
@@ -220,6 +222,10 @@ def check_status(
         "artifact": str(artifact),
         "pid_file": str(pid_file) if pid_file is not None else None,
         "pid_running": pid_running,
+        "source": {
+            "commit": source_commit,
+            "branch": source_branch,
+        },
         "markers": {
             "finished_hlos": finished_hlos,
             "compile_done": compile_done,
@@ -274,6 +280,8 @@ def main() -> int:
             args.expected_recurrent_dtype or env.get("GDN_RECURRENT_CACHE_DTYPE")
         ),
         expected_conv_dtype=args.expected_conv_dtype or env.get("GDN_CONV_CACHE_DTYPE"),
+        source_commit=env.get("SOURCE_COMMIT"),
+        source_branch=env.get("SOURCE_BRANCH"),
         failure_markers=args.failure_markers or DEFAULT_FAILURE_MARKERS,
     )
     print(json.dumps(result, indent=2, sort_keys=True))
