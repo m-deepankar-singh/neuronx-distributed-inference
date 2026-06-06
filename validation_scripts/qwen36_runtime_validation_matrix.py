@@ -35,6 +35,16 @@ def _csv_range(start: int, end: int) -> str:
     return ",".join(str(value) for value in range(start, end + 1))
 
 
+def _csv_ints(value: str) -> set[int]:
+    items: set[int] = set()
+    for raw in str(value or "").split(","):
+        text = raw.strip()
+        if not text:
+            continue
+        items.add(int(text))
+    return items
+
+
 def _script(name: str) -> str:
     return str(_SCRIPT_DIR / name)
 
@@ -52,6 +62,23 @@ def _common_model_args(args: argparse.Namespace) -> list[str]:
 
 def build_steps(args: argparse.Namespace) -> list[ValidationStep]:
     out = Path(args.output_dir)
+    required_boundaries = _csv_ints(DEFAULT_BOUNDARY_LENGTHS)
+    requested_boundaries = _csv_ints(args.boundary_lengths)
+    missing_boundaries = sorted(required_boundaries - requested_boundaries)
+    if missing_boundaries:
+        if not args.allow_incomplete_boundary_lengths:
+            missing_csv = ",".join(str(value) for value in missing_boundaries)
+            raise ValueError(
+                "--boundary-lengths is missing required known failure points: "
+                f"{missing_csv}"
+            )
+        if not str(args.incomplete_boundary_reason or "").strip():
+            raise ValueError(
+                "--incomplete-boundary-reason is required when "
+                "--allow-incomplete-boundary-lengths is set"
+            )
+        if not args.skip_speed:
+            raise ValueError("--allow-incomplete-boundary-lengths requires --skip-speed")
     steps = [
         ValidationStep(
             name="boundary_primary",
@@ -399,6 +426,16 @@ def main() -> int:
     parser.add_argument(
         "--boundary-lengths",
         default=DEFAULT_BOUNDARY_LENGTHS,
+    )
+    parser.add_argument(
+        "--allow-incomplete-boundary-lengths",
+        action="store_true",
+        help="Explicitly allow a diagnostic boundary subset instead of all known failures.",
+    )
+    parser.add_argument(
+        "--incomplete-boundary-reason",
+        default=None,
+        help="Required explanation when --allow-incomplete-boundary-lengths is used.",
     )
     parser.add_argument("--boundary-repeats", type=int, default=1)
     parser.add_argument("--boundary-max-tokens", type=int, default=1)

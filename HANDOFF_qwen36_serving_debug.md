@@ -878,3 +878,9 @@ bash tmp_compile_qwen32k_segcte2048_gdnseg512.sh
    - Reason: the speed target is 16k cold prefill. If a run skips the long-context coherence probes, it is diagnostic-only and cannot be used to advance usage-accounted speed or launch the next speed slice.
    - Updated regression coverage in `test/unit/scripts/test_qwen36_runtime_validation_matrix.py`.
    - Verification passed locally: py_compile for changed scripts/tests; focused runtime matrix pytest (`13 passed`); full `python3 -m pytest test/unit/scripts` (`117 passed`); compile-driver unit test (`7 passed`); artifact config audit unit test (`6 passed`); validation-tool manifest build/verify with `file_count=32`, `mismatch_count=0`.
+
+83. Runtime matrix cannot use an incomplete known-failure boundary list as speed evidence.
+   - Tightened `validation_scripts/qwen36_runtime_validation_matrix.py`: `--boundary-lengths` must include every known failure point from the default list (`123,146,160,485,505,526,1225,1265,1346,2048,2049,2500,4092,4096`) unless the caller explicitly sets `--allow-incomplete-boundary-lengths`, provides `--incomplete-boundary-reason`, and also sets `--skip-speed`.
+   - Reason: earlier coherence failures lived in specific short and chunk-boundary windows. A shortened boundary list is useful for diagnosis, but it must not support a coherent-speed verdict or launch the next speed slice.
+   - Updated regression coverage in `test/unit/scripts/test_qwen36_runtime_validation_matrix.py`.
+   - Verification passed locally: py_compile for changed scripts/tests; focused runtime matrix pytest (`14 passed`); full `python3 -m pytest test/unit/scripts` (`118 passed`); compile-driver unit test (`7 passed`); artifact config audit unit test (`6 passed`); validation-tool manifest build/verify with `file_count=32`, `mismatch_count=0`.

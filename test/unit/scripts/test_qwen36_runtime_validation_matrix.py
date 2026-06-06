@@ -30,7 +30,9 @@ def _args(**overrides):
         model_path="/models/Qwen3.6-27B",
         output_dir="/tmp/qwen-runtime-validation",
         serve_log=["/logs/server.log"],
-        boundary_lengths="146,160",
+        boundary_lengths=_SCRIPT.DEFAULT_BOUNDARY_LENGTHS,
+        allow_incomplete_boundary_lengths=False,
+        incomplete_boundary_reason=None,
         boundary_repeats=1,
         boundary_max_tokens=1,
         repeated_lengths="2500",
@@ -97,6 +99,52 @@ def test_build_steps_requires_log_scan_unless_explicitly_skipped():
 
     steps = _SCRIPT.build_steps(_args(serve_log=[], skip_log_scan=True))
     assert "runtime_log_scan" not in [step.name for step in steps]
+
+
+def test_build_steps_rejects_incomplete_boundary_lengths_when_speed_could_run():
+    try:
+        _SCRIPT.build_steps(_args(boundary_lengths="146,160"))
+    except ValueError as exc:
+        assert "known failure points" in str(exc)
+        assert "123" in str(exc)
+    else:
+        raise AssertionError("incomplete boundary list should fail")
+
+    try:
+        _SCRIPT.build_steps(
+            _args(
+                boundary_lengths="146,160",
+                allow_incomplete_boundary_lengths=True,
+                incomplete_boundary_reason="",
+            )
+        )
+    except ValueError as exc:
+        assert "--incomplete-boundary-reason" in str(exc)
+    else:
+        raise AssertionError("incomplete boundary list without reason should fail")
+
+    try:
+        _SCRIPT.build_steps(
+            _args(
+                boundary_lengths="146,160",
+                allow_incomplete_boundary_lengths=True,
+                incomplete_boundary_reason="diagnostic short-context run",
+            )
+        )
+    except ValueError as exc:
+        assert "--skip-speed" in str(exc)
+    else:
+        raise AssertionError("incomplete boundary list with speed enabled should fail")
+
+    steps = _SCRIPT.build_steps(
+        _args(
+            boundary_lengths="146,160",
+            allow_incomplete_boundary_lengths=True,
+            incomplete_boundary_reason="diagnostic short-context run",
+            skip_speed=True,
+        )
+    )
+    assert "raw_prefill_speed" not in [step.name for step in steps]
 
 
 def test_build_steps_requires_long_boundary_unless_explicitly_skipped():
