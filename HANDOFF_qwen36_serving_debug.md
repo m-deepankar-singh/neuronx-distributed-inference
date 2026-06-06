@@ -994,3 +994,9 @@ bash tmp_compile_qwen32k_segcte2048_gdnseg512.sh
    - Fix: `validation_scripts/qwen36_artifact_config_audit.py` now checks logged `CTE_BUCKETS` and normalizes it to `[2048]`; `CTE_BUCKETS_RAW` is no longer required in the env log.
    - Added regression coverage that the sample-token fixture passes with only `CTE_BUCKETS=2048`, and that `CTE_BUCKETS=1024` fails with `speed_slice_cte_buckets_mismatch`.
    - Verification passed locally: py_compile for audit/status scripts and tests; focused audit/status pytest (`20 passed`); full `python3 -m pytest test/unit/scripts` (`130 passed`); compile-driver plus artifact-audit pytest (`15 passed`); validation-tool manifest build/verify with `file_count=32`, `mismatch_count=0`.
+
+101. Active sample-token automation now points at the corrected CTE bucket policy.
+   - Updated the existing app heartbeat automation `monitor-qwen-sampletokonly-compile` in place after commit `7041b3c`, preserving its 30-minute cadence and same sample-token artifact paths.
+   - The live prompt now requires source checkout fast-forward through `7041b3c` or newer before artifact readiness and explicitly says speed-slice policy uses recorded `CTE_BUCKETS=2048`, not unlogged `CTE_BUCKETS_RAW`.
+   - The live prompt treats `speed_slice_prefix_cte_attention_backend_mismatch` and `speed_slice_cte_buckets_mismatch` as artifact validation failures before rsync/launch.
+   - No compile-host polling was performed for this update; the in-flight compile remains automation-owned.
