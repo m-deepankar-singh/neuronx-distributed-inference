@@ -102,6 +102,11 @@ def test_render_prompt_contains_compile_validation_and_runtime_gates():
     assert "usage.prompt_tokens / TTFT" in prompt
     assert "--min-prefill-tok-s 3000" in prompt
     assert "do not launch that compile directly from this monitor" in prompt
+    assert "git status --short" in prompt
+    assert "git fetch origin codex/qwen36-prefill-speed-coherent" in prompt
+    assert "git merge --ff-only origin/codex/qwen36-prefill-speed-coherent" in prompt
+    assert "Do not reset, rebase, stash, or overwrite local changes" in prompt
+    assert "source_sync_blocked" in prompt
     assert "qwen36_next_compile_preflight.py" in prompt
     assert "--automation-json-output <automation-payload.json>" in prompt
     assert "--boundary-lengths 146,160" in prompt
