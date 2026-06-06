@@ -116,7 +116,45 @@ def test_run_matrix_skips_speed_after_coherence_failure(tmp_path):
     assert not summary["coherence_and_log_scan_passed"]
     assert summary["results"][1]["skipped"]
     assert summary["results"][1]["skip_reason"] == "coherence_or_log_scan_failed"
+    assert summary["gate_counts"] == {
+        "total_gate_steps": 1,
+        "total_log_scan_steps": 0,
+        "passed_gate_steps": 0,
+    }
     assert (tmp_path / "runtime_validation_summary.json").exists()
+
+
+def test_run_matrix_skips_speed_when_log_scan_not_run(tmp_path):
+    steps = [
+        _SCRIPT.ValidationStep("boundary_primary", "coherence", ["ok"]),
+        _SCRIPT.ValidationStep("raw_prefill_speed", "speed", ["speed"]),
+    ]
+
+    def runner(step, log_dir):
+        return {
+            "name": step.name,
+            "phase": step.phase,
+            "returncode": 0,
+            "elapsed_seconds": 0.0,
+            "command": step.command,
+            "output_path": None,
+            "stdout": str(log_dir / f"{step.name}.stdout"),
+            "stderr": str(log_dir / f"{step.name}.stderr"),
+            "passed": True,
+            "skipped": False,
+        }
+
+    summary = _SCRIPT.run_matrix(steps, output_dir=tmp_path, runner=runner)
+
+    assert not summary["passed"]
+    assert not summary["coherence_and_log_scan_passed"]
+    assert summary["results"][1]["skipped"]
+    assert summary["results"][1]["skip_reason"] == "runtime_log_scan_not_run"
+    assert summary["gate_counts"] == {
+        "total_gate_steps": 1,
+        "total_log_scan_steps": 0,
+        "passed_gate_steps": 1,
+    }
 
 
 def test_run_matrix_passes_when_all_steps_pass(tmp_path):
@@ -144,6 +182,11 @@ def test_run_matrix_passes_when_all_steps_pass(tmp_path):
 
     assert summary["passed"]
     assert summary["coherence_and_log_scan_passed"]
+    assert summary["gate_counts"] == {
+        "total_gate_steps": 2,
+        "total_log_scan_steps": 1,
+        "passed_gate_steps": 2,
+    }
 
 
 def test_attach_speed_slice_decision_writes_next_action(tmp_path):

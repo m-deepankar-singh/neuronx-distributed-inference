@@ -241,9 +241,19 @@ def run_matrix(
     log_dir.mkdir(parents=True, exist_ok=True)
 
     results: list[dict[str, object]] = []
+    total_gate_steps = sum(1 for step in steps if step.phase in {"coherence", "log_scan"})
+    total_log_scan_steps = sum(1 for step in steps if step.phase == "log_scan")
+    passed_gate_steps = 0
     gate_failed = False
     for step in steps:
+        speed_skip_reason = None
         if step.phase == "speed" and gate_failed:
+            speed_skip_reason = "coherence_or_log_scan_failed"
+        elif step.phase == "speed" and total_log_scan_steps == 0:
+            speed_skip_reason = "runtime_log_scan_not_run"
+        elif step.phase == "speed" and passed_gate_steps < total_gate_steps:
+            speed_skip_reason = "coherence_or_log_scan_not_completed"
+        if speed_skip_reason is not None:
             results.append(
                 {
                     "name": step.name,
@@ -256,7 +266,7 @@ def run_matrix(
                     "stderr": None,
                     "passed": False,
                     "skipped": True,
-                    "skip_reason": "coherence_or_log_scan_failed",
+                    "skip_reason": speed_skip_reason,
                 }
             )
             continue
@@ -264,13 +274,26 @@ def run_matrix(
         results.append(result)
         if step.phase in {"coherence", "log_scan"} and not bool(result["passed"]):
             gate_failed = True
+        elif step.phase in {"coherence", "log_scan"}:
+            passed_gate_steps += 1
 
     required = [row for row in results if not bool(row.get("skipped"))]
     passed = bool(required) and all(bool(row["passed"]) for row in required)
     passed = passed and not any(bool(row.get("skipped")) for row in results)
+    coherence_and_log_scan_passed = (
+        not gate_failed
+        and total_gate_steps > 0
+        and total_log_scan_steps > 0
+        and passed_gate_steps == total_gate_steps
+    )
     summary = {
         "passed": passed,
-        "coherence_and_log_scan_passed": not gate_failed,
+        "coherence_and_log_scan_passed": coherence_and_log_scan_passed,
+        "gate_counts": {
+            "total_gate_steps": total_gate_steps,
+            "total_log_scan_steps": total_log_scan_steps,
+            "passed_gate_steps": passed_gate_steps,
+        },
         "output_dir": str(output_dir),
         "results": results,
     }
