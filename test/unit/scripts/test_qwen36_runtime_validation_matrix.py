@@ -109,21 +109,41 @@ def test_build_steps_requires_long_boundary_unless_explicitly_skipped():
 
     try:
         _SCRIPT.build_steps(
-            _args(long_lengths="", skip_long_boundary=True, skip_long_boundary_reason="")
+            _args(
+                long_lengths="",
+                skip_long_boundary=True,
+                skip_long_boundary_reason="",
+            )
         )
     except ValueError as exc:
         assert "--skip-long-boundary-reason" in str(exc)
     else:
         raise AssertionError("missing long boundary skip reason should fail")
 
+    try:
+        _SCRIPT.build_steps(
+            _args(
+                long_lengths="",
+                skip_long_boundary=True,
+                skip_long_boundary_reason="diagnostic short-context run",
+            )
+        )
+    except ValueError as exc:
+        assert "--skip-speed" in str(exc)
+    else:
+        raise AssertionError("skip long boundary with speed enabled should fail")
+
     steps = _SCRIPT.build_steps(
         _args(
             long_lengths="",
             skip_long_boundary=True,
             skip_long_boundary_reason="artifact max context below 8192",
+            skip_speed=True,
         )
     )
-    assert "boundary_long" not in [step.name for step in steps]
+    names = [step.name for step in steps]
+    assert "boundary_long" not in names
+    assert "raw_prefill_speed" not in names
 
 
 def test_build_steps_rejects_skip_chat_when_speed_could_still_run():

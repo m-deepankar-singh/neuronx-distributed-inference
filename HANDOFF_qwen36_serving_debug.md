@@ -872,3 +872,9 @@ bash tmp_compile_qwen32k_segcte2048_gdnseg512.sh
    - Reason: multi-turn probes at `160,1225,2500` are part of the coherence contract. A diagnostic boundary-only run may skip chat, but that run must not advance to usage-accounted prefill speed or the next speed slice.
    - Added regression coverage in `test/unit/scripts/test_qwen36_runtime_validation_matrix.py`.
    - Verification passed locally: py_compile for changed scripts/tests; focused runtime matrix pytest (`13 passed`); full `python3 -m pytest test/unit/scripts` (`117 passed`); compile-driver unit test (`7 passed`); artifact config audit unit test (`6 passed`); validation-tool manifest build/verify with `file_count=32`, `mismatch_count=0`.
+
+82. Runtime matrix cannot use skipped long-context probes as speed evidence.
+   - Tightened `validation_scripts/qwen36_runtime_validation_matrix.py`: `--skip-long-boundary` now also requires `--skip-speed`.
+   - Reason: the speed target is 16k cold prefill. If a run skips the long-context coherence probes, it is diagnostic-only and cannot be used to advance usage-accounted speed or launch the next speed slice.
+   - Updated regression coverage in `test/unit/scripts/test_qwen36_runtime_validation_matrix.py`.
+   - Verification passed locally: py_compile for changed scripts/tests; focused runtime matrix pytest (`13 passed`); full `python3 -m pytest test/unit/scripts` (`117 passed`); compile-driver unit test (`7 passed`); artifact config audit unit test (`6 passed`); validation-tool manifest build/verify with `file_count=32`, `mismatch_count=0`.

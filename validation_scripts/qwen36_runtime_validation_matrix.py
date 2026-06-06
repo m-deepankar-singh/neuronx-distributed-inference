@@ -146,6 +146,8 @@ def build_steps(args: argparse.Namespace) -> list[ValidationStep]:
         raise ValueError(
             "--skip-long-boundary-reason is required when --skip-long-boundary is set"
         )
+    elif not args.skip_speed:
+        raise ValueError("--skip-long-boundary requires --skip-speed")
     if args.skip_chat:
         if not str(args.skip_chat_reason or "").strip():
             raise ValueError("--skip-chat-reason is required when --skip-chat is set")
