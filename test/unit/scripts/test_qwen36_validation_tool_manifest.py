@@ -29,6 +29,16 @@ def test_default_manifest_covers_compile_driver_and_validation_tools():
     )
 
 
+def test_default_manifest_paths_exist_in_repo():
+    missing = [
+        path
+        for path in [*_SCRIPT.DEFAULT_FILES, *_SCRIPT.DEFAULT_TEST_FILES]
+        if not (_REPO_ROOT / path).exists()
+    ]
+
+    assert missing == []
+
+
 def test_build_manifest_records_hashes_and_missing_files(tmp_path):
     existing = tmp_path / "validation_scripts" / "tool.py"
     existing.parent.mkdir(parents=True)

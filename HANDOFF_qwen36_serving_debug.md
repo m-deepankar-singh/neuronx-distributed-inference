@@ -733,3 +733,6 @@ bash tmp_compile_qwen32k_segcte2048_gdnseg512.sh
    - Added `SOURCE_COMMIT` and `SOURCE_BRANCH` to `tmp_compile_qwen32k_segcte2048_gdnseg512.sh` env logs and dry-run/stdout output. This lets compile automations verify which source checkout produced the artifact without recomputing from a potentially changed repo later.
    - Updated `validation_scripts/qwen36_compile_monitor_prompt.py` to prefer `SOURCE_COMMIT` from the env log over a live `git rev-parse` lookup. The prompt still shows the source directory, but the commit identity now comes from the dry-run/launch artifact metadata when present.
    - Follow-up: `validation_scripts/qwen36_compile_status.py` now includes `source.commit` and `source.branch` in its structured JSON verdict when those fields are present in the compile env log. This keeps heartbeat readiness reports tied to the immutable dry-run/launch metadata.
+
+60. Validation manifest path integrity.
+   - Added unit coverage that every path in `qwen36_validation_tool_manifest.py` `DEFAULT_FILES` and `DEFAULT_TEST_FILES` exists in the current repo. This prevents a stale manifest entry from silently breaking remote source-drift verification or omitting the compile-driver dry-run tests from `--include-tests`.
