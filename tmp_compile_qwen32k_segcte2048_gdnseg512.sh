@@ -1,0 +1,262 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO=${REPO:-/home/ubuntu/inferentia-gdn-multihead-cte-20260531T1350Z}
+MODEL=${MODEL:-/home/ubuntu/models/Qwen3.6-27B}
+ART_ROOT=${ART_ROOT:-/mnt/trainium_artifacts/qwen_artifacts}
+LOGDIR=${LOGDIR:-/home/ubuntu/validation_logs/fp8_256k_decode_nki}
+TS=${TS:-$(date -u +%Y%m%dT%H%M%SZ)}
+
+SEQ_LEN=${SEQ_LEN:-32768}
+MAX_CONTEXT_LENGTH=${MAX_CONTEXT_LENGTH:-${SEQ_LEN}}
+if [[ -z "${PA_NUM_BLOCKS+x}" ]]; then
+  PA_NUM_BLOCKS=$(( (MAX_CONTEXT_LENGTH + 255) / 256 ))
+fi
+GDN_RECURRENT_CACHE_DTYPE=${GDN_RECURRENT_CACHE_DTYPE:-float32}
+GDN_CONV_CACHE_DTYPE=${GDN_CONV_CACHE_DTYPE:-bfloat16}
+MAX_GDN_CHECKPOINT_SLOTS=${MAX_GDN_CHECKPOINT_SLOTS:-64}
+ENABLE_QKV_NKI_KERNELS=${ENABLE_QKV_NKI_KERNELS:-1}
+ENABLE_KV_CACHE_QUANT=${ENABLE_KV_CACHE_QUANT:-1}
+QUANTIZE_LM_HEAD=${QUANTIZE_LM_HEAD:-0}
+FP8_QUANTIZE_LINEAR_ATTN_GATES=${FP8_QUANTIZE_LINEAR_ATTN_GATES:-0}
+FORCE_QUANTIZE=${FORCE_QUANTIZE:-0}
+FP8_EXCLUDE_GROUPS=${FP8_EXCLUDE_GROUPS:-}
+QWEN36_DELTANET_CTE_IMPL=${QWEN36_DELTANET_CTE_IMPL:-current}
+QWEN36_DELTANET_MULTIHEAD_CTE=${QWEN36_DELTANET_MULTIHEAD_CTE:-1}
+QWEN36_DELTANET_FUSED_SEGMENT_TOKENS=${QWEN36_DELTANET_FUSED_SEGMENT_TOKENS:-512}
+QWEN36_DELTANET_CHUNK_SIZE=${QWEN36_DELTANET_CHUNK_SIZE:-128}
+QWEN36_DELTANET_SOLVE_BLOCK_SIZE=${QWEN36_DELTANET_SOLVE_BLOCK_SIZE:-128}
+QWEN36_DELTANET_SOLVE_MODE=${QWEN36_DELTANET_SOLVE_MODE:-kkt_hier}
+QWEN36_DELTANET_SOLVE_SCAN_STEPS=${QWEN36_DELTANET_SOLVE_SCAN_STEPS:-7}
+QWEN36_PREFIX_ATTENTION_IMPL=${QWEN36_PREFIX_ATTENTION_IMPL:-expanded}
+PREFIX_CTE_ATTENTION_BACKEND=${PREFIX_CTE_ATTENTION_BACKEND:-segmented_cte}
+PREFIX_CTE_ATTENTION_SEGMENT_SIZE=${PREFIX_CTE_ATTENTION_SEGMENT_SIZE:-512}
+NKI_LIBRARY_SRC=${NKI_LIBRARY_SRC:-/home/ubuntu/nki-library-2.30/src/nkilib_src}
+CTE_BUCKETS_RAW=${CTE_BUCKETS_RAW:-2048}
+
+QKV_KERNEL_TAG="standard_qkv"
+QKV_KERNEL_FLAGS=()
+if [[ "${ENABLE_QKV_NKI_KERNELS}" == "1" ]]; then
+  QKV_KERNEL_TAG="qkvnki_tiled"
+  QKV_KERNEL_FLAGS=(--enable-qkv-nki-kernels)
+elif [[ "${ENABLE_QKV_NKI_KERNELS}" != "0" ]]; then
+  echo "ERROR: ENABLE_QKV_NKI_KERNELS must be 0 or 1, got ${ENABLE_QKV_NKI_KERNELS}" >&2
+  exit 2
+fi
+
+LM_HEAD_TAG="lmheadbf16"
+LM_HEAD_MEMORY_TAG="lm_head_bf16"
+LM_HEAD_FLAGS=()
+if [[ "${QUANTIZE_LM_HEAD}" == "1" ]]; then
+  LM_HEAD_TAG="lmheadfp8"
+  LM_HEAD_MEMORY_TAG="lm_head_fp8"
+  LM_HEAD_FLAGS=(--quantize-lm-head)
+elif [[ "${QUANTIZE_LM_HEAD}" != "0" ]]; then
+  echo "ERROR: QUANTIZE_LM_HEAD must be 0 or 1, got ${QUANTIZE_LM_HEAD}" >&2
+  exit 2
+fi
+
+LINEAR_ATTN_GATE_TAG="gatesbf16"
+LINEAR_ATTN_GATE_FLAGS=()
+if [[ "${FP8_QUANTIZE_LINEAR_ATTN_GATES}" == "1" ]]; then
+  LINEAR_ATTN_GATE_TAG="gatesfp8"
+  LINEAR_ATTN_GATE_FLAGS=(--fp8-quantize-linear-attn-gates)
+elif [[ "${FP8_QUANTIZE_LINEAR_ATTN_GATES}" != "0" ]]; then
+  echo "ERROR: FP8_QUANTIZE_LINEAR_ATTN_GATES must be 0 or 1, got ${FP8_QUANTIZE_LINEAR_ATTN_GATES}" >&2
+  exit 2
+fi
+
+KV_CACHE_TAG="kvbf16"
+KV_CACHE_FLAGS=()
+if [[ "${ENABLE_KV_CACHE_QUANT}" == "1" ]]; then
+  KV_CACHE_TAG="kvfp8"
+  KV_CACHE_FLAGS=(--enable-kv-cache-quant)
+elif [[ "${ENABLE_KV_CACHE_QUANT}" != "0" ]]; then
+  echo "ERROR: ENABLE_KV_CACHE_QUANT must be 0 or 1, got ${ENABLE_KV_CACHE_QUANT}" >&2
+  exit 2
+fi
+
+FORCE_QUANTIZE_FLAGS=()
+if [[ "${FORCE_QUANTIZE}" == "1" ]]; then
+  FORCE_QUANTIZE_FLAGS=(--force-quantize)
+elif [[ "${FORCE_QUANTIZE}" != "0" ]]; then
+  echo "ERROR: FORCE_QUANTIZE must be 0 or 1, got ${FORCE_QUANTIZE}" >&2
+  exit 2
+fi
+
+FP8_EXCLUDE_FLAGS=()
+FP8_EXCLUDE_TAG="fp8all"
+if [[ -n "${FP8_EXCLUDE_GROUPS}" ]]; then
+  read -r -a FP8_EXCLUDE_GROUP_ARRAY <<<"${FP8_EXCLUDE_GROUPS}"
+  FP8_EXCLUDE_FLAGS=(--fp8-exclude-groups "${FP8_EXCLUDE_GROUP_ARRAY[@]}")
+  FP8_EXCLUDE_TAG="fp8x$(printf '%s-' "${FP8_EXCLUDE_GROUP_ARRAY[@]}")"
+  FP8_EXCLUDE_TAG="${FP8_EXCLUDE_TAG%-}"
+fi
+
+read -r -a CTE_BUCKETS <<<"${CTE_BUCKETS_RAW}"
+if (( ${#CTE_BUCKETS[@]} == 0 )); then
+  echo "ERROR: CTE_BUCKETS_RAW produced no buckets" >&2
+  exit 2
+fi
+PREFIX_BUCKETS=(256 512 1024 2048 4096 8192 16384)
+if (( MAX_CONTEXT_LENGTH > 32768 )); then
+  PREFIX_BUCKETS+=(32768 65536 131072 262144)
+elif (( MAX_CONTEXT_LENGTH > 16384 )); then
+  PREFIX_BUCKETS+=(32768)
+fi
+PAIR_ARGS=()
+for cte_bucket in "${CTE_BUCKETS[@]}"; do
+  for prefix_bucket in "${PREFIX_BUCKETS[@]}"; do
+    PAIR_ARGS+=("${cte_bucket}:${prefix_bucket}")
+  done
+done
+TKG_BUCKETS=(512 16384 16640 32768)
+if (( MAX_CONTEXT_LENGTH > 32768 )); then
+  TKG_BUCKETS+=(65536 131072 262144)
+fi
+MAX_PREFIX_BUCKET="${PREFIX_BUCKETS[$(( ${#PREFIX_BUCKETS[@]} - 1 ))]}"
+PFX_TAG="pfx$(( MAX_PREFIX_BUCKET / 1024 ))k"
+SEQ_TAG="$(( SEQ_LEN / 1024 ))k"
+CTE_TAG="$(IFS=_; echo "${CTE_BUCKETS[*]}")"
+
+SOLVE_TAG="${QWEN36_DELTANET_SOLVE_MODE}_scan${QWEN36_DELTANET_SOLVE_SCAN_STEPS}"
+BASE="qwen36_${SEQ_TAG}_fp8_${FP8_EXCLUDE_TAG}_${LM_HEAD_TAG}_${LINEAR_ATTN_GATE_TAG}_${KV_CACHE_TAG}_${QKV_KERNEL_TAG}_${PREFIX_CTE_ATTENTION_BACKEND}${PREFIX_CTE_ATTENTION_SEGMENT_SIZE}_gdnseg${QWEN36_DELTANET_FUSED_SEGMENT_TOKENS}_cte${CTE_TAG}_${PFX_TAG}_slots${MAX_GDN_CHECKPOINT_SLOTS}_${TS}_${SOLVE_TAG}"
+ART="${ART_ROOT}/${BASE}"
+WORK="${ART_ROOT}/_nxd_work_${SEQ_TAG}_fp8_${FP8_EXCLUDE_TAG}_${LM_HEAD_TAG}_${LINEAR_ATTN_GATE_TAG}_${KV_CACHE_TAG}_${QKV_KERNEL_TAG}_${PREFIX_CTE_ATTENTION_BACKEND}${PREFIX_CTE_ATTENTION_SEGMENT_SIZE}_gdnseg${QWEN36_DELTANET_FUSED_SEGMENT_TOKENS}_cte${CTE_TAG}_${TS}_${SOLVE_TAG}"
+QUANT="${ART_ROOT}/_quantized/qwen36_27b_fp8_full_${FP8_EXCLUDE_TAG}_${LM_HEAD_TAG}_${LINEAR_ATTN_GATE_TAG}"
+LOG="${LOGDIR}/${BASE}_compile.log"
+PID="${LOGDIR}/${BASE}_compile.pid"
+ENVLOG="${LOGDIR}/${BASE}_env.txt"
+
+mkdir -p "${LOGDIR}"
+cd "${REPO}"
+
+export NEURON_PLATFORM_TARGET_OVERRIDE="${NEURON_PLATFORM_TARGET_OVERRIDE:-trn2}"
+export NEURON_CC_FLAGS="${NEURON_CC_FLAGS:---target trn2 --lnc 2}"
+export USE_NKI_DECODE=1
+export QWEN36_DELTANET_CTE_IMPL
+export QWEN36_DELTANET_MULTIHEAD_CTE
+export QWEN36_DELTANET_FUSED_SEGMENT_TOKENS
+export QWEN36_DELTANET_CHUNK_SIZE
+export QWEN36_DELTANET_SOLVE_BLOCK_SIZE
+export QWEN36_DELTANET_SOLVE_MODE
+export QWEN36_DELTANET_SOLVE_SCAN_STEPS
+export QWEN36_PREFIX_ATTENTION_IMPL
+
+printf "%s\n" \
+  "BASE=${BASE}" \
+  "ARTIFACT=${ART}" \
+  "WORKDIR=${WORK}" \
+  "QUANTIZED_CHECKPOINTS=${QUANT}" \
+  "LOG=${LOG}" \
+  "PIDFILE=${PID}" \
+  "REPO=${REPO}" \
+  "MODEL=${MODEL}" \
+  "NEURON_PLATFORM_TARGET_OVERRIDE=${NEURON_PLATFORM_TARGET_OVERRIDE}" \
+  "NEURON_CC_FLAGS=${NEURON_CC_FLAGS}" \
+  "NKI_LIBRARY_SRC=${NKI_LIBRARY_SRC}" \
+  "USE_NKI_DECODE=${USE_NKI_DECODE}" \
+  "QWEN36_DELTANET_CTE_IMPL=${QWEN36_DELTANET_CTE_IMPL}" \
+  "QWEN36_DELTANET_MULTIHEAD_CTE=${QWEN36_DELTANET_MULTIHEAD_CTE}" \
+  "QWEN36_DELTANET_FUSED_SEGMENT_TOKENS=${QWEN36_DELTANET_FUSED_SEGMENT_TOKENS}" \
+  "QWEN36_DELTANET_CHUNK_SIZE=${QWEN36_DELTANET_CHUNK_SIZE}" \
+  "QWEN36_DELTANET_SOLVE_BLOCK_SIZE=${QWEN36_DELTANET_SOLVE_BLOCK_SIZE}" \
+  "QWEN36_DELTANET_SOLVE_MODE=${QWEN36_DELTANET_SOLVE_MODE}" \
+  "QWEN36_DELTANET_SOLVE_SCAN_STEPS=${QWEN36_DELTANET_SOLVE_SCAN_STEPS}" \
+  "QWEN36_PREFIX_ATTENTION_IMPL=${QWEN36_PREFIX_ATTENTION_IMPL}" \
+  "SEQ_LEN=${SEQ_LEN}" \
+  "MAX_CONTEXT_LENGTH=${MAX_CONTEXT_LENGTH}" \
+  "PA_NUM_BLOCKS=${PA_NUM_BLOCKS}" \
+  "CTE_BUCKETS=${CTE_BUCKETS[*]}" \
+  "PREFIX_BUCKETS=${PREFIX_BUCKETS[*]}" \
+  "TOKEN_GENERATION_BUCKETS=${TKG_BUCKETS[*]}" \
+  "CONTEXT_ENCODING_BUCKET_PAIRS=${PAIR_ARGS[*]}" \
+  "PREFIX_CTE_ATTENTION_BACKEND=${PREFIX_CTE_ATTENTION_BACKEND}" \
+  "PREFIX_CTE_ATTENTION_SEGMENT_SIZE=${PREFIX_CTE_ATTENTION_SEGMENT_SIZE}" \
+  "KERNELS=decode_deltanet,${QKV_KERNEL_TAG},segmented_attention_cte" \
+  "SAMPLING=on_device_greedy_output_logits_1" \
+  "MEMORY_FLAGS=${LM_HEAD_MEMORY_TAG},kv_cache_${KV_CACHE_TAG},no_tkg_checkpoint_commit,gdn_recurrent_${GDN_RECURRENT_CACHE_DTYPE},gdn_conv_${GDN_CONV_CACHE_DTYPE}" \
+  "GDN_RECURRENT_CACHE_DTYPE=${GDN_RECURRENT_CACHE_DTYPE}" \
+  "GDN_CONV_CACHE_DTYPE=${GDN_CONV_CACHE_DTYPE}" \
+  "MAX_GDN_CHECKPOINT_SLOTS=${MAX_GDN_CHECKPOINT_SLOTS}" \
+  "ENABLE_QKV_NKI_KERNELS=${ENABLE_QKV_NKI_KERNELS}" \
+  "ENABLE_KV_CACHE_QUANT=${ENABLE_KV_CACHE_QUANT}" \
+  "QUANTIZE_LM_HEAD=${QUANTIZE_LM_HEAD}" \
+  "FP8_QUANTIZE_LINEAR_ATTN_GATES=${FP8_QUANTIZE_LINEAR_ATTN_GATES}" \
+  "FP8_EXCLUDE_GROUPS=${FP8_EXCLUDE_GROUPS:-none}" \
+  "FORCE_QUANTIZE=${FORCE_QUANTIZE}" \
+  "DISABLE_CONTEXT_ENCODING_ARGMAX_KERNEL=1" \
+  "OUTPUT_LOGITS_WITH_ON_DEVICE_SAMPLING=1" \
+  >"${ENVLOG}"
+
+(
+  set -euo pipefail
+  cd "${REPO}"
+  source /opt/aws_neuronx_venv_pytorch_inference_vllm_0_16/bin/activate
+  export PYTHONPATH="${NKI_LIBRARY_SRC}:${REPO}/src:${REPO}/contrib/models/Qwen3.6-27B:${REPO}/contrib/models/Qwen3.6-27B/vllm:${PYTHONPATH:-}"
+  export NEURON_PLATFORM_TARGET_OVERRIDE="${NEURON_PLATFORM_TARGET_OVERRIDE:-trn2}"
+  export NEURON_CC_FLAGS="${NEURON_CC_FLAGS:---target trn2 --lnc 2}"
+  export USE_NKI_DECODE=1
+  export QWEN36_DELTANET_CTE_IMPL
+  export QWEN36_DELTANET_MULTIHEAD_CTE
+  export QWEN36_DELTANET_FUSED_SEGMENT_TOKENS
+  export QWEN36_DELTANET_CHUNK_SIZE
+  export QWEN36_DELTANET_SOLVE_BLOCK_SIZE
+  export QWEN36_DELTANET_SOLVE_MODE
+  export QWEN36_DELTANET_SOLVE_SCAN_STEPS
+  export QWEN36_PREFIX_ATTENTION_IMPL
+
+  python contrib/models/Qwen3.6-27B/test/integration/qwen36_27b_compile_fp8.py \
+    --repo-root "${REPO}" \
+    --model-path "${MODEL}" \
+    --compiled-path "${ART}" \
+    --base-compile-work-dir "${WORK}" \
+    --quantized-checkpoints-path "${QUANT}" \
+    --weight-dtype fp8_full \
+    "${LM_HEAD_FLAGS[@]}" \
+    "${LINEAR_ATTN_GATE_FLAGS[@]}" \
+    "${FP8_EXCLUDE_FLAGS[@]}" \
+    "${FORCE_QUANTIZE_FLAGS[@]}" \
+    --seq-len "${SEQ_LEN}" \
+    --max-context-length "${MAX_CONTEXT_LENGTH}" \
+    --cte-buckets "${CTE_BUCKETS[@]}" \
+    --prefix-buckets "${PREFIX_BUCKETS[@]}" \
+    --context-encoding-bucket-pairs "${PAIR_ARGS[@]}" \
+    --token-generation-buckets "${TKG_BUCKETS[@]}" \
+    --block-size 256 \
+    --pa-num-blocks "${PA_NUM_BLOCKS}" \
+    --tp-degree 4 \
+    --logical-nc-config 2 \
+    --max-num-seqs 1 \
+    --ctx-batch-size 1 \
+    --skip-warmup \
+    --async-mode \
+    --enable-prefix-caching \
+    --enable-hybrid-apc \
+    --enable-vllm-chunked-prefill \
+    --enable-deltanet-decode-nki \
+    "${QKV_KERNEL_FLAGS[@]}" \
+    "${KV_CACHE_FLAGS[@]}" \
+    --deltanet-cte-backend fused \
+    --gdn-checkpoint-interval 256 \
+    --max-gdn-checkpoint-slots "${MAX_GDN_CHECKPOINT_SLOTS}" \
+    --gdn-recurrent-cache-dtype "${GDN_RECURRENT_CACHE_DTYPE}" \
+    --gdn-conv-cache-dtype "${GDN_CONV_CACHE_DTYPE}" \
+    --hybrid-cache-mode all \
+    --hybrid-apc-require-vllm-metadata \
+    --hybrid-apc-enable-backed-prefix-reads \
+    --output-logits-with-on-device-sampling \
+    --disable-context-encoding-argmax-kernel \
+    --prefix-cte-attention-backend "${PREFIX_CTE_ATTENTION_BACKEND}" \
+    --prefix-cte-attention-segment-size "${PREFIX_CTE_ATTENTION_SEGMENT_SIZE}"
+) >"${LOG}" 2>&1 &
+
+echo "$!" >"${PID}"
+echo "BASE=${BASE}"
+echo "ARTIFACT=${ART}"
+echo "WORKDIR=${WORK}"
+echo "QUANTIZED_CHECKPOINTS=${QUANT}"
+echo "LOG=${LOG}"
+echo "ENVLOG=${ENVLOG}"
+echo "PIDFILE=${PID}"
+echo "PID=$(cat "${PID}")"

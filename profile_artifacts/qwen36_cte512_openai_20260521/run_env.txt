@@ -1,0 +1,14 @@
+RUN_ID=patchedscheduler16k_20260521T154444Z
+LOG_DIR=/home/ubuntu/validation_logs/fp8_128k/openai_api_64k_cte512_patchedscheduler16k_20260521T154444Z
+REPO_DIR=/home/ubuntu/inferentia-gdn-experimental-test
+VENV=/opt/aws_neuronx_venv_pytorch_inference_vllm_0_16
+MODEL_PATH=/home/ubuntu/models/Qwen3.6-27B
+ARTIFACT=/mnt/trainium_artifacts/qwen_artifacts/qwen36_27b_128k_fp8_mlp_edgebf16_hybrid_apc_nki_chunked_b256_cte256_512_pfx16k_slots64_20260521T092332Z
+SERVER_PID=24317
+NEURON_MONITOR_PID=24318
+HOST_MONITOR_PID=24319
+MAX_MODEL_LEN=65536
+SEQ_LEN=131072
+CTE_BUCKETS=256,512
+HYBRID_APC_PREFILL_CHUNK_TOKENS=512
+PA_NUM_BLOCKS=256

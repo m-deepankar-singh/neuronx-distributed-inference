@@ -1,0 +1,79 @@
+/opt/aws_neuronx_venv_pytorch_inference_vllm_0_16/lib/python3.12/site-packages/neuronx_distributed/modules/moe/blockwise.py:100: DeprecationWarning: torch_neuronx.nki_jit is deprecated, use nki.jit instead.
+  component, error = import_nki(config)
+/opt/aws_neuronx_venv_pytorch_inference_vllm_0_16/lib/python3.12/site-packages/neuronx_distributed/modules/moe/blockwise.py:102: UserWarning: Warning: Failed to import blockwise_mm_baseline_shard_hidden: No module named 'neuronxcc.nki._private.blockwise_mm'
+  warnings.warn(f"Warning: {error}")
+/opt/aws_neuronx_venv_pytorch_inference_vllm_0_16/lib/python3.12/site-packages/neuronx_distributed/modules/moe/blockwise.py:102: UserWarning: Warning: Failed to import blockwise_mm_bwd: No module named 'neuronxcc.nki._private.blockwise_mm_bwd'
+  warnings.warn(f"Warning: {error}")
+/opt/aws_neuronx_venv_pytorch_inference_vllm_0_16/lib/python3.12/site-packages/neuronx_distributed/modules/moe/blockwise.py:102: UserWarning: Warning: Failed to import blockwise_mm_bwd_baseline_shard_hidden: No module named 'neuronxcc.nki._private.blockwise_mm_bwd'
+  warnings.warn(f"Warning: {error}")
+/home/ubuntu/inferentia-gdn-equiv-bd75e6c/src/neuronx_distributed_inference/utils/constants.py:1: DeprecationWarning: torch_neuronx.nki_jit is deprecated, use nki.jit instead.
+  from neuronx_distributed_inference.models.dbrx.modeling_dbrx import NeuronDbrxForCausalLM
+/home/ubuntu/inferentia-gdn-equiv-bd75e6c/src/neuronx_distributed_inference/utils/constants.py:6: DeprecationWarning: torch_neuronx.nki_jit is deprecated, use nki.jit instead.
+  from neuronx_distributed_inference.models.mixtral.modeling_mixtral import NeuronMixtralForCausalLM
+/home/ubuntu/inferentia-gdn-equiv-bd75e6c/src/neuronx_distributed_inference/utils/constants.py:13: DeprecationWarning: torch_neuronx.nki_jit is deprecated, use nki.jit instead.
+  from neuronx_distributed_inference.models.qwen3_moe.modeling_qwen3_moe import NeuronQwen3MoeForCausalLM
+/home/ubuntu/inferentia-gdn-equiv-bd75e6c/src/neuronx_distributed_inference/utils/accuracy.py:36: UserWarning: Intel extension for pytorch not found. For faster CPU references install `intel-extension-for-pytorch`.
+  warnings.warn(
+WARNING:root:NeuronConfig init: Unexpected keyword arguments: {'enable_long_context_mode': True, 'enable_token_tree': False, 'is_chunked_prefill': False, 'is_hidden_dim_shuffled': False, 'is_intermediate_dim_shuffled': False, 'is_prefill_stage': None, 'kv_cache_tiling': False, 'kv_cache_update_with_kernel': False, 'tile_cc': False}
+[transformers] The following generation flags are not valid and may be ignored: ['top_p', 'top_k']. Set `TRANSFORMERS_VERBOSITY=info` for more details.
+[transformers] The following generation flags are not valid and may be ignored: ['top_k']. Set `TRANSFORMERS_VERBOSITY=info` for more details.
+INFO:Neuron:Loading presharded checkpoints for ranks: 0...3
+2026-May-23 17:40:03.434343 36515:36515  WARN   NRT:nrt_config_parse_init_config            Implicit Async using NEURON_RT_ASYNC_EXEC_MAX_INFLIGHT_REQUESTS will not be supported in a future release of the Neuron Runtime. Migrate to using the new Neuron Runtime Async APIs to address the risk of this future breaking change. https://awsdocs-neuron.readthedocs-hosted.com/en/latest/neuron-runtime/api/nrt-async-api-overview.html
+INFO:Neuron:Finished weights loading in 195.62894759600022 seconds
+INFO:Neuron:Skipping model warmup
+[transformers] `torch_dtype` is deprecated! Use `dtype` instead!
+[transformers] The fast path is not available because one of the required library is not installed. Falling back to torch implementation. To install follow https://github.com/fla-org/flash-linear-attention#installation and https://github.com/Dao-AILab/causal-conv1d
+Loading compiled Neuron model...
+Loading HF reference (FP32)...
+Loading weights:   0%|          | 0/851 [00:00<?, ?it/s]Loading weights:  24%|██▍       | 203/851 [00:00<00:00, 1986.40it/s]Loading weights: 100%|██████████| 851/851 [00:00<00:00, 4544.36it/s]
+2026-May-23 17:45:47.0050 36515:36540 [0] int nccl_net_ofi_create_plugin(nccl_net_ofi_plugin_t**):232 CCOM WARN NET/OFI Failed to initialize rdma protocol
+2026-May-23 17:45:47.0052 36515:36540 [0] int nccl_net_ofi_create_plugin(nccl_net_ofi_plugin_t**):376 CCOM WARN NET/OFI aws-ofi-nccl initialization failed
+2026-May-23 17:45:47.0055 36515:36540 [0] ncclResult_t nccl_net_ofi_init(ncclDebugLogger_t):78 CCOM WARN NET/OFI Initializing plugin failed
+2026-May-23 17:45:47.0057 36515:36540 [0] net_plugin.cc:97 CCOM WARN OFI plugin initNet() failed is EFA enabled?
+[transformers] Unrecognized keys in `rope_parameters` for 'rope_type'='default': {'mrope_interleaved', 'mrope_section'}
+[transformers] Passing `generation_config` together with generation-related arguments=({'max_new_tokens', 'do_sample', 'output_scores', 'return_dict_in_generate'}) is deprecated and will be removed in future versions. Please pass either a `generation_config` object OR all generation parameters explicitly, but not both.
+
+======================================================================
+  Step 1.1: Token Matching (10 prompts, greedy decoding)
+======================================================================
+
+  Overall: 89.69% (287/320 tokens)
+  Prompt                                                   Match    Diverge
+  ------------------------------------------------------- ------ ----------
+  <|im_start|>user
+The capital of France is<|im_end|>
+<|i  100%          —
+  <|im_start|>user
+The color of the sky is<|im_end|>
+<|im  100%          —
+  <|im_start|>user
+Water freezes at<|im_end|>
+<|im_start|   97%   token 31
+  <|im_start|>user
+The largest planet in our solar system  100%          —
+  <|im_start|>user
+The speed of light is approximately<|i  100%          —
+  <|im_start|>user
+The chemical symbol for gold is<|im_en    3%    token 0
+  <|im_start|>user
+The square root of 144 is<|im_end|>
+<|  100%          —
+  <|im_start|>user
+The first president of the United Stat  100%          —
+  <|im_start|>user
+The boiling point of water is<|im_end|  100%          —
+  <|im_start|>user
+The number of continents on Earth is<|   97%   token 20
+
+======================================================================
+  Step 1.2: Enhanced Distribution Metrics (FP32 vs BF16)
+======================================================================
+  Enhanced metrics not available: hybrid APC request prep requires attention hit length
+
+Results saved to /home/ubuntu/agent_artifacts/equiv_qwen36_fused_vocabparallel_exact_20260523T144742Z/results/stage1_hybrid_cte256_512_adapterfix.json
+
+======================================================================
+  STAGE 1 VERDICT: FAIL
+  Token match rate: 89.69%
+  Action: Proceed to Stage 2 for component-level localization
+======================================================================

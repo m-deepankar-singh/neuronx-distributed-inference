@@ -1,0 +1,42 @@
+{
+  "results": [
+    {
+      "component": "rmsnorm",
+      "r_ratio": 266.6859,
+      "passed": false
+    },
+    {
+      "component": "mlp.down_proj",
+      "r_ratio": 1.0,
+      "passed": true
+    },
+    {
+      "component": "mlp.gate_proj",
+      "r_ratio": 1.0,
+      "passed": true
+    },
+    {
+      "component": "mlp.swiglu",
+      "r_ratio": 1.0,
+      "passed": true
+    },
+    {
+      "component": "mlp.up_proj",
+      "r_ratio": 1.0,
+      "passed": true
+    },
+    {
+      "component": "embedding.small_vocab",
+      "r_ratio": 1.0,
+      "passed": true
+    },
+    {
+      "component": "lm_head.small_vocab",
+      "r_ratio": 1.0,
+      "passed": true
+    }
+  ],
+  "passed": 6,
+  "failed": 1,
+  "total": 7
+}

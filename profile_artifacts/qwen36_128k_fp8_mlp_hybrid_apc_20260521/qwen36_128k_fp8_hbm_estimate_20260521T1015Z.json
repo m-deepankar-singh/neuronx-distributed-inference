@@ -1,0 +1,11 @@
+[
+  {
+    "attention_kv_gib": 2.0,
+    "bytes_per_gdn_checkpoint": 38486016,
+    "checkpoint_interval": 256,
+    "context_len": 131072,
+    "gdn_checkpoint_gib": 18.3515625,
+    "num_gdn_checkpoints": 512,
+    "total_gib": 20.3515625
+  }
+]

@@ -1,0 +1,43 @@
+{
+  "artifact": "/mnt/trainium_artifacts/qwen_artifacts/qwen36_27b_128k_fp8_mlp_edgebf16_hybrid_apc_nki_chunked_b256_cte256_512_pfx16k_slots64_20260521T092332Z",
+  "avg_elapsed_s": 10.349053463332288,
+  "avg_tok_s": 6.1841509539725505,
+  "cte_buckets": [
+    256,
+    512
+  ],
+  "max_num_seqs": 1,
+  "max_tokens": 64,
+  "model_path": "/home/ubuntu/models/Qwen3.6-27B",
+  "pa_num_blocks": 256,
+  "prompt": "Explain software benchmarking in two concise paragraphs.",
+  "runs": [
+    {
+      "completion_tokens": 64,
+      "elapsed_s": 10.341905737997877,
+      "run": 1,
+      "text": "\n\n<think>\nThinking Process:\n\n1.  **Deconstruct the user's request:**\n    *   Topic: Software benchmarking.\n    *   Constraint: Two concise paragraphs.\n\n2.  **Drafting - Paragraph 1: Definition and Purpose:**\n    *   *Goal:* Define what software",
+      "tok_s": 6.188414555438596
+    },
+    {
+      "completion_tokens": 64,
+      "elapsed_s": 10.337292886000796,
+      "run": 2,
+      "text": "\n\n<think>\nThinking Process:\n\n1.  **Deconstruct the user's request:**\n    *   Topic: Software benchmarking.\n    *   Constraint: Two concise paragraphs.\n\n2.  **Drafting - Paragraph 1: Definition and Purpose:**\n    *   *Goal:* Define what software",
+      "tok_s": 6.191176036684762
+    },
+    {
+      "completion_tokens": 64,
+      "elapsed_s": 10.367961765998189,
+      "run": 3,
+      "text": "\n\n<think>\nThinking Process:\n\n1.  **Deconstruct the user's request:**\n    *   Topic: Software benchmarking.\n    *   Constraint: Two concise paragraphs.\n\n2.  **Drafting - Paragraph 1: Definition and Purpose:**\n    *   *Goal:* Define what software",
+      "tok_s": 6.17286226979429
+    }
+  ],
+  "warmup": {
+    "completion_tokens": 8,
+    "elapsed_s": 1.715140001000691,
+    "text": "\n\n<think>\nThinking Process:\n\n1",
+    "tok_s": 4.664342266714341
+  }
+}

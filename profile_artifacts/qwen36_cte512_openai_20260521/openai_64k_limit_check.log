@@ -1,0 +1,56 @@
+{"body": {"choices": [{"finish_reason": "stop", "index": 0, "logprobs": null, "message": {"annotations": null, "audio": null, "content": "391", "function_call": null, "reasoning": null, "refusal": null, "role": "assistant", "tool_calls": []}, "stop_reason": null, "token_ids": null}], "created": 1779378652, "id": "chatcmpl-98f13ea449861436", "kv_transfer_params": null, "model": "/home/ubuntu/models/Qwen3.6-27B", "object": "chat.completion", "prompt_logprobs": null, "prompt_token_ids": null, "service_tier": null, "system_fingerprint": null, "usage": {"completion_tokens": 4, "prompt_tokens": 34, "prompt_tokens_details": null, "total_tokens": 38}}, "elapsed_seconds": 0.8752680760007934, "passed_contains_391": true, "phase": "semantic_smoke", "status": 200, "text": "391"}
+{"completion_tokens": 0, "content_chunk_count": 0, "decode_tokens_per_second": null, "error": null, "group": "cold_prefill", "label": "cold_prefill_32768", "max_tokens": 1, "metric_delta": {"local_cache_hit": 0.0, "local_compute": 0.0, "prefix_cache_hits_total": 0.0, "prefix_cache_queries_total": 0.0, "prompt_tokens_cached_total": 0.0, "prompt_tokens_total": 0.0}, "phase": "cold", "prefill_tokens_per_second": null, "prompt_tokens": 32761, "prompt_tokens_reported": null, "status": 200, "text": "", "total_seconds": 28.40828946399961, "tpot_seconds": null, "ttft_seconds": null, "usage": null}
+Traceback (most recent call last):
+  File "/usr/lib/python3.12/urllib/request.py", line 1344, in do_open
+    h.request(req.get_method(), req.selector, req.data, headers,
+  File "/usr/lib/python3.12/http/client.py", line 1356, in request
+    self._send_request(method, url, body, headers, encode_chunked)
+  File "/usr/lib/python3.12/http/client.py", line 1402, in _send_request
+    self.endheaders(body, encode_chunked=encode_chunked)
+  File "/usr/lib/python3.12/http/client.py", line 1351, in endheaders
+    self._send_output(message_body, encode_chunked=encode_chunked)
+  File "/usr/lib/python3.12/http/client.py", line 1111, in _send_output
+    self.send(msg)
+  File "/usr/lib/python3.12/http/client.py", line 1055, in send
+    self.connect()
+  File "/usr/lib/python3.12/http/client.py", line 1021, in connect
+    self.sock = self._create_connection(
+                ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/socket.py", line 852, in create_connection
+    raise exceptions[0]
+  File "/usr/lib/python3.12/socket.py", line 837, in create_connection
+    sock.connect(sa)
+ConnectionRefusedError: [Errno 111] Connection refused
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/tmp/qwen36_openai_api_perf.py", line 483, in <module>
+    raise SystemExit(main())
+                     ^^^^^^
+  File "/tmp/qwen36_openai_api_perf.py", line 384, in main
+    run_case(
+  File "/tmp/qwen36_openai_api_perf.py", line 304, in run_case
+    result = stream_chat(
+             ^^^^^^^^^^^^
+  File "/tmp/qwen36_openai_api_perf.py", line 160, in stream_chat
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/urllib/request.py", line 215, in urlopen
+    return opener.open(url, data, timeout)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/urllib/request.py", line 515, in open
+    response = self._open(req, data)
+               ^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/urllib/request.py", line 532, in _open
+    result = self._call_chain(self.handle_open, protocol, protocol +
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/urllib/request.py", line 492, in _call_chain
+    result = func(*args)
+             ^^^^^^^^^^^
+  File "/usr/lib/python3.12/urllib/request.py", line 1373, in http_open
+    return self.do_open(http.client.HTTPConnection, req)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/urllib/request.py", line 1347, in do_open
+    raise URLError(err)
+urllib.error.URLError: <urlopen error [Errno 111] Connection refused>

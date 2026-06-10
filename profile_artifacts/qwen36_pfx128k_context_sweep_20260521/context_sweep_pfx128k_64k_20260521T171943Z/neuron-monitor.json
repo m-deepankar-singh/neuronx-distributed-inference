@@ -1,0 +1,1 @@
+{"period":"5s","neuron_runtimes":[{"tag_filter":".*","metrics":[{"type":"memory_used","period":"5s"}]}]}

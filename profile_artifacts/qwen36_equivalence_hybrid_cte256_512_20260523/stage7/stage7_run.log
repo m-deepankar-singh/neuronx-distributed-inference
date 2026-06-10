@@ -1,0 +1,62 @@
+/opt/aws_neuronx_venv_pytorch_inference_vllm_0_16/lib/python3.12/site-packages/neuronx_distributed/modules/moe/blockwise.py:100: DeprecationWarning: torch_neuronx.nki_jit is deprecated, use nki.jit instead.
+  component, error = import_nki(config)
+/opt/aws_neuronx_venv_pytorch_inference_vllm_0_16/lib/python3.12/site-packages/neuronx_distributed/modules/moe/blockwise.py:102: UserWarning: Warning: Failed to import blockwise_mm_baseline_shard_hidden: No module named 'neuronxcc.nki._private.blockwise_mm'
+  warnings.warn(f"Warning: {error}")
+/opt/aws_neuronx_venv_pytorch_inference_vllm_0_16/lib/python3.12/site-packages/neuronx_distributed/modules/moe/blockwise.py:102: UserWarning: Warning: Failed to import blockwise_mm_bwd: No module named 'neuronxcc.nki._private.blockwise_mm_bwd'
+  warnings.warn(f"Warning: {error}")
+/opt/aws_neuronx_venv_pytorch_inference_vllm_0_16/lib/python3.12/site-packages/neuronx_distributed/modules/moe/blockwise.py:102: UserWarning: Warning: Failed to import blockwise_mm_bwd_baseline_shard_hidden: No module named 'neuronxcc.nki._private.blockwise_mm_bwd'
+  warnings.warn(f"Warning: {error}")
+/home/ubuntu/inferentia-gdn-equiv-bd75e6c/src/neuronx_distributed_inference/utils/constants.py:1: DeprecationWarning: torch_neuronx.nki_jit is deprecated, use nki.jit instead.
+  from neuronx_distributed_inference.models.dbrx.modeling_dbrx import NeuronDbrxForCausalLM
+/home/ubuntu/inferentia-gdn-equiv-bd75e6c/src/neuronx_distributed_inference/utils/constants.py:6: DeprecationWarning: torch_neuronx.nki_jit is deprecated, use nki.jit instead.
+  from neuronx_distributed_inference.models.mixtral.modeling_mixtral import NeuronMixtralForCausalLM
+/home/ubuntu/inferentia-gdn-equiv-bd75e6c/src/neuronx_distributed_inference/utils/constants.py:13: DeprecationWarning: torch_neuronx.nki_jit is deprecated, use nki.jit instead.
+  from neuronx_distributed_inference.models.qwen3_moe.modeling_qwen3_moe import NeuronQwen3MoeForCausalLM
+/home/ubuntu/inferentia-gdn-equiv-bd75e6c/src/neuronx_distributed_inference/utils/accuracy.py:36: UserWarning: Intel extension for pytorch not found. For faster CPU references install `intel-extension-for-pytorch`.
+  warnings.warn(
+[transformers] `torch_dtype` is deprecated! Use `dtype` instead!
+[transformers] The fast path is not available because one of the required library is not installed. Falling back to torch implementation. To install follow https://github.com/fla-org/flash-linear-attention#installation and https://github.com/Dao-AILab/causal-conv1d
+============================================================
+Phase 1: HF baseline (FP32 CPU)
+============================================================
+Loaded 5 exact HellaSwag validation rows from Hugging Face dataset-server
+Loading HF baseline model in FP32...
+Loading weights:   0%|          | 0/851 [00:00<?, ?it/s]Loading weights: 100%|██████████| 851/851 [00:00<00:00, 11999.92it/s]
+[transformers] The attention mask is not set and cannot be inferred from input because pad token is same as eos token. As a consequence, you may observe unexpected behavior. Please pass your input's `attention_mask` to obtain reliable results.
+WARNING:root:NeuronConfig init: Unexpected keyword arguments: {'enable_long_context_mode': True, 'enable_token_tree': False, 'is_chunked_prefill': False, 'is_hidden_dim_shuffled': False, 'is_intermediate_dim_shuffled': False, 'is_prefill_stage': None, 'kv_cache_tiling': False, 'kv_cache_update_with_kernel': False, 'tile_cc': False}
+[transformers] The following generation flags are not valid and may be ignored: ['top_p', 'top_k']. Set `TRANSFORMERS_VERBOSITY=info` for more details.
+[transformers] The following generation flags are not valid and may be ignored: ['top_k']. Set `TRANSFORMERS_VERBOSITY=info` for more details.
+INFO:Neuron:Loading presharded checkpoints for ranks: 0...3
+2026-May-23 18:46:14.249211 45084:45084  WARN   NRT:nrt_config_parse_init_config            Implicit Async using NEURON_RT_ASYNC_EXEC_MAX_INFLIGHT_REQUESTS will not be supported in a future release of the Neuron Runtime. Migrate to using the new Neuron Runtime Async APIs to address the risk of this future breaking change. https://awsdocs-neuron.readthedocs-hosted.com/en/latest/neuron-runtime/api/nrt-async-api-overview.html
+INFO:Neuron:Finished weights loading in 23.531014194999443 seconds
+INFO:Neuron:Skipping model warmup
+2026-May-23 18:46:38.0065 45084:45170 [3] int nccl_net_ofi_create_plugin(nccl_net_ofi_plugin_t**):232 CCOM WARN NET/OFI Failed to initialize rdma protocol
+2026-May-23 18:46:38.0068 45084:45170 [3] int nccl_net_ofi_create_plugin(nccl_net_ofi_plugin_t**):376 CCOM WARN NET/OFI aws-ofi-nccl initialization failed
+2026-May-23 18:46:38.0070 45084:45170 [3] ncclResult_t nccl_net_ofi_init(ncclDebugLogger_t):78 CCOM WARN NET/OFI Initializing plugin failed
+2026-May-23 18:46:38.0073 45084:45170 [3] net_plugin.cc:97 CCOM WARN OFI plugin initNet() failed is EFA enabled?
+  hf hellaswag[0] label=3 pred=3 generated='D'
+  hf hellaswag[1] label=3 pred=3 generated='D'
+  hf hellaswag[2] label=2 pred=0 generated='A'
+  hf hellaswag[3] label=2 pred=2 generated='C'
+  hf hellaswag[4] label=1 pred=1 generated='B'
+============================================================
+Phase 2: Neuron model
+============================================================
+Loaded 5 exact HellaSwag validation rows from Hugging Face dataset-server
+  neuron hellaswag[0] label=3 pred=3 generated='D\n#\n</think>\n\nD\n#\n</think>\n\nD\n#\n</think>\n\n'
+  neuron hellaswag[1] label=3 pred=3 generated='D\n# Title\n# Title\n# Title\n# Title\n'
+  neuron hellaswag[2] label=2 pred=0 generated='A\n# Answer\nA\n# Context\nTwo women in a child are shown in a canoe'
+  neuron hellaswag[3] label=2 pred=2 generated='C\n# System\nYou are an expert text classifier.\n<think>\n\n</think>\n\nC\n'
+  neuron hellaswag[4] label=1 pred=1 generated='B\n# Title\n# Answer\n#\n#\nassistant\n'
+============================================================
+Phase 3: Comparing HF vs Neuron
+============================================================
+
+Stage 7 comparison:
+  hellaswag: PASS acc hf=0.8000 neuron=0.8000 delta=0.0000 tol=0.0200
+  overall: PASS
+
+============================================================
+  Stage 7: PASS
+  Results saved to /home/ubuntu/agent_artifacts/equiv_qwen36_fused_vocabparallel_exact_20260523T144742Z/results/stage7
+============================================================

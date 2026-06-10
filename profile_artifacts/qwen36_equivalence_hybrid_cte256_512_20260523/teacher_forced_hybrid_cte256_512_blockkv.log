@@ -1,0 +1,135 @@
+/opt/aws_neuronx_venv_pytorch_inference_vllm_0_16/lib/python3.12/site-packages/neuronx_distributed/modules/moe/blockwise.py:100: DeprecationWarning: torch_neuronx.nki_jit is deprecated, use nki.jit instead.
+  component, error = import_nki(config)
+/opt/aws_neuronx_venv_pytorch_inference_vllm_0_16/lib/python3.12/site-packages/neuronx_distributed/modules/moe/blockwise.py:102: UserWarning: Warning: Failed to import blockwise_mm_baseline_shard_hidden: No module named 'neuronxcc.nki._private.blockwise_mm'
+  warnings.warn(f"Warning: {error}")
+/opt/aws_neuronx_venv_pytorch_inference_vllm_0_16/lib/python3.12/site-packages/neuronx_distributed/modules/moe/blockwise.py:102: UserWarning: Warning: Failed to import blockwise_mm_bwd: No module named 'neuronxcc.nki._private.blockwise_mm_bwd'
+  warnings.warn(f"Warning: {error}")
+/opt/aws_neuronx_venv_pytorch_inference_vllm_0_16/lib/python3.12/site-packages/neuronx_distributed/modules/moe/blockwise.py:102: UserWarning: Warning: Failed to import blockwise_mm_bwd_baseline_shard_hidden: No module named 'neuronxcc.nki._private.blockwise_mm_bwd'
+  warnings.warn(f"Warning: {error}")
+/home/ubuntu/inferentia-gdn-equiv-bd75e6c/src/neuronx_distributed_inference/utils/constants.py:1: DeprecationWarning: torch_neuronx.nki_jit is deprecated, use nki.jit instead.
+  from neuronx_distributed_inference.models.dbrx.modeling_dbrx import NeuronDbrxForCausalLM
+/home/ubuntu/inferentia-gdn-equiv-bd75e6c/src/neuronx_distributed_inference/utils/constants.py:6: DeprecationWarning: torch_neuronx.nki_jit is deprecated, use nki.jit instead.
+  from neuronx_distributed_inference.models.mixtral.modeling_mixtral import NeuronMixtralForCausalLM
+/home/ubuntu/inferentia-gdn-equiv-bd75e6c/src/neuronx_distributed_inference/utils/constants.py:13: DeprecationWarning: torch_neuronx.nki_jit is deprecated, use nki.jit instead.
+  from neuronx_distributed_inference.models.qwen3_moe.modeling_qwen3_moe import NeuronQwen3MoeForCausalLM
+/home/ubuntu/inferentia-gdn-equiv-bd75e6c/src/neuronx_distributed_inference/utils/accuracy.py:36: UserWarning: Intel extension for pytorch not found. For faster CPU references install `intel-extension-for-pytorch`.
+  warnings.warn(
+[transformers] `torch_dtype` is deprecated! Use `dtype` instead!
+[transformers] The fast path is not available because one of the required library is not installed. Falling back to torch implementation. To install follow https://github.com/fla-org/flash-linear-attention#installation and https://github.com/Dao-AILab/causal-conv1d
+Loading source model (FP32)...
+Loading weights:   0%|          | 0/851 [00:00<?, ?it/s]Loading weights: 100%|██████████| 851/851 [00:00<00:00, 12871.76it/s]
+Loading source model (BF16)...
+Loading weights:   0%|          | 0/851 [00:00<?, ?it/s]Loading weights: 100%|██████████| 851/851 [00:00<00:00, 11626.03it/s]
+WARNING:root:NeuronConfig init: Unexpected keyword arguments: {'enable_long_context_mode': True, 'enable_token_tree': False, 'is_chunked_prefill': False, 'is_hidden_dim_shuffled': False, 'is_intermediate_dim_shuffled': False, 'is_prefill_stage': None, 'kv_cache_tiling': False, 'kv_cache_update_with_kernel': False, 'tile_cc': False}
+[transformers] The following generation flags are not valid and may be ignored: ['top_p', 'top_k']. Set `TRANSFORMERS_VERBOSITY=info` for more details.
+[transformers] The following generation flags are not valid and may be ignored: ['top_k']. Set `TRANSFORMERS_VERBOSITY=info` for more details.
+INFO:Neuron:Loading presharded checkpoints for ranks: 0...3
+2026-May-23 18:03:33.551755 38525:38525  WARN   NRT:nrt_config_parse_init_config            Implicit Async using NEURON_RT_ASYNC_EXEC_MAX_INFLIGHT_REQUESTS will not be supported in a future release of the Neuron Runtime. Migrate to using the new Neuron Runtime Async APIs to address the risk of this future breaking change. https://awsdocs-neuron.readthedocs-hosted.com/en/latest/neuron-runtime/api/nrt-async-api-overview.html
+INFO:Neuron:Finished weights loading in 22.937607759002276 seconds
+INFO:Neuron:Skipping model warmup
+2026-May-23 18:05:55.0693 38525:38563 [3] int nccl_net_ofi_create_plugin(nccl_net_ofi_plugin_t**):232 CCOM WARN NET/OFI Failed to initialize rdma protocol
+2026-May-23 18:05:55.0696 38525:38563 [3] int nccl_net_ofi_create_plugin(nccl_net_ofi_plugin_t**):376 CCOM WARN NET/OFI aws-ofi-nccl initialization failed
+2026-May-23 18:05:55.0698 38525:38563 [3] ncclResult_t nccl_net_ofi_init(ncclDebugLogger_t):78 CCOM WARN NET/OFI Initializing plugin failed
+2026-May-23 18:05:55.0700 38525:38563 [3] net_plugin.cc:97 CCOM WARN OFI plugin initNet() failed is EFA enabled?
+Loading target model (compiled)...
+
+======================================================================
+  Prompt: "The capital of France is"
+======================================================================
+  Generating source tokens (FP32, greedy)...
+  Getting source FP32 logits (teacher-forced)...
+  Getting source BF16 logits (teacher-forced)...
+  Getting target logits (teacher-forced)...
+
+  Per-position results (32 positions, teacher-forced):
+   Pos  R-ratio   Cosine         KL  Top-1
+  ---- -------- -------- ---------- ------
+     0 224709.1164   0.9998     0.0012      ✓
+     1 215437.7853   0.9998     0.0013      ✓
+     2 230924.2291   0.9997     0.0008      ✓
+     3 302241.8000   0.9996     0.0025      ✓
+     4 2848821.6317   0.9586     0.0019      ✓
+     5 1855856.8485   0.9829     0.1604      ✓
+     6 628570.3746   0.9982     0.0000      ✓
+     7 459084.2208   0.9989     0.0058      ✓
+     8 301820.4019   0.9996     0.0016      ✓
+     9 262143.1877   0.9997     0.0000      ✓
+  ... (22 more positions)
+
+  Summary:
+    R-ratio:  mean=507924.0759, p95=1391090.3318, max=2848821.6317
+    Cosine:   mean=0.997468, min=0.958610, p5=0.990479
+    KL:       mean=0.007956, p95=0.029957, max=0.160416
+    Top-1:    100.00%
+
+======================================================================
+  Prompt: "Water freezes at"
+======================================================================
+  Generating source tokens (FP32, greedy)...
+  Getting source FP32 logits (teacher-forced)...
+  Getting source BF16 logits (teacher-forced)...
+  Getting target logits (teacher-forced)...
+
+  Per-position results (32 positions, teacher-forced):
+   Pos  R-ratio   Cosine         KL  Top-1
+  ---- -------- -------- ---------- ------
+     0 283762.4352   0.9996     0.0010      ✓
+     1 269962.5540   0.9996     0.0018      ✓
+     2 180529.8195   0.9998     0.0016      ✓
+     3 297231.7497   0.9996     0.0004      ✓
+     4 238412.1997   0.9997     0.0032      ✓
+     5 230458.9389   0.9998     0.0000      ✓
+     6 2932735.1531   0.9561     0.0003      ✓
+     7 813770.8395   0.9974     0.0001      ✓
+     8 241522.5723   0.9997     0.0000      ✓
+     9 242157.7865   0.9997     0.0000      ✓
+  ... (22 more positions)
+
+  Summary:
+    R-ratio:  mean=334390.0917, p95=529674.3401, max=2932735.1531
+    Cosine:   mean=0.998292, min=0.956102, p5=0.998606
+    KL:       mean=0.001061, p95=0.003442, max=0.004100
+    Top-1:    100.00%
+
+======================================================================
+  Prompt: "The speed of light is approximately"
+======================================================================
+  Generating source tokens (FP32, greedy)...
+  Getting source FP32 logits (teacher-forced)...
+  Getting source BF16 logits (teacher-forced)...
+  Getting target logits (teacher-forced)...
+
+  Per-position results (32 positions, teacher-forced):
+   Pos  R-ratio   Cosine         KL  Top-1
+  ---- -------- -------- ---------- ------
+     0 247216.8821   0.9997     0.0020      ✓
+     1 258779.0691   0.9997     0.0022      ✓
+     2 203813.3931   0.9998     0.0020      ✓
+     3 160657.5282   0.9999     0.0000      ✓
+     4 258751.6809   0.9997     0.0019      ✓
+     5 311983.5758   0.9995     0.0000      ✓
+     6 241224.0561   0.9997     0.0000      ✓
+     7 264806.3416   0.9997     0.0000      ✓
+     8 299318.2410   0.9997     0.0000      ✓
+     9 179886.4068   0.9999     0.0000      ✓
+  ... (22 more positions)
+
+  Summary:
+    R-ratio:  mean=237635.8573, p95=319000.0020, max=381386.4400
+    Cosine:   mean=0.999722, min=0.999285, p5=0.999520
+    KL:       mean=0.000882, p95=0.002130, max=0.005363
+    Top-1:    100.00%
+
+======================================================================
+  TEACHER-FORCED COMPARISON SUMMARY (96 total positions)
+======================================================================
+  Condition B (Semantic): PASS
+    cosine: mean=0.998494, min=0.956102, p5=0.998018 (θ=0.95)
+  Condition C (Distributional):
+    KL: mean=0.003300, p95=0.005152, max=0.160416
+  E2E R-ratio:
+    mean=359983.3416, p95=674870.4909, max=2932735.1531
+  Top-1 agreement: 100.00%
+======================================================================
+
+Results saved to /home/ubuntu/agent_artifacts/equiv_qwen36_fused_vocabparallel_exact_20260523T144742Z/results/teacher_forced_hybrid_cte256_512_blockkv.json

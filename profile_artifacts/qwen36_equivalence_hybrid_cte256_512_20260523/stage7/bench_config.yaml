@@ -1,0 +1,18 @@
+model:
+  model_class: "/home/ubuntu/inferentia-gdn-equiv-bd75e6c/contrib/models/Qwen3.6-27B/src/modeling_qwen35.py:NeuronQwen35ForCausalLM"
+  config_class: "/home/ubuntu/inferentia-gdn-equiv-bd75e6c/contrib/models/Qwen3.6-27B/src/modeling_qwen35.py:Qwen35InferenceConfig"
+  model_path: "/home/ubuntu/models/Qwen3.6-27B"
+  compiled_model_path: "/mnt/trainium_artifacts/qwen_artifacts/qwen36_27b_128k_fp8_mlp_edgebf16_hybrid_apc_nki_fusedstable_directsolve_samplelogits_vocabparallel_b256_cte256_512_pfx16k_slots64_tkg8192_32768_131072_async_20260523T123711Z"
+
+benchmarks:
+  lm_eval:
+    accuracy:
+      tasks: ["hellaswag"]
+      limit: 5
+      use_chat: true
+      method: "generate_choice"
+      max_new_tokens: 24
+
+run_hf_baseline: true
+tolerance:
+  default: 0.02

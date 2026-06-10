@@ -79,10 +79,10 @@ def _try_load_nki_cte():
     tensors (B*H, seq, d) but we wrap it to accept 4D (B, H, S, D) for
     drop-in compatibility with the ISA kernel interface.
 
-    Integration uses the nki 0.2.0 public API:
-      1. peel_decorations() strips the @nki.jit(mode='auto') decorator
-      2. nki.jit(mode='torchxla') redecorates for PyTorch XLA tensor support
-      3. Integer grid (2,) for LNC=2 sharding (nki 0.2.0 uses int grids)
+    Integration uses the current NKI public API:
+      1. peel_decorations() strips the source decorator
+      2. nki.jit() redecorates and auto-detects PyTorch XLA tensor support
+      3. NEURON_PLATFORM_TARGET_OVERRIDE selects the target platform
 
     Returns a callable matching scaled_dot_product_attention_kernel's 4D interface,
     or None if nkilib is not available.
@@ -94,16 +94,13 @@ def _try_load_nki_cte():
             peel_decorations,
         )
 
-        # Peel @nki.jit(mode='auto') and redecorate with mode='torchxla'
-        # for PyTorch tensor compatibility during torch_neuronx.trace().
+        # Peel the source decorator and redecorate for PyTorch tensor
+        # compatibility during torch_neuronx.trace().
         raw_func = peel_decorations(attention_cte)
-        decorated_cte = nki.jit(
-            raw_func,
-            mode="torchxla",
-            platform_target="trn2",
-        )
+        os.environ.setdefault("NEURON_PLATFORM_TARGET_OVERRIDE", "trn2")
+        decorated_cte = nki.jit(raw_func)
 
-        logger.info("nkilib attention_cte kernel loaded (nki 0.2.0 torchxla)")
+        logger.info("nkilib attention_cte kernel loaded")
 
         def attention_cte_4d(Q, K, V, is_causal=False, scale=None):
             """4D wrapper for attention_cte: (B, H, S, D) -> (B, H, S, D).
@@ -185,13 +182,10 @@ def _try_load_attention_cte_bias():
         )
 
         raw_func = peel_decorations(attention_cte_with_bias)
-        decorated_cte_bias = nki.jit(
-            raw_func,
-            mode="torchxla",
-            platform_target="trn2",
-        )
+        os.environ.setdefault("NEURON_PLATFORM_TARGET_OVERRIDE", "trn2")
+        decorated_cte_bias = nki.jit(raw_func)
 
-        logger.info("attention_cte_bias kernel loaded (nki 0.2.0 torchxla)")
+        logger.info("attention_cte_bias kernel loaded")
 
         def attention_cte_bias_4d(Q, K, V, attn_bias, scale=None):
             """4D wrapper: (B, H, S, D) + bias [B*H, K_seq] -> (B, H, S, D).

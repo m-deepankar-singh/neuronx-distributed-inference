@@ -1,0 +1,13 @@
+Qwen3.6 proxy listening on 0.0.0.0:8000, backend=http://127.0.0.1:8001, allow_completions=False, force_disable_thinking=False
+127.0.0.1 - "GET /v1/models HTTP/1.1" 200 -
+127.0.0.1 - "POST /v1/chat/completions HTTP/1.1" 200 -
+127.0.0.1 - "POST /v1/chat/completions HTTP/1.1" 200 -
+49.207.227.89 - "GET /v1/models HTTP/1.1" 200 -
+127.0.0.1 - "POST /v1/chat/completions HTTP/1.1" 200 -
+49.207.227.89 - "POST /v1/chat/completions HTTP/1.1" 200 -
+49.207.227.89 - "POST /v1/chat/completions HTTP/1.1" 200 -
+49.207.227.89 - "POST /v1/chat/completions HTTP/1.1" 200 -
+49.207.227.89 - "POST /v1/chat/completions HTTP/1.1" 200 -
+127.0.0.1 - "POST /v1/chat/completions HTTP/1.1" 200 -
+127.0.0.1 - "POST /v1/chat/completions HTTP/1.1" 200 -
+49.207.227.89 - "POST /v1/chat/completions HTTP/1.1" 200 -
