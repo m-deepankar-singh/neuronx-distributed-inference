@@ -746,6 +746,87 @@ class TestQwen36HybridAPCSchedulerPatch(unittest.TestCase):
         self.assertEqual(metadata["req-a"]["vllm_attention_hit_len"], 0)
         self.assertEqual(metadata["req-a"]["active_suffix_len"], 4)
 
+    def test_native_chunk_threshold_caps_cold_prefill_coordinates(self):
+        class FakeScheduler:
+            def __init__(self):
+                base = _scheduler(
+                    block_size=256,
+                    use_qwen_hybrid_chunked_prefill=True,
+                    additional_config={
+                        "qwen_prefill_group_size": 2048,
+                        "hybrid_apc_prefill_chunk_tokens": 2048,
+                    },
+                )
+                self.vllm_config = base.vllm_config
+                self.cache_config = base.cache_config
+                self.scheduler_config = base.scheduler_config
+                self.requests = {
+                    "req-long": types.SimpleNamespace(
+                        request_id="req-long",
+                        prompt_token_ids=list(range(4000)),
+                        all_token_ids=list(range(4000)),
+                        block_hashes=[
+                            f"hash-{idx}".encode()
+                            for idx in range(16)
+                        ],
+                        num_prompt_tokens=4000,
+                        num_tokens=4000,
+                        num_computed_tokens=0,
+                        cache_salt=None,
+                    )
+                }
+
+            def add_request(self, request):
+                del request
+
+            def schedule(self):
+                request = self.requests["req-long"]
+                threshold = getattr(
+                    self.scheduler_config,
+                    "long_prefill_token_threshold",
+                    0,
+                )
+                self.seen_threshold = threshold
+                num_new_tokens = request.num_tokens - request.num_computed_tokens
+                if threshold:
+                    num_new_tokens = min(num_new_tokens, threshold)
+                scheduler_output = types.SimpleNamespace(
+                    scheduled_new_reqs=[
+                        types.SimpleNamespace(
+                            req_id="req-long",
+                            block_ids=(list(range(16)),),
+                            num_computed_tokens=request.num_computed_tokens,
+                        )
+                    ],
+                    scheduled_cached_reqs=types.SimpleNamespace(
+                        req_ids=[],
+                        new_block_ids=[],
+                        num_computed_tokens=[],
+                    ),
+                    num_scheduled_tokens={"req-long": num_new_tokens},
+                )
+                request.num_computed_tokens += num_new_tokens
+                return scheduler_output
+
+        self.patch.patch_scheduler_class(FakeScheduler)
+        scheduler = FakeScheduler()
+        scheduler_output = scheduler.schedule()
+        metadata = getattr(
+            scheduler_output,
+            "_qwen36_hybrid_apc_metadata_by_request_id",
+        )["req-long"]
+
+        self.assertEqual(scheduler.seen_threshold, 2048)
+        self.assertFalse(
+            hasattr(scheduler.scheduler_config, "long_prefill_token_threshold")
+        )
+        self.assertEqual(scheduler.requests["req-long"].num_computed_tokens, 2048)
+        self.assertEqual(metadata["request_prefix_len"], 2048)
+        self.assertEqual(metadata["vllm_attention_hit_len"], 0)
+        self.assertEqual(metadata["active_suffix_len"], 2048)
+        self.assertIn(2048, metadata["cumulative_hashes_by_prefix_len"])
+        self.assertNotIn(4096, metadata["cumulative_hashes_by_prefix_len"])
+
     def test_scheduler_output_caps_cached_request_prefix_to_current_chunk(self):
         class FakeScheduler:
             def __init__(self):
@@ -909,6 +990,9 @@ class TestQwen36HybridAPCSchedulerPatch(unittest.TestCase):
                     enable_backed_prefix_reads=True,
                     use_qwen_hybrid_chunked_prefill=True,
                     max_num_seqs=2,
+                    additional_config={
+                        "override_neuron_config": {"ctx_batch_size": 2}
+                    },
                 )
                 self.vllm_config = base.vllm_config
                 self.cache_config = base.cache_config
@@ -1032,6 +1116,9 @@ class TestQwen36HybridAPCSchedulerPatch(unittest.TestCase):
                     enable_backed_prefix_reads=True,
                     use_qwen_hybrid_chunked_prefill=True,
                     max_num_seqs=2,
+                    additional_config={
+                        "override_neuron_config": {"ctx_batch_size": 2}
+                    },
                 )
                 self.vllm_config = base.vllm_config
                 self.cache_config = base.cache_config
@@ -1901,6 +1988,296 @@ class TestQwen36HybridAPCSchedulerPatch(unittest.TestCase):
                 },
             ),
         )
+
+    def test_runner_patch_slices_new_native_chunk_continuous_prefill(self):
+        class FakeRunner:
+            _BLOCK_TABLE_PAD = -1
+
+            def __init__(self):
+                self.vllm_config = types.SimpleNamespace(
+                    additional_config={"use_qwen_hybrid_chunked_prefill": True}
+                )
+                self.cache_config = types.SimpleNamespace(block_size=256)
+                self.model_config = types.SimpleNamespace(max_model_len=32768)
+                self.max_prompt_length = 32768
+                self.free_seq_ids = [7]
+                self.vllm_req_to_neuron_seq_id_mapping = {}
+                self.lora_config = None
+                self.device = torch.device("cpu")
+
+            def _prepare_continuous_batching_inputs(self, scheduler_output):
+                data = types.SimpleNamespace(
+                    request_ids=[],
+                    input_tokens=[],
+                    position_ids=[],
+                    input_block_ids=[],
+                    full_context_lens=[],
+                    computed_context_lens=[],
+                    prefill_completion_state=[],
+                    adapter_ids=[],
+                    block_tables=[],
+                    slot_mapping=[],
+                )
+                for request_data in scheduler_output.scheduled_new_reqs:
+                    self._process_new_request_for_continuous_batching(
+                        request_data,
+                        data,
+                    )
+                return data, False
+
+            def _process_new_request_for_continuous_batching(self, request_data, data):
+                del request_data, data
+                raise AssertionError("original new-request path should not run")
+
+            def _process_cached_request_for_continuous_batching(
+                self,
+                request_data,
+                index,
+                data,
+            ):
+                del request_data, index, data
+                raise AssertionError("original cached-request path should not run")
+
+            def _finalize_continuous_batching_inputs(self, data, is_prefill):
+                self.finalize_seen_is_prefill = is_prefill
+                self.finalize_seen_full_context_lens = list(data.full_context_lens)
+                return types.SimpleNamespace(
+                    prefill_completion_state=None,
+                    full_context_lens=torch.tensor(
+                        data.full_context_lens,
+                        dtype=torch.long,
+                    ).reshape(-1, 1),
+                )
+
+            def _prepare_adapter_id_in_new_request(self, request_data):
+                del request_data
+                return None
+
+            def _prepare_adapter_id_in_cached_request(self, req_id):
+                del req_id
+                return None
+
+            def _execute_model_for_text(self, model_input, intermediate_tensors=None):
+                del intermediate_tensors
+                return model_input
+
+        self.patch.patch_neuron_model_runner_class(FakeRunner)
+        runner = FakeRunner()
+        scheduler_output = types.SimpleNamespace(
+            scheduled_new_reqs=[
+                types.SimpleNamespace(
+                    req_id="req-long",
+                    prompt_token_ids=list(range(3658)),
+                    block_ids=(list(range(12, 20)),),
+                    num_computed_tokens=0,
+                )
+            ],
+            scheduled_cached_reqs=types.SimpleNamespace(req_ids=[]),
+            num_scheduled_tokens={"req-long": 2048},
+        )
+
+        data, is_prefill = runner._prepare_continuous_batching_inputs(
+            scheduler_output
+        )
+        model_input = runner._finalize_continuous_batching_inputs(data, is_prefill)
+
+        self.assertEqual(data.request_ids, ["req-long"])
+        self.assertEqual(runner.vllm_req_to_neuron_seq_id_mapping, {"req-long": 7})
+        self.assertEqual(len(data.input_tokens[0]), 2048)
+        self.assertEqual(data.input_tokens[0][0], 0)
+        self.assertEqual(data.input_tokens[0][-1], 2047)
+        self.assertEqual(data.position_ids[0][0], 0)
+        self.assertEqual(data.position_ids[0][-1], 2047)
+        self.assertEqual(data.full_context_lens, [2048])
+        self.assertEqual(data.computed_context_lens, [0])
+        self.assertEqual(data.prefill_completion_state, [False])
+        self.assertEqual(data.block_tables[0][:8], list(range(12, 20)))
+        self.assertEqual(len(data.slot_mapping[0]), 2048)
+        self.assertEqual(data.slot_mapping[0][0], 12 * 256)
+        self.assertEqual(data.slot_mapping[0][-1], 19 * 256 + 255)
+        self.assertEqual(model_input.prefill_completion_state.tolist(), [False])
+
+    def test_runner_patch_slices_cached_native_chunk_continuous_prefill(self):
+        class FakeRunner:
+            _BLOCK_TABLE_PAD = -1
+
+            def __init__(self):
+                self.vllm_config = types.SimpleNamespace(
+                    additional_config={"use_qwen_hybrid_chunked_prefill": True}
+                )
+                self.cache_config = types.SimpleNamespace(block_size=256)
+                self.model_config = types.SimpleNamespace(max_model_len=32768)
+                self.max_prompt_length = 32768
+                self.free_seq_ids = []
+                self.vllm_req_to_neuron_seq_id_mapping = {"req-long": 7}
+                self.requests = {
+                    "req-long": types.SimpleNamespace(
+                        prompt_token_ids=list(range(3658)),
+                        block_ids=(list(range(12, 27)),),
+                    )
+                }
+                self.lora_config = None
+                self.device = torch.device("cpu")
+
+            def _prepare_continuous_batching_inputs(self, scheduler_output):
+                data = types.SimpleNamespace(
+                    request_ids=[],
+                    input_tokens=[],
+                    position_ids=[],
+                    input_block_ids=[],
+                    full_context_lens=[],
+                    computed_context_lens=[],
+                    prefill_completion_state=[],
+                    adapter_ids=[],
+                    block_tables=[],
+                    slot_mapping=[],
+                )
+                cached_request_data = scheduler_output.scheduled_cached_reqs
+                for index, _ in enumerate(cached_request_data.req_ids):
+                    self._process_cached_request_for_continuous_batching(
+                        cached_request_data,
+                        index,
+                        data,
+                    )
+                return data, False
+
+            def _process_new_request_for_continuous_batching(self, request_data, data):
+                del request_data, data
+                raise AssertionError("original new-request path should not run")
+
+            def _process_cached_request_for_continuous_batching(
+                self,
+                request_data,
+                index,
+                data,
+            ):
+                del request_data, index, data
+                raise AssertionError("original cached-request path should not run")
+
+            def _finalize_continuous_batching_inputs(self, data, is_prefill):
+                self.finalize_seen_is_prefill = is_prefill
+                self.finalize_seen_full_context_lens = list(data.full_context_lens)
+                return types.SimpleNamespace(
+                    prefill_completion_state=None,
+                    full_context_lens=torch.tensor(
+                        data.full_context_lens,
+                        dtype=torch.long,
+                    ).reshape(-1, 1),
+                )
+
+            def _prepare_adapter_id_in_new_request(self, request_data):
+                del request_data
+                return None
+
+            def _prepare_adapter_id_in_cached_request(self, req_id):
+                del req_id
+                return None
+
+            def _execute_model_for_text(self, model_input, intermediate_tensors=None):
+                del intermediate_tensors
+                return model_input
+
+        self.patch.patch_neuron_model_runner_class(FakeRunner)
+        runner = FakeRunner()
+        scheduler_output = types.SimpleNamespace(
+            scheduled_new_reqs=[],
+            scheduled_cached_reqs=types.SimpleNamespace(
+                req_ids=["req-long"],
+                num_computed_tokens=[2048],
+            ),
+            num_scheduled_tokens={"req-long": 1610},
+        )
+
+        data, is_prefill = runner._prepare_continuous_batching_inputs(
+            scheduler_output
+        )
+        model_input = runner._finalize_continuous_batching_inputs(data, is_prefill)
+
+        self.assertEqual(data.request_ids, ["req-long"])
+        self.assertEqual(len(data.input_tokens[0]), 1610)
+        self.assertEqual(data.input_tokens[0][0], 2048)
+        self.assertEqual(data.input_tokens[0][-1], 3657)
+        self.assertEqual(data.position_ids[0][0], 2048)
+        self.assertEqual(data.position_ids[0][-1], 3657)
+        self.assertEqual(data.full_context_lens, [3658])
+        self.assertEqual(data.computed_context_lens, [2048])
+        self.assertEqual(data.prefill_completion_state, [True])
+        self.assertEqual(data.block_tables[0][:15], list(range(12, 27)))
+        self.assertEqual(len(data.slot_mapping[0]), 1610)
+        self.assertEqual(data.slot_mapping[0][0], 20 * 256)
+        self.assertEqual(data.slot_mapping[0][-1], 26 * 256 + 73)
+        self.assertEqual(model_input.input_tokens.shape, (1, 1610))
+        self.assertEqual(model_input.position_ids.shape, (1, 1610))
+        self.assertEqual(model_input.slot_mapping.shape, (1, 32768))
+        self.assertEqual(model_input.full_context_lens.reshape(-1).tolist(), [3658])
+        self.assertEqual(model_input.computed_context_lens.reshape(-1).tolist(), [2048])
+        self.assertEqual(model_input.prefill_completion_state.tolist(), [True])
+
+    def test_native_chunk_continuous_prefill_coordinates_scale_to_256k(self):
+        class FakeRunner:
+            _BLOCK_TABLE_PAD = -1
+            _SLOT_MAPPING_PAD = -1
+
+            def __init__(self):
+                self.cache_config = types.SimpleNamespace(block_size=256)
+                self.model_config = types.SimpleNamespace(max_model_len=262144)
+                self.device = torch.device("cpu")
+                self.lora_config = None
+
+            def _finalize_continuous_batching_inputs(self, data, is_prefill):
+                del data, is_prefill
+                raise AssertionError("original finalizer should not run")
+
+        runner = FakeRunner()
+        data = types.SimpleNamespace(
+            request_ids=[],
+            input_tokens=[],
+            position_ids=[],
+            input_block_ids=[],
+            full_context_lens=[],
+            computed_context_lens=[],
+            prefill_completion_state=[],
+            adapter_ids=[],
+            block_tables=[],
+            slot_mapping=[],
+            multi_modal_kwargs=None,
+        )
+        prompt_len = 262144
+        start = prompt_len - 2048
+        self.patch._append_native_chunked_continuous_prefill(
+            runner,
+            request_id="req-256k",
+            prompt_token_ids=list(range(prompt_len)),
+            block_ids=(list(range(prompt_len // 256)),),
+            start=start,
+            scheduled_tokens=2048,
+            input_block_id=0,
+            adapter_id=None,
+            data=data,
+        )
+        model_input = self.patch._finalize_native_chunked_continuous_prefill(
+            runner,
+            data,
+            runner._finalize_continuous_batching_inputs,
+        )
+
+        self.assertEqual(data.full_context_lens, [262144])
+        self.assertEqual(data.computed_context_lens, [260096])
+        self.assertEqual(data.prefill_completion_state, [True])
+        self.assertEqual(model_input.input_tokens.shape, (1, 2048))
+        self.assertEqual(model_input.input_tokens[0, 0].item(), 260096)
+        self.assertEqual(model_input.input_tokens[0, -1].item(), 262143)
+        self.assertEqual(model_input.position_ids.shape, (1, 2048))
+        self.assertEqual(model_input.slot_mapping.shape, (1, 262144))
+        self.assertEqual(model_input.slot_mapping[0, 0].item(), 260096)
+        self.assertEqual(model_input.slot_mapping[0, 2047].item(), 262143)
+        self.assertEqual(model_input.block_tables.shape, (1, 1024))
+        self.assertEqual(model_input.full_context_lens.reshape(-1).tolist(), [262144])
+        self.assertEqual(
+            model_input.computed_context_lens.reshape(-1).tolist(),
+            [260096],
+        )
+        self.assertEqual(model_input.prefill_completion_state.tolist(), [True])
 
     def test_runner_patch_uses_scheduler_ids_when_model_input_has_no_ids(self):
         @dataclass(frozen=True)

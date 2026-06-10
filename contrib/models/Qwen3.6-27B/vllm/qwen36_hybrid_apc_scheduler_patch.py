@@ -55,6 +55,9 @@ _MAX_PREFIX_CACHE_BLOCKS_ATTR = "_qwen36_hybrid_apc_max_prefix_cache_blocks"
 _RUNNER_PREFILL_STATE_FOR_OUTPUT_ATTR = (
     "_qwen36_hybrid_apc_prefill_completion_state_for_output"
 )
+_RUNNER_CURRENT_SCHEDULER_OUTPUT_ATTR = (
+    "_qwen36_current_continuous_batching_scheduler_output"
+)
 _HYBRID_APC_RUNTIME_CONFIG_KEYS = (
     "use_hybrid_apc_manager",
     "use_qwen_hybrid_chunked_prefill",
@@ -276,6 +279,84 @@ def _should_limit_waiting_prefill_admission(scheduler: Any) -> bool:
         _scheduler_config_flag(scheduler, "use_hybrid_apc_manager")
         and _scheduler_config_flag(scheduler, "use_qwen_hybrid_chunked_prefill")
         and _max_num_seqs_for_scheduler(scheduler) > 1
+    )
+
+
+def _qwen_native_prefill_chunk_tokens(scheduler: Any) -> int:
+    for name in ("hybrid_apc_prefill_chunk_tokens", "qwen_prefill_group_size"):
+        value = _scheduler_config_value(scheduler, name, 0)
+        if value is None:
+            continue
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return value
+    return 0
+
+
+def _set_temporary_attr(
+    obj: Any,
+    attr: str,
+    value: Any,
+    previous_values: list[tuple[Any, str, Any]],
+    missing: Any,
+) -> bool:
+    if obj is None:
+        return False
+    previous_values.append((obj, attr, getattr(obj, attr, missing)))
+    try:
+        setattr(obj, attr, value)
+    except Exception:
+        previous_values.pop()
+        return False
+    return True
+
+
+def _restore_temporary_attrs(
+    previous_values: list[tuple[Any, str, Any]],
+    missing: Any,
+) -> None:
+    for obj, attr, previous_value in reversed(previous_values):
+        if previous_value is missing:
+            try:
+                delattr(obj, attr)
+            except AttributeError:
+                pass
+        else:
+            setattr(obj, attr, previous_value)
+
+
+def _set_temporary_native_prefill_threshold(
+    scheduler: Any,
+    previous_values: list[tuple[Any, str, Any]],
+    missing: Any,
+) -> None:
+    if _env_flag("QWEN36_HYBRID_APC_DISABLE_NATIVE_PREFILL_THRESHOLD"):
+        return
+    if not _scheduler_config_flag(scheduler, "use_qwen_hybrid_chunked_prefill"):
+        return
+    threshold = _qwen_native_prefill_chunk_tokens(scheduler)
+    if threshold <= 0:
+        return
+    scheduler_config = getattr(scheduler, "scheduler_config", None)
+    if scheduler_config is None:
+        return
+    current = getattr(scheduler_config, "long_prefill_token_threshold", 0)
+    try:
+        current = int(current or 0)
+    except (TypeError, ValueError):
+        current = 0
+    target = threshold if current <= 0 else min(current, threshold)
+    if target <= 0 or target == current:
+        return
+    _set_temporary_attr(
+        scheduler_config,
+        "long_prefill_token_threshold",
+        target,
+        previous_values,
+        missing,
     )
 
 
@@ -1114,6 +1195,8 @@ def patch_scheduler_class(scheduler_cls: type) -> bool:
     ):
 
         def schedule_with_hybrid_apc_metadata(self, *args, **kwargs):
+            missing = object()
+            previous_values: list[tuple[Any, str, Any]] = []
             deferred_waiting = None
             temporary_waiting = None
             waiting = getattr(self, "waiting", None)
@@ -1134,8 +1217,14 @@ def patch_scheduler_class(scheduler_cls: type) -> bool:
                     else:
                         deferred_waiting = None
             try:
+                _set_temporary_native_prefill_threshold(
+                    self,
+                    previous_values,
+                    missing,
+                )
                 scheduler_output = original_schedule(self, *args, **kwargs)
             finally:
+                _restore_temporary_attrs(previous_values, missing)
                 if deferred_waiting is not None:
                     current_waiting = getattr(self, "waiting", temporary_waiting)
                     if current_waiting:
@@ -1370,6 +1459,274 @@ def _hybrid_apc_request_records_from_model_input(
             record["active_suffix_len"] = num_scheduled_tokens[normalized]
         records.append(record)
     return tuple(records) if found_metadata else None
+
+
+def _runner_uses_qwen_native_prefill_chunks(runner: Any) -> bool:
+    return bool(
+        _runner_hybrid_apc_runtime_config(runner).get(
+            "use_qwen_hybrid_chunked_prefill",
+            False,
+        )
+    )
+
+
+def _runner_scheduled_token_count(runner: Any, request_id: Any) -> int | None:
+    scheduler_output = getattr(
+        runner,
+        _RUNNER_CURRENT_SCHEDULER_OUTPUT_ATTR,
+        None,
+    )
+    scheduled_tokens = _num_scheduled_tokens_by_request_id(scheduler_output)
+    normalized = _normalize_request_id(request_id)
+    if normalized is None or normalized not in scheduled_tokens:
+        return None
+    return scheduled_tokens[normalized]
+
+
+def _append_native_chunked_continuous_prefill(
+    runner: Any,
+    *,
+    request_id: Any,
+    prompt_token_ids: Any,
+    block_ids: Any,
+    start: int,
+    scheduled_tokens: int,
+    input_block_id: int,
+    adapter_id: Any,
+    data: Any,
+) -> None:
+    prompt_token_ids = list(prompt_token_ids or ())
+    start = max(0, int(start))
+    scheduled_tokens = max(0, int(scheduled_tokens))
+    end = min(len(prompt_token_ids), start + scheduled_tokens)
+    if end <= start:
+        end = min(len(prompt_token_ids), start + 1)
+
+    block_table_source = block_ids or []
+    if (
+        isinstance(block_table_source, (list, tuple))
+        and block_table_source
+        and isinstance(block_table_source[0], (list, tuple))
+    ):
+        block_table_source = block_table_source[0]
+    block_table = list(block_table_source)
+    block_size = int(getattr(getattr(runner, "cache_config", None), "block_size"))
+    max_len = int(getattr(getattr(runner, "model_config", None), "max_model_len"))
+    max_blocks_per_seq = max_len // block_size
+    padded_block_table = [runner._BLOCK_TABLE_PAD] * max_blocks_per_seq
+    padded_block_table[: len(block_table)] = block_table[:]
+
+    slots = []
+    for position in range(start, end):
+        block_index = position // block_size
+        if block_index >= len(block_table):
+            raise IndexError(
+                "Qwen native chunk block table too short for scheduled "
+                f"prefill chunk: request_id={request_id!r} start={start} "
+                f"end={end} block_index={block_index} "
+                f"block_table_len={len(block_table)}"
+            )
+        block_number = block_table[block_index]
+        slots.append(block_number * block_size + position % block_size)
+
+    data.request_ids.append(request_id)
+    data.input_tokens.append(prompt_token_ids[start:end])
+    data.position_ids.append(list(range(start, end)))
+    data.input_block_ids.append(input_block_id)
+    data.full_context_lens.append(end)
+    data.computed_context_lens.append(start)
+    data.prefill_completion_state.append(end >= len(prompt_token_ids))
+    data.adapter_ids.append(adapter_id)
+    data.block_tables.append(padded_block_table)
+    data.slot_mapping.append(slots)
+
+
+def _make_tensor_with_pad_local(
+    values: Any,
+    *,
+    pad: int,
+    max_len: int,
+    dtype: Any,
+    device: Any,
+) -> torch.Tensor:
+    rows = [list(row) for row in values]
+    tensor = torch.full((len(rows), max_len), pad, dtype=dtype, device=device)
+    for row_index, row in enumerate(rows):
+        if len(row) > max_len:
+            raise ValueError(
+                "Qwen native chunk row exceeds padded tensor width: "
+                f"row_index={row_index} row_len={len(row)} max_len={max_len}"
+            )
+        if row:
+            tensor[row_index, : len(row)] = torch.tensor(
+                row,
+                dtype=dtype,
+                device=device,
+            )
+    return tensor
+
+
+class _SimpleModelInputForQwenNativeChunk:
+    def __init__(self, **kwargs: Any) -> None:
+        self.__dict__.update(kwargs)
+
+
+def _finalize_native_chunked_continuous_prefill(
+    runner: Any,
+    data: Any,
+    original_finalize_continuous: Any,
+) -> Any:
+    original_globals = getattr(original_finalize_continuous, "__globals__", {})
+    make_tensor_with_pad = original_globals.get(
+        "make_tensor_with_pad",
+        _make_tensor_with_pad_local,
+    )
+    model_input_cls = original_globals.get(
+        "ModelInputForNeuron",
+        _SimpleModelInputForQwenNativeChunk,
+    )
+
+    input_rows = [list(row) for row in getattr(data, "input_tokens", ())]
+    position_rows = [list(row) for row in getattr(data, "position_ids", ())]
+    slot_rows = [list(row) for row in getattr(data, "slot_mapping", ())]
+    request_ids = list(getattr(data, "request_ids", ()))
+    full_context_lens = [int(value) for value in getattr(data, "full_context_lens", ())]
+    computed_context_lens = [
+        int(value) for value in getattr(data, "computed_context_lens", ())
+    ]
+    prefill_state = list(getattr(data, "prefill_completion_state", ()) or ())
+
+    row_count = len(input_rows)
+    if not row_count:
+        raise ValueError("Qwen native chunk finalizer received no input rows")
+    expected_counts = {
+        "request_ids": len(request_ids),
+        "position_ids": len(position_rows),
+        "slot_mapping": len(slot_rows),
+        "full_context_lens": len(full_context_lens),
+        "computed_context_lens": len(computed_context_lens),
+        "prefill_completion_state": len(prefill_state),
+    }
+    mismatched = {
+        name: count for name, count in expected_counts.items() if count != row_count
+    }
+    if mismatched:
+        raise ValueError(
+            "Qwen native chunk finalizer received inconsistent batch rows: "
+            f"input_rows={row_count} mismatched={mismatched}"
+        )
+
+    active_width = max(len(row) for row in input_rows)
+    if active_width <= 0:
+        raise ValueError("Qwen native chunk finalizer received an empty chunk")
+    max_model_len = int(getattr(getattr(runner, "model_config", None), "max_model_len"))
+    if active_width > max_model_len:
+        raise ValueError(
+            "Qwen native chunk active width exceeds model max length: "
+            f"active_width={active_width} max_model_len={max_model_len}"
+        )
+    for row_index, (tokens, positions, slots, full_len, computed_len) in enumerate(
+        zip(input_rows, position_rows, slot_rows, full_context_lens, computed_context_lens)
+    ):
+        if len(tokens) != len(positions) or len(tokens) != len(slots):
+            raise ValueError(
+                "Qwen native chunk row has inconsistent token/position/slot widths: "
+                f"row={row_index} tokens={len(tokens)} positions={len(positions)} "
+                f"slots={len(slots)}"
+            )
+        if computed_len < 0 or full_len < computed_len:
+            raise ValueError(
+                "Qwen native chunk row has invalid context coordinates: "
+                f"row={row_index} computed={computed_len} full={full_len}"
+            )
+        if full_len - computed_len != len(tokens):
+            raise ValueError(
+                "Qwen native chunk row active width does not match context delta: "
+                f"row={row_index} computed={computed_len} full={full_len} "
+                f"tokens={len(tokens)}"
+            )
+        if positions and (positions[0] != computed_len or positions[-1] != full_len - 1):
+            raise ValueError(
+                "Qwen native chunk row position ids do not match context coordinates: "
+                f"row={row_index} computed={computed_len} full={full_len} "
+                f"first={positions[0] if positions else None} "
+                f"last={positions[-1] if positions else None}"
+            )
+
+    device = getattr(runner, "device", None)
+    input_tokens = make_tensor_with_pad(
+        input_rows,
+        pad=0,
+        max_len=active_width,
+        dtype=torch.long,
+        device=device,
+    )
+    position_ids = make_tensor_with_pad(
+        position_rows,
+        pad=0,
+        max_len=active_width,
+        dtype=torch.long,
+        device=device,
+    )
+    input_block_ids = torch.tensor(
+        list(getattr(data, "input_block_ids", ())),
+        dtype=torch.long,
+        device=device,
+    )
+    slot_mapping = make_tensor_with_pad(
+        slot_rows,
+        pad=getattr(runner, "_SLOT_MAPPING_PAD", -1),
+        max_len=max_model_len,
+        dtype=torch.long,
+        device=device,
+    )
+    block_tables = torch.tensor(
+        list(getattr(data, "block_tables", ())),
+        dtype=torch.long,
+        device=device,
+    )
+    full_context_lens_tensor = torch.tensor(
+        full_context_lens,
+        dtype=torch.long,
+        device=device,
+    ).reshape(-1, 1)
+    computed_context_lens_tensor = torch.tensor(
+        computed_context_lens,
+        dtype=torch.long,
+        device=device,
+    ).reshape(-1, 1)
+    prefill_completion_state = torch.tensor(
+        [bool(state) for state in prefill_state],
+        dtype=torch.bool,
+        device=device,
+    )
+    adapter_ids = None
+    if getattr(runner, "lora_config", None) is not None:
+        adapter_ids = torch.tensor(
+            list(getattr(data, "adapter_ids", ())),
+            dtype=torch.long,
+            device=device,
+        )
+    sampling_params = (
+        runner.get_nxd_sampling_params(input_tokens)
+        if hasattr(runner, "get_nxd_sampling_params")
+        else None
+    )
+
+    return model_input_cls(
+        request_ids=request_ids,
+        input_tokens=input_tokens,
+        position_ids=position_ids,
+        input_block_ids=input_block_ids,
+        slot_mapping=slot_mapping,
+        block_tables=block_tables,
+        full_context_lens=full_context_lens_tensor,
+        computed_context_lens=computed_context_lens_tensor,
+        prefill_completion_state=prefill_completion_state,
+        sampling_params=sampling_params,
+        multi_modal_kwargs=getattr(data, "multi_modal_kwargs", None),
+        adapter_ids=adapter_ids,
+    )
 
 
 def _request_id_target_models(model: Any) -> list[Any]:
@@ -2209,6 +2566,26 @@ def patch_neuron_model_runner_class(runner_cls: type) -> bool:
             f"{runner_cls!r} has no _execute_model_for_text method"
         )
     original_prepare = getattr(runner_cls, "_prepare_model_input", None)
+    original_prepare_continuous = getattr(
+        runner_cls,
+        "_prepare_continuous_batching_inputs",
+        None,
+    )
+    original_process_new_continuous = getattr(
+        runner_cls,
+        "_process_new_request_for_continuous_batching",
+        None,
+    )
+    original_process_cached_continuous = getattr(
+        runner_cls,
+        "_process_cached_request_for_continuous_batching",
+        None,
+    )
+    original_finalize_continuous = getattr(
+        runner_cls,
+        "_finalize_continuous_batching_inputs",
+        None,
+    )
     original_prepare_logits = getattr(
         runner_cls,
         "_prepare_logits_for_sampling",
@@ -2233,6 +2610,245 @@ def patch_neuron_model_runner_class(runner_cls: type) -> bool:
 
     missing = object()
     installed = False
+
+    if original_prepare_continuous is not None and not getattr(
+        original_prepare_continuous,
+        "_qwen36_native_chunk_scheduler_output_patched",
+        False,
+    ):
+
+        def prepare_continuous_batching_inputs_with_scheduler_output(
+            self,
+            scheduler_output,
+            *args,
+            **kwargs,
+        ):
+            previous_value = getattr(
+                self,
+                _RUNNER_CURRENT_SCHEDULER_OUTPUT_ATTR,
+                missing,
+            )
+            setattr(
+                self,
+                _RUNNER_CURRENT_SCHEDULER_OUTPUT_ATTR,
+                scheduler_output,
+            )
+            try:
+                return original_prepare_continuous(
+                    self,
+                    scheduler_output,
+                    *args,
+                    **kwargs,
+                )
+            finally:
+                if previous_value is missing:
+                    try:
+                        delattr(self, _RUNNER_CURRENT_SCHEDULER_OUTPUT_ATTR)
+                    except AttributeError:
+                        pass
+                else:
+                    setattr(
+                        self,
+                        _RUNNER_CURRENT_SCHEDULER_OUTPUT_ATTR,
+                        previous_value,
+                    )
+
+        prepare_continuous_batching_inputs_with_scheduler_output._qwen36_native_chunk_scheduler_output_patched = (
+            True
+        )
+        prepare_continuous_batching_inputs_with_scheduler_output._qwen36_original_prepare_continuous = (
+            original_prepare_continuous
+        )
+        runner_cls._prepare_continuous_batching_inputs = (
+            prepare_continuous_batching_inputs_with_scheduler_output
+        )
+        installed = True
+
+    if original_process_new_continuous is not None and not getattr(
+        original_process_new_continuous,
+        "_qwen36_native_chunk_new_prefill_patched",
+        False,
+    ):
+
+        def process_new_request_for_continuous_batching_with_native_chunk(
+            self,
+            request_data,
+            data,
+            *args,
+            **kwargs,
+        ):
+            scheduled_tokens = _runner_scheduled_token_count(
+                self,
+                getattr(request_data, "req_id", None),
+            )
+            prompt_token_ids = list(getattr(request_data, "prompt_token_ids", ()) or ())
+            start = int(getattr(request_data, "num_computed_tokens", 0) or 0)
+            remaining = max(0, len(prompt_token_ids) - start)
+            if (
+                _runner_uses_qwen_native_prefill_chunks(self)
+                and scheduled_tokens is not None
+                and scheduled_tokens > 0
+                and scheduled_tokens < remaining
+            ):
+                req_id = getattr(request_data, "req_id", None)
+                assert req_id not in self.vllm_req_to_neuron_seq_id_mapping, (
+                    "Encountered an existing request ID while prefilling a new request"
+                )
+                assert self.free_seq_ids, "No free sequence ID available!"
+                assigned_slot = self.free_seq_ids.pop()
+                self.vllm_req_to_neuron_seq_id_mapping[req_id] = assigned_slot
+                if len(prompt_token_ids) > self.max_prompt_length:
+                    raise ValueError(
+                        f"Prompt length ({len(prompt_token_ids)} tokens) exceeds "
+                        f"the maximum prompt length ({self.max_prompt_length} "
+                        "tokens) for this Neuron model."
+                    )
+                _append_native_chunked_continuous_prefill(
+                    self,
+                    request_id=req_id,
+                    prompt_token_ids=prompt_token_ids,
+                    block_ids=getattr(request_data, "block_ids", None),
+                    start=start,
+                    scheduled_tokens=scheduled_tokens,
+                    input_block_id=assigned_slot,
+                    adapter_id=self._prepare_adapter_id_in_new_request(request_data),
+                    data=data,
+                )
+                return None
+            return original_process_new_continuous(
+                self,
+                request_data,
+                data,
+                *args,
+                **kwargs,
+            )
+
+        process_new_request_for_continuous_batching_with_native_chunk._qwen36_native_chunk_new_prefill_patched = (
+            True
+        )
+        process_new_request_for_continuous_batching_with_native_chunk._qwen36_original_process_new_continuous = (
+            original_process_new_continuous
+        )
+        runner_cls._process_new_request_for_continuous_batching = (
+            process_new_request_for_continuous_batching_with_native_chunk
+        )
+        installed = True
+
+    if original_process_cached_continuous is not None and not getattr(
+        original_process_cached_continuous,
+        "_qwen36_native_chunk_cached_prefill_patched",
+        False,
+    ):
+
+        def process_cached_request_for_continuous_batching_with_native_chunk(
+            self,
+            request_data,
+            index,
+            data,
+            *args,
+            **kwargs,
+        ):
+            req_id = request_data.req_ids[index]
+            scheduled_tokens = _runner_scheduled_token_count(self, req_id)
+            if (
+                _runner_uses_qwen_native_prefill_chunks(self)
+                and scheduled_tokens is not None
+                and scheduled_tokens > 1
+            ):
+                assert req_id in self.vllm_req_to_neuron_seq_id_mapping, (
+                    "The request ID for the current prefill chunk request "
+                    "is not found in request to sequence ID mapping"
+                )
+                state = self.requests[req_id]
+                computed_tokens = list(
+                    getattr(request_data, "num_computed_tokens", ()) or ()
+                )
+                start = (
+                    int(computed_tokens[index])
+                    if index < len(computed_tokens)
+                    else int(getattr(state, "num_computed_tokens", 0) or 0)
+                )
+                prompt_token_ids = list(
+                    getattr(state, "prompt_token_ids", ()) or ()
+                )
+                remaining = max(0, len(prompt_token_ids) - start)
+                if remaining > 1:
+                    _append_native_chunked_continuous_prefill(
+                        self,
+                        request_id=req_id,
+                        prompt_token_ids=prompt_token_ids,
+                        block_ids=getattr(state, "block_ids", None),
+                        start=start,
+                        scheduled_tokens=min(scheduled_tokens, remaining),
+                        input_block_id=self.vllm_req_to_neuron_seq_id_mapping[req_id],
+                        adapter_id=self._prepare_adapter_id_in_cached_request(req_id),
+                        data=data,
+                    )
+                    return None
+            return original_process_cached_continuous(
+                self,
+                request_data,
+                index,
+                data,
+                *args,
+                **kwargs,
+            )
+
+        process_cached_request_for_continuous_batching_with_native_chunk._qwen36_native_chunk_cached_prefill_patched = (
+            True
+        )
+        process_cached_request_for_continuous_batching_with_native_chunk._qwen36_original_process_cached_continuous = (
+            original_process_cached_continuous
+        )
+        runner_cls._process_cached_request_for_continuous_batching = (
+            process_cached_request_for_continuous_batching_with_native_chunk
+        )
+        installed = True
+
+    if original_finalize_continuous is not None and not getattr(
+        original_finalize_continuous,
+        "_qwen36_native_chunk_prefill_state_patched",
+        False,
+    ):
+
+        def finalize_continuous_batching_inputs_with_prefill_state(
+            self,
+            data,
+            is_prefill,
+            *args,
+            **kwargs,
+        ):
+            prefill_state = list(
+                getattr(data, "prefill_completion_state", ()) or ()
+            )
+            has_native_prefill_chunk = any(
+                state is not None for state in prefill_state
+            )
+            if has_native_prefill_chunk:
+                return _finalize_native_chunked_continuous_prefill(
+                    self,
+                    data,
+                    original_finalize_continuous,
+                )
+            model_input = original_finalize_continuous(
+                self,
+                data,
+                is_prefill,
+                *args,
+                **kwargs,
+            )
+            return model_input
+
+        finalize_continuous_batching_inputs_with_prefill_state._qwen36_native_chunk_prefill_state_patched = (
+            True
+        )
+        finalize_continuous_batching_inputs_with_prefill_state._qwen36_original_finalize_continuous = (
+            original_finalize_continuous
+        )
+        runner_cls._finalize_continuous_batching_inputs = (
+            finalize_continuous_batching_inputs_with_prefill_state
+        )
+        installed = True
 
     if original_prepare is not None and not getattr(
         original_prepare,
