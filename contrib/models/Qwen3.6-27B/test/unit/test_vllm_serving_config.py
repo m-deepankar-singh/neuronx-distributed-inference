@@ -210,6 +210,23 @@ class TestVllmServingConfig(unittest.TestCase):
         self.assertTrue(config["use_qwen_hybrid_chunked_prefill"])
         self.assertTrue(config["use_qwen_hybrid_chunked_prefill_nki"])
 
+    def test_continuous_batching_sets_tkg_batch_to_max_num_seqs(self):
+        config = self.runner._override_config(
+            _args(
+                max_num_seqs=3,
+                ctx_batch_size=1,
+                enable_vllm_chunked_prefill=True,
+                token_generation_batches=["1,2,3"],
+            )
+        )
+        neuron_config = config["override_neuron_config"]
+
+        self.assertEqual(neuron_config["batch_size"], 3)
+        self.assertEqual(neuron_config["ctx_batch_size"], 1)
+        self.assertEqual(neuron_config["tkg_batch_size"], 3)
+        self.assertEqual(neuron_config["token_generation_batches"], [1, 2, 3])
+        self.assertEqual(neuron_config["chunked_prefill_config"]["max_num_seqs"], 3)
+
     def test_grouped_prefill_defaults_to_largest_compiled_bucket(self):
         config = self.runner._override_config(
             _args(

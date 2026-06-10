@@ -1119,7 +1119,7 @@ def main() -> int:
     )
     parser.add_argument("--tp-degree", type=int, default=4)
     parser.add_argument("--logical-nc-config", type=int, default=2)
-    parser.add_argument("--max-num-seqs", type=int, default=1)
+    parser.add_argument("--max-num-seqs", type=int, default=3)
     parser.add_argument("--ctx-batch-size", type=int, default=1)
     parser.add_argument("--skip-warmup", action="store_true")
     parser.add_argument("--async-mode", action="store_true")

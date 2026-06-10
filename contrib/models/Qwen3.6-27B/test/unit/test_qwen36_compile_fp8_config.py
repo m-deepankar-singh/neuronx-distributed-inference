@@ -217,7 +217,7 @@ class TestQwen36CompileFp8Config(unittest.TestCase):
             config.neuron_config.modules_to_not_convert,
         )
 
-    def test_compile_can_trace_batched_token_generation(self):
+    def test_compile_can_trace_three_way_batched_token_generation(self):
         with patch.object(
             _COMPILE,
             "_load_text_config",
@@ -234,17 +234,17 @@ class TestQwen36CompileFp8Config(unittest.TestCase):
                     disable_on_device_sampling=True,
                     weight_dtype="bf16_control",
                     quantized_checkpoints_path=None,
-                    max_num_seqs=2,
+                    max_num_seqs=3,
                     ctx_batch_size=1,
                     skip_warmup=True,
-                    pa_num_blocks=16,
+                    pa_num_blocks=24,
                 ),
             )
 
-        self.assertEqual(config.neuron_config.batch_size, 2)
+        self.assertEqual(config.neuron_config.batch_size, 3)
         self.assertEqual(config.neuron_config.ctx_batch_size, 1)
-        self.assertEqual(config.neuron_config.tkg_batch_size, 2)
-        self.assertEqual(config.neuron_config.pa_num_blocks, 16)
+        self.assertEqual(config.neuron_config.tkg_batch_size, 3)
+        self.assertEqual(config.neuron_config.pa_num_blocks, 24)
         self.assertTrue(config.neuron_config.skip_warmup)
 
     def test_compile_can_enable_block_tkg_attention_kernel_flags(self):
