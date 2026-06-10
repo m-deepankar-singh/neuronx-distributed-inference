@@ -249,6 +249,36 @@ def _max_num_seqs_for_scheduler(scheduler: Any) -> int:
     return int(max_num_seqs or 1)
 
 
+def _ctx_batch_size_for_scheduler(scheduler: Any) -> int:
+    vllm_config = getattr(scheduler, "vllm_config", None)
+    additional_config = _get_additional_config(vllm_config)
+    override_neuron_config = additional_config.get("override_neuron_config")
+    if isinstance(override_neuron_config, dict):
+        value = override_neuron_config.get("ctx_batch_size")
+        if value is not None:
+            try:
+                return max(1, int(value))
+            except (TypeError, ValueError):
+                pass
+    value = _scheduler_config_value(scheduler, "ctx_batch_size", 1)
+    try:
+        return max(1, int(value))
+    except (TypeError, ValueError):
+        return 1
+
+
+def _should_limit_waiting_prefill_admission(scheduler: Any) -> bool:
+    if _env_flag("QWEN36_HYBRID_APC_ALLOW_MULTI_CTE_PREFILL"):
+        return False
+    if _ctx_batch_size_for_scheduler(scheduler) > 1:
+        return False
+    return (
+        _scheduler_config_flag(scheduler, "use_hybrid_apc_manager")
+        and _scheduler_config_flag(scheduler, "use_qwen_hybrid_chunked_prefill")
+        and _max_num_seqs_for_scheduler(scheduler) > 1
+    )
+
+
 def _should_defer_waiting_prefills_while_running(scheduler: Any) -> bool:
     if _env_flag("QWEN36_HYBRID_APC_ALLOW_MIXED_PREFILL_DECODE"):
         return False
@@ -290,6 +320,19 @@ def _merge_waiting_queues(front: Any, back: Any):
     for request in back:
         _queue_add(merged, request)
     return merged
+
+
+def _split_waiting_queue(waiting: Any, admitted_count: int):
+    admitted = _new_empty_queue_like(waiting)
+    deferred = _new_empty_queue_like(waiting)
+    if admitted is None or deferred is None:
+        return None, None
+    for index, request in enumerate(waiting):
+        if index < admitted_count:
+            _queue_add(admitted, request)
+        else:
+            _queue_add(deferred, request)
+    return admitted, deferred
 
 
 def _normalize_dtype(value: Any, default: str) -> str:
@@ -1075,15 +1118,21 @@ def patch_scheduler_class(scheduler_cls: type) -> bool:
             temporary_waiting = None
             waiting = getattr(self, "waiting", None)
             running = getattr(self, "running", None)
-            if (
-                waiting
-                and running
-                and _should_defer_waiting_prefills_while_running(self)
-            ):
-                temporary_waiting = _new_empty_queue_like(waiting)
-                if temporary_waiting is not None:
-                    deferred_waiting = waiting
-                    self.waiting = temporary_waiting
+            if waiting:
+                if running and _should_defer_waiting_prefills_while_running(self):
+                    temporary_waiting = _new_empty_queue_like(waiting)
+                    if temporary_waiting is not None:
+                        deferred_waiting = waiting
+                        self.waiting = temporary_waiting
+                elif _should_limit_waiting_prefill_admission(self):
+                    temporary_waiting, deferred_waiting = _split_waiting_queue(
+                        waiting,
+                        admitted_count=1,
+                    )
+                    if temporary_waiting is not None:
+                        self.waiting = temporary_waiting
+                    else:
+                        deferred_waiting = None
             try:
                 scheduler_output = original_schedule(self, *args, **kwargs)
             finally:

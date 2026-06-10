@@ -5138,6 +5138,32 @@ def _qwen36_request_metadata_values(
     return values[0] if len(values) == 1 else tuple(values)
 
 
+def _qwen36_tensorize_full_input_ids(value, input_ids):
+    dtype = input_ids.dtype if isinstance(input_ids, torch.Tensor) else torch.int64
+    device = input_ids.device if isinstance(input_ids, torch.Tensor) else None
+    tensor_kwargs = {"dtype": dtype}
+    if device is not None:
+        tensor_kwargs["device"] = device
+
+    if not isinstance(value, (list, tuple)):
+        return torch.tensor([[value]], **tensor_kwargs)
+
+    if value and all(isinstance(row, (list, tuple)) or row is None for row in value):
+        rows = [list(row) if row is not None else [] for row in value]
+    else:
+        rows = [list(value)]
+
+    max_len = max((len(row) for row in rows), default=0)
+    if max_len == 0:
+        return torch.empty((len(rows), 0), **tensor_kwargs)
+
+    padded = torch.zeros((len(rows), max_len), **tensor_kwargs)
+    for row_idx, row in enumerate(rows):
+        if row:
+            padded[row_idx, : len(row)] = torch.tensor(row, **tensor_kwargs)
+    return padded
+
+
 def _qwen36_request_ids_have_metadata(
     metadata_by_request_id,
     request_ids,
@@ -5486,17 +5512,7 @@ def _qwen36_add_vllm_hybrid_apc_metadata(
         if value is not None:
             if key == "full_input_ids" and not isinstance(value, torch.Tensor):
                 input_ids = hybrid_apc_request_dict.get("input_ids")
-                dtype = (
-                    input_ids.dtype
-                    if isinstance(input_ids, torch.Tensor)
-                    else torch.int64
-                )
-                device = (
-                    input_ids.device
-                    if isinstance(input_ids, torch.Tensor)
-                    else None
-                )
-                value = torch.tensor([list(value)], dtype=dtype, device=device)
+                value = _qwen36_tensorize_full_input_ids(value, input_ids)
             hybrid_apc_request_dict[key] = value
 
 
